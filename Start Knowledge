@@ -26,91 +26,13 @@
 #    - 布林带 (Bollinger Bands): 用于衡量波动率和寻找均值回归机会。
 #    - 平均趋向指数 (ADX): 用于判断市场是趋势还是震荡。
 
-# --- 策略路线图绘制 ---
-# 这是一个基于所学知识构建的综合量化策略框架。
-
-class QuantStrategy:
-    """
-    这是一个综合了趋势跟踪和均值回归的量化策略类。
-    """
-    
-    def __init__(self):
-        # 初始化策略状态
-        self.market_regime = None  # 市场状态: 'trend' 或 'range'
-        self.position = 0          # 当前持仓: 1=做多, -1=做空, 0=空仓
-        
-    def identify_market_regime(self, adx_value):
-        """
-        根据ADX值判断当前市场状态。
-        ADX > 25: 趋势市场
-        ADX < 20: 震荡市场
-        """
-        if adx_value > 25:
-            self.market_regime = 'trend'
-        elif adx_value < 20:
-            self.market_regime = 'range'
-        else:
-            self.market_regime = None # 处于不确定状态，保持观望
-
-    def generate_signal(self, ma_short, ma_long, rsi, price, bb_upper, bb_lower):
-        """
-        根据市场状态和指标生成交易信号。
-        """
-        if self.market_regime == 'trend':
-            # 趋势跟踪策略
-            if ma_short > ma_long and rsi > 50:
-                # 入场: 短MA上穿长MA，且RSI强势
-                return 1  # 买入信号 (做多)
-            elif ma_short < ma_long and rsi < 50:
-                # 入场: 短MA下穿长MA，且RSI弱势
-                return -1 # 卖出信号 (做空)
-        
-        elif self.market_regime == 'range':
-            # 均值回归策略
-            if price <= bb_lower:
-                # 入场: 价格触及下轨
-                return 1  # 买入信号
-            elif price >= bb_upper:
-                # 入场: 价格触及上轨
-                return -1 # 卖出信号
-
-        return 0 # 无信号
-
-    def manage_position(self, signal, price, entry_price):
-        """
-        管理仓位和执行风险控制。
-        """
-        if signal != 0:
-            # 执行新信号，先平仓现有头寸
-            self.position = signal
-            print(f"新信号: {'买入' if signal == 1 else '卖出'}")
-            return price
-        
-        # 止损逻辑 (固定百分比止损)
-        stop_loss_pct = 0.05  # 5%止损
-        if self.position == 1 and price <= entry_price * (1 - stop_loss_pct):
-            self.position = 0
-            print("止损触发，平仓！")
-            return price
-        elif self.position == -1 and price >= entry_price * (1 + stop_loss_pct):
-            self.position = 0
-            print("止损触发，平仓！")
-            return price
-
-        # 止盈逻辑 (MA交叉) - 简化版，实际需要更多数据点
-        if self.position == 1 and ma_short < ma_long:
-            self.position = 0
-            print("止盈触发，平仓！")
-            return price
-        elif self.position == -1 and ma_short > ma_long:
-            self.position = 0
-            print("止盈触发，平仓！")
-            return price
-            
-        return None # 无操作
+# 4. 风险管理 (安全绳):
+#    - 仓位管理 (Position Sizing): 决定每次交易的风险暴露。
+#    - 动态止损 (Trailing Stop): 随着盈利调整止损位，锁定利润。
 
 # --- 风险认知总结 ---
 # - 做空风险: 理论上无限，故必须配合严格止损。
 # - 仓位管理: 每次交易投入总资金的固定百分比，而非全部。
 # - 盈亏比与胜率: 成功的关键在于二者的平衡，而非单纯追求高胜率。
 # - 过拟合: 避免策略过度适应历史数据，通过前向测试验证稳健性。
+# - 风险与纪律: 成功的量化交易，核心在于对风险的控制和对既定纪律的严格遵守。
