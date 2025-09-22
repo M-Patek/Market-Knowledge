@@ -1,2 +1,76 @@
-# Market-Knowledge
-This project is a systematic personal market knowledge base, documenting my learning journey in market analysis, industry research, and business strategy. It aims to provide a structured, reliable, and continuously updated resource for researchers, students, and professionals.
+# 📈 我的市场学习之路 | My Trading Journey
+
+欢迎来到我的个人金融市场学习仓库！
+
+这里是我探索、学习和实践交易与投资的公开日记。我创建这个仓库的目的是为了系统化地整理笔记、记录成长轨迹、沉淀思考，并通过代码实践来加深对市场的理解。
+
+---
+
+## 🎯 学习目标 (Goals)
+
+我的长期目标是建立一个稳定、可靠且适合自己的交易系统。为此，我将分阶段实现以下目标：
+
+- [ ] **理论入门**: 掌握金融市场的基础知识，包括但不限于市场结构、交易品种、核心术语和基本原理。
+- [ ] **技术分析**: 学习并熟练运用各种技术分析工具，如趋势线、K线形态、移动平均线(MA)、相对强弱指数(RSI)等。
+- [ ] **策略研发**: 学习、复现并回测至少 3-5 种经典的交易策略。
+- [ ] **量化实践**: 将有效的策略通过代码实现自动化回测与模拟交易。
+- [ ] **风控与心理**: 建立严格的风险管理体系，并培养成熟、理性的交易心态。
+
+## 🗂️ 仓库结构 (Repository Structure)
+
+为了系统地组织学习内容，本仓库采用以下目录结构：
+
+```
+/
+├── 📚 01-基础知识/       # 市场入门、术语、核心概念的笔记
+│   ├── 股票基础/
+│   ├── 期货基础/
+│   └── 期权基础/
+│
+├── 📊 02-技术分析/       # 图表模式、技术指标的学习笔记和图表示例
+│   ├── K线理论/
+│   ├── 技术指标/
+│   └── 波浪理论/
+│
+├── 펀 03-基本面分析/     # 宏观经济、行业分析、公司财报解读等
+│
+├── 🧠 04-交易策略/       # 我学习、研究和回测的各种策略
+│   ├── 趋势跟踪/
+│   ├── 均值回归/
+│   └── 网格交易/
+│
+├── 💻 05-量化交易/       # 策略代码、回测脚本、工具函数等
+│   ├── Python/
+│   └── MQL5/
+│
+├── 📜 06-交易日志/       # （若有）实盘/模拟盘的交易复盘与思考
+│
+└── 📖 07-读书笔记/       # 阅读经典投资交易书籍的摘要和感悟
+```
+
+## 🚀 当前重点 (Current Focus)
+
+目前，我正专注于学习 **[请在此处填写你当前的学习重点，例如：A股市场的技术分析与Python量化回测框架]**。
+
+## 🛠️ 工具与资源 (Tools & Resources)
+
+我主要使用以下工具和资源进行学习和研究：
+
+* **数据来源**: [Tushare](https://tushare.pro/), [Quandl](https://www.quandl.com/), [Yahoo Finance](https://finance.yahoo.com/)
+* **图表工具**: [TradingView](https://www.tradingview.com/)
+* **编程语言**: Python (Pandas, NumPy, Matplotlib)
+* **回测框架**: [Backtrader](https://www.backtrader.com/), [Zipline](https://www.zipline.io/)
+* **必读经典**:
+    * 《股票大作手回忆录》
+    * 《海龟交易法则》
+    * 《以交易为生》
+
+## ⚠️ 免责声明 (Disclaimer)
+
+**本仓库所有内容仅为个人学习、记录和思考之用，不构成任何投资建议。**
+
+市场有风险，投资需谨慎。请勿根据本仓库中的任何内容进行实际的投资决策。所有因参考本仓库内容而导致的任何盈亏，本人概不负责。
+
+---
+
+欢迎交流，共同进步！主人喵~
