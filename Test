@@ -1,20 +1,22 @@
+# Phoenix Project - Version 1.3
+# Integration of dynamic decision-making, VIX-based risk management,
+# and SMA-based asset selection.
+
 import os
 import requests
-import json
 import random
 import backtrader as bt
 import pandas as pd
-import numpy as np
+import yfinance as yf  # V1.1 ADDITION
 from typing import List, Dict, Optional
-from datetime import datetime
 
 # --- Section 1: Data Sensor Modules (Ongoing Upgrades) ---
+
 # ENGINEERING NOTE: Per "Phoenix Project", we will replace these prototypes one by one.
 
 def get_real_market_news() -> list:
     """
     PROTOTYPE: Simulates fetching real-time market news.
-    PHOENIX GOAL: Replace with a production-grade NewsAPI client.
     """
     print("\n--- [Sensor Call: Market News (Prototype)] ---")
     headlines = random.choice([
@@ -25,20 +27,28 @@ def get_real_market_news() -> list:
     print("Simulated news headlines obtained.")
     return headlines
 
-def get_vix_index() -> float:
+# ***** V1.1 UPGRADE: PRODUCTION-GRADE VIX SENSOR *****
+def get_historical_vix_data(start_date: str, end_date: str) -> Optional[pd.Series]:
     """
-    PROTOTYPE: Simulates fetching the VIX index.
-    PHOENIX GOAL: Replace with a real-time data provider for market indices.
+    PRODUCTION-GRADE V1.1: Fetches real historical VIX data from Yahoo Finance.
+    Returns a pandas Series with dates as index and VIX close prices as values.
     """
-    print("--- [Sensor Call: VIX Index (Prototype)] ---")
-    vix = random.uniform(12.0, 35.0)
-    print(f"Simulated VIX: {vix:.2f}")
-    return vix
+    print("\n--- [Sensor Call: VIX Data (Production V1.1)] ---")
+    try:
+        # The ticker for VIX on Yahoo Finance is ^VIX
+        vix_data = yf.download('^VIX', start=start_date, end=end_date, progress=False)
+        if vix_data.empty:
+            print("WARNING: No VIX data returned from yfinance.")
+            return None
+        print(f"Successfully obtained {len(vix_data)} data points for VIX index.")
+        return vix_data['Close']
+    except Exception as e:
+        print(f"CRITICAL ERROR: Failed to fetch VIX data: {e}")
+        return None
 
 def get_market_breadth() -> float:
     """
     PROTOTYPE: Simulates fetching market breadth data.
-    PHOENIX GOAL: Replace with an API call for advance/decline data.
     """
     print("--- [Sensor Call: Market Breadth (Prototype)] ---")
     breadth = random.uniform(0.25, 0.85)
@@ -48,7 +58,6 @@ def get_market_breadth() -> float:
 def get_cross_market_data() -> dict:
     """
     PROTOTYPE: Simulates fetching cross-market data (e.g., Treasury yields).
-    PHOENIX GOAL: Replace with a reliable source for economic data (e.g., FRED via API).
     """
     print("--- [Sensor Call: Cross-Market Data (Prototype)] ---")
     yield_rate = random.uniform(2.5, 5.0)
@@ -58,83 +67,176 @@ def get_cross_market_data() -> dict:
 def get_volatility_regime(current_vix: float) -> str:
     """
     PROTOTYPE: Simulates determining the volatility regime.
-    PHOENIX GOAL: Implement a robust calculation based on historical VIX data.
     """
     print("--- [Sensor Call: Volatility Regime (Prototype)] ---")
-    # ... (Simulation logic remains the same) ...
     regime = random.choice(["Fear Rising", "Fear Fading", "Low Volatility"])
     print(f"Simulated Volatility Regime: {regime}")
     return regime
 
-# --- Section 2: Gemini Cognitive Engine (Marshal-Level Brain - Prototype) ---
-# ENGINEERING NOTE: This function simulates the final decision logic.
-# In "Phoenix Project", this will be a robust module with real, async API calls.
+# --- Section 2: Gemini Cognitive Engine (Marshal-Level Brain) ---
 
-def marshal_capital_allocation(candidate_tickers: List[str]) -> List[Dict]:
+# ***** V1.3 UPGRADE: TECHNICAL ANALYST MODULE *****
+def analyze_asset_momentum(current_price: float, current_sma: float) -> float:
     """
-    PROTOTYPE: Simulates the entire marshal-level decision process.
+    ANALYST V1.3: Analyzes a single asset's momentum based on its price vs. SMA.
+    Returns an opportunity score between 0 and 100.
     """
-    print("\n--- [Cognitive Engine Call: Marshal Allocation (Prototype)] ---")
-    # ... (The detailed simulation logic from the previous version is kept here) ...
-    print(f"Received candidate assets: {candidate_tickers}")
-    analysis_results = [{"ticker": t, "opportunity_score": random.uniform(40, 98)} for t in candidate_tickers]
+    # Simple trend-following logic
+    if current_price > current_sma:
+        # Price is above the moving average, indicating positive momentum
+        return 80.0
+    else:
+        # Price is at or below the moving average, indicating weak or negative momentum
+        return 30.0
+
+# ***** V1.3 UPGRADE: ANALYST-ASSISTED COGNITIVE ENGINE *****
+# (Incorporates V1.2 VIX-Aware Logic)
+def marshal_capital_allocation(candidate_analysis: List[Dict], current_vix: float) -> List[Dict]:
+    """
+    PROTOTYPE V1.3: Simulates the marshal-level decision process,
+    now using an analyst's scores for asset selection and VIX for risk exposure.
+    """
+    print(f"\n--- [Cognitive Engine Call: Marshal Allocation (Analyst-Assisted V1.3)] ---")
+    print(f"Marshal is assessing the situation. Current VIX: {current_vix:.2f}")
+
+    # Step 1: Determine capital modifier from VIX (logic from V1.2)
+    capital_modifier = 1.0
+    if current_vix > 30:
+        print("Marshal's Read: High fear. Defensive stance.")
+        capital_modifier = 0.5
+    elif current_vix < 20:
+        print("Marshal's Read: Low fear. Aggressive stance.")
+        capital_modifier = 1.0
+    else:
+        print("Marshal's Read: Normal fear. Standard operations.")
+        capital_modifier = 0.9
+
+    # Step 2: Use the pre-calculated analyst scores (logic from V1.3)
+    print("Received pre-analyzed candidate assets from field analysts.")
+    analysis_results = candidate_analysis
     worthy_targets = [res for res in analysis_results if res["opportunity_score"] > 55]
+
     if not worthy_targets:
         print("Marshal's Decision: No high-quality opportunities found. Stand down.")
         return []
-    # ... (Rest of the simulation logic is omitted for brevity but is identical to the V0.9 prototype) ...
-    battle_plan = [{"ticker": t['ticker'], "capital_allocation_pct": round(t['opportunity_score']/200, 2)} for t in worthy_targets]
-    print("\n--- [Marshal's Final Battle Plan] ---")
-    for deployment in battle_plan: print(f"- Asset: {deployment['ticker']}, Deploy Capital: {deployment['capital_allocation_pct']:.2%}")
+
+    # Step 3: Formulate battle plan (logic from V1.2)
+    total_score = sum(t['opportunity_score'] for t in worthy_targets)
+    battle_plan = []
+    for target in worthy_targets:
+        base_allocation = target['opportunity_score'] / total_score
+        final_allocation = base_allocation * capital_modifier
+        battle_plan.append({
+            "ticker": target['ticker'],
+            "capital_allocation_pct": final_allocation
+        })
+    
+    print("\n--- [Marshal's Final Battle Plan (VIX & SMA-Adjusted)] ---")
+    total_planned_allocation = sum(d['capital_allocation_pct'] for d in battle_plan)
+    print(f"Total planned capital deployment today: {total_planned_allocation:.2%}")
+    for deployment in battle_plan:
+        print(f"- Asset: {deployment['ticker']}, Deploy Capital: {deployment['capital_allocation_pct']:.2%}")
+        
     return battle_plan
 
 # --- Section 3: Strategy Execution Layer (The Roman Legion) ---
-# ENGINEERING NOTE: This strategy is an "execution-only" agent.
-# Its logic will be expanded in "Phoenix Project" to handle real-world complexities.
 
+# ***** V1.3 UPGRADE: DYNAMIC STRATEGY WITH ONBOARD ANALYTICS *****
+# (Incorporates V1.1 Dynamic Decision Logic)
 class RomanLegionStrategy(bt.Strategy):
-    params = (('battle_plan', None),)
+    params = (
+        ('vix_data', None),
+        ('sma_period', 50),
+    )
 
     def __init__(self):
-        if not self.params.battle_plan:
-            raise ValueError("Battle plan not received! The Legion cannot be deployed!")
+        if self.p.vix_data is None:
+            raise ValueError("VIX data not provided!")
+        
         self.data_map = {d._name: d for d in self.datas}
+        self.sma_indicators = {
+            d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.p.sma_period)
+            for d in self.datas
+        }
 
     def start(self):
-        print(f"\n{self.datas[0].datetime.date(0).isoformat()}: [Legion Commander]: Battle plan received! Deploying forces...")
-        total_value = self.broker.getvalue()
-        for deployment in self.params.battle_plan:
-            ticker = deployment['ticker']
-            allocation_pct = deployment['capital_allocation_pct']
-            if ticker in self.data_map:
-                target_value = total_value * allocation_pct
-                price = self.data_map[ticker].close[0]
-                size_to_buy = int(target_value / price)
-                if size_to_buy > 0:
-                    print(f"  - Issuing BUY order for {ticker}: {size_to_buy} shares.")
-                    self.buy(data=self.data_map[ticker], size=size_to_buy)
+        print(f"\n{self.datas[0].datetime.date(0).isoformat()}: [Legion Commander]: Awaiting daily orders...")
+
+    def next(self):
+        if len(self.datas[0]) < self.p.sma_period:
+            return
+
+        current_date = self.datas[0].datetime.date(0)
+        print(f"\n--- {current_date.isoformat()}: Daily Briefing ---")
+
+        # Step 1: Sense the environment for the CURRENT day (VIX)
+        try:
+            current_vix = self.p.vix_data[current_date]
+            print(f"VIX Index for today: {current_vix:.2f}")
+        except KeyError:
+            print(f"No VIX data available for {current_date}. Standing by.")
+            return
+
+        # Step 2: Gather intelligence from the field (run local analysis)
+        candidate_analysis = []
+        for ticker, data in self.data_map.items():
+            current_price = data.close[0]
+            current_sma = self.sma_indicators[ticker][0]
+            
+            opportunity_score = analyze_asset_momentum(current_price, current_sma)
+            
+            candidate_analysis.append({
+                "ticker": ticker,
+                "opportunity_score": opportunity_score
+            })
+            print(f"  [Analyst Report for {ticker}]: Price=${current_price:.2f}, SMA({self.p.sma_period})=${current_sma:.2f}, Score={opportunity_score}")
+
+        # Step 3: Marshal's Strategic Decision for the CURRENT day
+        battle_plan = marshal_capital_allocation(candidate_analysis, current_vix)
+
+        # Step 4: Execute the Battle Plan
+        if not battle_plan:
+            print(f"{current_date.isoformat()}: [Comms]: Marshal advises no action today.")
+        else:
+            print(f"{current_date.isoformat()}: [Legion Commander]: New battle plan received! Executing...")
+            total_value = self.broker.getvalue()
+            for deployment in battle_plan:
+                ticker = deployment['ticker']
+                allocation_pct = deployment['capital_allocation_pct']
+                
+                if ticker in self.data_map and not self.getpositionbyname(ticker):
+                    target_value = total_value * allocation_pct
+                    price = self.data_map[ticker].close[0]
+                    size_to_buy = int(target_value / price)
+                    if size_to_buy > 0:
+                        print(f"  - Issuing BUY order for {ticker}: {size_to_buy} shares.")
+                        self.buy(data=self.data_map[ticker], size=size_to_buy)
 
     def notify_order(self, order):
-        if order.status == order.Completed and order.isbuy():
-            print(f"{self.datas[0].datetime.date(0).isoformat()}: [Comms]: Marshal, the {order.data._name} legion is in position!")
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                print(f"{self.datas[0].datetime.date(0).isoformat()}: [Comms]: Marshal, the {order.data._name} legion is in position! ({order.executed.size} shares)")
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            print(f"{self.datas[0].datetime.date(0).isoformat()}: [Comms]: Order for {order.data._name} failed: {order.getstatusname()}")
 
 # --- Section 4: Main Execution Engine (The High Command) ---
 
 ASSET_UNIVERSE = ['QQQ', 'SPY', 'GLD', 'TLT', 'IWM'] 
 
-# ***** V1.0 UPGRADE: PRODUCTION-GRADE PRICE SENSOR *****
+# ***** V1.0: PRODUCTION-GRADE PRICE SENSOR *****
 def get_real_price_data(ticker: str, start_date: str, end_date: str, timeframe: str = '1Day') -> Optional[pd.DataFrame]:
     """
     PRODUCTION-GRADE V1.0: Fetches real historical price data via Alpaca API.
-    Includes full error handling and returns a Backtrader-compatible DataFrame.
     """
     print(f"\n--- [Sensor Call: Price Data (Production V1.0)] ---")
     
+    # NOTE: Ensure your Alpaca API keys are set as environment variables
+    # APCA_API_KEY_ID and APCA_API_SECRET_KEY
     api_key = os.getenv("APCA_API_KEY_ID")
     secret_key = os.getenv("APCA_API_SECRET_KEY")
     
     if not api_key or not secret_key:
-        print(f"CRITICAL ERROR: Alpaca API keys not found for {ticker}. Cannot fetch real price data.")
+        print(f"CRITICAL ERROR: Alpaca API keys not found for {ticker}. Set environment variables.")
         return None
 
     base_url = "https://data.alpaca.markets/v2/stocks/bars"
@@ -165,42 +267,37 @@ def get_real_price_data(ticker: str, start_date: str, end_date: str, timeframe: 
         return None
 
 if __name__ == '__main__':
-    # Step 1: Reconnaissance Scan (Using Prototype for now)
-    top_assets = random.sample(ASSET_UNIVERSE, 3) # Simplified scanner
-    print(f"--- [Reconnaissance Scan] Top candidates: {top_assets} ---")
-    
-    if not top_assets:
-        print("\n[High Command]: Reconnaissance found no viable opportunities. Stand down for today.")
+    # Define date range for the operation
+    start_date = '2022-01-01'
+    end_date = '2024-12-31'
+
+    # Step 1: Pre-load all necessary historical sensor data
+    vix_data = get_historical_vix_data(start_date, end_date)
+    if vix_data is None:
+        print("\nCRITICAL ERROR: Could not obtain VIX data. Aborting operation.")
     else:
-        # Step 2: Marshal's Strategic Decision (Using Prototype for now)
-        battle_plan = marshal_capital_allocation(top_assets)
-        
-        if not battle_plan:
-            print("\n[High Command]: Marshal advises against any deployment today.")
+        # Step 2: Prepare the Battlefield (Cerebro)
+        cerebro = bt.Cerebro()
+
+        # Step 3: Supply the Legions (Data Feeds for ALL assets in universe)
+        print(f"\n--- Preparing asset universe for dynamic allocation: {ASSET_UNIVERSE} ---")
+        for ticker in ASSET_UNIVERSE:
+            dataframe = get_real_price_data(ticker, start_date, end_date)
+            if dataframe is not None:
+                cerebro.adddata(bt.feeds.PandasData(dataname=dataframe, name=ticker))
+
+        if not cerebro.datas:
+            print("\nCRITICAL ERROR: Failed to load data for any asset. Aborting operation.")
         else:
-            # Step 3: Prepare the Battlefield (Cerebro)
-            cerebro = bt.Cerebro()
-            
-            # Step 4: Supply the Legions (Data Feeds)
-            assets_in_plan = [p['ticker'] for p in battle_plan]
-            for ticker in assets_in_plan:
-                # ***** CALLING THE PRODUCTION-GRADE SENSOR *****
-                dataframe = get_real_price_data(ticker, '2022-01-01', '2024-12-31')
-                if dataframe is not None:
-                    cerebro.adddata(bt.feeds.PandasData(dataname=dataframe, name=ticker))
+            # Step 4: Deploy the Legion WITH the VIX data
+            cerebro.addstrategy(RomanLegionStrategy, vix_data=vix_data)
+            cerebro.broker.setcash(1_000_000.0)
+            cerebro.broker.setcommission(commission=0.001)
 
-            if not cerebro.datas:
-                print("\nCRITICAL ERROR: Failed to load data for any asset in the battle plan. Aborting operation.")
-            else:
-                # Step 5: Deploy the Legion with the Battle Plan
-                cerebro.addstrategy(RomanLegionStrategy, battle_plan=battle_plan)
-                cerebro.broker.setcash(1_000_000.0)
-                cerebro.broker.setcommission(commission=0.001)
+            # Step 5: Authorize the Operation
+            print('\n--- Launching "Phoenix Project" V1.3 (Fully Data-Driven) ---')
+            results = cerebro.run()
 
-                # Step 6: Authorize the Operation
-                print('\n--- Launching "Phoenix Project" V1.0 (Price Grounded) ---')
-                results = cerebro.run()
-                
-                # Step 7: After-Action Report
-                print('--- Operation Concluded ---')
-                print(f'Final Empire Assets: {cerebro.broker.getvalue():.2f}')
+            # Step 6: After-Action Report
+            print('\n--- Operation Concluded ---')
+            print(f'Final Empire Assets: ${cerebro.broker.getvalue():,.2f}')
