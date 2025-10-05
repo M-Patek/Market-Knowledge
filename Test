@@ -1,0 +1,210 @@
+import os
+import requests
+import json
+import random
+import backtrader as bt
+import pandas as pd
+import numpy as np
+import datetime
+
+# --- 模块一: 终极感官系统 (V2.3) ---
+
+def get_real_market_news() -> list:
+    """获取实时市场新闻 (模拟版)"""
+    print("\n--- [调用新闻感官] ---")
+    headlines = random.choice([
+        ["Tech stocks surge on unexpected dovish Fed pivot."],
+        ["Inflation fears resurface, sending jitters across the market."],
+        ["Sector-wide software upgrades lead to broad positive sentiment."]
+    ])
+    print("成功获取到新闻标题 (模拟)。")
+    return headlines
+
+def get_vix_index() -> float:
+    """获取VIX恐慌指数 (模拟版)"""
+    print("--- [调用VIX恐慌指数感官] ---")
+    vix = random.uniform(12.0, 35.0)
+    print(f"VIX (模拟): {vix:.2f}")
+    return vix
+
+def get_market_breadth() -> float:
+    """获取市场宽度 (模拟版)"""
+    print("--- [调用市场宽度感官] ---")
+    breadth = random.uniform(0.25, 0.85)
+    print(f"市场宽度 (模拟): {breadth:.2%}")
+    return breadth
+
+def get_cross_market_data() -> dict:
+    """获取跨市场分析数据 (模拟版)"""
+    print("--- [调用跨市场分析感官] ---")
+    yield_rate = random.uniform(2.5, 5.0)
+    print(f"跨市场数据 (模拟): 10年期美债收益率 = {yield_rate:.2f}%")
+    return {"us_10y_yield": yield_rate}
+
+def get_volatility_regime(current_vix: float) -> str:
+    """判断波动率状态 (模拟版)"""
+    print("--- [调用波动率状态感官] ---")
+    vix_ma = current_vix * random.uniform(0.95, 1.05)
+    if current_vix > vix_ma and current_vix > 22: regime = "Fear Rising"
+    elif current_vix < vix_ma and current_vix > 22: regime = "Fear Fading"
+    else: regime = "Low Volatility"
+    print(f"波动率状态 (模拟): {regime}")
+    return regime
+
+# --- 模块二: Gemini认知分析引擎 (V2.3 - 终极版) ---
+
+def analyze_market_factors(
+    news_headlines: list, 
+    vix_level: float, 
+    signal_type: str, 
+    market_regime: str, 
+    market_breadth: float,
+    cross_market_data: dict,
+    volatility_regime: str
+) -> dict:
+    """
+    调用真实的Gemini API，V2.3终极版集成了所有维度，进行全球宏观态势感知。
+    (在此最终编译版中，我们使用一个复杂的模拟器来展示其思考过程)
+    """
+    print("\n--- [调用Gemini认知分析引擎 V2.3 - 终极版] ---")
+    us_yield = cross_market_data.get('us_10y_yield', 4.0)
+    print(f"宏观气候='{market_regime}', 信号质量={market_breadth:.2%}, 波动率状态='{volatility_regime}'")
+    print(f"VIX指数={vix_level:.2f}, 10年期美债收益率={us_yield:.2f}%")
+    
+    # 在此版本中，我们使用一个复杂的本地模拟器来代替真实的API调用，以确保可运行性
+    # 真实API的Prompt和调用逻辑已在之前的增量更新中验证
+    print("\n正在进行终极态势分析 (模拟)...")
+
+    # 1. 宏观气候是最高指令
+    if market_regime == 'Bear':
+        return {"decision": "REJECT", "confidence_score": 0.0, "risk_adjustment": "NORMAL",
+                "reasoning": "Synthesized Reasoning: Rejecting due to the primary Bear market regime, overriding all other factors."}
+
+    # 2. 基于其他因素计算一个基础分数
+    score = 100
+    reasons = [f"Operating within a '{market_regime}' regime"]
+    
+    # 市场宽度
+    if market_breadth < 0.3: score -= 50; reasons.append("but signal quality is very poor")
+    elif market_breadth < 0.5: score -= 25; reasons.append("but signal quality is weak")
+    else: reasons.append("with healthy signal quality")
+
+    # 美债收益率
+    if us_yield > 4.5: score -= 30; reasons.append("under high pressure from treasury yields")
+    elif us_yield > 4.0: score -= 15; reasons.append("with some pressure from treasury yields")
+
+    # 波动率状态
+    if volatility_regime == 'Fear Rising': score -= 40; reasons.append("and rising fear is a major headwind")
+    elif volatility_regime == 'Fear Fading': score += 10; reasons.append("while fading fear provides a tailwind")
+
+    # VIX 绝对水平
+    if vix_level > 30: score -= 50; reasons.append("and VIX indicates extreme market fear")
+
+    # 3. 根据最终分数生成决策
+    if score >= 70:
+        decision = "EXECUTE"
+        confidence = min(score / 100.0, 1.0)
+        risk_adj = "NORMAL" if score > 85 else "REDUCE_SIZE"
+    elif score >= 40:
+        decision = "EXECUTE"
+        confidence = score / 100.0
+        risk_adj = "REDUCE_SIZE" if score > 55 else "TIGHTEN_STOP"
+    elif score >= 20:
+        decision = "MONITOR"
+        confidence = 0.0
+        risk_adj = "TIGHTEN_STOP"
+    else:
+        decision = "REJECT"
+        confidence = 0.0
+        risk_adj = "NORMAL"
+
+    final_reasoning = ", ".join(reasons) + "."
+    analysis_result = {
+        "decision": decision,
+        "confidence_score": round(confidence, 2),
+        "risk_adjustment": risk_adj,
+        "reasoning": final_reasoning
+    }
+    
+    print("\n成功接收并解析Gemini的结构化指令 (模拟):")
+    print(analysis_result)
+    print("--- [认知分析结束] ---")
+    return analysis_result
+
+
+# --- 模块三: 终极策略类 (V2.3) ---
+
+class CerebrumPrimeStrategy(bt.Strategy):
+    params = (('short_period', 15), ('long_period', 70), ('macro_period', 40),
+              ('normal_stop_loss', 0.10), ('tight_stop_loss', 0.05), ('printlog', True))
+
+    def __init__(self):
+        self.d_daily = self.datas[0]
+        self.d_weekly = self.datas[1]
+        self.daily_close = self.d_daily.close
+        self.sma_short = bt.indicators.SimpleMovingAverage(self.d_daily, period=self.params.short_period)
+        self.sma_long = bt.indicators.SimpleMovingAverage(self.d_daily, period=self.params.long_period)
+        self.crossover = bt.indicators.CrossOver(self.sma_short, self.sma_long)
+        self.weekly_ma = bt.indicators.SimpleMovingAverage(self.d_weekly, period=self.params.macro_period)
+        self.order, self.stop_order, self.current_gemini_instruction = None, None, {}
+
+    def log(self, txt):
+        if self.params.printlog:
+            print(f'{self.d_daily.datetime.date(0).isoformat()}, {txt}')
+            
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]: return
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.log(f'BUY EXECUTED, Price: {order.executed.price:.2f}, Size: {order.executed.size:.2f}')
+                stop_pct = self.params.tight_stop_loss if self.current_gemini_instruction.get('risk_adjustment') == 'TIGHTEN_STOP' else self.params.normal_stop_loss
+                stop_price = order.executed.price * (1.0 - stop_pct)
+                self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price, size=order.executed.size)
+                self.log(f"动态风控: 设置止损位于 {stop_price:.2f} (止损率: {stop_pct*100:.1f}%)")
+            elif order.issell(): self.log(f'SELL EXECUTED, Price: {order.executed.price:.2f}'); self.stop_order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected, order.Expired]: self.log(f'订单 {order.getstatusname()}')
+        self.order = None
+
+    def next(self):
+        if self.order or self.position: return
+        is_bull_market = self.daily_close[0] > self.weekly_ma[0]
+        market_regime = 'Bull' if is_bull_market else 'Bear'
+        if not is_bull_market: return
+        if self.crossover > 0:
+            self.log('战术信号: 检测到日线金叉，启动终极态势感知...')
+            current_news, current_vix = get_real_market_news(), get_vix_index()
+            current_breadth, cross_market_data = get_market_breadth(), get_cross_market_data()
+            volatility_regime = get_volatility_regime(current_vix)
+            self.current_gemini_instruction = analyze_market_factors(
+                news_headlines=current_news, vix_level=current_vix, signal_type="Golden Cross", 
+                market_regime=market_regime, market_breadth=current_breadth,
+                cross_market_data=cross_market_data, volatility_regime=volatility_regime)
+            decision = self.current_gemini_instruction.get('decision')
+            self.log(f'Gemini指令 (V2.3): {self.current_gemini_instruction}')
+            if decision == 'EXECUTE':
+                confidence = self.current_gemini_instruction.get('confidence_score', 0.5)
+                risk_adj_factor = 0.5 if self.current_gemini_instruction.get('risk_adjustment') == 'REDUCE_SIZE' else 1.0
+                adjusted_stake = self.broker.get_cash() * 0.95 * confidence * risk_adj_factor
+                size_to_buy = int(adjusted_stake / self.daily_close[0])
+                if size_to_buy > 0:
+                    self.log(f"动态仓位: 信心 {confidence:.2f}, 风险调整 {risk_adj_factor:.1f} -> 计算买入 {size_to_buy} 股")
+                    self.order = self.buy(size=size_to_buy)
+                else: self.log("动态仓位: 计算后买入股数为0，放弃交易。")
+            else: self.log(f"最终决策: {decision}。放弃交易。")
+
+# --- 模块四: 主执行引擎 ---
+if __name__ == '__main__':
+    cerebro = bt.Cerebro()
+    dataframe_daily = pd.DataFrame(index=pd.date_range(start='2022-01-01', end='2025-12-31', freq='B'))
+    dataframe_daily['Close'] = 400.0 * np.exp(np.cumsum(np.random.normal(0.0005, 0.02, len(dataframe_daily))))
+    for col in ['Open', 'High', 'Low']: dataframe_daily[col] = dataframe_daily['Close']
+    data_feed_daily = bt.feeds.PandasData(dataname=dataframe_daily)
+    cerebro.adddata(data_feed_daily)
+    cerebro.resampledata(data_feed_daily, timeframe=bt.TimeFrame.Weeks, compression=1)
+    cerebro.addstrategy(CerebrumPrimeStrategy)
+    cerebro.broker.setcash(100000.0)
+    cerebro.broker.setcommission(commission=0.001)
+    print('--- “Cerebrum Prime” V2.3 终极版启动 ---')
+    cerebro.run()
+    print('--- 回测结束 ---')
+    print(f'最终投资组合价值: {cerebro.broker.getvalue():.2f}')
