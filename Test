@@ -10,6 +10,7 @@ import random
 import requests
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
+import concurrent.futures
 
 import backtrader as bt
 import pandas as pd
@@ -27,6 +28,9 @@ class StrategyConfig:
     start_date: str = '2022-01-01'
     end_date: str = '2024-12-31'
     asset_universe: List[str] = field(default_factory=lambda: ['QQQ', 'SPY', 'GLD', 'TLT', 'IWM'])
+
+    # 1.5. Market Breadth Tickers
+    market_breadth_tickers: List[str] = field(default_factory=lambda: ['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA'])
 
     # 2. Strategy Parameters
     sma_period: int = 50
@@ -116,9 +120,8 @@ class DataManager:
             return pd.read_feather(cache_path).set_index('Date').squeeze()
 
         self.logger.info("Calculating market breadth...")
-        # Note: Using a hardcoded list for S&P500 components for simplicity. Can be extended.
-        sp500_tickers = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA'] 
-        all_prices_df_container = self._fetch_with_cache("sp500_prices.feather", self.get_yfinance_data, tickers=sp500_tickers, start=self.config.start_date, end=self.config.end_date)
+        # Fetch prices for tickers defined in the configuration for market breadth calculation.
+        all_prices_df_container = self._fetch_with_cache("sp500_prices.feather", self.get_yfinance_data, tickers=self.config.market_breadth_tickers, start=self.config.start_date, end=self.config.end_date)
         
         if all_prices_df_container is None or 'Close' not in all_prices_df_container:
             return None
@@ -138,6 +141,8 @@ class DataManager:
         Gathers, aligns, and sanitizes all data before backtesting.
         """
         self.logger.info("--- Starting data alignment and sanitization ---")
+        
+        # Step 1: Fetch asset universe data first, as it defines the master index. This must be sequential.
         asset_df = self.get_asset_universe_data()
         if asset_df is None or asset_df.empty:
             self.logger.critical("Cannot create master index: Asset universe data is missing.")
@@ -145,13 +150,20 @@ class DataManager:
         master_index = asset_df.index
         self.logger.info(f"Master trading index created with {len(master_index)} days.")
 
-        data_streams = {
-            "vix": self.get_vix_data(),
-            "treasury_yield": self.get_treasury_yield_data(),
-            "market_breadth": self.get_market_breadth_data()
-        }
-        
-        sanitized_streams = {}
+        # Step 2: Fetch all other auxiliary data streams in parallel.
+        data_streams = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_name = {
+                executor.submit(self.get_vix_data): "vix",
+                executor.submit(self.get_treasury_yield_data): "treasury_yield",
+                executor.submit(self.get_market_breadth_data): "market_breadth"
+            }
+            for future in concurrent.futures.as_completed(future_to_name):
+                name = future_to_name[future]
+                data_streams[name] = future.result()
+    
+        # Step 3: Align and sanitize all data streams as before.
+        sanitized_streams = {}    
         for name, series in data_streams.items():
             aligned_series = series.reindex(master_index) if series is not None else pd.Series(index=master_index)
             sanitized_streams[name] = aligned_series.ffill().bfill()
@@ -162,6 +174,26 @@ class DataManager:
         return {"asset_universe_df": asset_df, **sanitized_streams}
 
 # --- Section 2: Gemini Cognitive Engine (The Marshal's Brain) ---
+class CognitiveEngine:
+    """[Phase 3.3] The central coordinating brain of the strategy.
+    Encapsulates all decision-making logic by coordinating specialized managers.
+    """
+    def __init__(self, config: StrategyConfig):
+        self.config = config
+        self.logger = logging.getLogger("PhoenixProject")
+        self.risk_manager = RiskManager(config)
+        self.portfolio_constructor = PortfolioConstructor(config)
+
+    def determine_allocations(self, candidate_analysis: List[Dict], current_vix: float) -> List[Dict]:
+        """The primary entry point for the engine's decision-making process."""
+        self.logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
+        capital_modifier = self.risk_manager.get_capital_modifier(current_vix)
+        return self.portfolio_constructor.construct_portfolio(candidate_analysis, capital_modifier)
+
+    def analyze_asset_momentum(self, current_price: float, current_sma: float) -> float:
+        """A proxy method to access the momentum analysis function."""
+        return self.portfolio_constructor.analyze_asset_momentum(current_price, current_sma, self.config)
+
 class RiskManager:
     """[Phase 3.1] Encapsulates all market risk assessment logic."""
     def __init__(self, config: StrategyConfig):
@@ -187,6 +219,11 @@ class PortfolioConstructor:
         self.config = config
         self.logger = logging.getLogger("PhoenixProject")
 
+    @staticmethod
+    def analyze_asset_momentum(current_price: float, current_sma: float, config: StrategyConfig) -> float:
+        """ANALYST V1.4: Analyzes a single asset's momentum. Now depends on the config object."""
+        return config.momentum_score_positive if current_price > current_sma else config.momentum_score_negative
+
     def construct_portfolio(self, candidate_analysis: List[Dict], capital_modifier: float) -> List[Dict]:
         """Filters candidates and calculates final capital allocation."""
         self.logger.info("PortfolioConstructor is analyzing candidates...")
@@ -208,17 +245,6 @@ class PortfolioConstructor:
             self.logger.info(f"- Asset: {deployment['ticker']}, Deploy Capital: {deployment['capital_allocation_pct']:.2%}")
         return battle_plan
 
-def analyze_asset_momentum(current_price: float, current_sma: float, config: StrategyConfig) -> float:
-    """ANALYST V1.4: Analyzes a single asset's momentum. Now depends on the config object."""
-    return config.momentum_score_positive if current_price > current_sma else config.momentum_score_negative
-
-def marshal_capital_allocation(candidate_analysis: List[Dict], current_vix: float, risk_manager: RiskManager, portfolio_constructor: PortfolioConstructor) -> List[Dict]:
-    """PROTOTYPE V2.0: A pure coordinator delegating all tasks to specialized managers."""
-    logger = logging.getLogger("PhoenixProject")
-    logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
-    capital_modifier = risk_manager.get_capital_modifier(current_vix)
-    return portfolio_constructor.construct_portfolio(candidate_analysis, capital_modifier)
-
 # --- Section 3: Strategy Execution Layer (The Roman Legion) ---
 class RomanLegionStrategy(bt.Strategy):
     params = (('config', None), ('vix_data', None), ('treasury_yield_data', None), ('market_breadth_data', None))
@@ -227,8 +253,7 @@ class RomanLegionStrategy(bt.Strategy):
         self.logger = logging.getLogger("PhoenixProject")
         if self.p.config is None: raise ValueError("StrategyConfig object not provided!")
         self.config = self.p.config
-        self.risk_manager = RiskManager(self.config)
-        self.portfolio_constructor = PortfolioConstructor(self.config)
+        self.cognitive_engine = CognitiveEngine(self.config)
         self.data_map = {d._name: d for d in self.datas}
         self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.config.sma_period) for d in self.datas}
 
@@ -251,25 +276,22 @@ class RomanLegionStrategy(bt.Strategy):
         self.logger.info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f}%, Market Breadth: {current_breadth:.2%}")
 
         candidate_analysis = [
-            {"ticker": ticker, "opportunity_score": analyze_asset_momentum(d.close[0], self.sma_indicators[ticker][0], self.config)}
+            {"ticker": ticker, "opportunity_score": self.cognitive_engine.analyze_asset_momentum(d.close[0], self.sma_indicators[ticker][0])}
             for ticker, d in self.data_map.items()
         ]
-        battle_plan = marshal_capital_allocation(candidate_analysis, current_vix, self.risk_manager, self.portfolio_constructor)
+        battle_plan = self.cognitive_engine.determine_allocations(candidate_analysis, current_vix)
 
-        self.logger.info("--- Starting Rebalancing Protocol ---")
+        self.logger.info("--- Starting Unified Rebalancing Protocol ---")
         total_value = self.broker.getvalue()
         target_portfolio = {deployment['ticker']: total_value * deployment['capital_allocation_pct'] for deployment in battle_plan}
         
         current_positions = {pos.data._name for pos in self.positions if self.getposition(pos).size != 0}
         target_tickers = set(target_portfolio.keys())
-        
-        for ticker in current_positions - target_tickers:
-            self.logger.info(f"Rebalance SELL (Exit): Closing position in {ticker}.")
-            self.close(data=self.getdatabyname(ticker))
+        all_tickers_in_play = current_positions.union(target_tickers)
 
-        self.logger.info("Adjusting and opening positions based on target values...")
-        for ticker, target_value in target_portfolio.items():
-            self.logger.info(f"Rebalance ADJUST/BUY: Setting target value for {ticker} to ${target_value:,.2f}.")
+        for ticker in all_tickers_in_play:
+            target_value = target_portfolio.get(ticker, 0.0)
+            self.logger.info(f"Rebalance SYNC: Aligning {ticker} to target value ${target_value:,.2f}.")
             self.order_target_value(target=target_value, data=self.getdatabyname(ticker))
         self.logger.info("--- Rebalancing Protocol Concluded ---")
 
