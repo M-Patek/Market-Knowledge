@@ -11,12 +11,15 @@ import asyncio
 import yaml
 import hashlib
 import json
+import random
 from io import StringIO
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
+from pathlib import Path
 
 from pydantic import BaseModel, Field, validator
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from jinja2 import Environment, FileSystemLoader
+from gemini_service import GeminiService, MalformedResponseError
 import httpx
 import backtrader as bt
 import pandas as pd
@@ -247,46 +250,75 @@ class DataManager:
 
 # --- Section 2: Gemini Cognitive Engine (The Marshal's Brain) V2.0 ---
 class CognitiveEngine:
-    """The central coordinating brain of the strategy."""
-    def __init__(self, config: StrategyConfig):
+    """
+    The central coordinating brain of the strategy.
+    V2.1: Now accepts sentiment data to pass to the RiskManager.
+    """
+    def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[datetime.date, float]] = None, asset_analysis_data: Optional[Dict[datetime.date, Dict]] = None):
         self.config = config
         self.logger = logging.getLogger("PhoenixProject.CognitiveEngine")
-        self.risk_manager = RiskManager(config)
-        self.portfolio_constructor = PortfolioConstructor(config)
+        self.risk_manager = RiskManager(config, sentiment_data)
+        self.portfolio_constructor = PortfolioConstructor(config, asset_analysis_data)
 
-    def determine_allocations(self, candidate_analysis: List[Dict], current_vix: float) -> List[Dict]:
+    def determine_allocations(self, candidate_analysis: List[Dict], current_vix: float, current_date: datetime.date) -> List[Dict]:
         """The primary entry point for the engine's decision-making process."""
         self.logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
-        capital_modifier = self.risk_manager.get_capital_modifier(current_vix)
-        return self.portfolio_constructor.construct_portfolio(candidate_analysis, capital_modifier)
+        # Pass current_date to the risk manager for sentiment lookup
+        capital_modifier = self.risk_manager.get_capital_modifier(current_vix, current_date)
+        return self.portfolio_constructor.construct_portfolio(candidate_analysis, capital_modifier, current_date)
 
     def analyze_asset_momentum(self, current_price: float, current_sma: float) -> float:
         """A proxy method to access the momentum analysis function."""
         return self.portfolio_constructor.analyze_asset_momentum(current_price, current_sma)
 
 class RiskManager:
-    """Encapsulates all market risk assessment logic."""
-    def __init__(self, config: StrategyConfig):
+    """
+    Encapsulates all market risk assessment logic.
+    V2.1: Now integrates pre-computed market sentiment scores.
+    """
+    def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[datetime.date, float]] = None):
         self.config = config
+        self.sentiment_data = sentiment_data if sentiment_data is not None else {}
         self.logger = logging.getLogger("PhoenixProject.RiskManager")
+        if self.sentiment_data:
+            self.logger.info(f"RiskManager initialized with {len(self.sentiment_data)} days of sentiment data.")
 
-    def get_capital_modifier(self, current_vix: float) -> float:
-        """Returns a capital modifier based on the current VIX level."""
-        self.logger.info(f"RiskManager is assessing VIX: {current_vix:.2f}")
+    def get_capital_modifier(self, current_vix: float, current_date: datetime.date) -> float:
+        """
+        Returns a capital modifier based on VIX and, if available, market sentiment.
+        """
+        # --- Step 1: Determine base modifier from VIX ---
+        self.logger.info(f"Assessing risk for {current_date.isoformat()}. VIX: {current_vix:.2f}")
         if current_vix > self.config.vix_high_threshold:
-            self.logger.info("RiskManager Read: High fear. Defensive stance.")
-            return self.config.capital_modifier_high_vix
+            base_modifier = self.config.capital_modifier_high_vix
+            self.logger.info(f"VIX indicates High Fear. Base modifier: {base_modifier:.2f}")
         elif current_vix < self.config.vix_low_threshold:
-            self.logger.info("RiskManager Read: Low fear. Aggressive stance.")
-            return self.config.capital_modifier_low_vix
+            base_modifier = self.config.capital_modifier_low_vix
+            self.logger.info(f"VIX indicates Low Fear. Base modifier: {base_modifier:.2f}")
         else:
-            self.logger.info("RiskManager Read: Normal fear. Standard operations.")
-            return self.config.capital_modifier_normal_vix
+            base_modifier = self.config.capital_modifier_normal_vix
+            self.logger.info(f"VIX indicates Normal Fear. Base modifier: {base_modifier:.2f}")
+
+        # --- Step 2: Adjust modifier based on Gemini's sentiment score ---
+        if not self.sentiment_data:
+            return base_modifier
+            
+        sentiment_score = self.sentiment_data.get(current_date, 0.0) # Default to neutral if date missing
+        sentiment_adjustment = 1.0 + (sentiment_score * 0.2) # As designed: score can sway modifier by +/- 20%
+        final_modifier = base_modifier * sentiment_adjustment
+        final_modifier = max(0.0, min(1.1, final_modifier)) # Clamp result to a safe range [0, 1.1]
+
+        self.logger.info(f"Gemini Sentiment Score: {sentiment_score:.2f}. Final Capital Modifier: {final_modifier:.2%}")
+        return final_modifier
 
 class PortfolioConstructor:
-    """Encapsulates the logic for constructing the target portfolio."""
-    def __init__(self, config: StrategyConfig):
+    """
+    Encapsulates the logic for constructing the target portfolio.
+    V2.1: Integrates AI-driven qualitative analysis to adjust opportunity scores.
+    """
+    def __init__(self, config: StrategyConfig, asset_analysis_data: Optional[Dict[datetime.date, Dict]] = None):
         self.config = config
+        self.asset_analysis_data = asset_analysis_data if asset_analysis_data is not None else {}
         self.logger = logging.getLogger("PhoenixProject.PortfolioConstructor")
 
     @staticmethod
@@ -300,20 +332,41 @@ class PortfolioConstructor:
         score = 50 + 50 * ((current_price / current_sma) - 1)
         return max(0.0, min(100.0, score))
 
-    def construct_portfolio(self, candidate_analysis: List[Dict], capital_modifier: float) -> List[Dict]:
+    def construct_portfolio(self, candidate_analysis: List[Dict], capital_modifier: float, current_date: datetime.date) -> List[Dict]:
         """Filters candidates and calculates final capital allocation."""
         self.logger.info("PortfolioConstructor is analyzing candidates...")
-        worthy_targets = [res for res in candidate_analysis if res["opportunity_score"] > self.config.opportunity_score_threshold]
+        
+        # --- AI Adjustment Step ---
+        adjusted_candidates = []
+        daily_asset_analysis = self.asset_analysis_data.get(current_date, {})
+
+        for candidate in candidate_analysis:
+            ticker = candidate["ticker"]
+            original_score = candidate["opportunity_score"]
+            
+            analysis = daily_asset_analysis.get(ticker, {"adjustment_factor": 1.0, "reasoning": "N/A"})
+            adjustment_factor = analysis.get("adjustment_factor", 1.0)
+            
+            adjusted_score = original_score * adjustment_factor
+            adjusted_candidates.append({**candidate, "adjusted_score": adjusted_score})
+            
+            if adjustment_factor != 1.0:
+                self.logger.info(f"AI Insight for {ticker}: Factor={adjustment_factor:.2f}. Score: {original_score:.2f} -> {adjusted_score:.2f}")
+
+        # --- Filtering and Allocation Step (using adjusted scores) ---
+        worthy_targets = [res for res in adjusted_candidates if res["adjusted_score"] > self.config.opportunity_score_threshold]
+        
         if not worthy_targets:
-            self.logger.info("PortfolioConstructor: No high-quality opportunities found. Standing down.")
+            self.logger.info("PortfolioConstructor: No high-quality opportunities found after AI adjustment. Standing down.")
             return []
-        total_score = sum(t['opportunity_score'] for t in worthy_targets)
+            
+        total_score = sum(t['adjusted_score'] for t in worthy_targets)
         battle_plan = []
         for target in worthy_targets:
-            base_allocation = target['opportunity_score'] / total_score
+            base_allocation = target['adjusted_score'] / total_score
             final_allocation = base_allocation * capital_modifier
             battle_plan.append({"ticker": target['ticker'], "capital_allocation_pct": final_allocation})
-        
+
         self.logger.info("--- [PortfolioConstructor's Final Battle Plan] ---")
         total_planned_allocation = sum(d['capital_allocation_pct'] for d in battle_plan)
         self.logger.info(f"Total planned capital deployment today: {total_planned_allocation:.2%}")
@@ -323,13 +376,13 @@ class PortfolioConstructor:
 
 # --- Section 3: Strategy Execution Layer (The Roman Legion) ---
 class RomanLegionStrategy(bt.Strategy):
-    params = (('config', None), ('vix_data', None), ('treasury_yield_data', None), ('market_breadth_data', None))
+    params = (('config', None), ('vix_data', None), ('treasury_yield_data', None), ('market_breadth_data', None), ('sentiment_data', None), ('asset_analysis_data', None))
 
     def __init__(self):
         self.logger = logging.getLogger("PhoenixProject.Strategy")
         if self.p.config is None: raise ValueError("StrategyConfig object not provided!")
         self.config = self.p.config
-        self.cognitive_engine = CognitiveEngine(self.config)
+        self.cognitive_engine = CognitiveEngine(self.config, self.p.sentiment_data, self.p.asset_analysis_data)
         self.data_map = {d._name: d for d in self.datas}
         self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.config.sma_period) for d in self.datas}
         
@@ -361,7 +414,7 @@ class RomanLegionStrategy(bt.Strategy):
             {"ticker": ticker, "opportunity_score": self.cognitive_engine.analyze_asset_momentum(d.close[0], self.sma_indicators[ticker][0])}
             for ticker, d in self.data_map.items()
         ]
-        battle_plan = self.cognitive_engine.determine_allocations(candidate_analysis, current_vix)
+        battle_plan = self.cognitive_engine.determine_allocations(candidate_analysis, current_vix, current_date)
 
         self.logger.info("--- Starting Unified Rebalancing Protocol ---")
         total_value = self.broker.getvalue()
@@ -391,13 +444,28 @@ class RomanLegionStrategy(bt.Strategy):
             self.logger.warning(f"{self.datas[0].datetime.date(0).isoformat()}: Order for {order.data._name} failed: {order.getstatusname()}")
 
 # --- Section 5: Reporting Engine ---
-def generate_html_report(cerebro, strat, report_filename="phoenix_report.html"):
+async def generate_ai_report(gemini_service: Optional[GeminiService], context: Dict) -> Optional[str]:
+    """Helper function to generate the AI summary report with error handling."""
+    if not gemini_service:
+        return None
+    
+    logger = logging.getLogger("PhoenixProject.ReportGenerator")
+    logger.info("Generating AI Marshal's Report...")
+    try:
+        report_text = await gemini_service.generate_summary_report(context)
+        logger.info("Successfully generated AI Marshal's Report.")
+        return report_text
+    except Exception as e:
+        logger.error(f"Failed to generate AI report: {e}")
+        return "## Marshal's Debriefing Failed ##\n\nAn error occurred during communication with the AI Command. The quantitative report below remains accurate."
+
+def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, gemini_service: Optional[GeminiService] = None, report_filename="phoenix_report.html"):
     """
     Generates a professional HTML report from the backtest results.
     """
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating HTML after-action report...")
-
+    
     trade_analysis = strat.analyzers.trade_analyzer.get_analysis()
     total_trades = trade_analysis.total.get('total', 0)
     win_rate = (trade_analysis.won.get('total', 0) / total_trades) if total_trades > 0 else 0
@@ -416,6 +484,10 @@ def generate_html_report(cerebro, strat, report_filename="phoenix_report.html"):
         "report_date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "plot_filename": "phoenix_plot.png"
     }
+    
+    # --- Generate and add AI Summary Report to context ---
+    ai_summary = asyncio.run(generate_ai_report(gemini_service, context))
+    context['ai_summary_report'] = ai_summary
 
     try:
         logger.info(f"Saving backtest plot to {context['plot_filename']}...")
@@ -439,12 +511,118 @@ def generate_html_report(cerebro, strat, report_filename="phoenix_report.html"):
     except Exception as e:
         logger.error(f"Failed to generate HTML report: {e}")
 
+# --- Section 4.5: AI Pre-computation Helpers ---
+def fetch_mock_news_for_date(date_obj: datetime.date) -> List[str]:
+    """
+    Generates mock news headlines for a given date.
+    This function serves as a placeholder for a real news API.
+    """
+    base_headlines = [
+        "Global markets show mixed signals as investors await inflation data.",
+        "Tech sector rally continues, led by gains in semiconductor stocks.",
+        "New geopolitical tensions in Eastern Europe cause oil prices to spike.",
+        "Federal Reserve hints at a more hawkish stance in upcoming meeting.",
+    ]
+    # Make news slightly different based on day of week for variety
+    day_of_week = date_obj.weekday()
+    if day_of_week == 0: # Monday
+        base_headlines.append("Weekend uncertainty weighs on market open.")
+    elif day_of_week == 4: # Friday
+        base_headlines.append("Positive jobs report boosts investor confidence ahead of the weekend.")
+    
+    random.shuffle(base_headlines)
+    return base_headlines[:3]
+
+async def precompute_sentiments(gemini_service: GeminiService, dates: List[datetime.date]) -> Dict[datetime.date, float]:
+    """
+    Pre-computes and caches sentiment scores for all dates in the backtest period.
+    """
+    logger = logging.getLogger("PhoenixProject.SentimentPrecomputer")
+    cache_dir = Path("data_cache")
+    cache_file = cache_dir / "sentiment_cache.json"
+    
+    # --- Caching Logic ---
+    if cache_file.exists():
+        logger.info(f"Found sentiment cache file: {cache_file}")
+        with open(cache_file, 'r') as f:
+            cached_data_str = json.load(f)
+            cached_data = {datetime.date.fromisoformat(k): v for k, v in cached_data_str.items()}
+        
+        # Validate if the cache covers all required dates
+        required_dates = set(dates)
+        cached_dates = set(cached_data.keys())
+        if required_dates.issubset(cached_dates):
+            logger.info("Sentiment cache is valid and covers the entire backtest period. Loading from cache.")
+            return {d: cached_data[d] for d in dates}
+        else:
+            logger.warning("Sentiment cache is stale or incomplete. Re-computing sentiments.")
+
+    logger.info(f"Pre-computing sentiments for {len(dates)} trading days. This may take a while...")
+    sentiment_lookup_str = {}
+    for date_obj in dates:
+        try:
+            mock_headlines = fetch_mock_news_for_date(date_obj)
+            analysis = await gemini_service.get_market_sentiment(mock_headlines)
+            sentiment_lookup_str[date_obj.isoformat()] = analysis.get('sentiment_score', 0.0)
+            logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
+        except (MalformedResponseError, Exception) as e:
+            logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
+            sentiment_lookup_str[date_obj.isoformat()] = 0.0
+    
+    # Save to cache
+    with open(cache_file, 'w') as f:
+        json.dump(sentiment_lookup_str, f, indent=2)
+    logger.info(f"Saved computed sentiments to cache: {cache_file}")
+    
+    return {datetime.date.fromisoformat(k): v for k, v in sentiment_lookup_str.items()}
+
+async def precompute_asset_analyses(gemini_service: GeminiService, dates: List[datetime.date], asset_universe: List[str]) -> Dict[datetime.date, Dict]:
+    """
+    Pre-computes and caches qualitative analysis for all assets on all dates.
+    """
+    logger = logging.getLogger("PhoenixProject.AssetAnalysisPrecomputer")
+    cache_dir = Path("data_cache")
+    cache_file = cache_dir / "asset_analysis_cache.json"
+
+    # --- Caching Logic ---
+    if cache_file.exists():
+        logger.info(f"Found asset analysis cache file: {cache_file}")
+        with open(cache_file, 'r') as f:
+            cached_data_str = json.load(f)
+        
+        # Validate cache integrity (all dates and tickers must be present)
+        try:
+            required_dates_str = {d.isoformat() for d in dates}
+            cached_dates_str = set(cached_data_str.keys())
+            if required_dates_str.issubset(cached_dates_str) and all(
+                set(asset_universe).issubset(set(cached_data_str[d].keys())) for d in required_dates_str
+            ):
+                logger.info("Asset analysis cache is valid. Loading from cache.")
+                return {datetime.date.fromisoformat(k): v for k, v in cached_data_str.items()}
+        except Exception:
+            logger.warning("Asset analysis cache is corrupted or malformed. Re-computing.")
+
+    logger.info(f"Pre-computing asset analyses for {len(asset_universe)} assets over {len(dates)} days...")
+    analysis_lookup_str = {d.isoformat(): {} for d in dates}
+    for date_obj in dates:
+        for ticker in asset_universe:
+            try:
+                analysis = await gemini_service.get_asset_analysis(ticker, date_obj)
+                analysis_lookup_str[date_obj.isoformat()][ticker] = analysis
+            except Exception as e:
+                logger.error(f"Could not compute analysis for {ticker} on {date_obj.isoformat()}: {e}. Defaulting to neutral.")
+                analysis_lookup_str[date_obj.isoformat()][ticker] = {"adjustment_factor": 1.0, "reasoning": "Error in computation"}
+
+    with open(cache_file, 'w') as f:
+        json.dump(analysis_lookup_str, f)
+    logger.info(f"Saved computed asset analyses to cache: {cache_file}")
+    return {datetime.date.fromisoformat(k): v for k, v in analysis_lookup_str.items()}
+
 # --- Section 4: Main Execution Engine (The High Command) ---
 if __name__ == '__main__':
     try:
-        with open("config.yaml", 'r', encoding='utf-8') as f:
-            params = yaml.safe_load(f)
-        config = StrategyConfig.parse_obj(params)
+        config_params = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+        config = StrategyConfig.parse_obj(config_params)
     except FileNotFoundError:
         print("CRITICAL: Configuration file 'config.yaml' not found. Aborting.")
         exit()
@@ -471,13 +649,35 @@ if __name__ == '__main__':
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     logger.info("Phoenix Project Final Optimized Version - Logging System Initialized.")
-
+    
+    # --- Initialize Services ---
     data_manager = DataManager(config)
-    all_aligned_data = asyncio.run(data_manager.get_aligned_data())
+    gemini_service = None
+    gemini_config = config_params.get('gemini_config', {})
+    if gemini_config.get('enable', False):
+        try:
+            gemini_service = GeminiService(gemini_config)
+            logger.info("Gemini Service has been enabled and initialized.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini Service: {e}. Continuing without AI features.")
+            gemini_service = None
 
+    # --- Data Fetching and Pre-computation ---
+    all_aligned_data = asyncio.run(data_manager.get_aligned_data())
     if not all_aligned_data:
         logger.critical("Failed to get aligned data. Aborting operation.")
     else:
+        master_dates = [dt.to_pydatetime().date() for dt in all_aligned_data["asset_universe_df"].index]
+        
+        # --- Run all AI pre-computations ---
+        sentiment_lookup = {}
+        asset_analysis_lookup = {}
+        if gemini_service:
+            sentiment_lookup = asyncio.run(precompute_sentiments(gemini_service, master_dates))
+            asset_analysis_lookup = asyncio.run(precompute_asset_analyses(
+                gemini_service, master_dates, config.asset_universe
+            ))
+
         cerebro = bt.Cerebro()
         
         try:
@@ -503,7 +703,9 @@ if __name__ == '__main__':
                 config=config,
                 vix_data=all_aligned_data["vix"],
                 treasury_yield_data=all_aligned_data["treasury_yield"],
-                market_breadth_data=all_aligned_data["market_breadth"]
+                market_breadth_data=all_aligned_data["market_breadth"],
+                sentiment_data=sentiment_lookup,
+                asset_analysis_data=asset_analysis_lookup
             )
             cerebro.broker.setcash(config.initial_cash)
             cerebro.broker.setcommission(commission=config.commission_rate)
@@ -519,4 +721,4 @@ if __name__ == '__main__':
             logger.info("--- Operation Concluded ---")
             strat = results[0]
             
-            generate_html_report(cerebro, strat)
+            generate_html_report(cerebro, strat, gemini_service)
