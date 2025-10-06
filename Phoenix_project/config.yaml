@@ -1,0 +1,79 @@
+# Phoenix Project - Strategy Configuration
+# ------------------------------------------
+# This file centralizes all parameters for the backtest.
+# Modifying this file allows for experiments without changing the source code.
+
+# 1. Backtest Timeframe & Universe
+start_date: '2022-01-01'
+end_date: '2024-12-31'
+asset_universe:
+  - 'QQQ'
+  - 'SPY'
+  - 'GLD'
+  - 'TLT'
+  - 'IWM'
+
+# 1.5. Market Breadth Tickers
+market_breadth_tickers:
+  - 'SPY'
+  - 'QQQ'
+  - 'AAPL'
+  - 'MSFT'
+  - 'GOOGL'
+  - 'AMZN'
+  - 'NVDA'
+  - 'TSLA'
+
+# 2. Strategy Parameters
+sma_period: 50
+opportunity_score_threshold: 55.0
+
+# 3. Risk Management Parameters (VIX-based)
+vix_high_threshold: 30.0
+vix_low_threshold: 20.0
+capital_modifier_high_vix: 0.5
+capital_modifier_normal_vix: 0.9
+capital_modifier_low_vix: 1.0
+
+# 4. Cerebro Engine Settings
+initial_cash: 1000000.0
+commission_rate: 0.001
+log_level: "INFO"
+
+# 5. Gemini AI Advisor Settings
+gemini_config:
+  # Master switch to enable/disable all Gemini features.
+  # Useful for debugging or running the pure quantitative version.
+  enable: true
+
+  # Load the API key from an environment variable for security.
+  api_key_env_var: "GEMINI_API_KEY"
+
+  # Model configuration
+  model_name: "gemini-1.5-flash-latest"
+  request_timeout: 90 # Request timeout in seconds
+
+  # Prompt templates. Using YAML's literal block style for readability.
+  prompts:
+    market_sentiment: >
+      你是一位专业的金融市场分析师。请分析以下今天的财经新闻标题，并以-1.0（极度悲观）到+1.0（极度乐观）的范围给出一个总体的市场情绪得分。
+      请仅返回一个符合规范的JSON对象，格式为：{"sentiment_score": <得分>, "reasoning": "<简要分析理由>"}.
+      新闻标题：
+      {headlines}
+    asset_analysis: >
+      分析资产 {ticker} 最近的重大新闻、财报预期或分析师评级。是否存在任何可能在短期内影响其价格的、非技术性的积极或消极因素？
+      请给出一个调整系数，范围从0.5（有重大利空）到1.5（有重大利好），正常情况为1.0。同时，请提供一个0.0（完全不确定）到1.0（非常确定）之间的可信度评分。
+      请仅返回一个符合规范的JSON对象，格式为：{"adjustment_factor": <系数>, "confidence": <可信度>, "reasoning": "<简要分析理由>"}.
+    summary_report: >
+      你是一位名为'凤凰元帅'的AI交易模型的总指挥。请根据以下整个回测周期的表现和关键决策数据，撰写一份给项目主管的“战后总结报告”。报告需要用指挥官的口吻，分析策略的优势、劣劣势，并解释在关键时间点（如市场大跌时）我们是如何利用VIX和宏观情绪分析来调整风险敞口的。
+      你的分析需要富有洞察力且易于理解。
+      回测数据:
+      {metrics}
+
+# 6. Execution & Experimentation Settings
+execution_mode:
+  # Controls the AI's influence. Options:
+  # "off":        Run the pure quantitative strategy without any AI input.
+  # "raw":        Use the AI's raw adjustment_factor directly (legacy mode for comparison).
+  # "processed":  Use the full AI factor pipeline (confidence, EMA, clamp).
+  ai_mode: "processed"
