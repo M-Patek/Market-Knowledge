@@ -1,66 +1,66 @@
-# Phoenix Project - Final Version (Phoenix Ascendant)
+# Phoenix Project - Final Optimized Version (Phoenix Resurrected)
 # A collaborative masterpiece by Gemini & AI, guided by our Master.
-# This version features a modular, robust architecture with a centralized DataManager,
-# a type-safe configuration, refined error handling, and a clear separation of concerns.
+# This version features an externalized configuration, refined strategy logic,
+# modular logging, high-performance asynchronous data fetching, and a professional HTML reporting system.
 
 import os
 import datetime
 import logging
-import random
-import requests
+import asyncio
+import yaml
+from io import StringIO
 from typing import List, Dict, Optional
-from dataclasses import dataclass, field
-import concurrent.futures
+from dataclasses import dataclass
 
+from jinja2 import Environment, FileSystemLoader
+import httpx
 import backtrader as bt
 import pandas as pd
-import yfinance as yf
 
 
-# --- [Phase 1.1] Configuration Layer (The Command Deck) V2.0 ---
+# --- [Phase 1.1] Configuration Layer (The Command Deck) V3.0 ---
 @dataclass(frozen=True)
 class StrategyConfig:
     """
     Central configuration for the Phoenix Project.
-    Immutable (frozen) to ensure run-to-run consistency and prevent accidental changes.
+    Immutable (frozen) and now loaded from an external YAML file.
+    All fields are mandatory and have no default values.
     """
     # 1. Backtest Timeframe & Universe
-    start_date: str = '2022-01-01'
-    end_date: str = '2024-12-31'
-    asset_universe: List[str] = field(default_factory=lambda: ['QQQ', 'SPY', 'GLD', 'TLT', 'IWM'])
+    start_date: str
+    end_date: str
+    asset_universe: List[str]
 
     # 1.5. Market Breadth Tickers
-    market_breadth_tickers: List[str] = field(default_factory=lambda: ['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA'])
+    market_breadth_tickers: List[str]
 
     # 2. Strategy Parameters
-    sma_period: int = 50
-    opportunity_score_threshold: float = 55.0
-    momentum_score_positive: float = 80.0
-    momentum_score_negative: float = 30.0
+    sma_period: int
+    opportunity_score_threshold: float
 
     # 3. Risk Management Parameters (VIX-based)
-    vix_high_threshold: float = 30.0
-    vix_low_threshold: float = 20.0
-    capital_modifier_high_vix: float = 0.5
-    capital_modifier_normal_vix: float = 0.9
-    capital_modifier_low_vix: float = 1.0
+    vix_high_threshold: float
+    vix_low_threshold: float
+    capital_modifier_high_vix: float
+    capital_modifier_normal_vix: float
+    capital_modifier_low_vix: float
 
     # 4. Cerebro Engine Settings
-    initial_cash: float = 1_000_000.0
-    commission_rate: float = 0.001
-    log_level: str = "INFO"
+    initial_cash: float
+    commission_rate: float
+    log_level: str
 
 
-# --- Section 1.5: Data Management Layer (The Data Hub) ---
+# --- Section 1.5: Data Management Layer (The Data Hub) V3.0 ---
 class DataManager:
     """
-    [Phase 2.0] Handles all data fetching, caching, and pre-processing for the Phoenix Project.
-    Centralizes data logic to ensure consistency and robustness.
+    [Phase 3.0] Handles all data fetching, caching, and pre-processing.
+    Features a high-performance asynchronous I/O engine for data fetching.
     """
     def __init__(self, config: StrategyConfig, cache_dir: str = "data_cache"):
         self.config = config
         self.cache_dir = cache_dir
-        self.logger = logging.getLogger("PhoenixProject")
+        self.logger = logging.getLogger("PhoenixProject.DataManager")
         os.makedirs(self.cache_dir, exist_ok=True)
         self.logger.info(f"DataManager initialized. Cache directory set to '{self.cache_dir}'.")
 
@@ -70,7 +70,11 @@ class DataManager:
         if os.path.exists(cache_path):
             self.logger.info(f"Loading data from cache: {cache_path}")
             try:
-                return pd.read_feather(cache_path).set_index('Date')
+                df = pd.read_feather(cache_path)
+                # Ensure 'Date' column is the index if it exists
+                if 'Date' in df.columns:
+                    df = df.set_index('Date')
+                return df
             except Exception as e:
                 self.logger.error(f"Failed to load from cache {cache_path}: {e}. Refetching.")
 
@@ -85,27 +89,64 @@ class DataManager:
         self.logger.info(f"Saved fresh data to cache: {cache_path}")
         return data
 
-    def get_yfinance_data(self, tickers: List[str] or str, start: str, end: str) -> Optional[pd.DataFrame]:
-        """A robust wrapper for yf.download with refined error handling."""
+    async def _async_fetch_one_ticker(self, client: httpx.AsyncClient, ticker: str, start_ts: int, end_ts: int) -> Optional[pd.DataFrame]:
+        """Asynchronously fetches data for a single ticker from Yahoo Finance."""
+        URL = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}"
+        params = {
+            "period1": start_ts,
+            "period2": end_ts,
+            "interval": "1d",
+            "events": "history",
+            "includeAdjustedClose": "true"
+        }
         try:
-            df = yf.download(tickers, start=start, end=end, progress=False)
-            if df.empty:
-                 self.logger.warning(f"yfinance returned an empty DataFrame for ticker(s): {tickers}.")
+            response = await client.get(URL, params=params, timeout=10)
+            response.raise_for_status()
+            
+            df = pd.read_csv(StringIO(response.text), index_col='Date', parse_dates=True)
+            df.columns = pd.MultiIndex.from_product([df.columns, [ticker]])
             return df
-        except requests.exceptions.ConnectionError as e:
-            self.logger.error(f"Network ConnectionError for {tickers}: {e}. Check internet connection.")
-            return None
+        except httpx.HTTPStatusError as e:
+            self.logger.error(f"HTTP error for {ticker}: {e.response.status_code} - {e.response.text}")
         except Exception as e:
-            self.logger.critical(f"An unexpected error occurred during yfinance download for {tickers}: {e}", exc_info=True)
+            self.logger.error(f"Failed to fetch or parse data for {ticker}: {e}")
+        return None
+
+    async def async_get_yfinance_data(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
+        """The new async core for fetching data concurrently."""
+        start_dt = datetime.datetime.strptime(start, '%Y-%m-%d')
+        end_dt = datetime.datetime.strptime(end, '%Y-%m-%d')
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+        
+        async with httpx.AsyncClient() as client:
+            tasks = [self._async_fetch_one_ticker(client, ticker, start_ts, end_ts) for ticker in tickers]
+            results = await asyncio.gather(*tasks)
+        
+        valid_dfs = [df for df in results if df is not None]
+        if not valid_dfs:
+            self.logger.warning(f"Async fetch returned no valid data for tickers: {tickers}")
+            return None
+            
+        combined_df = pd.concat(valid_dfs, axis=1)
+        return combined_df.sort_index()
+
+    def get_yfinance_data(self, tickers: List[str] or str, start: str, end: str) -> Optional[pd.DataFrame]:
+        """Synchronous wrapper for the new async data fetching engine."""
+        if isinstance(tickers, str): tickers = [tickers]
+        try:
+            return asyncio.run(self.async_get_yfinance_data(tickers, start, end))
+        except Exception as e:
+            self.logger.critical(f"An unexpected error occurred during async data fetch for {tickers}: {e}", exc_info=True)
             return None
 
-    def get_vix_data(self) -> Optional[pd.Series]:
-        df = self._fetch_with_cache("vix_data.feather", self.get_yfinance_data, tickers='^VIX', start=self.config.start_date, end=self.config.end_date)
-        return df['Close'] if df is not None and 'Close' in df else None
+    async def get_vix_data(self) -> Optional[pd.Series]:
+        df = self._fetch_with_cache("vix_data.feather", self.get_yfinance_data, tickers=['^VIX'], start=self.config.start_date, end=self.config.end_date)
+        return df['Close']['^VIX'] if df is not None and ('Close', '^VIX') in df.columns else None
 
-    def get_treasury_yield_data(self) -> Optional[pd.Series]:
-        df = self._fetch_with_cache("treasury_yield_data.feather", self.get_yfinance_data, tickers='^TNX', start=self.config.start_date, end=self.config.end_date)
-        return df['Close'] if df is not None and 'Close' in df else None
+    async def get_treasury_yield_data(self) -> Optional[pd.Series]:
+        df = self._fetch_with_cache("treasury_yield_data.feather", self.get_yfinance_data, tickers=['^TNX'], start=self.config.start_date, end=self.config.end_date)
+        return df['Close']['^TNX'] if df is not None and ('Close', '^TNX') in df.columns else None
         
     def get_asset_universe_data(self) -> Optional[pd.DataFrame]:
         """Fetches data for the main asset universe defined in the config."""
@@ -117,11 +158,11 @@ class DataManager:
         cache_path = os.path.join(self.cache_dir, cache_filename)
         if os.path.exists(cache_path):
             self.logger.info(f"Loading final market breadth from cache: {cache_path}")
-            return pd.read_feather(cache_path).set_index('Date').squeeze()
+            df = pd.read_feather(cache_path).set_index('Date')
+            return df.squeeze()
 
         self.logger.info("Calculating market breadth...")
-        # Fetch prices for tickers defined in the configuration for market breadth calculation.
-        all_prices_df_container = self._fetch_with_cache("sp500_prices.feather", self.get_yfinance_data, tickers=self.config.market_breadth_tickers, start=self.config.start_date, end=self.config.end_date)
+        all_prices_df_container = self._fetch_with_cache("market_breadth_prices.feather", self.get_yfinance_data, tickers=self.config.market_breadth_tickers, start=self.config.start_date, end=self.config.end_date)
         
         if all_prices_df_container is None or 'Close' not in all_prices_df_container:
             return None
@@ -135,14 +176,13 @@ class DataManager:
         self.logger.info(f"Saved final market breadth to cache: {cache_path}")
         return breadth_series
 
-    def get_aligned_data(self) -> Optional[Dict[str, pd.DataFrame | pd.Series]]:
+    async def get_aligned_data(self) -> Optional[Dict[str, pd.DataFrame | pd.Series]]:
         """
-        [Phase 2.1] The core data pre-processing hub.
-        Gathers, aligns, and sanitizes all data before backtesting.
+        [Phase 3.1] The core data pre-processing hub.
+        Gathers, aligns, and sanitizes all data before backtesting using async concurrency.
         """
         self.logger.info("--- Starting data alignment and sanitization ---")
         
-        # Step 1: Fetch asset universe data first, as it defines the master index. This must be sequential.
         asset_df = self.get_asset_universe_data()
         if asset_df is None or asset_df.empty:
             self.logger.critical("Cannot create master index: Asset universe data is missing.")
@@ -150,20 +190,16 @@ class DataManager:
         master_index = asset_df.index
         self.logger.info(f"Master trading index created with {len(master_index)} days.")
 
-        # Step 2: Fetch all other auxiliary data streams in parallel.
-        data_streams = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_name = {
-                executor.submit(self.get_vix_data): "vix",
-                executor.submit(self.get_treasury_yield_data): "treasury_yield",
-                executor.submit(self.get_market_breadth_data): "market_breadth"
-            }
-            for future in concurrent.futures.as_completed(future_to_name):
-                name = future_to_name[future]
-                data_streams[name] = future.result()
-    
-        # Step 3: Align and sanitize all data streams as before.
-        sanitized_streams = {}    
+        self.logger.info("Fetching auxiliary data streams concurrently...")
+        tasks = {
+            "vix": self.get_vix_data(),
+            "treasury_yield": self.get_treasury_yield_data(),
+            "market_breadth": asyncio.to_thread(self.get_market_breadth_data) # Wrap sync function
+        }
+        results = await asyncio.gather(*tasks.values())
+        data_streams = dict(zip(tasks.keys(), results))
+        
+        sanitized_streams = {}
         for name, series in data_streams.items():
             aligned_series = series.reindex(master_index) if series is not None else pd.Series(index=master_index)
             sanitized_streams[name] = aligned_series.ffill().bfill()
@@ -173,14 +209,12 @@ class DataManager:
         self.logger.info("--- Data alignment and sanitization complete ---")
         return {"asset_universe_df": asset_df, **sanitized_streams}
 
-# --- Section 2: Gemini Cognitive Engine (The Marshal's Brain) ---
+# --- Section 2: Gemini Cognitive Engine (The Marshal's Brain) V2.0 ---
 class CognitiveEngine:
-    """[Phase 3.3] The central coordinating brain of the strategy.
-    Encapsulates all decision-making logic by coordinating specialized managers.
-    """
+    """[Phase 3.3] The central coordinating brain of the strategy."""
     def __init__(self, config: StrategyConfig):
         self.config = config
-        self.logger = logging.getLogger("PhoenixProject")
+        self.logger = logging.getLogger("PhoenixProject.CognitiveEngine")
         self.risk_manager = RiskManager(config)
         self.portfolio_constructor = PortfolioConstructor(config)
 
@@ -192,13 +226,13 @@ class CognitiveEngine:
 
     def analyze_asset_momentum(self, current_price: float, current_sma: float) -> float:
         """A proxy method to access the momentum analysis function."""
-        return self.portfolio_constructor.analyze_asset_momentum(current_price, current_sma, self.config)
+        return self.portfolio_constructor.analyze_asset_momentum(current_price, current_sma)
 
 class RiskManager:
     """[Phase 3.1] Encapsulates all market risk assessment logic."""
     def __init__(self, config: StrategyConfig):
         self.config = config
-        self.logger = logging.getLogger("PhoenixProject")
+        self.logger = logging.getLogger("PhoenixProject.RiskManager")
 
     def get_capital_modifier(self, current_vix: float) -> float:
         """Returns a capital modifier based on the current VIX level."""
@@ -217,12 +251,18 @@ class PortfolioConstructor:
     """[Phase 3.2] Encapsulates the logic for constructing the target portfolio."""
     def __init__(self, config: StrategyConfig):
         self.config = config
-        self.logger = logging.getLogger("PhoenixProject")
+        self.logger = logging.getLogger("PhoenixProject.PortfolioConstructor")
 
     @staticmethod
-    def analyze_asset_momentum(current_price: float, current_sma: float, config: StrategyConfig) -> float:
-        """ANALYST V1.4: Analyzes a single asset's momentum. Now depends on the config object."""
-        return config.momentum_score_positive if current_price > current_sma else config.momentum_score_negative
+    def analyze_asset_momentum(current_price: float, current_sma: float) -> float:
+        """
+        ANALYST V2.0: Analyzes an asset's momentum using a continuous score.
+        The score reflects how far the price is from its SMA, clamped between 0 and 100.
+        """
+        if current_sma <= 0:
+            return 0.0
+        score = 50 + 50 * ((current_price / current_sma) - 1)
+        return max(0.0, min(100.0, score))
 
     def construct_portfolio(self, candidate_analysis: List[Dict], capital_modifier: float) -> List[Dict]:
         """Filters candidates and calculates final capital allocation."""
@@ -250,30 +290,37 @@ class RomanLegionStrategy(bt.Strategy):
     params = (('config', None), ('vix_data', None), ('treasury_yield_data', None), ('market_breadth_data', None))
 
     def __init__(self):
-        self.logger = logging.getLogger("PhoenixProject")
+        self.logger = logging.getLogger("PhoenixProject.Strategy")
         if self.p.config is None: raise ValueError("StrategyConfig object not provided!")
         self.config = self.p.config
         self.cognitive_engine = CognitiveEngine(self.config)
         self.data_map = {d._name: d for d in self.datas}
         self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.config.sma_period) for d in self.datas}
+        
+        # Convert pandas Series to a dictionary for fast lookups
+        self.vix_lookup = self.p.vix_data.to_dict()
+        self.yield_lookup = self.p.treasury_yield_data.to_dict()
+        self.breadth_lookup = self.p.market_breadth_data.to_dict()
 
     def start(self):
         self.logger.info(f"{self.datas[0].datetime.date(0).isoformat()}: [Legion Commander]: Awaiting daily orders...")
 
     def next(self):
         if len(self.datas[0]) < self.config.sma_period: return
+        current_date_dt = self.datas[0].datetime.datetime(0)
         current_date = self.datas[0].datetime.date(0)
         self.logger.info(f"--- {current_date.isoformat()}: Daily Rebalancing Briefing ---")
-
-        current_vix = self.p.vix_data.get(current_date)
-        current_yield = self.p.treasury_yield_data.get(current_date)
-        current_breadth = self.p.market_breadth_data.get(current_date)
+        
+        # Use fast dictionary lookup
+        current_vix = self.vix_lookup.get(current_date_dt)
+        current_yield = self.yield_lookup.get(current_date_dt)
+        current_breadth = self.breadth_lookup.get(current_date_dt)
 
         if current_vix is None:
             self.logger.warning(f"Critical data VIX missing for {current_date}, halting for the day.")
             return
 
-        self.logger.info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f}%, Market Breadth: {current_breadth:.2%}")
+        self.logger.info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f if current_yield else 'N/A'}%, Market Breadth: {current_breadth:.2% if current_breadth else 'N/A'}")
 
         candidate_analysis = [
             {"ticker": ticker, "opportunity_score": self.cognitive_engine.analyze_asset_momentum(d.close[0], self.sma_indicators[ticker][0])}
@@ -303,15 +350,73 @@ class RomanLegionStrategy(bt.Strategy):
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.logger.warning(f"{self.datas[0].datetime.date(0).isoformat()}: Order for {order.data._name} failed: {order.getstatusname()}")
 
+# --- Section 5: Reporting Engine ---
+def generate_html_report(cerebro, strat, report_filename="phoenix_report.html"):
+    """
+    Generates a professional HTML report from the backtest results.
+    """
+    logger = logging.getLogger("PhoenixProject.ReportGenerator")
+    logger.info("Generating HTML after-action report...")
+
+    trade_analysis = strat.analyzers.trade_analyzer.get_analysis()
+    total_trades = trade_analysis.total.get('total', 0)
+    win_rate = (trade_analysis.won.get('total', 0) / total_trades) if total_trades > 0 else 0
+    
+    sharpe_ratio_analysis = strat.analyzers.sharpe_ratio.get_analysis()
+    
+    context = {
+        "final_value": cerebro.broker.getvalue(),
+        "total_return": strat.analyzers.returns.get_analysis().get('rtot', 0.0),
+        "sharpe_ratio": sharpe_ratio_analysis.get('sharperatio', None),
+        "max_drawdown": strat.analyzers.drawdown.get_analysis().max.get('drawdown', 0.0),
+        "total_trades": total_trades,
+        "winning_trades": trade_analysis.won.get('total', 0),
+        "losing_trades": trade_analysis.lost.get('total', 0),
+        "win_rate": win_rate,
+        "report_date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "plot_filename": "phoenix_plot.png"
+    }
+
+    try:
+        logger.info(f"Saving backtest plot to {context['plot_filename']}...")
+        figures = cerebro.plot(style='candlestick', barup='green', bardown='red', iplot=False)
+        if figures:
+            figures[0][0].savefig(context['plot_filename'], dpi=300)
+        else:
+            raise RuntimeError("Cerebro plot returned no figures.")
+    except Exception as e:
+        logger.error(f"Failed to save plot: {e}")
+        context['plot_filename'] = None
+
+    try:
+        env = Environment(loader=FileSystemLoader('.'))
+        template = env.get_template("report_template.html")
+        html_output = template.render(context)
+        
+        with open(report_filename, 'w', encoding='utf-8') as f:
+            f.write(html_output)
+        logger.info(f"Successfully generated HTML report: {report_filename}")
+    except Exception as e:
+        logger.error(f"Failed to generate HTML report: {e}")
+
 # --- Section 4: Main Execution Engine (The High Command) ---
 if __name__ == '__main__':
-    config = StrategyConfig()
-    
+    try:
+        with open("config.yaml", 'r', encoding='utf-8') as f:
+            params = yaml.safe_load(f)
+        config = StrategyConfig(**params)
+    except FileNotFoundError:
+        print("CRITICAL: Configuration file 'config.yaml' not found. Aborting.")
+        exit()
+    except Exception as e:
+        print(f"CRITICAL: Error parsing 'config.yaml': {e}. Aborting.")
+        exit()
+
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
     logger = logging.getLogger("PhoenixProject")
     logger.setLevel(log_level)
     if not logger.handlers:
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
         log_dir = "logs"
         os.makedirs(log_dir, exist_ok=True)
         log_filename = f"phoenix_project_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -323,10 +428,10 @@ if __name__ == '__main__':
         file_handler = logging.FileHandler(os.path.join(log_dir, log_filename))
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
-    logger.info("Phoenix Project Final Version - Logging System Initialized.")
+    logger.info("Phoenix Project Final Optimized Version - Logging System Initialized.")
 
     data_manager = DataManager(config)
-    all_aligned_data = data_manager.get_aligned_data()
+    all_aligned_data = asyncio.run(data_manager.get_aligned_data())
 
     if not all_aligned_data:
         logger.critical("Failed to get aligned data. Aborting operation.")
@@ -366,30 +471,10 @@ if __name__ == '__main__':
             cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
             cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
 
-            logger.info('--- Launching "Phoenix Project" (Ascendant Version) ---')
+            logger.info('--- Launching "Phoenix Project" (Resurrected Version) ---')
             results = cerebro.run()
             
             logger.info("--- Operation Concluded ---")
             strat = results[0]
-            trade_analysis = strat.analyzers.trade_analyzer.get_analysis()
-            total_trades = trade_analysis.total.get('total', 0)
-            win_rate = (trade_analysis.won.get('total', 0) / total_trades) if total_trades > 0 else 0
-
-            report = f"""
-\n================== PHOENIX PROJECT: AFTER-ACTION REPORT ==================
-Final Empire Assets: ${cerebro.broker.getvalue():,.2f}
---------------------------------------------------------------------------
-Performance Metrics:
-- Total Return: {strat.analyzers.returns.get_analysis().get('rtot', 0.0) * 100:.2f}%
-- Sharpe Ratio: {strat.analyzers.sharpe_ratio.get_analysis().get('sharperatio', 'N/A')}
-- Max Drawdown: {strat.analyzers.drawdown.get_analysis().max.get('drawdown', 0.0):.2f}%
---------------------------------------------------------------------------
-Trade Statistics:
-- Total Trades: {total_trades}
-- Winning Trades: {trade_analysis.won.get('total', 0)}
-- Losing Trades: {trade_analysis.lost.get('total', 0)}
-- Win Rate: {win_rate:.2%}
-==========================================================================
-"""
-            logger.info(report)
-            cerebro.plot(style='candlestick', barup='green', bardown='red')
+            
+            generate_html_report(cerebro, strat)
