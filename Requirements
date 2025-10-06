@@ -1,16 +1,18 @@
-# Phoenix Project V2.2 - Dependencies
-
-# Core backtesting engine
+Phoenix Project Final Version - Dependencies
+Core backtesting engine
 backtrader==1.9.76.123
 
-# Data manipulation and analysis
+Data manipulation and analysis
 pandas==2.2.2
 
-# Financial data source from Yahoo Finance
+Financial data source from Yahoo Finance
 yfinance==0.2.38
 
-# Required by pandas for efficient .to_feather() and .read_feather() caching
+Required by pandas for efficient .to_feather() and .read_feather() caching
 pyarrow==16.1.0
 
-# Optional but recommended for pandas.read_html() if we re-add the Wikipedia feature
+Used by yfinance for network requests
+requests==2.31.0
+
+Optional but recommended for pandas.read_html() if extending DataManager
 lxml==5.2.2
