@@ -8,6 +8,7 @@ pyarrow==16.1.0  # Explicitly required for consistent Parquet cache handling
 Asynchronous HTTP & Retries
 yfinance==0.2.40
 tenacity==8.3.0
+google-generativeai==0.7.1 # For Gemini API
 
 Configuration & Validation
 pydantic==2.7.1
@@ -19,5 +20,5 @@ Jinja2==3.1.4
 (Optional, but good to have for plotting)
 matplotlib==3.9.0
 
-Testing
+测试
 pytest==8.2.0
