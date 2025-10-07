@@ -19,7 +19,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, validator, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from jinja2 import Environment, FileSystemLoader
-from gemini_service import GeminiService, MalformedResponseError
+from ai.client import AIClient, GeminiAIClient, MockAIClient, MalformedResponseError
 import backtrader as bt
 import pandas as pd
 import yfinance as yf
@@ -29,10 +29,12 @@ import yfinance as yf
 class GeminiConfig(BaseModel):
     """Configuration for the Gemini AI Advisor service."""
     enable: bool = False
-    mode: Literal["mock", "production"] = "production"
+    mode: Literal["mock", "production"] = "mock"
     api_key_env_var: str
     model_name: str
     request_timeout: int = 90
+    audit_log_retention_days: int = 30
+    max_concurrent_requests: int = 5
     prompts: Dict[str, str]
 
 class StrategyConfig(BaseModel):
@@ -402,19 +404,19 @@ class RomanLegionStrategy(bt.Strategy):
             self.logger.warning(f"{self.datas[0].datetime.date(0).isoformat()}: Order for {order.data._name} failed: {order.getstatusname()}")
 
 # --- Reporting Engine ---
-async def generate_ai_report(gemini_service: Optional[GeminiService], context: Dict) -> Optional[str]:
-    if not gemini_service: return None
+async def generate_ai_report(ai_client: Optional[AIClient], context: Dict) -> Optional[str]:
+    if not ai_client: return None
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating AI Marshal's Report...")
     try:
-        report_text = await gemini_service.generate_summary_report(context)
+        report_text = await ai_client.generate_summary_report(context)
         logger.info("Successfully generated AI Marshal's Report.")
         return report_text
     except Exception as e:
         logger.error(f"Failed to generate AI report: {e}")
         return "## Marshal's Debriefing Failed ##\n\nAn error occurred during communication with the AI Command. The quantitative report below remains accurate."
 
-async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, gemini_service: Optional[GeminiService] = None, report_filename="phoenix_report.html"):
+async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, ai_client: Optional[AIClient] = None, report_filename="phoenix_report.html"):
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating HTML after-action report...")
 
@@ -441,7 +443,7 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
         "sharpe_ratio": sharpe_ratio, "max_drawdown": dd_analysis.get('max', {}).get('drawdown', 0.0),
         "total_trades": total_trades, "winning_trades": winning_trades, "losing_trades": losing_trades, "win_rate": win_rate, "report_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "plot_filename": "phoenix_plot.png"
     }
-    context['ai_summary_report'] = await generate_ai_report(gemini_service, context)
+    context['ai_summary_report'] = await generate_ai_report(ai_client, context)
     try:
         plot_path = Path(report_filename).with_suffix('.png')
         logger.info(f"Saving backtest plot to {plot_path}...")
@@ -469,7 +471,7 @@ def fetch_mock_news_for_date(date_obj: date) -> List[str]:
     random.shuffle(base_headlines)
     return base_headlines[:3]
 
-async def precompute_sentiments(gemini_service: GeminiService, dates: List[date]) -> Dict[date, float]:
+async def precompute_sentiments(ai_client: AIClient, dates: List[date]) -> Dict[date, float]:
     logger = logging.getLogger("PhoenixProject.SentimentPrecomputer")
     cache_file = Path("data_cache") / "sentiment_cache.json"    
     cached_sentiments_str = {}
@@ -487,18 +489,16 @@ async def precompute_sentiments(gemini_service: GeminiService, dates: List[date]
 
     if missing_dates:
         logger.info(f"Sentiment cache miss for {len(missing_dates)} days. Fetching incrementally...")
-        sem = asyncio.Semaphore(10)  # Limit concurrency to 10 requests at a time 
 
         async def fetch_single_sentiment(date_obj: date):
-            async with sem:
-                try:
-                    mock_headlines = fetch_mock_news_for_date(date_obj)
-                    analysis = await gemini_service.get_market_sentiment(mock_headlines)
-                    logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
-                    return date_obj, analysis.get('sentiment_score', 0.0)
-                except (MalformedResponseError, Exception) as e:
-                    logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
-                    return date_obj, 0.0
+            try:
+                mock_headlines = fetch_mock_news_for_date(date_obj)
+                analysis = await ai_client.get_market_sentiment(mock_headlines)
+                logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
+                return date_obj, analysis.get('sentiment_score', 0.0)
+            except (MalformedResponseError, Exception) as e:
+                logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
+                return date_obj, 0.0
 
         tasks = [fetch_single_sentiment(date_obj) for date_obj in missing_dates]
         new_results = await asyncio.gather(*tasks)
@@ -513,7 +513,7 @@ async def precompute_sentiments(gemini_service: GeminiService, dates: List[date]
 
     return {dt: cached_sentiments_str[dt.isoformat()] for dt in required_dates}
 
-async def precompute_asset_analyses(gemini_service: GeminiService, dates: List[date], asset_universe: List[str]) -> Dict[date, Dict]:
+async def precompute_asset_analyses(ai_client: AIClient, dates: List[date], asset_universe: List[str]) -> Dict[date, Dict]:
     logger = logging.getLogger("PhoenixProject.AssetAnalysisPrecomputer")
     cache_file = Path("data_cache") / "asset_analysis_cache.json"
     cached_data_str = {}
@@ -530,18 +530,16 @@ async def precompute_asset_analyses(gemini_service: GeminiService, dates: List[d
 
     if missing_dates:
         logger.info(f"Asset analysis cache miss for {len(missing_dates)} days. Fetching incrementally...")
-        sem = asyncio.Semaphore(5)  # Limit concurrency for heavier batch calls 
 
         async def fetch_single_analysis(date_obj: date):
-            async with sem:
-                try:
-                    daily_batch_analysis = await gemini_service.get_batch_asset_analysis(asset_universe, date_obj)
-                    logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
-                    return date_obj, daily_batch_analysis
-                except Exception as e:
-                    logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
-                    default_analysis = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
-                    return date_obj, default_analysis
+            try:
+                daily_batch_analysis = await ai_client.get_batch_asset_analysis(asset_universe, date_obj)
+                logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
+                return date_obj, daily_batch_analysis
+            except Exception as e:
+                logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
+                default_analysis = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
+                return date_obj, default_analysis
 
         tasks = [fetch_single_analysis(date_obj) for date_obj in missing_dates]
         new_results = await asyncio.gather(*tasks)
@@ -557,7 +555,7 @@ async def precompute_asset_analyses(gemini_service: GeminiService, dates: List[d
     return {dt: cached_data_str[dt.isoformat()] for dt in required_dates}
 
 # --- Main Execution Engine ---
-async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, gemini_service: Optional[GeminiService] = None):
+async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai_client: Optional[AIClient] = None):
     """Runs a standard, single backtest over the full date range."""
     logger = logging.getLogger("PhoenixProject")
     logger.info(f"--- Launching 'Phoenix Project' in SINGLE BACKTEST mode (AI: {config.ai_mode.upper()}) ---")
@@ -565,9 +563,9 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ge
     master_dates = [dt.to_pydatetime().date() for dt in all_aligned_data["asset_universe_df"].index]
     sentiment_lookup = {}
     asset_analysis_lookup = {}
-    if gemini_service and config.ai_mode != "off":
-        sentiment_lookup = await precompute_sentiments(gemini_service, master_dates)
-        asset_analysis_lookup = await precompute_asset_analyses(gemini_service, master_dates, config.asset_universe)
+    if ai_client and config.ai_mode != "off":
+        sentiment_lookup = await precompute_sentiments(ai_client, master_dates)
+        asset_analysis_lookup = await precompute_asset_analyses(ai_client, master_dates, config.asset_universe)
 
     cerebro = bt.Cerebro()
     try:
@@ -603,7 +601,7 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ge
 
     results = cerebro.run()
     strat = results[0]
-    await generate_html_report(cerebro, strat, gemini_service, report_filename=f"phoenix_report_{config.ai_mode}_single.html")
+    await generate_html_report(cerebro, strat, ai_client, report_filename=f"phoenix_report_{config.ai_mode}_single.html")
 
 def _find_best_opt_run(opt_runs):
     best_sharpe = -float('inf')
@@ -618,7 +616,7 @@ def _find_best_opt_run(opt_runs):
                 best_params = best_run.p._getkwargs()
     return best_params, best_sharpe
 
-async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemini_service: Optional[GeminiService] = None):
+async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, ai_client: Optional[AIClient] = None):
     """Runs the walk-forward optimization process."""
     logger = logging.getLogger("PhoenixProject")
     logger.info(f"--- Launching 'Phoenix Project' in WALK-FORWARD mode (AI: {config.ai_mode.upper()}) ---")
@@ -670,8 +668,8 @@ async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemin
         temp_config.rsi_period = best_params.get('rsi_period', config.rsi_period)
         
         master_dates = pd.date_range(start=train_end, end=test_end).date
-        sentiment_lookup = await precompute_sentiments(gemini_service, master_dates) if gemini_service else {}
-        asset_analysis_lookup = await precompute_asset_analyses(gemini_service, master_dates, config.asset_universe) if gemini_service else {}
+        sentiment_lookup = await precompute_sentiments(ai_client, master_dates) if ai_client else {}
+        asset_analysis_lookup = await precompute_asset_analyses(ai_client, master_dates, config.asset_universe) if ai_client else {}
         
         val_cerebro.addstrategy(
             RomanLegionStrategy, config=temp_config,
@@ -698,7 +696,7 @@ async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemin
         results = val_cerebro.run()
         strat = results[0]
         out_of_sample_results.append(strat)
-        await generate_html_report(val_cerebro, strat, gemini_service, report_filename=f"phoenix_report_wf_{window_num}.html")
+        await generate_html_report(val_cerebro, strat, ai_client, report_filename=f"phoenix_report_wf_{window_num}.html")
 
         current_start += step_delta
     
@@ -731,17 +729,17 @@ async def main():
         file_handler.setFormatter(formatter); logger.addHandler(file_handler)
     logger.info("Phoenix Project Final Optimized Version - Logging System Initialized.")
 
-    gemini_service = None
+    ai_client: Optional[AIClient] = None
     if config.gemini_config.enable:
         try:
             if hasattr(config.gemini_config, "model_dump"):
                 gem_cfg = config.gemini_config.model_dump()
             else:
                 gem_cfg = config.gemini_config.dict()
-            gemini_service = GeminiService(gem_cfg)
-            logger.info(f"Gemini Service has been enabled and initialized in '{config.gemini_config.mode}' mode.")
+            ai_client = MockAIClient(gem_cfg) if gem_cfg['mode'] == 'mock' else GeminiAIClient(gem_cfg)
+            logger.info(f"AI Client has been enabled and initialized in '{config.gemini_config.mode}' mode.")
         except Exception as e:
-            logger.error(f"Failed to initialize Gemini Service: {e}. Continuing without AI features.")
+            logger.error(f"Failed to initialize AI Client: {e}. Continuing without AI features.")
 
     data_manager = DataManager(config)
     all_aligned_data = await data_manager.get_aligned_data()
@@ -750,9 +748,9 @@ async def main():
         return
 
     if config.walk_forward.get('enabled', False):
-        await run_walk_forward(config, all_aligned_data, gemini_service)
+        await run_walk_forward(config, all_aligned_data, ai_client)
     else:
-        await run_single_backtest(config, all_aligned_data, gemini_service)
+        await run_single_backtest(config, all_aligned_data, ai_client)
     
     logger.info("--- Operation Concluded ---")
 
