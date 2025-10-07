@@ -20,9 +20,9 @@ from pydantic import BaseModel, Field, validator, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from jinja2 import Environment, FileSystemLoader
 from gemini_service import GeminiService, MalformedResponseError
-import httpx
 import backtrader as bt
 import pandas as pd
+import yfinance as yf
 
 
 # --- [Optimized] Configuration Models ---
@@ -45,6 +45,8 @@ class StrategyConfig(BaseModel):
     asset_universe: List[str] = Field(..., min_items=1)
     market_breadth_tickers: List[str] = Field(..., min_items=1)
     sma_period: int = Field(..., gt=0)
+    rsi_period: int = Field(..., gt=0)
+    rsi_overbought_threshold: float = Field(..., ge=0, le=100)
     opportunity_score_threshold: float = Field(..., ge=0, le=100)
     vix_high_threshold: float = Field(..., gt=0)
     vix_low_threshold: float = Field(..., gt=0)
@@ -56,6 +58,7 @@ class StrategyConfig(BaseModel):
     log_level: str
     gemini_config: GeminiConfig
     ai_mode: Literal["off", "raw", "processed"] = "processed"
+    walk_forward: Dict[str, Any]
     max_total_allocation: float = Field(default=1.0, gt=0, le=1.0)
 
     @validator('end_date')
@@ -78,7 +81,6 @@ class DataManager:
         self.config = config
         self.cache_dir = cache_dir
         self.logger = logging.getLogger("PhoenixProject.DataManager")
-        self.semaphore = asyncio.Semaphore(8)
         os.makedirs(self.cache_dir, exist_ok=True)
         self.logger.info(f"DataManager initialized. Cache directory set to '{self.cache_dir}'.")
 
@@ -110,56 +112,34 @@ class DataManager:
         self.logger.info(f"Saved fresh data to cache: {cache_path}")
         return data
 
-    @retry(
-        wait=wait_exponential(multiplier=1, min=2, max=60),
-        stop=stop_after_attempt(5),
-        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
-        reraise=True
-    )
-    async def _async_fetch_one_ticker(self, client: httpx.AsyncClient, ticker: str, start_ts: int, end_ts: int) -> pd.DataFrame:
-        URL = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}"
-        params = {"period1": start_ts, "period2": end_ts, "interval": "1d", "events": "history", "includeAdjustedClose": "true"}
-        async with self.semaphore:
-            try:
-                self.logger.info(f"Fetching data for {ticker}...")
-                response = await client.get(URL, params=params, timeout=20)
-                response.raise_for_status()
-                df = pd.read_csv(StringIO(response.text), index_col='Date', parse_dates=True)
-                df.columns = pd.MultiIndex.from_product([df.columns, [ticker]])
-                return df
-            except httpx.HTTPStatusError as e:
-                self.logger.warning(f"HTTP error for {ticker}: {e.response.status_code}. Retrying if applicable...")
-                raise
-            except Exception as e:
-                # [Optimized] Raise a specific exception instead of returning None
-                self.logger.error(f"Non-retryable error for {ticker}: {e}")
-                raise DataFetchError(f"Non-retryable error for {ticker}: {e}") from e
-
     async def async_get_yfinance_data(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        start_dt = datetime.datetime.strptime(start, '%Y-%m-%d')
-        end_dt = datetime.datetime.strptime(end, '%Y-%m-%d')
-        start_ts = int(start_dt.timestamp())
-        end_ts = int(end_dt.timestamp())
+        self.logger.info(f"Fetching data for tickers: {tickers} via yfinance...")
+        try:
+            # yfinance download is a blocking I/O call, run it in a separate thread
+            # to avoid blocking the asyncio event loop.
+            df = await asyncio.to_thread(
+                yf.download,
+                tickers=tickers,
+                start=start,
+                end=end,
+                auto_adjust=True,  # Automatically adjusts for splits and dividends
+                progress=False,    # Disable progress bar for cleaner logs
+                group_by='ticker'
+            )
 
-        limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
-        async with httpx.AsyncClient(limits=limits) as client:
-            tasks = [self._async_fetch_one_ticker(client, ticker, start_ts, end_ts) for ticker in tickers]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if df.empty:
+                self.logger.warning(f"yfinance returned no data for tickers: {tickers}")
+                return None
 
-        # [Optimized] Explicitly log failures instead of silently filtering
-        valid_dfs = []
-        for i, res in enumerate(results):
-            if isinstance(res, pd.DataFrame):
-                valid_dfs.append(res)
-            elif isinstance(res, Exception):
-                self.logger.error(f"Data fetch failed for ticker '{tickers[i]}': {res}")
+            # For a single ticker, yfinance returns a DataFrame without multi-level columns.
+            # We need to standardize the column format to a MultiIndex for consistency.
+            if len(tickers) == 1:
+                df.columns = pd.MultiIndex.from_product([df.columns, tickers])
 
-        if not valid_dfs:
-            self.logger.critical(f"Async fetch returned no valid data for any of the requested tickers: {tickers}")
-            return None
-
-        combined_df = pd.concat(valid_dfs, axis=1)
-        return combined_df.sort_index()
+            return df.sort_index()
+        except Exception as e:
+            self.logger.error(f"yfinance failed to download data for {tickers}: {e}")
+            raise DataFetchError(f"yfinance download failed for {tickers}: {e}") from e
 
     async def get_vix_data(self) -> Optional[pd.Series]:
         params = {'tickers': ['^VIX'], 'start': self.config.start_date, 'end': self.config.end_date}
@@ -237,8 +217,8 @@ class CognitiveEngine:
         capital_modifier = self.risk_manager.get_capital_modifier(current_vix, current_date)
         return self.portfolio_constructor.construct_portfolio(candidate_analysis, capital_modifier, current_date)
 
-    def analyze_asset_momentum(self, current_price: float, current_sma: float) -> float:
-        return self.portfolio_constructor.analyze_asset_momentum(current_price, current_sma)
+    def calculate_opportunity_score(self, current_price: float, current_sma: float, current_rsi: float) -> float:
+        return self.portfolio_constructor.calculate_opportunity_score(current_price, current_sma, current_rsi)
 
 class RiskManager:
     def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[datetime.date, float]] = None):
@@ -276,12 +256,26 @@ class PortfolioConstructor:
         self.ema_alpha = 0.2
         self.global_scale = 1.0
 
-    @staticmethod
-    def analyze_asset_momentum(current_price: float, current_sma: float) -> float:
+    def calculate_opportunity_score(self, current_price: float, current_sma: float, current_rsi: float) -> float:
+        """
+        Calculates a score based on momentum, moderated by an RSI overbought penalty.
+        """
         if current_sma <= 0: return 0.0
-        score = 50 + 50 * ((current_price / current_sma) - 1)
-        return max(0.0, min(100.0, score))
+        momentum_score = 50 + 50 * ((current_price / current_sma) - 1)
 
+        # Apply RSI moderation only if momentum is positive (score > 50) and RSI is overbought
+        if momentum_score > 50 and current_rsi > self.config.rsi_overbought_threshold:
+            # The more overbought, the higher the penalty. Max penalty is 50%
+            # At threshold (e.g., 70), intensity is 0, penalty is 1.0
+            # At max RSI (100), intensity is 1, penalty is 0.5
+            overbought_intensity = (current_rsi - self.config.rsi_overbought_threshold) / (100 - self.config.rsi_overbought_threshold)
+            penalty_factor = 1.0 - (overbought_intensity * 0.5)
+            final_score = momentum_score * penalty_factor
+        else:
+            final_score = momentum_score
+
+        return max(0.0, min(100.0, final_score))
+        
     def _sanitize_ai_output(self, raw: Dict) -> tuple[float, float]:
         try:
             f = float(raw.get("adjustment_factor", 1.0))
@@ -343,7 +337,13 @@ class PortfolioConstructor:
 
 # --- Strategy Execution Layer ---
 class RomanLegionStrategy(bt.Strategy):
-    params = (('config', None), ('vix_data', None), ('treasury_yield_data', None), ('market_breadth_data', None), ('sentiment_data', None), ('asset_analysis_data', None))
+    params = (
+        ('config', None), ('vix_data', None), ('treasury_yield_data', None), 
+        ('market_breadth_data', None), ('sentiment_data', None), ('asset_analysis_data', None),
+        # -- Tunable Parameters --
+        ('sma_period', 50),
+        ('rsi_period', 14),
+    )
 
     def __init__(self):
         self.logger = logging.getLogger("PhoenixProject.Strategy")
@@ -351,7 +351,8 @@ class RomanLegionStrategy(bt.Strategy):
         self.config = self.p.config
         self.cognitive_engine = CognitiveEngine(self.config, self.p.sentiment_data, self.p.asset_analysis_data, ai_mode=self.config.ai_mode)
         self.data_map = {d._name: d for d in self.datas}
-        self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.config.sma_period) for d in self.datas}
+        self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.p.sma_period) for d in self.datas}
+        self.rsi_indicators = {d._name: bt.indicators.RSI(d.close, period=self.p.rsi_period) for d in self.datas}
         self.vix_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.vix_data.items()}
         self.yield_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.treasury_yield_data.items()}
         self.breadth_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.market_breadth_data.items()}
@@ -360,7 +361,7 @@ class RomanLegionStrategy(bt.Strategy):
         self.logger.info(f"{self.datas[0].datetime.date(0).isoformat()}: [Legion Commander]: Awaiting daily orders...")
 
     def next(self):
-        if len(self.datas[0]) < self.config.sma_period: return
+        if len(self.datas[0]) < self.p.sma_period: return
         current_date = self.datas[0].datetime.date(0)
         self.logger.info(f"--- {current_date.isoformat()}: Daily Rebalancing Briefing ---")
         current_vix = self.vix_lookup.get(current_date)
@@ -370,7 +371,12 @@ class RomanLegionStrategy(bt.Strategy):
             self.logger.warning(f"Critical data VIX missing for {current_date}, halting for the day.")
             return
         self.logger.info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f if current_yield else 'N/A'}%, Market Breadth: {current_breadth:.2% if current_breadth else 'N/A'}")
-        candidate_analysis = [{"ticker": ticker, "opportunity_score": self.cognitive_engine.analyze_asset_momentum(d.close[0], self.sma_indicators[ticker][0])} for ticker, d in self.data_map.items()]
+        candidate_analysis = [{
+            "ticker": ticker,
+            "opportunity_score": self.cognitive_engine.calculate_opportunity_score(
+                d.close[0], self.sma_indicators[ticker][0], self.rsi_indicators[ticker][0])
+        } for ticker, d in self.data_map.items()]
+
         battle_plan = self.cognitive_engine.determine_allocations(candidate_analysis, current_vix, current_date)
         self.logger.info("--- Starting Unified Rebalancing Protocol ---")
         total_value = self.broker.getvalue()
@@ -413,7 +419,7 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating HTML after-action report...")
     trade_analysis = strat.analyzers.trade_analyzer.get_analysis()
-    total_trades = trade_analysis.total.get('total', 0)
+    total_trades = trade_analysis.total.get('total', 0) if trade_analysis else 0
     win_rate = (trade_analysis.won.get('total', 0) / total_trades) if total_trades > 0 else 0
     sharpe_ratio_analysis = strat.analyzers.sharpe_ratio.get_analysis()
     context = {
@@ -424,9 +430,12 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
     }
     context['ai_summary_report'] = await generate_ai_report(gemini_service, context)
     try:
-        logger.info(f"Saving backtest plot to {context['plot_filename']}...")
+        plot_path = Path(report_filename).with_suffix('.png')
+        logger.info(f"Saving backtest plot to {plot_path}...")
         figures = cerebro.plot(style='candlestick', barup='green', bardown='red', iplot=False)
-        if figures: figures[0][0].savefig(context['plot_filename'], dpi=300)
+        if figures: 
+            figures[0][0].savefig(plot_path, dpi=300)
+            context['plot_filename'] = plot_path.name
         else: raise RuntimeError("Cerebro plot returned no figures.")
     except Exception as e:
         logger.error(f"Failed to save plot: {e}")
@@ -489,26 +498,184 @@ async def precompute_asset_analyses(gemini_service: GeminiService, dates: List[d
                 return {datetime.date.fromisoformat(k): v for k, v in cached_data_str.items()}
         except Exception: logger.warning("Asset analysis cache is corrupted. Re-computing.")
 
-    logger.info(f"Pre-computing asset analyses for {len(asset_universe)} assets over {len(dates)} days...")
-    analysis_lookup_str = {d.isoformat(): {} for d in dates}
+    logger.info(f"Pre-computing asset analyses for {len(asset_universe)} assets over {len(dates)} days via batch API calls...")
+    analysis_lookup_str = {}
     for date_obj in dates:
-        for ticker in asset_universe:
-            try:
-                analysis = await gemini_service.get_asset_analysis(ticker, date_obj)
-                analysis_lookup_str[date_obj.isoformat()][ticker] = analysis
-            except Exception as e:
-                logger.error(f"Could not compute analysis for {ticker} on {date_obj.isoformat()}: {e}. Defaulting to neutral.")
-                analysis_lookup_str[date_obj.isoformat()][ticker] = {"adjustment_factor": 1.0, "reasoning": "Error in computation"}
+        try:
+            # One API call for all assets for the given day
+            daily_batch_analysis = await gemini_service.get_batch_asset_analysis(asset_universe, date_obj)
+            analysis_lookup_str[date_obj.isoformat()] = daily_batch_analysis
+            logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
+        except Exception as e:
+            logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
+            analysis_lookup_str[date_obj.isoformat()] = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
     
     with open(cache_file, 'w') as f: json.dump(analysis_lookup_str, f)
     logger.info(f"Saved computed asset analyses to cache: {cache_file}")
     return {datetime.date.fromisoformat(k): v for k, v in analysis_lookup_str.items()}
 
 # --- Main Execution Engine ---
+async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, gemini_service: Optional[GeminiService] = None):
+    """Runs a standard, single backtest over the full date range."""
+    logger = logging.getLogger("PhoenixProject")
+    logger.info(f"--- Launching 'Phoenix Project' in SINGLE BACKTEST mode (AI: {config.ai_mode.upper()}) ---")
+
+    master_dates = [dt.to_pydatetime().date() for dt in all_aligned_data["asset_universe_df"].index]
+    sentiment_lookup = {}
+    asset_analysis_lookup = {}
+    if gemini_service and config.ai_mode != "off":
+        sentiment_lookup = await precompute_sentiments(gemini_service, master_dates)
+        asset_analysis_lookup = await precompute_asset_analyses(gemini_service, master_dates, config.asset_universe)
+
+    cerebro = bt.Cerebro()
+    try:
+        all_data_df = all_aligned_data["asset_universe_df"]
+        if all_data_df is None or all_data_df.empty: raise ValueError("Asset universe data is empty.")
+        unique_tickers = all_data_df.columns.get_level_values(1).unique()
+        for ticker in unique_tickers:
+            ticker_df = all_data_df.xs(ticker, level=1, axis=1).copy()
+            ticker_df.columns = [col.lower() for col in ticker_df.columns]
+            ticker_df.dropna(inplace=True)
+            if not ticker_df.empty:
+                data_feed = bt.feeds.PandasData(dataname=ticker_df, name=ticker)
+                cerebro.adddata(data_feed)
+    except Exception as e:
+        logger.critical(f"A critical error occurred during data loading: {e}. Aborting.")
+        return
+
+    if not cerebro.datas:
+        logger.critical("Failed to load data for any asset. Aborting operation.")
+        return
+        
+    cerebro.addstrategy(
+        RomanLegionStrategy, config=config, vix_data=all_aligned_data["vix"],
+        treasury_yield_data=all_aligned_data["treasury_yield"], market_breadth_data=all_aligned_data["market_breadth"],
+        sentiment_data=sentiment_lookup, asset_analysis_data=asset_analysis_lookup
+    )
+    cerebro.broker.setcash(config.initial_cash)
+    cerebro.broker.setcommission(commission=config.commission_rate)
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', timeframe=bt.TimeFrame.Days, compression=1, annualize=True, riskfreerate=0.0)
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+    cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
+    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
+
+    results = cerebro.run()
+    strat = results[0]
+    await generate_html_report(cerebro, strat, gemini_service, report_filename=f"phoenix_report_{config.ai_mode}_single.html")
+
+def _find_best_opt_run(opt_runs):
+    best_sharpe = -float('inf')
+    best_run = None
+    best_params = {}
+    for run in opt_runs:
+        for strat in run: # opt_runs is a list of lists of strategies
+            sharpe = strat.analyzers.sharpe_ratio.get_analysis().get('sharperatio', -float('inf'))
+            if sharpe is not None and sharpe > best_sharpe:
+                best_sharpe = sharpe
+                best_run = strat
+                best_params = best_run.p._getkwargs()
+    return best_params, best_sharpe
+
+async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemini_service: Optional[GeminiService] = None):
+    """Runs the walk-forward optimization process."""
+    logger = logging.getLogger("PhoenixProject")
+    logger.info(f"--- Launching 'Phoenix Project' in WALK-FORWARD mode (AI: {config.ai_mode.upper()}) ---")
+    
+    wf_config = config.walk_forward
+    train_delta = datetime.timedelta(days=wf_config['train_days'])
+    test_delta = datetime.timedelta(days=wf_config['test_days'])
+    step_delta = datetime.timedelta(days=wf_config['step_days'])
+    
+    full_start_date = datetime.datetime.strptime(config.start_date, '%Y-%m-%d').date()
+    full_end_date = datetime.datetime.strptime(config.end_date, '%Y-%m-%d').date()
+
+    out_of_sample_results = []
+    current_start = full_start_date
+    window_num = 0
+
+    while current_start + train_delta + test_delta <= full_end_date:
+        window_num += 1
+        train_end = current_start + train_delta
+        test_end = train_end + test_delta
+        logger.info(f"--- W-F Window {window_num}: Train=[{current_start} to {train_end}] ---")
+
+        # --- 1. Optimization Phase ---
+        opt_cerebro = bt.Cerebro(stdstats=False, optreturn=False)
+        opt_cerebro.optstrategy(
+            RomanLegionStrategy,
+            config=config, vix_data=all_aligned_data["vix"], treasury_yield_data=all_aligned_data["treasury_yield"],
+            market_breadth_data=all_aligned_data["market_breadth"], sentiment_data={}, asset_analysis_data={},
+            sma_period=range(30, 81, 10), # Example range for SMA
+            rsi_period=range(10, 21, 2)   # Example range for RSI
+        )
+        for ticker in config.asset_universe:
+            df = all_aligned_data["asset_universe_df"].xs(ticker, level=1, axis=1).copy()
+            df.columns = [col.lower() for col in df.columns]
+            data_feed = bt.feeds.PandasData(dataname=df, fromdate=current_start, todate=train_end, name=ticker)
+            opt_cerebro.adddata(data_feed)
+        
+        opt_cerebro.broker.setcash(config.initial_cash)
+        opt_cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', annualize=True)
+        
+        logger.info(f"Running optimization for Window {window_num}...")
+        opt_runs = opt_cerebro.run()
+        best_params, best_sharpe = _find_best_opt_run(opt_runs)
+        logger.info(f"Window {window_num} Best Sharpe: {best_sharpe:.3f}, Best Params: {best_params}")
+
+        # --- 2. Validation Phase ---
+        logger.info(f"--- W-F Window {window_num}: Test=[{train_end} to {test_end}] ---")
+        val_cerebro = bt.Cerebro()
+        # Create a temporary config to pass to the strategy instance for this specific run
+        temp_config = config.copy(deep=True)
+        temp_config.sma_period = best_params.get('sma_period', config.sma_period)
+        temp_config.rsi_period = best_params.get('rsi_period', config.rsi_period)
+        
+        val_cerebro.addstrategy(RomanLegionStrategy, config=temp_config, **best_params) # Pass best params
+        
+        # For the validation run, we can use the pre-computed AI data
+        master_dates = pd.date_range(start=train_end, end=test_end).date
+        sentiment_lookup = await precompute_sentiments(gemini_service, master_dates) if gemini_service and gemini_service.mode == 'production' else {}
+        asset_analysis_lookup = await precompute_asset_analyses(gemini_service, master_dates, config.asset_universe) if gemini_service and gemini_service.mode == 'production' else {}
+        
+        val_cerebro.broker.setcash(config.initial_cash)
+        # Pass full data, strategy will use its date range
+        for ticker in config.asset_universe:
+            df = all_aligned_data["asset_universe_df"].xs(ticker, level=1, axis=1).copy()
+            df.columns = [col.lower() for col in df.columns]
+            data_feed = bt.feeds.PandasData(dataname=df, fromdate=train_end, todate=test_end, name=ticker)
+            val_cerebro.adddata(data_feed)
+
+        # Pass the full auxiliary data; the strategy will look up the correct dates
+        val_cerebro.strats[0][0][0].p.vix_data=all_aligned_data["vix"]
+        val_cerebro.strats[0][0][0].p.treasury_yield_data=all_aligned_data["treasury_yield"]
+        val_cerebro.strats[0][0][0].p.market_breadth_data=all_aligned_data["market_breadth"]
+        val_cerebro.strats[0][0][0].p.sentiment_data=sentiment_lookup
+        val_cerebro.strats[0][0][0].p.asset_analysis_data=asset_analysis_lookup
+
+        val_cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', annualize=True)
+        val_cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+        val_cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
+        val_cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
+        
+        results = val_cerebro.run()
+        strat = results[0]
+        out_of_sample_results.append(strat)
+        await generate_html_report(val_cerebro, strat, gemini_service, report_filename=f"phoenix_report_wf_{window_num}.html")
+
+        current_start += step_delta
+    
+    # --- 3. Final Aggregation ---
+    logger.info("--- Walk-Forward Out-of-Sample Performance Summary ---")
+    for i, strat in enumerate(out_of_sample_results):
+        sharpe = strat.analyzers.sharpe_ratio.get_analysis().get('sharperatio', 'N/A')
+        returns = strat.analyzers.returns.get_analysis().get('rtot', 0.0)
+        drawdown = strat.analyzers.drawdown.get_analysis().max.get('drawdown', 0.0)
+        logger.info(f"Window {i+1}: Sharpe = {sharpe:.3f}, Return = {returns:.2%}, Max Drawdown = {drawdown:.2f}%")
+
 async def main():
     try:
         config_params = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
-        # [Optimized] Flatten nested execution_mode config safely
+        # Flatten nested execution_mode config safely
         config_params.update(config_params.pop('execution_mode', {}))
         config = StrategyConfig(**config_params)
     except (FileNotFoundError, ValidationError) as e:
@@ -530,7 +697,6 @@ async def main():
     gemini_service = None
     if config.gemini_config.enable:
         try:
-            # [Optimized] Pass the validated config as a dictionary
             gemini_service = GeminiService(config.gemini_config.model_dump())
             logger.info(f"Gemini Service has been enabled and initialized in '{config.gemini_config.mode}' mode.")
         except Exception as e:
@@ -542,50 +708,12 @@ async def main():
         logger.critical("Failed to get aligned data. Aborting operation.")
         return
 
-    master_dates = [dt.to_pydatetime().date() for dt in all_aligned_data["asset_universe_df"].index]
-    sentiment_lookup = {}
-    asset_analysis_lookup = {}
-    if gemini_service 和 config.ai_mode != "off":
-        sentiment_lookup = await precompute_sentiments(gemini_service, master_dates)
-        asset_analysis_lookup = await precompute_asset_analyses(gemini_service, master_dates, config.asset_universe)
-
-    cerebro = bt.Cerebro()
-    try:
-        all_data_df = all_aligned_data["asset_universe_df"]
-        if all_data_df is None or all_data_df.empty: raise ValueError("Asset universe data is empty.")
-        unique_tickers = all_data_df.columns。get_level_values(1)。unique()
-        for ticker 在 unique_tickers:
-            ticker_df = all_data_df.xs(ticker, level=1, axis=1).copy()
-            ticker_df.columns = [col.lower() for col in ticker_df.columns]
-            ticker_df.dropna(inplace=True)
-            if not ticker_df.empty:
-                logger.info(f"Adding data feed for {ticker} with {len(ticker_df)} bars.")
-                cerebro.adddata(bt.feeds.PandasData(dataname=ticker_df, name=ticker))
-    except Exception as e:
-        logger.critical(f"A critical error occurred during data loading: {e}. Aborting.")
-        return
-
-    if not cerebro.datas:
-        logger.critical("Failed to load data for any asset. Aborting operation.")
-        return
-        
-    cerebro.addstrategy(
-        RomanLegionStrategy, config=config, vix_data=all_aligned_data["vix"],
-        treasury_yield_data=all_aligned_data["treasury_yield"], market_breadth_data=all_aligned_data["market_breadth"],
-        sentiment_data=sentiment_lookup, asset_analysis_data=asset_analysis_lookup
-    )
-    cerebro.broker.setcash(config.initial_cash)
-    cerebro.broker.setcommission(commission=config.commission_rate)
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', timeframe=bt.TimeFrame.Days, compression=1, annualize=True, riskfreerate=0.0)
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-    cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
-    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
-
-    logger.info(f"--- Launching 'Phoenix Project' (Resurrected Version) with AI Mode: {config.ai_mode.upper()} ---")
-    results = cerebro.run()
+    if config.walk_forward.get('enabled', False):
+        await run_walk_forward(config, all_aligned_data, gemini_service)
+    else:
+        await run_single_backtest(config, all_aligned_data, gemini_service)
+    
     logger.info("--- Operation Concluded ---")
-    strat = results[0]
-    await generate_html_report(cerebro, strat, gemini_service, report_filename=f"phoenix_report_{config.ai_mode}.html")
 
 if __name__ == '__main__':
     asyncio.run(main())
