@@ -40,8 +40,8 @@ class StrategyConfig(BaseModel):
     Central configuration for the Phoenix Project.
     Uses Pydantic for robust, self-validating configuration.
     """
-    start_date: str
-    end_date: str
+    start_date: datetime.date
+    end_date: datetime.date
     asset_universe: List[str] = Field(..., min_items=1)
     market_breadth_tickers: List[str] = Field(..., min_items=1)
     sma_period: int = Field(..., gt=0)
@@ -63,8 +63,8 @@ class StrategyConfig(BaseModel):
 
     @validator('end_date')
     def end_date_must_be_after_start_date(cls, v, values):
-        if 'start_date' in values and v < values['start_date']:
-            raise ValueError('end_date must be after start_date')
+        if 'start_date' in values and v <= values['start_date']:
+            raise ValueError('end_date must be strictly after start_date')
         return v
 
 # --- [Optimized] Custom Exception for Data Layer ---
@@ -85,7 +85,7 @@ class DataManager:
         self.logger.info(f"DataManager initialized. Cache directory set to '{self.cache_dir}'.")
 
     def _generate_cache_filename(self, prefix: str, params: Dict) -> str:
-        param_string = json.dumps(params, sort_keys=True)
+        param_string = json.dumps(params, sort_keys=True, default=str) # Use default=str for dates
         param_hash = hashlib.sha256(param_string.encode()).hexdigest()[:16]
         return f"{prefix}_{param_hash}.parquet"
 
@@ -108,8 +108,20 @@ class DataManager:
             self.logger.warning(f"Fetching function for '{cache_filename}' returned no data.")
             return None
 
-        data.reset_index().to_parquet(cache_path)
-        self.logger.info(f"Saved fresh data to cache: {cache_path}")
+        # Atomic write: write to a temporary file then rename to avoid race conditions.
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"  # Add PID for extra safety in multi-processing
+        try:
+            # For Series, directly use to_parquet. For DataFrame, reset_index first.
+            if isinstance(data, pd.DataFrame):
+                data.reset_index().to_parquet(tmp_path)
+            else:
+                data.to_parquet(tmp_path)
+            os.replace(tmp_path, cache_path)
+            self.logger.info(f"Saved fresh data to cache: {cache_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to write cache file {cache_path}: {e}")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)  # Clean up temp file on failure
         return data
 
     async def async_get_yfinance_data(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
@@ -131,9 +143,8 @@ class DataManager:
                 self.logger.warning(f"yfinance returned no data for tickers: {tickers}")
                 return None
 
-            # For a single ticker, yfinance returns a DataFrame without multi-level columns.
-            # We need to standardize the column format to a MultiIndex for consistency.
-            if len(tickers) == 1:
+            # Standardize the column format to a MultiIndex for consistency.
+            if not isinstance(df.columns, pd.MultiIndex):
                 df.columns = pd.MultiIndex.from_product([df.columns, tickers])
 
             return df.sort_index()
@@ -163,25 +174,24 @@ class DataManager:
         cache_filename = self._generate_cache_filename("market_breadth_indicator", params)
         cache_path = os.path.join(self.cache_dir, cache_filename)
         if os.path.exists(cache_path):
-            self.logger.info(f"Loading final market breadth from cache: {cache_path}")
-            df = pd.read_parquet(cache_path).set_index('Date')
-            return df.squeeze()
+            self.logger.info(f"Loading market breadth Series from cache: {cache_path}")
+            return pd.read_parquet(cache_path)
 
         self.logger.info("Calculating market breadth...")
-        price_params = {k: v for k, v in params.items() if k != 'sma'}
+        price_params = {k: v for k, v in params.items() if k not in ['sma']}
         price_cache_filename = self._generate_cache_filename("market_breadth_prices", price_params)
         all_prices_df_container = await self._fetch_with_cache_async(
             price_cache_filename, self.async_get_yfinance_data,
             tickers=self.config.market_breadth_tickers, start=self.config.start_date, end=self.config.end_date
         )
 
-        if all_prices_df_container is None or 'Close' not in all_prices_df_container: return None
+        if all_prices_df_container is None or 'Close' not in all_prices_df_container.columns: return None
         all_prices_df = all_prices_df_container['Close']
         smas = all_prices_df.rolling(window=self.config.sma_period).mean()
         is_above_sma = all_prices_df > smas
         breadth_series = (is_above_sma.sum(axis=1) / all_prices_df.notna().sum(axis=1)).fillna(0)
-        breadth_series.to_frame(name='breadth').reset_index().to_parquet(cache_path)
-        self.logger.info(f"Saved final market breadth to cache: {cache_path}")
+        breadth_series.name = 'breadth'
+        await self._fetch_with_cache_async(cache_filename, lambda s: asyncio.FromResult(s), breadth_series)
         return breadth_series
 
     async def get_aligned_data(self) -> Optional[Dict[str, pd.DataFrame | pd.Series]]:
@@ -257,23 +267,14 @@ class PortfolioConstructor:
         self.global_scale = 1.0
 
     def calculate_opportunity_score(self, current_price: float, current_sma: float, current_rsi: float) -> float:
-        """
-        Calculates a score based on momentum, moderated by an RSI overbought penalty.
-        """
         if current_sma <= 0: return 0.0
         momentum_score = 50 + 50 * ((current_price / current_sma) - 1)
-
-        # Apply RSI moderation only if momentum is positive (score > 50) and RSI is overbought
         if momentum_score > 50 and current_rsi > self.config.rsi_overbought_threshold:
-            # The more overbought, the higher the penalty. Max penalty is 50%
-            # At threshold (e.g., 70), intensity is 0, penalty is 1.0
-            # At max RSI (100), intensity is 1, penalty is 0.5
             overbought_intensity = (current_rsi - self.config.rsi_overbought_threshold) / (100 - self.config.rsi_overbought_threshold)
             penalty_factor = 1.0 - (overbought_intensity * 0.5)
             final_score = momentum_score * penalty_factor
         else:
             final_score = momentum_score
-
         return max(0.0, min(100.0, final_score))
         
     def _sanitize_ai_output(self, raw: Dict) -> tuple[float, float]:
@@ -340,9 +341,7 @@ class RomanLegionStrategy(bt.Strategy):
     params = (
         ('config', None), ('vix_data', None), ('treasury_yield_data', None), 
         ('market_breadth_data', None), ('sentiment_data', None), ('asset_analysis_data', None),
-        # -- Tunable Parameters --
-        ('sma_period', 50),
-        ('rsi_period', 14),
+        ('sma_period', 50), ('rsi_period', 14),
     )
 
     def __init__(self):
@@ -418,14 +417,29 @@ async def generate_ai_report(gemini_service: Optional[GeminiService], context: D
 async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, gemini_service: Optional[GeminiService] = None, report_filename="phoenix_report.html"):
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating HTML after-action report...")
-    trade_analysis = strat.analyzers.trade_analyzer.get_analysis()
-    total_trades = trade_analysis.total.get('total', 0) if trade_analysis else 0
-    win_rate = (trade_analysis.won.get('total', 0) / total_trades) if total_trades > 0 else 0
-    sharpe_ratio_analysis = strat.analyzers.sharpe_ratio.get_analysis()
+
+    # --- Robustly extract analyzer data ---
+    trade_analyzer = getattr(strat.analyzers, 'trade_analyzer', None)
+    ta = trade_analyzer.get_analysis() if trade_analyzer else {}
+    total_trades = ta.get('total', {}).get('total', 0)
+    winning_trades = ta.get('won', {}).get('total', 0)
+    losing_trades = ta.get('lost', {}).get('total', 0)
+    win_rate = (winning_trades / total_trades) if total_trades > 0 else 0.0
+
+    sharpe_analyzer = getattr(strat.analyzers, 'sharpe_ratio', None)
+    sharpe_analysis = sharpe_analyzer.get_analysis() if sharpe_analyzer else {}
+    sharpe_ratio = sharpe_analysis.get('sharperatio', None)
+
+    returns_analyzer = getattr(strat.analyzers, 'returns', None)
+    returns_analysis = returns_analyzer.get_analysis() if returns_analyzer else {}
+
+    drawdown_analyzer = getattr(strat.analyzers, 'drawdown', None)
+    dd_analysis = drawdown_analyzer.get_analysis() if drawdown_analyzer else {}
+
     context = {
-        "final_value": cerebro.broker.getvalue(), "total_return": strat.analyzers.returns.get_analysis().get('rtot', 0.0),
-        "sharpe_ratio": sharpe_ratio_analysis.get('sharperatio', None), "max_drawdown": strat.analyzers.drawdown.get_analysis().max.get('drawdown', 0.0),
-        "total_trades": total_trades, "winning_trades": trade_analysis.won.get('total', 0), "losing_trades": trade_analysis.lost.get('total', 0), "win_rate": win_rate,
+        "final_value": cerebro.broker.getvalue(), "total_return": returns_analysis.get('rtot', 0.0),
+        "sharpe_ratio": sharpe_ratio, "max_drawdown": dd_analysis.get('max', {}).get('drawdown', 0.0),
+        "total_trades": total_trades, "winning_trades": winning_trades, "losing_trades": losing_trades, "win_rate": win_rate,
         "report_date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "plot_filename": "phoenix_plot.png"
     }
     context['ai_summary_report'] = await generate_ai_report(gemini_service, context)
@@ -458,61 +472,90 @@ def fetch_mock_news_for_date(date_obj: datetime.date) -> List[str]:
 
 async def precompute_sentiments(gemini_service: GeminiService, dates: List[datetime.date]) -> Dict[datetime.date, float]:
     logger = logging.getLogger("PhoenixProject.SentimentPrecomputer")
-    cache_file = Path("data_cache") / "sentiment_cache.json"
-    if cache_file.exists():
+    cache_file = Path("data_cache") / "sentiment_cache.json"    
+    cached_sentiments_str = {}
+    if cache_file.exists():        
         logger.info(f"Found sentiment cache file: {cache_file}")
-        with open(cache_file, 'r') as f: cached_data_str = json.load(f)
-        cached_data = {datetime.date.fromisoformat(k): v for k, v in cached_data_str.items()}
-        if set(dates).issubset(set(cached_data.keys())):
-            logger.info("Sentiment cache is valid. Loading from cache.")
-            return {d: cached_data[d] for d in dates}
-        else: logger.warning("Sentiment cache is stale. Re-computing.")
-    
-    logger.info(f"Pre-computing sentiments for {len(dates)} trading days...")
-    sentiment_lookup_str = {}
-    for date_obj in dates:
         try:
-            mock_headlines = fetch_mock_news_for_date(date_obj)
-            analysis = await gemini_service.get_market_sentiment(mock_headlines)
-            sentiment_lookup_str[date_obj.isoformat()] = analysis.get('sentiment_score', 0.0)
-            logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
-        except (MalformedResponseError, Exception) as e:
-            logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
-            sentiment_lookup_str[date_obj.isoformat()] = 0.0
-    
-    with open(cache_file, 'w') as f: json.dump(sentiment_lookup_str, f, indent=2)
-    logger.info(f"Saved computed sentiments to cache: {cache_file}")
-    return {datetime.date.fromisoformat(k): v for k, v in sentiment_lookup_str.items()}
+            with open(cache_file, 'r') as f: cached_sentiments_str = json.load(f)
+        except json.JSONDecodeError:
+            logger.warning(f"Cache file {cache_file} is corrupted. Re-computing all sentiments.")
+            cached_sentiments_str = {}
+
+    cached_dates = {datetime.date.fromisoformat(k) for k in cached_sentiments_str.keys()}
+    required_dates = set(dates)
+    missing_dates = sorted(list(required_dates - cached_dates))
+
+    if missing_dates:
+        logger.info(f"Sentiment cache miss for {len(missing_dates)} days. Fetching incrementally...")
+        sem = asyncio.Semaphore(10)  # Limit concurrency to 10 requests at a time
+
+        async def fetch_single_sentiment(date_obj: datetime.date):
+            async with sem:
+                try:
+                    mock_headlines = fetch_mock_news_for_date(date_obj)
+                    analysis = await gemini_service.get_market_sentiment(mock_headlines)
+                    logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
+                    return date_obj, analysis.get('sentiment_score', 0.0)
+                except (MalformedResponseError, Exception) as e:
+                    logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
+                    return date_obj, 0.0
+
+        tasks = [fetch_single_sentiment(date_obj) for date_obj in missing_dates]
+        new_results = await asyncio.gather(*tasks)
+        
+        for d, score in new_results:
+            if d: cached_sentiments_str[d.isoformat()] = score
+        
+        with open(cache_file, 'w') as f: json.dump(cached_sentiments_str, f, indent=2)
+        logger.info(f"Updated and saved sentiment cache to: {cache_file}")
+    else:
+        logger.info("Sentiment cache is fully populated. No new data needed.")
+
+    return {dt: cached_sentiments_str[dt.isoformat()] for dt in required_dates}
 
 async def precompute_asset_analyses(gemini_service: GeminiService, dates: List[datetime.date], asset_universe: List[str]) -> Dict[datetime.date, Dict]:
     logger = logging.getLogger("PhoenixProject.AssetAnalysisPrecomputer")
     cache_file = Path("data_cache") / "asset_analysis_cache.json"
+    cached_data_str = {}
     if cache_file.exists():
         logger.info(f"Found asset analysis cache file: {cache_file}")
-        with open(cache_file, 'r') as f: cached_data_str = json.load(f)
         try:
-            required_dates_str = {d.isoformat() for d in dates}
-            cached_dates_str = set(cached_data_str.keys())
-            if required_dates_str.issubset(cached_dates_str) and all(set(asset_universe).issubset(set(cached_data_str[d].keys())) for d in required_dates_str):
-                logger.info("Asset analysis cache is valid. Loading from cache.")
-                return {datetime.date.fromisoformat(k): v for k, v in cached_data_str.items()}
-        except Exception: logger.warning("Asset analysis cache is corrupted. Re-computing.")
+            with open(cache_file, 'r') as f: cached_data_str = json.load(f)
+        except json.JSONDecodeError:
+            logger.warning(f"Cache file {cache_file} is corrupted. Re-computing all asset analyses.")
+            cached_data_str = {}
+    cached_dates = {datetime.date.fromisoformat(k) for k in cached_data_str.keys()}
+    required_dates = set(dates)
+    missing_dates = sorted(list(required_dates - cached_dates))
 
-    logger.info(f"Pre-computing asset analyses for {len(asset_universe)} assets over {len(dates)} days via batch API calls...")
-    analysis_lookup_str = {}
-    for date_obj in dates:
-        try:
-            # One API call for all assets for the given day
-            daily_batch_analysis = await gemini_service.get_batch_asset_analysis(asset_universe, date_obj)
-            analysis_lookup_str[date_obj.isoformat()] = daily_batch_analysis
-            logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
-        except Exception as e:
-            logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
-            analysis_lookup_str[date_obj.isoformat()] = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
-    
-    with open(cache_file, 'w') as f: json.dump(analysis_lookup_str, f)
-    logger.info(f"Saved computed asset analyses to cache: {cache_file}")
-    return {datetime.date.fromisoformat(k): v for k, v in analysis_lookup_str.items()}
+    if missing_dates:
+        logger.info(f"Asset analysis cache miss for {len(missing_dates)} days. Fetching incrementally...")
+        sem = asyncio.Semaphore(5)  # Limit concurrency for heavier batch calls
+
+        async def fetch_single_analysis(date_obj: datetime.date):
+            async with sem:
+                try:
+                    daily_batch_analysis = await gemini_service.get_batch_asset_analysis(asset_universe, date_obj)
+                    logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
+                    return date_obj, daily_batch_analysis
+                except Exception as e:
+                    logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
+                    default_analysis = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
+                    return date_obj, default_analysis
+
+        tasks = [fetch_single_analysis(date_obj) for date_obj in missing_dates]
+        new_results = await asyncio.gather(*tasks)
+
+        for d, analysis in new_results:
+            if d: cached_data_str[d.isoformat()] = analysis
+
+        with open(cache_file, 'w') as f: json.dump(cached_data_str, f)
+        logger.info(f"Updated and saved asset analysis cache to: {cache_file}")
+    else:
+        logger.info("Asset analysis cache is fully populated. No new data needed.")
+
+    return {dt: cached_data_str[dt.isoformat()] for dt in required_dates}
 
 # --- Main Execution Engine ---
 async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, gemini_service: Optional[GeminiService] = None):
@@ -568,7 +611,7 @@ def _find_best_opt_run(opt_runs):
     best_run = None
     best_params = {}
     for run in opt_runs:
-        for strat in run: # opt_runs is a list of lists of strategies
+        for strat in run:
             sharpe = strat.analyzers.sharpe_ratio.get_analysis().get('sharperatio', -float('inf'))
             if sharpe is not None and sharpe > best_sharpe:
                 best_sharpe = sharpe
@@ -586,8 +629,8 @@ async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemin
     test_delta = datetime.timedelta(days=wf_config['test_days'])
     step_delta = datetime.timedelta(days=wf_config['step_days'])
     
-    full_start_date = datetime.datetime.strptime(config.start_date, '%Y-%m-%d').date()
-    full_end_date = datetime.datetime.strptime(config.end_date, '%Y-%m-%d').date()
+    full_start_date = config.start_date
+    full_end_date = config.end_date
 
     out_of_sample_results = []
     current_start = full_start_date
@@ -599,14 +642,13 @@ async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemin
         test_end = train_end + test_delta
         logger.info(f"--- W-F Window {window_num}: Train=[{current_start} to {train_end}] ---")
 
-        # --- 1. Optimization Phase ---
         opt_cerebro = bt.Cerebro(stdstats=False, optreturn=False)
         opt_cerebro.optstrategy(
             RomanLegionStrategy,
             config=config, vix_data=all_aligned_data["vix"], treasury_yield_data=all_aligned_data["treasury_yield"],
             market_breadth_data=all_aligned_data["market_breadth"], sentiment_data={}, asset_analysis_data={},
-            sma_period=range(30, 81, 10), # Example range for SMA
-            rsi_period=range(10, 21, 2)   # Example range for RSI
+            sma_period=range(30, 81, 10),
+            rsi_period=range(10, 21, 2)
         )
         for ticker in config.asset_universe:
             df = all_aligned_data["asset_universe_df"].xs(ticker, level=1, axis=1).copy()
@@ -622,35 +664,32 @@ async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemin
         best_params, best_sharpe = _find_best_opt_run(opt_runs)
         logger.info(f"Window {window_num} Best Sharpe: {best_sharpe:.3f}, Best Params: {best_params}")
 
-        # --- 2. Validation Phase ---
         logger.info(f"--- W-F Window {window_num}: Test=[{train_end} to {test_end}] ---")
         val_cerebro = bt.Cerebro()
-        # Create a temporary config to pass to the strategy instance for this specific run
         temp_config = config.copy(deep=True)
         temp_config.sma_period = best_params.get('sma_period', config.sma_period)
         temp_config.rsi_period = best_params.get('rsi_period', config.rsi_period)
         
-        val_cerebro.addstrategy(RomanLegionStrategy, config=temp_config, **best_params) # Pass best params
-        
-        # For the validation run, we can use the pre-computed AI data
         master_dates = pd.date_range(start=train_end, end=test_end).date
-        sentiment_lookup = await precompute_sentiments(gemini_service, master_dates) if gemini_service and gemini_service.mode == 'production' else {}
-        asset_analysis_lookup = await precompute_asset_analyses(gemini_service, master_dates, config.asset_universe) if gemini_service and gemini_service.mode == 'production' else {}
+        sentiment_lookup = await precompute_sentiments(gemini_service, master_dates) if gemini_service else {}
+        asset_analysis_lookup = await precompute_asset_analyses(gemini_service, master_dates, config.asset_universe) if gemini_service else {}
         
+        val_cerebro.addstrategy(
+            RomanLegionStrategy, config=temp_config,
+            vix_data=all_aligned_data["vix"],
+            treasury_yield_data=all_aligned_data["treasury_yield"],
+            market_breadth_data=all_aligned_data["market_breadth"],
+            sentiment_data=sentiment_lookup,
+            asset_analysis_data=asset_analysis_lookup,
+            **best_params
+        )
+
         val_cerebro.broker.setcash(config.initial_cash)
-        # Pass full data, strategy will use its date range
         for ticker in config.asset_universe:
             df = all_aligned_data["asset_universe_df"].xs(ticker, level=1, axis=1).copy()
             df.columns = [col.lower() for col in df.columns]
             data_feed = bt.feeds.PandasData(dataname=df, fromdate=train_end, todate=test_end, name=ticker)
             val_cerebro.adddata(data_feed)
-
-        # Pass the full auxiliary data; the strategy will look up the correct dates
-        val_cerebro.strats[0][0][0].p.vix_data=all_aligned_data["vix"]
-        val_cerebro.strats[0][0][0].p.treasury_yield_data=all_aligned_data["treasury_yield"]
-        val_cerebro.strats[0][0][0].p.market_breadth_data=all_aligned_data["market_breadth"]
-        val_cerebro.strats[0][0][0].p.sentiment_data=sentiment_lookup
-        val_cerebro.strats[0][0][0].p.asset_analysis_data=asset_analysis_lookup
 
         val_cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', annualize=True)
         val_cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
@@ -664,7 +703,6 @@ async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemin
 
         current_start += step_delta
     
-    # --- 3. Final Aggregation ---
     logger.info("--- Walk-Forward Out-of-Sample Performance Summary ---")
     for i, strat in enumerate(out_of_sample_results):
         sharpe = strat.analyzers.sharpe_ratio.get_analysis().get('sharperatio', 'N/A')
@@ -674,8 +712,8 @@ async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemin
 
 async def main():
     try:
-        config_params = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
-        # Flatten nested execution_mode config safely
+        with open("config.yaml", "r", encoding="utf-8") as f:
+            config_params = yaml.safe_load(f)
         config_params.update(config_params.pop('execution_mode', {}))
         config = StrategyConfig(**config_params)
     except (FileNotFoundError, ValidationError) as e:
@@ -697,7 +735,11 @@ async def main():
     gemini_service = None
     if config.gemini_config.enable:
         try:
-            gemini_service = GeminiService(config.gemini_config.model_dump())
+            if hasattr(config.gemini_config, "model_dump"):
+                gem_cfg = config.gemini_config.model_dump()
+            else:
+                gem_cfg = config.gemini_config.dict()
+            gemini_service = GeminiService(gem_cfg)
             logger.info(f"Gemini Service has been enabled and initialized in '{config.gemini_config.mode}' mode.")
         except Exception as e:
             logger.error(f"Failed to initialize Gemini Service: {e}. Continuing without AI features.")
