@@ -103,69 +103,63 @@ white-space: pre-wrap; / Preserves line breaks */
 <div class="container">
 <h1>Phoenix Project: After-Action Report</h1>
 
-<!-- Marshal's Debriefing Section -->
+    <!-- Marshal's Debriefing Section -->
+    <div class="marshal-report">
+        <h2>Marshal's After-Action Debriefing</h2>
+        <p>{{ ai_summary_report }}</p>
+    </div>
 
-<div class="marshal-report">
-<h2>Marshal's After-Action Debriefing</h2>
-<p>{{ ai_summary_report }}</p>
+    <!-- Summary of Final Portfolio Value -->
+    <div class="summary">
+        <h2>Final Portfolio Value</h2>
+        <p>${{ "%.2f"|format(final_value) }}</p>
+    </div>
+
+    <!-- Performance Metrics Section -->
+    <h2>Performance Metrics</h2>
+    <div class="metrics-grid">
+        <div class="metric">
+            <div class="metric-title">Total Return</div>
+            <div class="metric-value">{{ "%.2f"|format(total_return * 100) }}%</div>
+        </div>
+        <div class="metric">
+            <div class="metric-title">Sharpe Ratio</div>
+            <div class="metric-value">{{ "%.3f"|format(sharpe_ratio) if sharpe_ratio is not none else 'N/A' }}</div>
+        </div>
+        <div class="metric">
+            <div class="metric-title">Max Drawdown</div>
+            <div class="metric-value">{{ "%.2f"|format(max_drawdown) }}%</div>
+        </div>
+    </div>
+
+    <!-- Trade Statistics Section -->
+    <h2>Trade Statistics</h2>
+    <div class="metrics-grid">
+        <div class="metric">
+            <div class="metric-title">Total Trades</div>
+            <div class="metric-value">{{ total_trades }}</div>
+        </div>
+        <div class="metric">
+            <div class="metric-title">Win Rate</div>
+            <div class="metric-value">{{ "%.2f"|format(win_rate * 100) }}%</div>
+        </div>
+        <div class="metric">
+            <div class="metric-title">Winning / Losing Trades</div>
+            <div class="metric-value">{{ winning_trades }} / {{ losing_trades }}</div>
+        </div>
+    </div>
+
+    <!-- Equity Curve and Drawdown Chart -->
+    {% if plot_filename %}
+    <h2>Equity Curve & Drawdown</h2>
+    <img src="{{ plot_filename }}" alt="Backtest Plot">
+    {% endif %}
+
+    <!-- Footer -->
+    <div class="footer">
+        Report generated on {{ report_date }}.
+    </div>
 </div>
 
-<!-- Summary of Final Portfolio Value -->
-
-<div class="summary">
-<h2>Final Portfolio Value</h2>
-<p>${{ "%.2f"|format(final_value) }}</p>
-</div>
-
-<!-- Performance Metrics Section -->
-
-<h2>Performance Metrics</h2>
-<div class="metrics-grid">
-<div class="metric">
-<div class="metric-title">Total Return</div>
-<div class="metric-value">{{ "%.2f"|format(total_return * 100) }}%</div>
-</div>
-<div class="metric">
-<div class="metric-title">Sharpe Ratio</div>
-<div class="metric-value">{{ "%.3f"|format(sharpe_ratio) if sharpe_ratio is not none else 'N/A' }}</div>
-</div>
-<div class="metric">
-<div class="metric-title">Max Drawdown</div>
-<div class="metric-value">{{ "%.2f"|format(max_drawdown) }}%</div>
-</div>
-</div>
-
-<!-- Trade Statistics Section -->
-
-<h2>Trade Statistics</h2>
-<div class="metrics-grid">
-<div class="metric">
-<div class="metric-title">Total Trades</div>
-<div class="metric-value">{{ total_trades }}</div>
-</div>
-<div class="metric">
-<div class="metric-title">Win Rate</div>
-<div class="metric-value">{{ "%.2f"|format(win_rate * 100) }}%</div>
-</div>
-<div class="metric">
-<div class="metric-title">Winning / Losing Trades</div>
-<div class="metric-value">{{ winning_trades }} / {{ losing_trades }}</div>
-</div>
-</div>
-
-<!-- Equity Curve and Drawdown Chart -->
-
-{% if plot_filename %}
-
-<h2>Equity Curve & Drawdown</h2>
-<img src="{{ plot_filename }}" alt="Backtest Plot">
-{% endif %}
-
-<!-- Footer -->
-
-<div class="footer">
-Report generated on {{ report_date }}.
-</div>
-</div>
 </body>
 </html>
