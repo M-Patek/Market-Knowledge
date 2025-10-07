@@ -16,7 +16,7 @@ def mock_config():
         "vix_low_threshold": 20.0, "capital_modifier_high_vix": 0.5,
         "capital_modifier_normal_vix": 0.9, "capital_modifier_low_vix": 1.0,
         "initial_cash": 100000, "commission_rate": 0.001,
-        "log_level": "INFO", "gemini_config": {"enable": False, "mode": "mock", "api_key_env_var": "FAKE_KEY", "model_name": "fake", "prompts": {}},
+        "log_level": "INFO", "gemini_config": {"enable": False, "mode": "mock", "api_key_env_var": "FAKE_KEY", "model_name": "fake", "prompts": {}, "audit_log_retention_days": 30, "max_concurrent_requests": 5},
         "ai_mode": "off", "walk_forward": {}, "max_total_allocation": 1.0
     }
     return StrategyConfig(**config_dict)
