@@ -4,7 +4,7 @@
 # an intelligent auto-invalidating cache, professional logging, and a comprehensive HTML reporting system.
 
 import os
-import datetime
+from datetime import date, datetime, timedelta
 import logging
 from logging.handlers import RotatingFileHandler
 import asyncio
@@ -40,8 +40,8 @@ class StrategyConfig(BaseModel):
     Central configuration for the Phoenix Project.
     Uses Pydantic for robust, self-validating configuration.
     """
-    start_date: datetime.date
-    end_date: datetime.date
+    start_date: date
+    end_date: date
     asset_universe: List[str] = Field(..., min_items=1)
     market_breadth_tickers: List[str] = Field(..., min_items=1)
     sma_period: int = Field(..., gt=0)
@@ -113,9 +113,9 @@ class DataManager:
         try:
             # For Series, directly use to_parquet. For DataFrame, reset_index first.
             if isinstance(data, pd.DataFrame):
-                data.reset_index().to_parquet(tmp_path)
+                data.reset_index().to_parquet(tmp_path, engine='pyarrow')
             else:
-                data.to_parquet(tmp_path)
+                data.to_parquet(tmp_path, engine='pyarrow')
             os.replace(tmp_path, cache_path)
             self.logger.info(f"Saved fresh data to cache: {cache_path}")
         except Exception as e:
@@ -216,13 +216,13 @@ class DataManager:
 
 # --- Cognitive Engine Layer ---
 class CognitiveEngine:
-    def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[datetime.date, float]] = None, asset_analysis_data: Optional[Dict[datetime.date, Dict]] = None, ai_mode: str = "processed"):
+    def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[date, float]] = None, asset_analysis_data: Optional[Dict[date, Dict]] = None, ai_mode: str = "processed"):
         self.config = config
         self.logger = logging.getLogger("PhoenixProject.CognitiveEngine")
         self.risk_manager = RiskManager(config, sentiment_data)
         self.portfolio_constructor = PortfolioConstructor(config, asset_analysis_data, mode=ai_mode)
 
-    def determine_allocations(self, candidate_analysis: List[Dict], current_vix: float, current_date: datetime.date) -> List[Dict]:
+    def determine_allocations(self, candidate_analysis: List[Dict], current_vix: float, current_date: date) -> List[Dict]:
         self.logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
         capital_modifier = self.risk_manager.get_capital_modifier(current_vix, current_date)
         return self.portfolio_constructor.construct_portfolio(candidate_analysis, capital_modifier, current_date)
@@ -231,13 +231,13 @@ class CognitiveEngine:
         return self.portfolio_constructor.calculate_opportunity_score(current_price, current_sma, current_rsi)
 
 class RiskManager:
-    def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[datetime.date, float]] = None):
+    def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[date, float]] = None):
         self.config = config
         self.sentiment_data = sentiment_data if sentiment_data is not None else {}
         self.logger = logging.getLogger("PhoenixProject.RiskManager")
         if self.sentiment_data: self.logger.info(f"RiskManager initialized with {len(self.sentiment_data)} days of sentiment data.")
 
-    def get_capital_modifier(self, current_vix: float, current_date: datetime.date) -> float:
+    def get_capital_modifier(self, current_vix: float, current_date: date) -> float:
         self.logger.info(f"Assessing risk for {current_date.isoformat()}. VIX: {current_vix:.2f}")
         if current_vix > self.config.vix_high_threshold:
             base_modifier = self.config.capital_modifier_high_vix
@@ -257,7 +257,7 @@ class RiskManager:
         return final_modifier
 
 class PortfolioConstructor:
-    def __init__(self, config: StrategyConfig, asset_analysis_data: Optional[Dict[datetime.date, Dict]] = None, mode: str = "processed"):
+    def __init__(self, config: StrategyConfig, asset_analysis_data: Optional[Dict[date, Dict]] = None, mode: str = "processed"):
         self.config = config
         self.asset_analysis_data = asset_analysis_data or {}
         self.logger = logging.getLogger("PhoenixProject.PortfolioConstructor")
@@ -295,7 +295,7 @@ class PortfolioConstructor:
         final = max(0.5, min(1.2, final))
         return final
 
-    def construct_portfolio(self, candidate_analysis: List[Dict], capital_modifier: float, current_date: datetime.date) -> List[Dict]:
+    def construct_portfolio(self, candidate_analysis: List[Dict], capital_modifier: float, current_date: date) -> List[Dict]:
         self.logger.info("PortfolioConstructor is analyzing candidates...")
         adjusted_candidates = []
         daily_asset_analysis = self.asset_analysis_data.get(current_date, {})
@@ -439,8 +439,7 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
     context = {
         "final_value": cerebro.broker.getvalue(), "total_return": returns_analysis.get('rtot', 0.0),
         "sharpe_ratio": sharpe_ratio, "max_drawdown": dd_analysis.get('max', {}).get('drawdown', 0.0),
-        "total_trades": total_trades, "winning_trades": winning_trades, "losing_trades": losing_trades, "win_rate": win_rate,
-        "report_date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "plot_filename": "phoenix_plot.png"
+        "total_trades": total_trades, "winning_trades": winning_trades, "losing_trades": losing_trades, "win_rate": win_rate, "report_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "plot_filename": "phoenix_plot.png"
     }
     context['ai_summary_report'] = await generate_ai_report(gemini_service, context)
     try:
@@ -463,14 +462,14 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
     except Exception as e: logger.error(f"Failed to generate HTML report: {e}")
 
 # --- AI Pre-computation Helpers ---
-def fetch_mock_news_for_date(date_obj: datetime.date) -> List[str]:
+def fetch_mock_news_for_date(date_obj: date) -> List[str]:
     base_headlines = ["Global markets show mixed signals...", "Tech sector rally continues...", "New geopolitical tensions...", "Federal Reserve hints at a more hawkish stance..."]
     if date_obj.weekday() == 0: base_headlines.append("Weekend uncertainty weighs on market open.")
     elif date_obj.weekday() == 4: base_headlines.append("Positive jobs report boosts investor confidence.")
     random.shuffle(base_headlines)
     return base_headlines[:3]
 
-async def precompute_sentiments(gemini_service: GeminiService, dates: List[datetime.date]) -> Dict[datetime.date, float]:
+async def precompute_sentiments(gemini_service: GeminiService, dates: List[date]) -> Dict[date, float]:
     logger = logging.getLogger("PhoenixProject.SentimentPrecomputer")
     cache_file = Path("data_cache") / "sentiment_cache.json"    
     cached_sentiments_str = {}
@@ -482,15 +481,15 @@ async def precompute_sentiments(gemini_service: GeminiService, dates: List[datet
             logger.warning(f"Cache file {cache_file} is corrupted. Re-computing all sentiments.")
             cached_sentiments_str = {}
 
-    cached_dates = {datetime.date.fromisoformat(k) for k in cached_sentiments_str.keys()}
+    cached_dates = {date.fromisoformat(k) for k in cached_sentiments_str.keys()}
     required_dates = set(dates)
     missing_dates = sorted(list(required_dates - cached_dates))
 
     if missing_dates:
         logger.info(f"Sentiment cache miss for {len(missing_dates)} days. Fetching incrementally...")
-        sem = asyncio.Semaphore(10)  # Limit concurrency to 10 requests at a time
+        sem = asyncio.Semaphore(10)  # Limit concurrency to 10 requests at a time 
 
-        async def fetch_single_sentiment(date_obj: datetime.date):
+        async def fetch_single_sentiment(date_obj: date):
             async with sem:
                 try:
                     mock_headlines = fetch_mock_news_for_date(date_obj)
@@ -514,7 +513,7 @@ async def precompute_sentiments(gemini_service: GeminiService, dates: List[datet
 
     return {dt: cached_sentiments_str[dt.isoformat()] for dt in required_dates}
 
-async def precompute_asset_analyses(gemini_service: GeminiService, dates: List[datetime.date], asset_universe: List[str]) -> Dict[datetime.date, Dict]:
+async def precompute_asset_analyses(gemini_service: GeminiService, dates: List[date], asset_universe: List[str]) -> Dict[date, Dict]:
     logger = logging.getLogger("PhoenixProject.AssetAnalysisPrecomputer")
     cache_file = Path("data_cache") / "asset_analysis_cache.json"
     cached_data_str = {}
@@ -525,15 +524,15 @@ async def precompute_asset_analyses(gemini_service: GeminiService, dates: List[d
         except json.JSONDecodeError:
             logger.warning(f"Cache file {cache_file} is corrupted. Re-computing all asset analyses.")
             cached_data_str = {}
-    cached_dates = {datetime.date.fromisoformat(k) for k in cached_data_str.keys()}
+    cached_dates = {date.fromisoformat(k) for k in cached_data_str.keys()}
     required_dates = set(dates)
     missing_dates = sorted(list(required_dates - cached_dates))
 
     if missing_dates:
         logger.info(f"Asset analysis cache miss for {len(missing_dates)} days. Fetching incrementally...")
-        sem = asyncio.Semaphore(5)  # Limit concurrency for heavier batch calls
+        sem = asyncio.Semaphore(5)  # Limit concurrency for heavier batch calls 
 
-        async def fetch_single_analysis(date_obj: datetime.date):
+        async def fetch_single_analysis(date_obj: date):
             async with sem:
                 try:
                     daily_batch_analysis = await gemini_service.get_batch_asset_analysis(asset_universe, date_obj)
@@ -625,9 +624,9 @@ async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, gemin
     logger.info(f"--- Launching 'Phoenix Project' in WALK-FORWARD mode (AI: {config.ai_mode.upper()}) ---")
     
     wf_config = config.walk_forward
-    train_delta = datetime.timedelta(days=wf_config['train_days'])
-    test_delta = datetime.timedelta(days=wf_config['test_days'])
-    step_delta = datetime.timedelta(days=wf_config['step_days'])
+    train_delta = timedelta(days=wf_config['train_days'])
+    test_delta = timedelta(days=wf_config['test_days'])
+    step_delta = timedelta(days=wf_config['step_days'])
     
     full_start_date = config.start_date
     full_end_date = config.end_date
@@ -726,7 +725,7 @@ async def main():
     if not logger.handlers:
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
         log_dir = "logs"; os.makedirs(log_dir, exist_ok=True)
-        log_filename = f"phoenix_project_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_filename = f"phoenix_project_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter); logger.addHandler(stream_handler)
         file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
         file_handler.setFormatter(formatter); logger.addHandler(file_handler)
