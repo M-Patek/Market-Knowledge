@@ -148,12 +148,12 @@ class GeminiService:
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=30), stop=stop_after_attempt(3), reraise=True)
     async def get_batch_asset_analysis(self, tickers: List[str], date_obj: datetime.date) -> Dict[str, Any]:
-        self.logger。info(f"正在为 {tickers} 请求批量定性分析 (模式: {self.mode})...")
+        self.logger.info(f"正在为 {tickers} 请求批量定性分析 (模式: {self.mode})...")
         context = {"tickers": tickers, "date": date_obj.isoformat()}
 
         if self.mode == 'mock':
             await asyncio.sleep(0.1) # 模拟稍长的批量调用
-            mock_factors = {'QQQ': 1.15， 'SPY': 1.05， 'IWM': 0.95， 'GLD': 0.90， 'TLT': 0.85}
+            mock_factors = {'QQQ': 1.15, 'SPY': 1.05, 'IWM': 0.95, 'GLD': 0.90, 'TLT': 0.85}
             batch_response = {"analyses": {}}
             for ticker 在 tickers:
                 factor = mock_factors.get(ticker, 1.0)
@@ -167,7 +167,7 @@ class GeminiService:
             self.logger.info(f"收到 {tickers} 的模拟批量分析。")
             return validated_data.model_dump()["analyses"]
         else: # Production mode
-            prompt = self.config['prompts']['batch_asset_analysis'].format(tickers=", ".join(tickers))
+            prompt = self.config['prompts']['batch_asset_analysis']。format(tickers=", "。join(tickers))
             try:
                 response = await self._generate_with_timeout(prompt, generation_config=self.generation_config)
                 raw_text = response.text
@@ -176,13 +176,13 @@ class GeminiService:
                 response_data = json.loads(raw_text)
                 validated_data = BatchAssetAnalysisResponse(analyses=response_data)
 
-                self.logger。info(f"收到 {tickers} 的有效批量资产分析。")
+                self.logger.info(f"收到 {tickers} 的有效批量资产分析。")
                 return validated_data.model_dump()["analyses"]
             except (json.JSONDecodeError, ValidationError) as e:
                 self.logger.error(f"解析或验证 {tickers} 的批量资产分析失败: {e}")
                 raise MalformedResponseError(f"解析或验证 {tickers} 的批量资产分析响应失败: {e}") from e
             except Exception as e:
-                self.logger.error(f"在为 {tickers} 进行批量资产分析时发生意外错误: {e}")
+                self.logger。error(f"在为 {tickers} 进行批量资产分析时发生意外错误: {e}")
                 raise
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=30), stop=stop_after_attempt(3), reraise=True)
