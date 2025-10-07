@@ -57,6 +57,7 @@ class StrategyConfig(BaseModel):
 
     # 6. Execution & Experimentation Settings
     ai_mode: Literal["off", "raw", "processed"] = "processed"
+    max_total_allocation: float = Field(default=1.0, gt=0, le=1.0)
 
     @validator('end_date')
     def end_date_must_be_after_start_date(cls, v, values):
@@ -412,7 +413,16 @@ class PortfolioConstructor:
 
         self.logger.info("--- [PortfolioConstructor's Final Battle Plan] ---")
         total_planned_allocation = sum(d['capital_allocation_pct'] for d in battle_plan)
-        self.logger.info(f"Total planned capital deployment today: {total_planned_allocation:.2%}")
+
+        # Apply a hard cap on total portfolio allocation for the day
+        if total_planned_allocation > self.config.max_total_allocation:
+            self.logger.warning(f"Total planned allocation {total_planned_allocation:.2%} exceeds cap of {self.config.max_total_allocation:.2%}. Scaling down.")
+            scale_factor = self.config.max_total_allocation / total_planned_allocation
+            for deployment in battle_plan:
+                deployment['capital_allocation_pct'] *= scale_factor
+
+        final_total_allocation = sum(d['capital_allocation_pct'] for d in battle_plan)
+        self.logger.info(f"Final planned capital deployment: {final_total_allocation:.2%}")
         for deployment in battle_plan:
             self.logger.info(f"- Asset: {deployment['ticker']}, Deploy Capital: {deployment['capital_allocation_pct']:.2%}")
         return battle_plan
