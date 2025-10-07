@@ -1,7 +1,9 @@
+This file specifies the project's dependencies.
+It's crucial to pin versions for reproducible builds.
 Core Backtesting & Data Handling
 backtrader==1.9.76.123
 pandas==2.2.2
-pyarrow==16.1.0
+pyarrow==16.1.0  # Explicitly required for consistent Parquet cache handling
 
 Asynchronous HTTP & Retries
 yfinance==0.2.40
