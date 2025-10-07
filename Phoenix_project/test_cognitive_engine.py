@@ -1,6 +1,7 @@
 # tests/test_cognitive_engine.py
 
 import pytest
+from datetime import date
 from phoenix_project import PortfolioConstructor, StrategyConfig
 
 @pytest.fixture
@@ -68,4 +69,3 @@ def test_calculate_opportunity_score_with_rsi_penalty(mock_config, current_price
     constructor = PortfolioConstructor(config=mock_config)
     score = constructor.calculate_opportunity_score(current_price, current_sma, current_rsi)
     assert score == pytest.approx(expected_score)
-
