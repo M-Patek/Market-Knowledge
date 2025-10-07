@@ -40,6 +40,8 @@ class GeminiService:
         self.model = genai.GenerativeModel(self.config['model_name'])
         self.generation_config = {"response_mime_type": "application/json"}
         self.timeout = self.config.get('request_timeout', 60)
+        self.audit_log_dir = "ai_audit_logs"
+        os.makedirs(self.audit_log_dir, exist_ok=True)
         self.logger.info(f"GeminiService initialized for model '{self.config['model_name']}'.")
 
     async def _generate_with_timeout(self, *args, **kwargs):
@@ -48,6 +50,28 @@ class GeminiService:
             self.model.generate_content_async(*args, **kwargs),
             timeout=self.timeout
         )
+
+    def _save_audit_record(self, call_type: str, prompt: str, raw_response_text: str, context: Dict[str, Any]) -> None:
+        """Saves a record of the AI interaction for auditing purposes."""
+        try:
+            timestamp_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            context_str = "_".join(str(v) for v in context.values())
+            filename = f"{timestamp_str}_{call_type}_{context_str}.json"
+            filepath = os.path.join(self.audit_log_dir, filename)
+
+            record = {
+                "timestamp_utc": datetime.datetime.utcnow().isoformat(),
+                "call_type": call_type,
+                "context": context,
+                "prompt": prompt,
+                "raw_response": raw_response_text
+            }
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(record, f, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            self.logger.error(f"Failed to save AI audit record for '{call_type}': {e}")
 
     @retry(
         wait=wait_exponential(multiplier=1, min=2, max=30),
@@ -65,7 +89,9 @@ class GeminiService:
 
         try:
             response = await self._generate_with_timeout(prompt, generation_config=self.generation_config)
-            response_data = json.loads(response.text)
+            raw_text = response.text
+            self._save_audit_record("market_sentiment", prompt, raw_text, context={"date": datetime.date.today().isoformat()})
+            response_data = json.loads(raw_text)
 
             if 'sentiment_score' not in response_data or 'reasoning' not in response_data:
                 raise MalformedResponseError(f"Missing required keys in sentiment response: {response_data}")
@@ -112,7 +138,10 @@ class GeminiService:
             "confidence": confidence,
             "reasoning": reasoning
         }
-        self.logger.info(f"Received mock analysis for {ticker}: factor={mock_response['adjustment_factor']:.2f}, confidence={mock_response['confidence']:.2f}")
+        # For auditing, we simulate the raw text that the API would have returned
+        raw_mock_text = json.dumps(mock_response, indent=2)
+        self._save_audit_record("asset_analysis"， "mock_prompt_for_dev", raw_mock_text, context={"ticker": ticker, "date": date_obj.isoformat()})
+        self.logger。info(f"Received mock analysis for {ticker}: factor={mock_response['adjustment_factor']:.2f}, confidence={mock_response['confidence']:.2f}")
         return mock_response
         # --- [End of Development Mock] ---
 
@@ -159,7 +188,9 @@ class GeminiService:
         try:
             # Note: We expect a text response, so we don't use the JSON generation_config
             response = await self._generate_with_timeout(prompt)
-            return response.text
+            raw_text = response.text
+            self._save_audit_record("summary_report", prompt, raw_text, context={"metrics_hash": hash(metrics_str)})
+            return raw_text
         except Exception as e:
             self.logger.error(f"An unexpected error occurred during summary report generation: {e}")
             raise
