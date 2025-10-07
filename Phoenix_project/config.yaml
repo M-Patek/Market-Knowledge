@@ -44,12 +44,12 @@ log_level: "INFO"
 # 5. Gemini AI Advisor Settings
 gemini_config:
   enable: true
-  # "mock": 使用预定义数据进行测试，无需API调用。
-  # "production": 对Gemini API进行真实调用。
   mode: "mock"
   api_key_env_var: "GEMINI_API_KEY"
   model_name: "gemini-1.5-flash-latest"
   request_timeout: 90
+  audit_log_retention_days: 30 # Set to 0 to disable cleanup
+  max_concurrent_requests: 5  # Max parallel requests to the API
   prompts:
     market_sentiment: >
       你是一位专业的金融市场分析师。请分析以下今天的财经新闻标题，并以-1.0（极度悲观）到+1.0（极度乐观）的范围给出一个总体的市场情绪得分。
