@@ -77,3 +77,6 @@ execution_mode:
   # "raw":        Use the AI's raw adjustment_factor directly (legacy mode for comparison).
   # "processed":  Use the full AI factor pipeline (confidence, EMA, clamp).
   ai_mode: "processed"
+
+# NEW: A hard cap on the total capital allocated on any given day (e.g., 0.95 = 95%)
+max_total_allocation: 0.95
