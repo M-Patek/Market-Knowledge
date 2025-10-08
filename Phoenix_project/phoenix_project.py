@@ -28,7 +28,6 @@ from sizing.fixed_fraction import FixedFractionSizer
 from execution_model import VolumeShareSlippageModel
 from audit_manager import archive_logs_to_s3
 from observability import BACKTEST_DURATION, TRADES_EXECUTED, start_metrics_server, CACHE_HITS, CACHE_MISSES
-from optimizer import Optimizer
 from ai.client import AIClient, GeminiAIClient, MockAIClient, MalformedResponseError
 import backtrader as bt
 import pandas as pd
@@ -720,13 +719,14 @@ async def main():
     log_filename = f"phoenix_project_{datetime.now().strftime('%Y%m%d')}.log"
 
     stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter)
-    file_handler = RotatingFileHandler(os.path。join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
 
     for handler 在 [stream_handler, file_handler]:
         handler.addFilter(RunIdFilter())
         logger.addHandler(handler)
 
     logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
+    from optimizer import Optimizer
 
     start_metrics_server(config.observability.metrics_port)
 
