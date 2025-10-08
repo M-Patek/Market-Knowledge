@@ -1,5 +1,5 @@
 # Phoenix Project - Final Optimized Version (Phoenix Resurrected)
-# A collaborative masterpiece by Gemini & AI, guided by our Master.
+# A collaborative masterpiece by Gemini & GPT, guided by our Master.
 # This version features a robust Pydantic configuration, resilient and concurrent data fetching,
 # an intelligent auto-invalidating cache, professional logging, and a comprehensive HTML reporting system.
 
