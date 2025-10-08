@@ -12,6 +12,7 @@ from logging.handlers import RotatingFileHandler
 import asyncio
 import yaml
 import hashlib
+import pyarrow
 import json
 import random
 from io import StringIO
@@ -50,6 +51,7 @@ class ExecutionConfig(BaseModel):
     """Configuration for the execution model."""
     impact_coefficient: float = Field(..., gt=0)
     max_volume_share: float = Field(..., gt=0, le=1.0)
+    min_trade_notional: float = Field(default=1.0, gt=0)
 
 class ObservabilityConfig(BaseModel):
     """Configuration for observability settings."""
@@ -125,19 +127,52 @@ class DataManager:
         self.logger.info(f"DataManager initialized. Cache directory set to '{self.cache_dir}'.")
 
     def _generate_cache_filename(self, prefix: str, params: Dict) -> str:
-        param_string = json.dumps(params, sort_keys=True, default=str) # Use default=str for dates
+        param_string = json.dumps(params, sort_keys=True, default=str)  # Use default=str for dates
         param_hash = hashlib.sha256(param_string.encode()).hexdigest()[:16]
         return f"{prefix}_{param_hash}.parquet"
 
-    async def _fetch_with_cache_async(self, cache_filename: str, fetch_coro, *args, **kwargs) -> Optional[pd.DataFrame]:
+    async def _write_cache_direct(self, cache_path: str, data: pd.DataFrame | pd.Series, source: str, params: Dict):
+        """Atomically writes a pandas DataFrame or Series to a Parquet file."""
+        # Atomic write: write to a temporary file then rename to avoid race conditions.
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"  # Add PID for extra safety in multi-processing
+        try:
+            # For Series, convert to DataFrame to preserve name. For DataFrame, reset_index.
+            if isinstance(data, pd.Series):
+                data.to_frame(name=data.name or 'value').reset_index().to_parquet(tmp_path, engine='pyarrow', index=False)
+            else: # DataFrame
+                data.reset_index().to_parquet(tmp_path, engine='pyarrow', index=False)
+            os.replace(tmp_path, cache_path)
+            self.logger.info(f"Saved fresh data to cache: {cache_path}")
+
+            # Write metadata file
+            meta_path = Path(cache_path).with_suffix('.meta.json')
+            param_hash = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
+            metadata = {
+                "params_hash": param_hash,
+                "created_utc": datetime.utcnow().isoformat(),
+                "pandas_version": pd.__version__,
+                "pyarrow_version": pyarrow.__version__,
+                "source": source,
+                "params": {k: str(v) for k, v in params.items()} # Ensure all values are strings for JSON
+            }
+            with open(meta_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Failed to write cache file {cache_path}: {e}")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)  # Clean up temp file on failure
+
+    async def _fetch_with_cache_async(self, cache_filename: str, source: str, params: Dict, fetch_coro, *args, **kwargs) -> Optional[pd.DataFrame | pd.Series]:
         cache_path = os.path.join(self.cache_dir, cache_filename)
         if os.path.exists(cache_path):
             self.logger.info(f"Loading data from cache: {cache_path}")
             CACHE_HITS.inc()
             try:
                 df = pd.read_parquet(cache_path)
-                if 'Date' in df.columns:
-                    df = df.set_index('Date')
+                # Check if it was a Series, if so, return it as such.
+                if 'Date' in df.columns: df = df.set_index('Date')
+                if len(df.columns) == 1:
+                    return df.iloc[:, 0]
                 return df
             except Exception as e:
                 self.logger.error(f"Failed to load from cache {cache_path}: {e}. Refetching.")
@@ -150,21 +185,17 @@ class DataManager:
             self.logger.warning(f"Fetching function for '{cache_filename}' returned no data.")
             return None
 
-        # Atomic write: write to a temporary file then rename to avoid race conditions.
-        tmp_path = f"{cache_path}.{os.getpid()}.tmp"  # Add PID for extra safety in multi-processing
-        try:
-            # For Series, directly use to_parquet. For DataFrame, reset_index first.
-            if isinstance(data, pd.DataFrame):
-                data.reset_index().to_parquet(tmp_path, engine='pyarrow')
-            else:
-                data.to_parquet(tmp_path, engine='pyarrow')
-            os.replace(tmp_path, cache_path)
-            self.logger.info(f"Saved fresh data to cache: {cache_path}")
-        except Exception as e:
-            self.logger.error(f"Failed to write cache file {cache_path}: {e}")
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)  # Clean up temp file on failure
+        await self._write_cache_direct(cache_path, data, source, params)
         return data
+
+    def _normalize_yfinance_df(self, df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
+        """Ensures the yfinance DataFrame has a consistent MultiIndex column structure."""
+        if not isinstance(df.columns, pd.MultiIndex):
+            # If only one ticker is requested, yfinance returns a flat column index.
+            # We convert it to a MultiIndex to match the multi-ticker format.
+            if len(tickers) == 1:
+                df.columns = pd.MultiIndex.from_product([df.columns, tickers])
+        return df
 
     async def async_get_yfinance_data(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
         self.logger.info(f"Fetching data for tickers: {tickers} via yfinance...")
@@ -185,10 +216,7 @@ class DataManager:
                 self.logger.warning(f"yfinance returned no data for tickers: {tickers}")
                 return None
 
-            # Standardize the column format to a MultiIndex for consistency.
-            if not isinstance(df.columns, pd.MultiIndex):
-                df.columns = pd.MultiIndex.from_product([df.columns, tickers])
-
+            df = self._normalize_yfinance_df(df, tickers)
             return df.sort_index()
         except Exception as e:
             self.logger.error(f"yfinance failed to download data for {tickers}: {e}")
@@ -197,19 +225,19 @@ class DataManager:
     async def get_vix_data(self) -> Optional[pd.Series]:
         params = {'tickers': ['^VIX'], 'start': self.config.start_date, 'end': self.config.end_date}
         cache_filename = self._generate_cache_filename("vix_data", params)
-        df = await self._fetch_with_cache_async(cache_filename, self.async_get_yfinance_data, **params)
+        df = await self._fetch_with_cache_async(cache_filename, "yfinance", params, self.async_get_yfinance_data, **params)
         return df['Close']['^VIX'] if df is not None and ('Close', '^VIX') in df.columns else None
 
     async def get_treasury_yield_data(self) -> Optional[pd.Series]:
         params = {'tickers': ['^TNX'], 'start': self.config.start_date, 'end': self.config.end_date}
         cache_filename = self._generate_cache_filename("treasury_yield_data", params)
-        df = await self._fetch_with_cache_async(cache_filename, self.async_get_yfinance_data, **params)
+        df = await self._fetch_with_cache_async(cache_filename, "yfinance", params, self.async_get_yfinance_data, **params)
         return df['Close']['^TNX'] if df is not None and ('Close', '^TNX') in df.columns else None
 
     async def get_asset_universe_data(self) -> Optional[pd.DataFrame]:
         params = {'tickers': sorted(self.config.asset_universe), 'start': self.config.start_date, 'end': self.config.end_date}
         cache_filename = self._generate_cache_filename("asset_universe_data", params)
-        return await self._fetch_with_cache_async(cache_filename, self.async_get_yfinance_data, **params)
+        return await self._fetch_with_cache_async(cache_filename, "yfinance", params, self.async_get_yfinance_data, **params)
 
     async def get_market_breadth_data(self) -> Optional[pd.Series]:
         params = {'tickers': sorted(self.config.market_breadth_tickers), 'start': self.config.start_date, 'end': self.config.end_date, 'sma': self.config.sma_period}
@@ -222,8 +250,8 @@ class DataManager:
         self.logger.info("Calculating market breadth...")
         price_params = {k: v for k, v in params.items() if k not in ['sma']}
         price_cache_filename = self._generate_cache_filename("market_breadth_prices", price_params)
-        all_prices_df_container = await self._fetch_with_cache_async(
-            price_cache_filename, self.async_get_yfinance_data,
+        all_prices_df_container = await self._fetch_with_cache_async(price_cache_filename, "yfinance", price_params,
+            self.async_get_yfinance_data,
             tickers=self.config.market_breadth_tickers, start=self.config.start_date, end=self.config.end_date
         )
 
@@ -232,8 +260,9 @@ class DataManager:
         smas = all_prices_df.rolling(window=self.config.sma_period).mean()
         is_above_sma = all_prices_df > smas
         breadth_series = (is_above_sma.sum(axis=1) / all_prices_df.notna().sum(axis=1)).fillna(0)
-        breadth_series.name = 'breadth'
-        await self._fetch_with_cache_async(cache_filename, lambda s: asyncio.FromResult(s), breadth_series)
+        breadth_series.name = 'market_breadth_indicator'
+        # Directly write the computed series to cache using the atomic helper, providing full metadata
+        await self._write_cache_direct(cache_path, breadth_series, source="computed_market_breadth", params=params)
         return breadth_series
 
     async def get_aligned_data(self) -> Optional[Dict[str, pd.DataFrame | pd.Series]]:
@@ -398,7 +427,8 @@ class RomanLegionStrategy(bt.Strategy):
         self.config = self.p.config
         self.execution_model = VolumeShareSlippageModel(
             impact_coefficient=self.config.execution_model.impact_coefficient,
-            max_volume_share=self.config.execution_model.max_volume_share
+            max_volume_share=self.config.execution_model.max_volume_share,
+            min_trade_notional=self.config.execution_model.min_trade_notional
         )
         self.cognitive_engine = CognitiveEngine(self.config, self.p.sentiment_data, self.p.asset_analysis_data, ai_mode=self.config.ai_mode)
         self.data_map = {d._name: d for d in self.datas}
@@ -499,7 +529,7 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
         context['plot_filename'] = None
     try:
         env = Environment(loader=FileSystemLoader('.'))
-        template = env.get_template("report_template.html.txt")
+        template = env.get_template("report_template.html")
         html_output = template.render(context)
         with open(report_filename, 'w', encoding='utf-8') as f: f.write(html_output)
         logger.info(f"Successfully generated HTML report: {report_filename}")
@@ -532,23 +562,27 @@ async def precompute_sentiments(ai_client: AIClient, dates: List[date]) -> tuple
     if missing_dates:
         logger.info(f"Sentiment cache miss for {len(missing_dates)} days. Fetching incrementally...")
 
-        async def fetch_single_sentiment(date_obj: date):
-            try:
-                mock_headlines = fetch_mock_news_for_date(date_obj)
-                analysis, audit_path = await ai_client.get_market_sentiment(mock_headlines)
-                logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
-                return date_obj, analysis.get('sentiment_score', 0.0), audit_path
-            except (MalformedResponseError, Exception) as e:
-                logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
-                return date_obj, 0.0, None
+        # The semaphore is on the client instance if it's the GeminiAIClient
+        semaphore = getattr(ai_client, 'semaphore', None)
 
-        tasks = [fetch_single_sentiment(date_obj) for date_obj in missing_dates]
+        async def fetch_single_sentiment(date_obj: date, sem: asyncio.Semaphore | None):
+            async with sem if sem else asyncio.Semaphore(): # Acquire semaphore
+                try:
+                    mock_headlines = fetch_mock_news_for_date(date_obj)
+                    analysis, audit_path = await ai_client.get_market_sentiment(mock_headlines)
+                    logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
+                    return date_obj, analysis.get('sentiment_score', 0.0), audit_path
+                except (MalformedResponseError, Exception) as e:
+                    logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
+                    return date_obj, 0.0, None
+
+        tasks = [fetch_single_sentiment(date_obj, semaphore) for date_obj in missing_dates]
         new_results = await asyncio.gather(*tasks)
-        
+
         for d, score, audit_path in new_results:
             if d: cached_sentiments_str[d.isoformat()] = score
             if audit_path: all_audit_files.append(os.path.basename(audit_path))
-        
+
         with open(cache_file, 'w') as f: json.dump(cached_sentiments_str, f, indent=2)
         logger.info(f"Updated and saved sentiment cache to: {cache_file}")
     else:
@@ -573,17 +607,21 @@ async def precompute_asset_analyses(ai_client: AIClient, dates: List[date], asse
     if missing_dates:
         logger.info(f"Asset analysis cache miss for {len(missing_dates)} days. Fetching incrementally...")
 
-        async def fetch_single_analysis(date_obj: date):
-            try:
-                daily_batch_analysis, audit_path = await ai_client.get_batch_asset_analysis(asset_universe, date_obj)
-                logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
-                return date_obj, daily_batch_analysis, audit_path
-            except Exception as e:
-                logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
-                default_analysis = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
-                return date_obj, default_analysis, None
+        # The semaphore is on the client instance if it's the GeminiAIClient
+        semaphore = getattr(ai_client, 'semaphore', None)
 
-        tasks = [fetch_single_analysis(date_obj) for date_obj in missing_dates]
+        async def fetch_single_analysis(date_obj: date, sem: asyncio.Semaphore | None):
+            async with sem if sem else asyncio.Semaphore(): # Acquire semaphore
+                try:
+                    daily_batch_analysis, audit_path = await ai_client.get_batch_asset_analysis(asset_universe, date_obj)
+                    logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
+                    return date_obj, daily_batch_analysis, audit_path
+                except Exception as e:
+                    logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
+                    default_analysis = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
+                    return date_obj, default_analysis, None
+
+        tasks = [fetch_single_analysis(date_obj, semaphore) for date_obj in missing_dates]
         new_results = await asyncio.gather(*tasks)
 
         for d, analysis, audit_path in new_results:
@@ -654,7 +692,7 @@ async def main():
         with open("config.yaml", "r", encoding="utf-8") as f:
             config_params = yaml.safe_load(f)
         # Flatten nested configs for Pydantic
-        config_params.update(config_params.pop('execution_mode', {})) 
+        config_params.update(config_params.pop('execution_model', {})) 
         config_params['observability'] = config_params.pop('observability', {})
         config_params['audit'] = config_params.pop('audit', {})
         config_params['optimizer'] = config_params.pop('optimizer', {})
@@ -675,14 +713,14 @@ async def main():
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
     logger = logging.getLogger("PhoenixProject")
     logger.setLevel(log_level)
-    logger.handlers。clear() # Ensure no duplicate handlers
+    logger.handlers.clear() # Ensure no duplicate handlers
 
     formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(run_id)s %(message)s')
     log_dir = "logs"; os.makedirs(log_dir, exist_ok=True)
     log_filename = f"phoenix_project_{datetime.now().strftime('%Y%m%d')}.log"
 
     stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter)
-    file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(os.path。join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
 
     for handler 在 [stream_handler, file_handler]:
         handler.addFilter(RunIdFilter())
@@ -693,11 +731,15 @@ async def main():
     start_metrics_server(config.observability。metrics_port)
 
     ai_client: Optional[AIClient] = None
-    if config.gemini_config。enable:
+    if config.gemini_config.enable:
         try:
-            gem_cfg = config.gemini_config.model_dump()
+            # Ensure compatibility with both Pydantic v1 and v2
+            if hasattr(config.gemini_config, 'model_dump'):
+                gem_cfg = config.gemini_config。model_dump()  # Pydantic v2
+            else:
+                gem_cfg = config.gemini_config。dict()  # Pydantic v1 fallback
             ai_client = MockAIClient(gem_cfg) if gem_cfg['mode'] == 'mock' else GeminiAIClient(gem_cfg)
-            logger.info(f"AI Client has been enabled and initialized in '{config.gemini_config.mode}' mode.")
+            logger.info(f"AI Client has been enabled and initialized in '{config.gemini_config。mode}' mode.")
         except Exception as e:
             logger.error(f"Failed to initialize AI Client: {e}. Continuing without AI features.")
 
