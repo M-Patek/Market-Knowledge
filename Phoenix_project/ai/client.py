@@ -166,9 +166,9 @@ class GeminiAIClient:
                 elif "return" in key or "rate" in key: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value:.2%}")
                 else: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value:.3f}")
             elif value is not None: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value}")
-        metrics_str = "\n"。join(formatted_metrics)
+        metrics_str = "\n".join(formatted_metrics)
         # Using a hash of metrics for context to avoid huge filenames
-        context = {"metrics_hash": hashlib.sha256(metrics_str.encode()).hexdigest()[:12]}
+        context = {"metrics_hash": hashlib.sha256(metrics_str.encode())。hexdigest()[:12]}
         prompt = self.config['prompts']['summary_report'].format(metrics=metrics_str)
         response = await self._generate_with_timeout(prompt)
         audit_path = self._save_audit_record("summary_report", prompt, response.text, context=context)
@@ -180,10 +180,10 @@ class MockAIClient:
 
     def __init__(self, config: Dict[str, Any]):
         self.logger = logging.getLogger("PhoenixProject.MockAIClient")
-        self.logger。info("MockAIClient initialized.")
+        self.logger.info("MockAIClient initialized.")
 
     async def get_market_sentiment(self, headlines: List[str]) -> tuple[Dict[str, Any], str | None]:
-        self.logger。info("Mocking market sentiment request.")
+        self.logger.info("Mocking market sentiment request.")
         await asyncio.sleep(0.01)
         return {"sentiment_score": 0.1, "reasoning": "Mocked neutral sentiment."}, "mock_sentiment_audit.json"
 
