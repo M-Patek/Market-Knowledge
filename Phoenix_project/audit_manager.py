@@ -35,7 +35,11 @@ def archive_logs_to_s3(source_dir: str, bucket_name: str):
     for filename in log_files:
         local_path = os.path.join(source_dir, filename)
         try:
-            s3_client.upload_file(local_path, bucket_name, filename)
+            # Enforce server-side encryption for data at rest
+            extra_args = {'ServerSideEncryption': 'AES256'}
+            s3_client.upload_file(
+                local_path, bucket_name, filename, ExtraArgs=extra_args
+            )
             logger.debug(f"Successfully uploaded {filename} to S3.")
             os.remove(local_path)
             archived_count += 1
