@@ -1,0 +1,16 @@
+Python
+pycache/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+
+Project Specific
+data_cache/
+logs/
+ai_audit_logs/
+*.db
+*.log
+.env
