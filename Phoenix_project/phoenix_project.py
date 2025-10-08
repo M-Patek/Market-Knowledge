@@ -690,15 +690,12 @@ async def main():
     try:
         with open("config.yaml", "r", encoding="utf-8") as f:
             config_params = yaml.safe_load(f)
-        # Flatten nested configs for Pydantic
-        config_params.update(config_params.pop('execution_model', {})) 
-        config_params['observability'] = config_params.pop('observability', {})
-        config_params['audit'] = config_params.pop('audit', {})
-        config_params['optimizer'] = config_params.pop('optimizer', {})
+        # Pydantic V2 can handle nested dictionaries automatically.
+        # The previous manual manipulation was causing the error.
         config = StrategyConfig(**config_params)
     except (FileNotFoundError, ValidationError) as e:
         print(f"CRITICAL: Error loading or validating 'config.yaml': {e}. Aborting.")
-        exit()
+        return # Use return instead of exit() for cleaner exit in async
 
     # --- [Optimized] Structured Logging Setup ---
     run_id = f"run-{uuid.uuid4().hex[:8]}"
@@ -721,12 +718,12 @@ async def main():
     stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter)
     file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
 
-    for handler 在 [stream_handler, file_handler]:
+    for handler in [stream_handler, file_handler]:
         handler.addFilter(RunIdFilter())
         logger.addHandler(handler)
 
-    logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
     from optimizer import Optimizer
+    logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
 
     start_metrics_server(config.observability.metrics_port)
 
@@ -764,7 +761,7 @@ async def main():
     # Archive audit logs if a real bucket is configured
     if config.audit.s3_bucket_name and config.audit.s3_bucket_name != "your-phoenix-project-audit-logs-bucket":
         archive_logs_to_s3(source_dir="ai_audit_logs", bucket_name=config.audit.s3_bucket_name)
-    
+
     logger.info("--- Operation Concluded ---")
 
 if __name__ == '__main__':
