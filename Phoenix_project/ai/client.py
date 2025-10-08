@@ -9,7 +9,7 @@ import datetime
 from typing import List, Dict, Any, Protocol, Tuple
 
 import google.generativeai as genai
-from tenacity import retry, wait_exponential, stop_after_attempt, wait_random_jitter
+from tenacity import retry, wait_exponential, stop_after_attempt, wait_random_exponential
 from pydantic import ValidationError
 
 from ai.validation import AssetAnalysisModel, MarketSentimentModel
@@ -65,7 +65,7 @@ class GeminiAIClient:
         if self.retention_days <= 0:
             self.logger.info("Audit log retention is disabled. Skipping cleanup.")
             return
-        
+
         self.logger.info(f"Cleaning up audit logs older than {self.retention_days} days...")
         cutoff_datetime = datetime.datetime.utcnow() - datetime.timedelta(days=self.retention_days)
         cleaned_count = 0
@@ -98,7 +98,7 @@ class GeminiAIClient:
             }
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(record, f, indent=2, ensure_ascii=False)
-            
+
             # Set file permissions to read/write for owner only (600)
             if hasattr(os, 'chmod'): # os.chmod is not available on all OSes (e.g. Windows)
                 os.chmod(filepath, 0o600)
@@ -108,7 +108,7 @@ class GeminiAIClient:
             return ""
 
     @retry(
-        wait=wait_exponential(multiplier=1, min=2, max=30) + wait_random_jitter(jitter=2),
+        wait=wait_random_exponential(multiplier=1, min=2, max=30),
         stop=stop_after_attempt(3), reraise=True
     )
     async def get_market_sentiment(self, headlines: List[str]) -> tuple[Dict[str, Any], str | None]:
@@ -129,7 +129,7 @@ class GeminiAIClient:
             raise
 
     @retry(
-        wait=wait_exponential(multiplier=1, min=2, max=30) + wait_random_jitter(jitter=2),
+        wait=wait_random_exponential(multiplier=1, min=2, max=30),
         stop=stop_after_attempt(3), reraise=True
     )
     async def get_batch_asset_analysis(self, tickers: List[str], date_obj: datetime.date) -> tuple[Dict[str, Dict[str, Any]], str | None]:
@@ -154,7 +154,7 @@ class GeminiAIClient:
             raise
 
     @retry(
-        wait=wait_exponential(multiplier=1, min=2, max=30) + wait_random_jitter(jitter=2),
+        wait=wait_random_exponential(multiplier=1, min=2, max=30),
         stop=stop_after_attempt(3), reraise=True
     )
     async def generate_summary_report(self, metrics: Dict[str, Any]) -> tuple[str, str | None]:
@@ -166,9 +166,9 @@ class GeminiAIClient:
                 elif "return" in key or "rate" in key: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value:.2%}")
                 else: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value:.3f}")
             elif value is not None: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value}")
-        metrics_str = "\n".join(formatted_metrics)
+        metrics_str = "\n"。join(formatted_metrics)
         # Using a hash of metrics for context to avoid huge filenames
-        context = {"metrics_hash": hashlib.sha256(metrics_str.encode())。hexdigest()[:12]}
+        context = {"metrics_hash": hashlib.sha256(metrics_str.encode()).hexdigest()[:12]}
         prompt = self.config['prompts']['summary_report'].format(metrics=metrics_str)
         response = await self._generate_with_timeout(prompt)
         audit_path = self._save_audit_record("summary_report", prompt, response.text, context=context)
@@ -180,10 +180,10 @@ class MockAIClient:
 
     def __init__(self, config: Dict[str, Any]):
         self.logger = logging.getLogger("PhoenixProject.MockAIClient")
-        self.logger.info("MockAIClient initialized.")
+        self.logger。info("MockAIClient initialized.")
 
     async def get_market_sentiment(self, headlines: List[str]) -> tuple[Dict[str, Any], str | None]:
-        self.logger.info("Mocking market sentiment request.")
+        self.logger。info("Mocking market sentiment request.")
         await asyncio.sleep(0.01)
         return {"sentiment_score": 0.1, "reasoning": "Mocked neutral sentiment."}, "mock_sentiment_audit.json"
 
