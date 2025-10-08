@@ -19,7 +19,8 @@ from io import StringIO
 from typing import List, Dict, Optional, Any, Literal
 from pathlib import Path
 
-from pydantic import BaseModel, Field, validator, ValidationError
+import httpx
+from pydantic import BaseModel, Field, field_validator, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pythonjsonlogger import jsonlogger
 from jinja2 import Environment, FileSystemLoader
@@ -102,9 +103,9 @@ class StrategyConfig(BaseModel):
     optimizer: OptimizerConfig
     max_total_allocation: float = Field(default=1.0, gt=0, le=1.0)
 
-    @validator('end_date')
+    @field_validator('end_date')
     def end_date_must_be_after_start_date(cls, v, values):
-        if 'start_date' in values and v <= values['start_date']:
+        if 'start_date' in values.data and v <= values.data['start_date']:
             raise ValueError('end_date must be strictly after start_date')
         return v
 
@@ -132,34 +133,23 @@ class DataManager:
 
     async def _write_cache_direct(self, cache_path: str, data: pd.DataFrame | pd.Series, source: str, params: Dict):
         """Atomically writes a pandas DataFrame or Series to a Parquet file."""
-        # Atomic write: write to a temporary file then rename to avoid race conditions.
-        tmp_path = f"{cache_path}.{os.getpid()}.tmp"  # Add PID for extra safety in multi-processing
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
         try:
-            # For Series, convert to DataFrame to preserve name. For DataFrame, reset_index.
             if isinstance(data, pd.Series):
                 data.to_frame(name=data.name or 'value').reset_index().to_parquet(tmp_path, engine='pyarrow', index=False)
-            else: # DataFrame
+            else:
                 data.reset_index().to_parquet(tmp_path, engine='pyarrow', index=False)
             os.replace(tmp_path, cache_path)
             self.logger.info(f"Saved fresh data to cache: {cache_path}")
-
-            # Write metadata file
             meta_path = Path(cache_path).with_suffix('.meta.json')
             param_hash = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
-            metadata = {
-                "params_hash": param_hash,
-                "created_utc": datetime.utcnow().isoformat(),
-                "pandas_version": pd.__version__,
-                "pyarrow_version": pyarrow.__version__,
-                "source": source,
-                "params": {k: str(v) for k, v in params.items()} # Ensure all values are strings for JSON
-            }
+            metadata = { "params_hash": param_hash, "created_utc": datetime.utcnow().isoformat(), "pandas_version": pd.__version__, "pyarrow_version": pyarrow.__version__, "source": source, "params": {k: str(v) for k, v in params.items()} }
             with open(meta_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2)
         except Exception as e:
             self.logger.error(f"Failed to write cache file {cache_path}: {e}")
             if os.path.exists(tmp_path):
-                os.remove(tmp_path)  # Clean up temp file on failure
+                os.remove(tmp_path)
 
     async def _fetch_with_cache_async(self, cache_filename: str, source: str, params: Dict, fetch_coro, *args, **kwargs) -> Optional[pd.DataFrame | pd.Series]:
         cache_path = os.path.join(self.cache_dir, cache_filename)
@@ -168,75 +158,75 @@ class DataManager:
             CACHE_HITS.inc()
             try:
                 df = pd.read_parquet(cache_path)
-                # Check if it was a Series, if so, return it as such.
                 if 'Date' in df.columns: df = df.set_index('Date')
-                if len(df.columns) == 1:
-                    return df.iloc[:, 0]
-                return df
+                if 'timestamp' in df.columns: df = df.set_index('timestamp')
+                return df.squeeze() if len(df.columns) == 1 else df
             except Exception as e:
                 self.logger.error(f"Failed to load from cache {cache_path}: {e}. Refetching.")
-
         self.logger.info(f"Cache not found for '{cache_filename}'. Fetching fresh data...")
         CACHE_MISSES.inc()
         data = await fetch_coro(*args, **kwargs)
-
         if data is None or data.empty:
             self.logger.warning(f"Fetching function for '{cache_filename}' returned no data.")
             return None
-
         await self._write_cache_direct(cache_path, data, source, params)
         return data
 
-    def _normalize_yfinance_df(self, df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
+    def _normalize_yfinance_df(self, df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         """Ensures the yfinance DataFrame has a consistent MultiIndex column structure."""
-        if not isinstance(df.columns, pd.MultiIndex):
-            # If only one ticker is requested, yfinance returns a flat column index.
-            # We convert it to a MultiIndex to match the multi-ticker format.
-            if len(tickers) == 1:
-                df.columns = pd.MultiIndex.from_product([df.columns, tickers])
+        df.columns = pd.MultiIndex.from_product([df.columns, [ticker]])
         return df
 
-    async def async_get_yfinance_data(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        self.logger.info(f"Fetching data for tickers: {tickers} via yfinance...")
-        try:
-            # yfinance download is a blocking I/O call, run it in a separate thread
-            # to avoid blocking the asyncio event loop.
-            df = await asyncio.to_thread(
-                yf.download,
-                tickers=tickers,
-                start=start,
-                end=end,
-                auto_adjust=True,  # Automatically adjusts for splits and dividends
-                progress=False,    # Disable progress bar for cleaner logs
-                group_by='ticker'
-            )
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), retry=retry_if_exception_type(httpx.RequestError))
+    async def async_get_yfinance_data(self, tickers: List[str], start: date, end: date) -> Optional[pd.DataFrame]:
+        self.logger.info(f"Fetching data for tickers: {tickers} via direct API call...")
+        all_dfs = []
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            tasks = []
+            for ticker in tickers:
+                start_ts = int(time.mktime(start.timetuple()))
+                end_ts = int(time.mktime(end.timetuple()))
+                url = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}?period1={start_ts}&period2={end_ts}&interval=1d&events=history&includeAdjustedClose=true"
+                tasks.append(client.get(url, headers={'User-Agent': 'Mozilla/5.0'}))
+            
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if df.empty:
-                self.logger.warning(f"yfinance returned no data for tickers: {tickers}")
-                return None
+            for ticker, response in zip(tickers, responses):
+                if isinstance(response, httpx.Response) and response.status_code == 200:
+                    try:
+                        df = pd.read_csv(StringIO(response.text))
+                        df['Date'] = pd.to_datetime(df['Date'])
+                        df = df.set_index('Date')
+                        df.columns = [col.capitalize() for col in df.columns]
+                        all_dfs.append(self._normalize_yfinance_df(df, ticker))
+                        self.logger.info(f"Successfully fetched and parsed data for {ticker}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to parse data for {ticker}: {e}")
+                else:
+                    self.logger.error(f"Failed to download data for {ticker}. Response: {response}")
 
-            df = self._normalize_yfinance_df(df, tickers)
-            return df.sort_index()
-        except Exception as e:
-            self.logger.error(f"yfinance failed to download data for {tickers}: {e}")
-            raise DataFetchError(f"yfinance download failed for {tickers}: {e}") from e
+        if not all_dfs:
+            return None
+        
+        combined_df = pd.concat(all_dfs, axis=1)
+        return combined_df.sort_index()
 
     async def get_vix_data(self) -> Optional[pd.Series]:
         params = {'tickers': ['^VIX'], 'start': self.config.start_date, 'end': self.config.end_date}
         cache_filename = self._generate_cache_filename("vix_data", params)
-        df = await self._fetch_with_cache_async(cache_filename, "yfinance", params, self.async_get_yfinance_data, **params)
+        df = await self._fetch_with_cache_async(cache_filename, "direct_api", params, self.async_get_yfinance_data, **params)
         return df['Close']['^VIX'] if df is not None and ('Close', '^VIX') in df.columns else None
 
     async def get_treasury_yield_data(self) -> Optional[pd.Series]:
         params = {'tickers': ['^TNX'], 'start': self.config.start_date, 'end': self.config.end_date}
         cache_filename = self._generate_cache_filename("treasury_yield_data", params)
-        df = await self._fetch_with_cache_async(cache_filename, "yfinance", params, self.async_get_yfinance_data, **params)
+        df = await self._fetch_with_cache_async(cache_filename, "direct_api", params, self.async_get_yfinance_data, **params)
         return df['Close']['^TNX'] if df is not None and ('Close', '^TNX') in df.columns else None
 
     async def get_asset_universe_data(self) -> Optional[pd.DataFrame]:
         params = {'tickers': sorted(self.config.asset_universe), 'start': self.config.start_date, 'end': self.config.end_date}
         cache_filename = self._generate_cache_filename("asset_universe_data", params)
-        return await self._fetch_with_cache_async(cache_filename, "yfinance", params, self.async_get_yfinance_data, **params)
+        return await self._fetch_with_cache_async(cache_filename, "direct_api", params, self.async_get_yfinance_data, **params)
 
     async def get_market_breadth_data(self) -> Optional[pd.Series]:
         params = {'tickers': sorted(self.config.market_breadth_tickers), 'start': self.config.start_date, 'end': self.config.end_date, 'sma': self.config.sma_period}
@@ -244,23 +234,24 @@ class DataManager:
         cache_path = os.path.join(self.cache_dir, cache_filename)
         if os.path.exists(cache_path):
             self.logger.info(f"Loading market breadth Series from cache: {cache_path}")
-            return pd.read_parquet(cache_path)
+            df = pd.read_parquet(cache_path)
+            return df.squeeze()
 
         self.logger.info("Calculating market breadth...")
         price_params = {k: v for k, v in params.items() if k not in ['sma']}
         price_cache_filename = self._generate_cache_filename("market_breadth_prices", price_params)
-        all_prices_df_container = await self._fetch_with_cache_async(price_cache_filename, "yfinance", price_params,
+        
+        all_prices_df_container = await self._fetch_with_cache_async(price_cache_filename, "direct_api", price_params,
             self.async_get_yfinance_data,
             tickers=self.config.market_breadth_tickers, start=self.config.start_date, end=self.config.end_date
         )
 
-        if all_prices_df_container is None or 'Close' not in all_prices_df_container.columns: return None
+        if all_prices_df_container is None or 'Close' not in all_prices_df_container.columns.get_level_values(0): return None
         all_prices_df = all_prices_df_container['Close']
         smas = all_prices_df.rolling(window=self.config.sma_period).mean()
         is_above_sma = all_prices_df > smas
         breadth_series = (is_above_sma.sum(axis=1) / all_prices_df.notna().sum(axis=1)).fillna(0)
         breadth_series.name = 'market_breadth_indicator'
-        # Directly write the computed series to cache using the atomic helper, providing full metadata
         await self._write_cache_direct(cache_path, breadth_series, source="computed_market_breadth", params=params)
         return breadth_series
 
@@ -278,9 +269,14 @@ class DataManager:
         data_streams = dict(zip(tasks.keys(), results))
         sanitized_streams = {}
         for name, series in data_streams.items():
-            aligned_series = series.reindex(master_index) if series is not None else pd.Series(index=master_index)
-            sanitized_streams[name] = aligned_series.ffill().bfill()
-            if sanitized_streams[name].isnull().any(): self.logger.warning(f"{name} data still contains NaNs after sanitization.")
+            if series is not None:
+                 aligned_series = series.reindex(master_index)
+                 sanitized_streams[name] = aligned_series.ffill().bfill()
+                 if sanitized_streams[name].isnull().any(): self.logger.warning(f"{name} data still contains NaNs after sanitization.")
+            else:
+                 sanitized_streams[name] = pd.Series(index=master_index, dtype=float).fillna(0)
+                 self.logger.warning(f"Data for '{name}' could not be fetched. Using a series of zeros.")
+
         self.logger.info("--- Data alignment and sanitization complete ---")
         return {"asset_universe_df": asset_df, **sanitized_streams}
 
@@ -299,17 +295,13 @@ class CognitiveEngine:
         self.logger.info(f"Initializing position sizer: '{method}' with params: {params}")
         if method == "fixed_fraction":
             return FixedFractionSizer(**params)
-        # Future sizers like "volatility_parity" would be added here
         else:
             raise ValueError(f"Unknown position sizer method: {method}")
 
     def determine_allocations(self, candidate_analysis: List[Dict], current_vix: float, current_date: date) -> List[Dict]:
         self.logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
-        # 1. Determine overall risk appetite
         capital_modifier = self.risk_manager.get_capital_modifier(current_vix, current_date)
-        # 2. Identify high-quality opportunities
         worthy_targets = self.portfolio_constructor.identify_opportunities(candidate_analysis, current_date)
-        # 3. Size positions for the worthy targets based on the chosen sizing strategy
         effective_max_allocation = self.config.max_total_allocation * capital_modifier
         battle_plan = self.position_sizer.size_positions(worthy_targets, effective_max_allocation)
         
@@ -431,8 +423,8 @@ class RomanLegionStrategy(bt.Strategy):
         )
         self.cognitive_engine = CognitiveEngine(self.config, self.p.sentiment_data, self.p.asset_analysis_data, ai_mode=self.config.ai_mode)
         self.data_map = {d._name: d for d in self.datas}
-        self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.p.sma_period) for d in self.datas}
-        self.rsi_indicators = {d._name: bt.indicators.RSI(d.close, period=self.p.rsi_period) for d in self.datas}
+        self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.p.config.sma_period) for d in self.datas}
+        self.rsi_indicators = {d._name: bt.indicators.RSI(d.close, period=self.p.config.rsi_period) for d in self.datas}
         self.vix_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.vix_data.items()}
         self.yield_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.treasury_yield_data.items()}
         self.breadth_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.market_breadth_data.items()}
@@ -441,7 +433,7 @@ class RomanLegionStrategy(bt.Strategy):
         self.logger.info(f"{self.datas[0].datetime.date(0).isoformat()}: [Legion Commander]: Awaiting daily orders...")
 
     def next(self):
-        if len(self.datas[0]) < self.p.sma_period: return
+        if len(self.datas[0]) < self.p.config.sma_period: return
         current_date = self.datas[0].datetime.date(0)
         self.logger.info(f"--- {current_date.isoformat()}: Daily Rebalancing Briefing ---")
         current_vix = self.vix_lookup.get(current_date)
@@ -458,7 +450,6 @@ class RomanLegionStrategy(bt.Strategy):
         } for ticker, d in self.data_map.items()]
 
         battle_plan = self.cognitive_engine.determine_allocations(candidate_analysis, current_vix, current_date)
-        # Delegate all execution logic to the dedicated model
         self.execution_model.rebalance(self, battle_plan)
 
     def notify_order(self, order):
@@ -486,25 +477,19 @@ async def generate_ai_report(ai_client: Optional[AIClient], context: Dict) -> tu
 async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, ai_client: Optional[AIClient] = None, audit_files: List[str] = None, report_filename="phoenix_report.html"):
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating HTML after-action report...")
-
-    # --- Robustly extract analyzer data ---
     trade_analyzer = getattr(strat.analyzers, 'trade_analyzer', None)
     ta = trade_analyzer.get_analysis() if trade_analyzer else {}
     total_trades = ta.get('total', {}).get('total', 0)
     winning_trades = ta.get('won', {}).get('total', 0)
     losing_trades = ta.get('lost', {}).get('total', 0)
     win_rate = (winning_trades / total_trades) if total_trades > 0 else 0.0
-
     sharpe_analyzer = getattr(strat.analyzers, 'sharpe_ratio', None)
     sharpe_analysis = sharpe_analyzer.get_analysis() if sharpe_analyzer else {}
     sharpe_ratio = sharpe_analysis.get('sharperatio', None)
-
     returns_analyzer = getattr(strat.analyzers, 'returns', None)
     returns_analysis = returns_analyzer.get_analysis() if returns_analyzer else {}
-
     drawdown_analyzer = getattr(strat.analyzers, 'drawdown', None)
     dd_analysis = drawdown_analyzer.get_analysis() if drawdown_analyzer else {}
-
     context = {
         "final_value": cerebro.broker.getvalue(), "total_return": returns_analysis.get('rtot', 0.0),
         "sharpe_ratio": sharpe_ratio, "max_drawdown": dd_analysis.get('max', {}).get('drawdown', 0.0),
@@ -560,20 +545,25 @@ async def precompute_sentiments(ai_client: AIClient, dates: List[date]) -> tuple
     all_audit_files = []
     if missing_dates:
         logger.info(f"Sentiment cache miss for {len(missing_dates)} days. Fetching incrementally...")
-
-        # The semaphore is on the client instance if it's the GeminiAIClient
         semaphore = getattr(ai_client, 'semaphore', None)
-
         async def fetch_single_sentiment(date_obj: date, sem: asyncio.Semaphore | None):
-            async with sem if sem else asyncio.Semaphore(): # Acquire semaphore
-                try:
-                    mock_headlines = fetch_mock_news_for_date(date_obj)
-                    analysis, audit_path = await ai_client.get_market_sentiment(mock_headlines)
-                    logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
-                    return date_obj, analysis.get('sentiment_score', 0.0), audit_path
-                except (MalformedResponseError, Exception) as e:
-                    logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
-                    return date_obj, 0.0, None
+            # No semaphore needed if it doesn't exist.
+            if sem:
+                async with sem:
+                    try:
+                        mock_headlines = fetch_mock_news_for_date(date_obj)
+                        analysis, audit_path = await ai_client.get_market_sentiment(mock_headlines)
+                        logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
+                        return date_obj, analysis.get('sentiment_score', 0.0), audit_path
+                    except (MalformedResponseError, Exception) as e:
+                        logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
+                        return date_obj, 0.0, None
+            else: # Fallback for mock client
+                mock_headlines = fetch_mock_news_for_date(date_obj)
+                analysis, audit_path = await ai_client.get_market_sentiment(mock_headlines)
+                logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
+                return date_obj, analysis.get('sentiment_score', 0.0), audit_path
+
 
         tasks = [fetch_single_sentiment(date_obj, semaphore) for date_obj in missing_dates]
         new_results = await asyncio.gather(*tasks)
@@ -605,20 +595,23 @@ async def precompute_asset_analyses(ai_client: AIClient, dates: List[date], asse
     all_audit_files = []
     if missing_dates:
         logger.info(f"Asset analysis cache miss for {len(missing_dates)} days. Fetching incrementally...")
-
-        # The semaphore is on the client instance if it's the GeminiAIClient
         semaphore = getattr(ai_client, 'semaphore', None)
-
         async def fetch_single_analysis(date_obj: date, sem: asyncio.Semaphore | None):
-            async with sem if sem else asyncio.Semaphore(): # Acquire semaphore
-                try:
-                    daily_batch_analysis, audit_path = await ai_client.get_batch_asset_analysis(asset_universe, date_obj)
-                    logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
-                    return date_obj, daily_batch_analysis, audit_path
-                except Exception as e:
-                    logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
-                    default_analysis = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
-                    return date_obj, default_analysis, None
+             if sem:
+                async with sem:
+                    try:
+                        daily_batch_analysis, audit_path = await ai_client.get_batch_asset_analysis(asset_universe, date_obj)
+                        logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
+                        return date_obj, daily_batch_analysis, audit_path
+                    except Exception as e:
+                        logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
+                        default_analysis = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
+                        return date_obj, default_analysis, None
+             else: # Fallback for mock client
+                daily_batch_analysis, audit_path = await ai_client.get_batch_asset_analysis(asset_universe, date_obj)
+                logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
+                return date_obj, daily_batch_analysis, audit_path
+
 
         tasks = [fetch_single_analysis(date_obj, semaphore) for date_obj in missing_dates]
         new_results = await asyncio.gather(*tasks)
@@ -657,10 +650,18 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai
         unique_tickers = all_data_df.columns.get_level_values(1).unique()
         for ticker in unique_tickers:
             ticker_df = all_data_df.xs(ticker, level=1, axis=1).copy()
-            ticker_df.columns = [col.lower() for col in ticker_df.columns]
+            # Rename columns to backtrader expected format
+            column_map = {'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Adj close': 'adj_close', 'Volume': 'volume'}
+            ticker_df.rename(columns=column_map, inplace=True)
+            # Ensure all required columns exist, add missing ones with 0
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                if col not in ticker_df.columns:
+                    ticker_df[col] = 0
+            ticker_df['openinterest'] = 0 # Add openinterest column
             ticker_df.dropna(inplace=True)
+
             if not ticker_df.empty:
-                data_feed = bt.feeds.PandasData(dataname=ticker_df, name=ticker)
+                data_feed = bt.feeds.PandasData(datename=ticker_df.index, **{col: ticker_df[col] for col in ticker_df.columns}, name=ticker)
                 cerebro.adddata(data_feed)
     except Exception as e:
         logger.critical(f"A critical error occurred during data loading: {e}. Aborting.")
@@ -690,18 +691,13 @@ async def main():
     try:
         with open("config.yaml", "r", encoding="utf-8") as f:
             config_params = yaml.safe_load(f)
-        # Pydantic V2 can handle nested dictionaries automatically.
-        # The previous manual manipulation was causing the error.
         config = StrategyConfig(**config_params)
     except (FileNotFoundError, ValidationError) as e:
         print(f"CRITICAL: Error loading or validating 'config.yaml': {e}. Aborting.")
-        return # Use return instead of exit() for cleaner exit in async
+        return
 
-    # --- [Optimized] Structured Logging Setup ---
     run_id = f"run-{uuid.uuid4().hex[:8]}"
-
     class RunIdFilter(logging.Filter):
-        """Injects the unique run_id into each log record."""
         def filter(self, record):
             record.run_id = run_id
             return True
@@ -709,32 +705,26 @@ async def main():
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
     logger = logging.getLogger("PhoenixProject")
     logger.setLevel(log_level)
-    logger.handlers.clear() # Ensure no duplicate handlers
+    logger.handlers.clear()
 
     formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(run_id)s %(message)s')
     log_dir = "logs"; os.makedirs(log_dir, exist_ok=True)
-    log_filename = f"phoenix_project_{datetime.now().strftime('%Y%m%d')}.log"
-
+    log_filename = f"phoenix_project_{datetime.当前()。strftime('%Y%m%d')}.log"
     stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter)
-    file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(os.path。join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
 
     for handler in [stream_handler, file_handler]:
         handler.addFilter(RunIdFilter())
         logger.addHandler(handler)
-
+    
     from optimizer import Optimizer
     logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
-
-    start_metrics_server(config.observability.metrics_port)
+    start_metrics_server(config.observability。metrics_port)
 
     ai_client: Optional[AIClient] = None
     if config.gemini_config。enable:
         try:
-            # Ensure compatibility with both Pydantic v1 and v2
-            if hasattr(config.gemini_config, 'model_dump'):
-                gem_cfg = config.gemini_config。model_dump()  # Pydantic v2
-            else:
-                gem_cfg = config.gemini_config。dict()  # Pydantic v1 fallback
+            gem_cfg = config.gemini_config。model_dump()
             ai_client = MockAIClient(gem_cfg) if gem_cfg['mode'] == 'mock' else GeminiAIClient(gem_cfg)
             logger.info(f"AI Client has been enabled and initialized in '{config.gemini_config。mode}' mode.")
         except Exception as e:
@@ -758,10 +748,9 @@ async def main():
         BACKTEST_DURATION.set(duration)
         logger.info(f"Backtest completed in {duration:.2f} seconds.")
 
-    # Archive audit logs if a real bucket is configured
     if config.audit.s3_bucket_name and config.audit.s3_bucket_name != "your-phoenix-project-audit-logs-bucket":
         archive_logs_to_s3(source_dir="ai_audit_logs", bucket_name=config.audit.s3_bucket_name)
-
+    
     logger.info("--- Operation Concluded ---")
 
 if __name__ == '__main__':
