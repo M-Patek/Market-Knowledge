@@ -19,7 +19,7 @@ def mock_config():
         "log_level": "INFO", "gemini_config": {"enable": False, "mode": "mock", "api_key_env_var": "FAKE_KEY", "model_name": "fake", "prompts": {}, "audit_log_retention_days": 30, "max_concurrent_requests": 5},
         "ai_mode": "off", "walk_forward": {}, "max_total_allocation": 1.0,
         # Add dummy values for new config sections to pass validation
-        "execution_model": {"impact_coefficient": 0.1， "max_volume_share": 0.25},
+        "execution_model": {"impact_coefficient": 0.1， "max_volume_share": 0.25， "min_trade_notional": 100.0},
         "position_sizer": {"method": "fixed_fraction", "parameters": {"fraction_per_position": 0.1}},
         "optimizer": {"study_name": "test", "n_trials": 1, "parameters": {}},
         "observability": {"metrics_port": 8001},
