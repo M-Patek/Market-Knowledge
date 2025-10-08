@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  phoenix-project:
+    build: .
+    container_name: phoenix_project_runner
+    env_file:
+      - .env # For injecting secrets like GEMINI_API_KEY
+    volumes:
+      - ./data_cache:/usr/src/app/data_cache
+      - ./logs:/usr/src/app/logs
+      - ./ai_audit_logs:/usr/src/app/ai_audit_logs
+      - ./phoenix_walk_forward_study.db:/usr/src/app/phoenix_walk_forward_study.db # Persist the Optuna study DB
