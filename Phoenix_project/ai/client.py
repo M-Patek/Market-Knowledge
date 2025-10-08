@@ -100,7 +100,7 @@ class GeminiAIClient:
                 json.dump(record, f, indent=2, ensure_ascii=False)
             
             # Set file permissions to read/write for owner only (600)
-            if hasattr(os, 'chmod'):
+            if hasattr(os, 'chmod'): # os.chmod is not available on all OSes (e.g. Windows)
                 os.chmod(filepath, 0o600)
             return filepath
         except Exception as e:
@@ -113,14 +113,16 @@ class GeminiAIClient:
     )
     async def get_market_sentiment(self, headlines: List[str]) -> tuple[Dict[str, Any], str | None]:
         prompt = self.config['prompts']['market_sentiment'].format(headlines="\n- ".join(headlines))
+        raw_text = ""
         try:
             response = await self._generate_with_timeout(prompt, generation_config=self.generation_config)
             raw_text = response.text
             audit_path = self._save_audit_record("market_sentiment", prompt, raw_text, context={"headlines": headlines})
+            # --- Validation Firewall ---
             validated_data = MarketSentimentModel.model_validate_json(raw_text)
             return validated_data.model_dump(), audit_path
         except (json.JSONDecodeError, ValidationError) as e:
-            self.logger.error(f"AI response validation failed for market sentiment: {e}. Falling back to neutral.")
+            self.logger.error(f"AI response validation failed for market sentiment. Error: {e}. Raw Text: '{raw_text}'. Falling back to neutral.")
             return {"sentiment_score": 0.0, "reasoning": "Fallback due to validation error."}, None
         except Exception as e:
             self.logger.error(f"An unexpected error occurred during sentiment analysis: {e}")
@@ -132,17 +134,19 @@ class GeminiAIClient:
     )
     async def get_batch_asset_analysis(self, tickers: List[str], date_obj: datetime.date) -> tuple[Dict[str, Dict[str, Any]], str | None]:
         prompt = self.config['prompts']['batch_asset_analysis'].format(tickers=", ".join(tickers))
-        context = {"tickers": tickers, "date": date_obj}
+        raw_text = "" # Initialize to empty string for error logging
+        context = {"tickers": tickers, "date": str(date_obj)}
         try:
             response = await self._generate_with_timeout(prompt, generation_config=self.generation_config)
             raw_text = response.text
             audit_path = self._save_audit_record("batch_asset_analysis", prompt, raw_text, context=context)
+            # --- Validation Firewall ---
             # The response is a dict where keys are tickers and values are the analysis objects
             raw_data = json.loads(raw_text)
             validated_data = {ticker: AssetAnalysisModel.model_validate(analysis) for ticker, analysis in raw_data.items()}
             return {ticker: model.model_dump() for ticker, model in validated_data.items()}, audit_path
         except (json.JSONDecodeError, ValidationError) as e:
-            self.logger.error(f"AI response validation failed for batch asset analysis: {e}. Falling back to neutral for all tickers.")
+            self.logger.error(f"AI response validation failed for batch asset analysis. Error: {e}. Raw Text: '{raw_text}'. Falling back to neutral for all tickers.")
             fallback_analysis = {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Fallback due to validation error."}
             return {ticker: fallback_analysis for ticker in tickers}, None
         except Exception as e:
@@ -162,10 +166,10 @@ class GeminiAIClient:
                 elif "return" in key or "rate" in key: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value:.2%}")
                 else: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value:.3f}")
             elif value is not None: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value}")
-        metrics_str = "\n"。join(formatted_metrics)
+        metrics_str = "\n".join(formatted_metrics)
         # Using a hash of metrics for context to avoid huge filenames
         context = {"metrics_hash": hashlib.sha256(metrics_str.encode()).hexdigest()[:12]}
-        prompt = self.config['prompts']['summary_report']。format(metrics=metrics_str)
+        prompt = self.config['prompts']['summary_report'].format(metrics=metrics_str)
         response = await self._generate_with_timeout(prompt)
         audit_path = self._save_audit_record("summary_report", prompt, response.text, context=context)
         return response.text, audit_path
@@ -176,10 +180,10 @@ class MockAIClient:
 
     def __init__(self, config: Dict[str, Any]):
         self.logger = logging.getLogger("PhoenixProject.MockAIClient")
-        self.logger.info("MockAIClient initialized.")
+        self.logger。info("MockAIClient initialized.")
 
     async def get_market_sentiment(self, headlines: List[str]) -> tuple[Dict[str, Any], str | None]:
-        self.logger.info("Mocking market sentiment request.")
+        self.logger。info("Mocking market sentiment request.")
         await asyncio.sleep(0.01)
         return {"sentiment_score": 0.1, "reasoning": "Mocked neutral sentiment."}, "mock_sentiment_audit.json"
 
