@@ -1,9 +1,11 @@
 # Phoenix Project - Final Optimized Version (Phoenix Resurrected)
-# A collaborative masterpiece by Gemini & GPT, guided by our Master.
+# A collaborative masterpiece by Gemini & AI, guided by our Master.
 # This version features a robust Pydantic configuration, resilient and concurrent data fetching,
 # an intelligent auto-invalidating cache, professional logging, and a comprehensive HTML reporting system.
 
+import time
 import os
+import uuid
 from datetime import date, datetime, timedelta
 import logging
 from logging.handlers import RotatingFileHandler
@@ -18,7 +20,14 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, validator, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from pythonjsonlogger import jsonlogger
 from jinja2 import Environment, FileSystemLoader
+from sizing.base import IPositionSizer
+from sizing.fixed_fraction import FixedFractionSizer
+from execution_model import VolumeShareSlippageModel
+from audit_manager import archive_logs_to_s3
+from observability import BACKTEST_DURATION, TRADES_EXECUTED, start_metrics_server, CACHE_HITS, CACHE_MISSES
+from optimizer import Optimizer
 from ai.client import AIClient, GeminiAIClient, MockAIClient, MalformedResponseError
 import backtrader as bt
 import pandas as pd
@@ -36,6 +45,30 @@ class GeminiConfig(BaseModel):
     audit_log_retention_days: int = 30
     max_concurrent_requests: int = 5
     prompts: Dict[str, str]
+
+class ExecutionConfig(BaseModel):
+    """Configuration for the execution model."""
+    impact_coefficient: float = Field(..., gt=0)
+    max_volume_share: float = Field(..., gt=0, le=1.0)
+
+class ObservabilityConfig(BaseModel):
+    """Configuration for observability settings."""
+    metrics_port: int = Field(..., gt=1023)
+
+class AuditConfig(BaseModel):
+    """Configuration for audit settings."""
+    s3_bucket_name: str
+
+class PositionSizerConfig(BaseModel):
+    """Configuration for the position sizer."""
+    method: str
+    parameters: Dict[str, Any] = {}
+
+class OptimizerConfig(BaseModel):
+    """Configuration for the Optuna optimizer."""
+    study_name: str
+    n_trials: int
+    parameters: Dict[str, Any]
 
 class StrategyConfig(BaseModel):
     """
@@ -61,6 +94,11 @@ class StrategyConfig(BaseModel):
     gemini_config: GeminiConfig
     ai_mode: Literal["off", "raw", "processed"] = "processed"
     walk_forward: Dict[str, Any]
+    execution_model: ExecutionConfig
+    position_sizer: PositionSizerConfig
+    audit: AuditConfig
+    observability: ObservabilityConfig
+    optimizer: OptimizerConfig
     max_total_allocation: float = Field(default=1.0, gt=0, le=1.0)
 
     @validator('end_date')
@@ -95,6 +133,7 @@ class DataManager:
         cache_path = os.path.join(self.cache_dir, cache_filename)
         if os.path.exists(cache_path):
             self.logger.info(f"Loading data from cache: {cache_path}")
+            CACHE_HITS.inc()
             try:
                 df = pd.read_parquet(cache_path)
                 if 'Date' in df.columns:
@@ -104,6 +143,7 @@ class DataManager:
                 self.logger.error(f"Failed to load from cache {cache_path}: {e}. Refetching.")
 
         self.logger.info(f"Cache not found for '{cache_filename}'. Fetching fresh data...")
+        CACHE_MISSES.inc()
         data = await fetch_coro(*args, **kwargs)
 
         if data is None or data.empty:
@@ -222,12 +262,34 @@ class CognitiveEngine:
         self.config = config
         self.logger = logging.getLogger("PhoenixProject.CognitiveEngine")
         self.risk_manager = RiskManager(config, sentiment_data)
-        self.portfolio_constructor = PortfolioConstructor(config, asset_analysis_data, mode=ai_mode)
+        self.portfolio_constructor = PortfolioConstructor(config, asset_analysis_data, mode=config.ai_mode)
+        self.position_sizer = self._create_sizer(config.position_sizer)
+
+    def _create_sizer(self, sizer_config: PositionSizerConfig) -> IPositionSizer:
+        method = sizer_config.method
+        params = sizer_config.parameters
+        self.logger.info(f"Initializing position sizer: '{method}' with params: {params}")
+        if method == "fixed_fraction":
+            return FixedFractionSizer(**params)
+        # Future sizers like "volatility_parity" would be added here
+        else:
+            raise ValueError(f"Unknown position sizer method: {method}")
 
     def determine_allocations(self, candidate_analysis: List[Dict], current_vix: float, current_date: date) -> List[Dict]:
         self.logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
+        # 1. Determine overall risk appetite
         capital_modifier = self.risk_manager.get_capital_modifier(current_vix, current_date)
-        return self.portfolio_constructor.construct_portfolio(candidate_analysis, capital_modifier, current_date)
+        # 2. Identify high-quality opportunities
+        worthy_targets = self.portfolio_constructor.identify_opportunities(candidate_analysis, current_date)
+        # 3. Size positions for the worthy targets based on the chosen sizing strategy
+        effective_max_allocation = self.config.max_total_allocation * capital_modifier
+        battle_plan = self.position_sizer.size_positions(worthy_targets, effective_max_allocation)
+        
+        self.logger.info("--- [Cognitive Engine's Final Battle Plan] ---")
+        final_total_allocation = sum(d['capital_allocation_pct'] for d in battle_plan)
+        self.logger.info(f"Final planned capital deployment: {final_total_allocation:.2%}")
+        for deployment in battle_plan: self.logger.info(f"- Asset: {deployment['ticker']}, Deploy Capital: {deployment['capital_allocation_pct']:.2%}")
+        return battle_plan
 
     def calculate_opportunity_score(self, current_price: float, current_sma: float, current_rsi: float) -> float:
         return self.portfolio_constructor.calculate_opportunity_score(current_price, current_sma, current_rsi)
@@ -297,8 +359,8 @@ class PortfolioConstructor:
         final = max(0.5, min(1.2, final))
         return final
 
-    def construct_portfolio(self, candidate_analysis: List[Dict], capital_modifier: float, current_date: date) -> List[Dict]:
-        self.logger.info("PortfolioConstructor is analyzing candidates...")
+    def identify_opportunities(self, candidate_analysis: List[Dict], current_date: date) -> List[Dict]:
+        self.logger.info("PortfolioConstructor is identifying high-quality opportunities...")
         adjusted_candidates = []
         daily_asset_analysis = self.asset_analysis_data.get(current_date, {})
         for candidate in candidate_analysis:
@@ -317,26 +379,10 @@ class PortfolioConstructor:
         
         worthy_targets = [res for res in adjusted_candidates if res["adjusted_score"] > self.config.opportunity_score_threshold]
         if not worthy_targets:
-            self.logger.info("PortfolioConstructor: No high-quality opportunities found. Standing down.")
-            return []
-        total_score = sum(t['adjusted_score'] for t in worthy_targets)
-        battle_plan = []
-        for target in worthy_targets:
-            base_allocation = target['adjusted_score'] / total_score
-            final_allocation = base_allocation * capital_modifier
-            battle_plan.append({"ticker": target['ticker'], "capital_allocation_pct": final_allocation})
-        
-        self.logger.info("--- [PortfolioConstructor's Final Battle Plan] ---")
-        total_planned_allocation = sum(d['capital_allocation_pct'] for d in battle_plan)
-        if total_planned_allocation > self.config.max_total_allocation:
-            self.logger.warning(f"Total planned allocation {total_planned_allocation:.2%} exceeds cap of {self.config.max_total_allocation:.2%}. Scaling down.")
-            scale_factor = self.config.max_total_allocation / total_planned_allocation
-            for deployment in battle_plan: deployment['capital_allocation_pct'] *= scale_factor
-        
-        final_total_allocation = sum(d['capital_allocation_pct'] for d in battle_plan)
-        self.logger.info(f"Final planned capital deployment: {final_total_allocation:.2%}")
-        for deployment in battle_plan: self.logger.info(f"- Asset: {deployment['ticker']}, Deploy Capital: {deployment['capital_allocation_pct']:.2%}")
-        return battle_plan
+            self.logger.info("PortfolioConstructor: No opportunities met the threshold.")
+        else:
+            self.logger.info(f"PortfolioConstructor: Identified {len(worthy_targets)} high-quality opportunities.")
+        return worthy_targets
 
 # --- Strategy Execution Layer ---
 class RomanLegionStrategy(bt.Strategy):
@@ -350,6 +396,10 @@ class RomanLegionStrategy(bt.Strategy):
         self.logger = logging.getLogger("PhoenixProject.Strategy")
         if self.p.config is None: raise ValueError("StrategyConfig object not provided!")
         self.config = self.p.config
+        self.execution_model = VolumeShareSlippageModel(
+            impact_coefficient=self.config.execution_model.impact_coefficient,
+            max_volume_share=self.config.execution_model.max_volume_share
+        )
         self.cognitive_engine = CognitiveEngine(self.config, self.p.sentiment_data, self.p.asset_analysis_data, ai_mode=self.config.ai_mode)
         self.data_map = {d._name: d for d in self.datas}
         self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.p.sma_period) for d in self.datas}
@@ -379,24 +429,12 @@ class RomanLegionStrategy(bt.Strategy):
         } for ticker, d in self.data_map.items()]
 
         battle_plan = self.cognitive_engine.determine_allocations(candidate_analysis, current_vix, current_date)
-        self.logger.info("--- Starting Unified Rebalancing Protocol ---")
-        total_value = self.broker.getvalue()
-        target_portfolio = {deployment['ticker']: total_value * deployment['capital_allocation_pct'] for deployment in battle_plan}
-        current_positions = {d._name for d in self.datas if self.getposition(d).size != 0}
-        target_tickers = set(target_portfolio.keys())
-        all_tickers_in_play = current_positions.union(target_tickers)
-        for ticker in all_tickers_in_play:
-            target_value = target_portfolio.get(ticker, 0.0)
-            data_feed = self.getdatabyname(ticker)
-            if not data_feed:
-                self.logger.warning(f"Could not find data feed for {ticker} during rebalance. Skipping.")
-                continue
-            self.logger.info(f"Rebalance SYNC: Aligning {ticker} to target value ${target_value:,.2f}.")
-            self.order_target_value(data=data_feed, value=target_value)
-        self.logger.info("--- Rebalancing Protocol Concluded ---")
+        # Delegate all execution logic to the dedicated model
+        self.execution_model.rebalance(self, battle_plan)
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
+            TRADES_EXECUTED.inc()
             dt = self.datas[0].datetime.date(0).isoformat()
             if order.isbuy(): self.logger.info(f"{dt}: BUY EXECUTED, {order.data._name}, Size: {order.executed.size}, Price: {order.executed.price:.2f}")
             elif order.issell(): self.logger.info(f"{dt}: SELL EXECUTED, {order.data._name}, Size: {order.executed.size}, Price: {order.executed.price:.2f}")
@@ -404,19 +442,19 @@ class RomanLegionStrategy(bt.Strategy):
             self.logger.warning(f"{self.datas[0].datetime.date(0).isoformat()}: Order for {order.data._name} failed: {order.getstatusname()}")
 
 # --- Reporting Engine ---
-async def generate_ai_report(ai_client: Optional[AIClient], context: Dict) -> Optional[str]:
-    if not ai_client: return None
+async def generate_ai_report(ai_client: Optional[AIClient], context: Dict) -> tuple[str | None, str | None]:
+    if not ai_client: return None, None
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating AI Marshal's Report...")
     try:
-        report_text = await ai_client.generate_summary_report(context)
+        report_text, audit_path = await ai_client.generate_summary_report(context)
         logger.info("Successfully generated AI Marshal's Report.")
-        return report_text
+        return report_text, audit_path
     except Exception as e:
         logger.error(f"Failed to generate AI report: {e}")
-        return "## Marshal's Debriefing Failed ##\n\nAn error occurred during communication with the AI Command. The quantitative report below remains accurate."
+        return "## Marshal's Debriefing Failed ##\n\nAn error occurred during communication with the AI Command. The quantitative report below remains accurate.", None
 
-async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, ai_client: Optional[AIClient] = None, report_filename="phoenix_report.html"):
+async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, ai_client: Optional[AIClient] = None, audit_files: List[str] = None, report_filename="phoenix_report.html"):
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating HTML after-action report...")
 
@@ -443,7 +481,11 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
         "sharpe_ratio": sharpe_ratio, "max_drawdown": dd_analysis.get('max', {}).get('drawdown', 0.0),
         "total_trades": total_trades, "winning_trades": winning_trades, "losing_trades": losing_trades, "win_rate": win_rate, "report_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "plot_filename": "phoenix_plot.png"
     }
-    context['ai_summary_report'] = await generate_ai_report(ai_client, context)
+    context['ai_summary_report'], summary_audit_file = await generate_ai_report(ai_client, context)
+    
+    all_audit_files = audit_files or []
+    if summary_audit_file: all_audit_files.append(os.path.basename(summary_audit_file))
+    context['audit_files'] = sorted(list(set(all_audit_files)))
     try:
         plot_path = Path(report_filename).with_suffix('.png')
         logger.info(f"Saving backtest plot to {plot_path}...")
@@ -471,7 +513,7 @@ def fetch_mock_news_for_date(date_obj: date) -> List[str]:
     random.shuffle(base_headlines)
     return base_headlines[:3]
 
-async def precompute_sentiments(ai_client: AIClient, dates: List[date]) -> Dict[date, float]:
+async def precompute_sentiments(ai_client: AIClient, dates: List[date]) -> tuple[Dict[date, float], List[str]]:
     logger = logging.getLogger("PhoenixProject.SentimentPrecomputer")
     cache_file = Path("data_cache") / "sentiment_cache.json"    
     cached_sentiments_str = {}
@@ -486,34 +528,34 @@ async def precompute_sentiments(ai_client: AIClient, dates: List[date]) -> Dict[
     cached_dates = {date.fromisoformat(k) for k in cached_sentiments_str.keys()}
     required_dates = set(dates)
     missing_dates = sorted(list(required_dates - cached_dates))
-
+    all_audit_files = []
     if missing_dates:
         logger.info(f"Sentiment cache miss for {len(missing_dates)} days. Fetching incrementally...")
 
         async def fetch_single_sentiment(date_obj: date):
             try:
                 mock_headlines = fetch_mock_news_for_date(date_obj)
-                analysis = await ai_client.get_market_sentiment(mock_headlines)
+                analysis, audit_path = await ai_client.get_market_sentiment(mock_headlines)
                 logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
-                return date_obj, analysis.get('sentiment_score', 0.0)
+                return date_obj, analysis.get('sentiment_score', 0.0), audit_path
             except (MalformedResponseError, Exception) as e:
                 logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
-                return date_obj, 0.0
+                return date_obj, 0.0, None
 
         tasks = [fetch_single_sentiment(date_obj) for date_obj in missing_dates]
         new_results = await asyncio.gather(*tasks)
         
-        for d, score in new_results:
+        for d, score, audit_path in new_results:
             if d: cached_sentiments_str[d.isoformat()] = score
+            if audit_path: all_audit_files.append(os.path.basename(audit_path))
         
         with open(cache_file, 'w') as f: json.dump(cached_sentiments_str, f, indent=2)
         logger.info(f"Updated and saved sentiment cache to: {cache_file}")
     else:
         logger.info("Sentiment cache is fully populated. No new data needed.")
+    return {dt: cached_sentiments_str[dt.isoformat()] for dt in required_dates}, all_audit_files
 
-    return {dt: cached_sentiments_str[dt.isoformat()] for dt in required_dates}
-
-async def precompute_asset_analyses(ai_client: AIClient, dates: List[date], asset_universe: List[str]) -> Dict[date, Dict]:
+async def precompute_asset_analyses(ai_client: AIClient, dates: List[date], asset_universe: List[str]) -> tuple[Dict[date, Dict], List[str]]:
     logger = logging.getLogger("PhoenixProject.AssetAnalysisPrecomputer")
     cache_file = Path("data_cache") / "asset_analysis_cache.json"
     cached_data_str = {}
@@ -527,32 +569,32 @@ async def precompute_asset_analyses(ai_client: AIClient, dates: List[date], asse
     cached_dates = {date.fromisoformat(k) for k in cached_data_str.keys()}
     required_dates = set(dates)
     missing_dates = sorted(list(required_dates - cached_dates))
-
+    all_audit_files = []
     if missing_dates:
         logger.info(f"Asset analysis cache miss for {len(missing_dates)} days. Fetching incrementally...")
 
         async def fetch_single_analysis(date_obj: date):
             try:
-                daily_batch_analysis = await ai_client.get_batch_asset_analysis(asset_universe, date_obj)
+                daily_batch_analysis, audit_path = await ai_client.get_batch_asset_analysis(asset_universe, date_obj)
                 logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
-                return date_obj, daily_batch_analysis
+                return date_obj, daily_batch_analysis, audit_path
             except Exception as e:
                 logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
                 default_analysis = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
-                return date_obj, default_analysis
+                return date_obj, default_analysis, None
 
         tasks = [fetch_single_analysis(date_obj) for date_obj in missing_dates]
         new_results = await asyncio.gather(*tasks)
 
-        for d, analysis in new_results:
+        for d, analysis, audit_path in new_results:
             if d: cached_data_str[d.isoformat()] = analysis
+            if audit_path: all_audit_files.append(os.path.basename(audit_path))
 
         with open(cache_file, 'w') as f: json.dump(cached_data_str, f)
         logger.info(f"Updated and saved asset analysis cache to: {cache_file}")
     else:
         logger.info("Asset analysis cache is fully populated. No new data needed.")
-
-    return {dt: cached_data_str[dt.isoformat()] for dt in required_dates}
+    return {dt: cached_data_str[dt.isoformat()] for dt in required_dates}, all_audit_files
 
 # --- Main Execution Engine ---
 async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai_client: Optional[AIClient] = None):
@@ -562,10 +604,14 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai
 
     master_dates = [dt.to_pydatetime().date() for dt in all_aligned_data["asset_universe_df"].index]
     sentiment_lookup = {}
+    sentiment_audits = []
     asset_analysis_lookup = {}
+    asset_audits = []
+    run_audit_files = []
     if ai_client and config.ai_mode != "off":
-        sentiment_lookup = await precompute_sentiments(ai_client, master_dates)
-        asset_analysis_lookup = await precompute_asset_analyses(ai_client, master_dates, config.asset_universe)
+        sentiment_lookup, sentiment_audits = await precompute_sentiments(ai_client, master_dates)
+        asset_analysis_lookup, asset_audits = await precompute_asset_analyses(ai_client, master_dates, config.asset_universe)
+        run_audit_files.extend(sentiment_audits + asset_audits)
 
     cerebro = bt.Cerebro()
     try:
@@ -601,156 +647,81 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai
 
     results = cerebro.run()
     strat = results[0]
-    await generate_html_report(cerebro, strat, ai_client, report_filename=f"phoenix_report_{config.ai_mode}_single.html")
-
-def _find_best_opt_run(opt_runs):
-    best_sharpe = -float('inf')
-    best_run = None
-    best_params = {}
-    for run in opt_runs:
-        for strat in run:
-            sharpe = strat.analyzers.sharpe_ratio.get_analysis().get('sharperatio', -float('inf'))
-            if sharpe is not None and sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_run = strat
-                best_params = best_run.p._getkwargs()
-    return best_params, best_sharpe
-
-async def run_walk_forward(config: StrategyConfig, all_aligned_data: Dict, ai_client: Optional[AIClient] = None):
-    """Runs the walk-forward optimization process."""
-    logger = logging.getLogger("PhoenixProject")
-    logger.info(f"--- Launching 'Phoenix Project' in WALK-FORWARD mode (AI: {config.ai_mode.upper()}) ---")
-    
-    wf_config = config.walk_forward
-    train_delta = timedelta(days=wf_config['train_days'])
-    test_delta = timedelta(days=wf_config['test_days'])
-    step_delta = timedelta(days=wf_config['step_days'])
-    
-    full_start_date = config.start_date
-    full_end_date = config.end_date
-
-    out_of_sample_results = []
-    current_start = full_start_date
-    window_num = 0
-
-    while current_start + train_delta + test_delta <= full_end_date:
-        window_num += 1
-        train_end = current_start + train_delta
-        test_end = train_end + test_delta
-        logger.info(f"--- W-F Window {window_num}: Train=[{current_start} to {train_end}] ---")
-
-        opt_cerebro = bt.Cerebro(stdstats=False, optreturn=False)
-        opt_cerebro.optstrategy(
-            RomanLegionStrategy,
-            config=config, vix_data=all_aligned_data["vix"], treasury_yield_data=all_aligned_data["treasury_yield"],
-            market_breadth_data=all_aligned_data["market_breadth"], sentiment_data={}, asset_analysis_data={},
-            sma_period=range(30, 81, 10),
-            rsi_period=range(10, 21, 2)
-        )
-        for ticker in config.asset_universe:
-            df = all_aligned_data["asset_universe_df"].xs(ticker, level=1, axis=1).copy()
-            df.columns = [col.lower() for col in df.columns]
-            data_feed = bt.feeds.PandasData(dataname=df, fromdate=current_start, todate=train_end, name=ticker)
-            opt_cerebro.adddata(data_feed)
-        
-        opt_cerebro.broker.setcash(config.initial_cash)
-        opt_cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', annualize=True)
-        
-        logger.info(f"Running optimization for Window {window_num}...")
-        opt_runs = opt_cerebro.run()
-        best_params, best_sharpe = _find_best_opt_run(opt_runs)
-        logger.info(f"Window {window_num} Best Sharpe: {best_sharpe:.3f}, Best Params: {best_params}")
-
-        logger.info(f"--- W-F Window {window_num}: Test=[{train_end} to {test_end}] ---")
-        val_cerebro = bt.Cerebro()
-        temp_config = config.copy(deep=True)
-        temp_config.sma_period = best_params.get('sma_period', config.sma_period)
-        temp_config.rsi_period = best_params.get('rsi_period', config.rsi_period)
-        
-        master_dates = pd.date_range(start=train_end, end=test_end).date
-        sentiment_lookup = await precompute_sentiments(ai_client, master_dates) if ai_client else {}
-        asset_analysis_lookup = await precompute_asset_analyses(ai_client, master_dates, config.asset_universe) if ai_client else {}
-        
-        val_cerebro.addstrategy(
-            RomanLegionStrategy, config=temp_config,
-            vix_data=all_aligned_data["vix"],
-            treasury_yield_data=all_aligned_data["treasury_yield"],
-            market_breadth_data=all_aligned_data["market_breadth"],
-            sentiment_data=sentiment_lookup,
-            asset_analysis_data=asset_analysis_lookup,
-            **best_params
-        )
-
-        val_cerebro.broker.setcash(config.initial_cash)
-        for ticker in config.asset_universe:
-            df = all_aligned_data["asset_universe_df"].xs(ticker, level=1, axis=1).copy()
-            df.columns = [col.lower() for col in df.columns]
-            data_feed = bt.feeds.PandasData(dataname=df, fromdate=train_end, todate=test_end, name=ticker)
-            val_cerebro.adddata(data_feed)
-
-        val_cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', annualize=True)
-        val_cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-        val_cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
-        val_cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
-        
-        results = val_cerebro.run()
-        strat = results[0]
-        out_of_sample_results.append(strat)
-        await generate_html_report(val_cerebro, strat, ai_client, report_filename=f"phoenix_report_wf_{window_num}.html")
-
-        current_start += step_delta
-    
-    logger.info("--- Walk-Forward Out-of-Sample Performance Summary ---")
-    for i, strat in enumerate(out_of_sample_results):
-        sharpe = strat.analyzers.sharpe_ratio.get_analysis().get('sharperatio', 'N/A')
-        returns = strat.analyzers.returns.get_analysis().get('rtot', 0.0)
-        drawdown = strat.analyzers.drawdown.get_analysis().max.get('drawdown', 0.0)
-        logger.info(f"Window {i+1}: Sharpe = {sharpe:.3f}, Return = {returns:.2%}, Max Drawdown = {drawdown:.2f}%")
+    await generate_html_report(cerebro, strat, ai_client, run_audit_files, report_filename=f"phoenix_report_{config.ai_mode}_single.html")
 
 async def main():
     try:
         with open("config.yaml", "r", encoding="utf-8") as f:
             config_params = yaml.safe_load(f)
-        config_params.update(config_params.pop('execution_mode', {}))
+        # Flatten nested configs for Pydantic
+        config_params.update(config_params.pop('execution_mode', {})) 
+        config_params['observability'] = config_params.pop('observability', {})
+        config_params['audit'] = config_params.pop('audit', {})
+        config_params['optimizer'] = config_params.pop('optimizer', {})
         config = StrategyConfig(**config_params)
     except (FileNotFoundError, ValidationError) as e:
         print(f"CRITICAL: Error loading or validating 'config.yaml': {e}. Aborting.")
         exit()
 
+    # --- [Optimized] Structured Logging Setup ---
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+
+    class RunIdFilter(logging.Filter):
+        """Injects the unique run_id into each log record."""
+        def filter(self, record):
+            record.run_id = run_id
+            return True
+
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
     logger = logging.getLogger("PhoenixProject")
     logger.setLevel(log_level)
-    if not logger.handlers:
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-        log_dir = "logs"; os.makedirs(log_dir, exist_ok=True)
-        log_filename = f"phoenix_project_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter); logger.addHandler(stream_handler)
-        file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
-        file_handler.setFormatter(formatter); logger.addHandler(file_handler)
-    logger.info("Phoenix Project Final Optimized Version - Logging System Initialized.")
+    logger.handlers。clear() # Ensure no duplicate handlers
+
+    formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(run_id)s %(message)s')
+    log_dir = "logs"; os.makedirs(log_dir, exist_ok=True)
+    log_filename = f"phoenix_project_{datetime.now().strftime('%Y%m%d')}.log"
+
+    stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
+
+    for handler 在 [stream_handler, file_handler]:
+        handler.addFilter(RunIdFilter())
+        logger.addHandler(handler)
+
+    logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
+
+    start_metrics_server(config.observability。metrics_port)
 
     ai_client: Optional[AIClient] = None
-    if config.gemini_config.enable:
+    if config.gemini_config。enable:
         try:
-            if hasattr(config.gemini_config, "model_dump"):
-                gem_cfg = config.gemini_config.model_dump()
-            else:
-                gem_cfg = config.gemini_config.dict()
+            gem_cfg = config.gemini_config.model_dump()
             ai_client = MockAIClient(gem_cfg) if gem_cfg['mode'] == 'mock' else GeminiAIClient(gem_cfg)
             logger.info(f"AI Client has been enabled and initialized in '{config.gemini_config.mode}' mode.")
         except Exception as e:
             logger.error(f"Failed to initialize AI Client: {e}. Continuing without AI features.")
 
-    data_manager = DataManager(config)
-    all_aligned_data = await data_manager.get_aligned_data()
-    if not all_aligned_data:
-        logger.critical("Failed to get aligned data. Aborting operation.")
-        return
+    start_time = time.time()
+    try:
+        data_manager = DataManager(config)
+        all_aligned_data = await data_manager.get_aligned_data()
+        if not all_aligned_data:
+            logger.critical("Failed to get aligned data. Aborting operation.")
+            return
 
-    if config.walk_forward.get('enabled', False):
-        await run_walk_forward(config, all_aligned_data, ai_client)
-    else:
-        await run_single_backtest(config, all_aligned_data, ai_client)
+        if config.walk_forward.get('enabled', False):
+            optimizer = Optimizer(config, all_aligned_data, ai_client)
+            optimizer.run_optimization()
+        else:
+            await run_single_backtest(config, all_aligned_data, ai_client)
+    finally:
+        duration = time.time() - start_time
+        BACKTEST_DURATION.set(duration)
+        logger.info(f"Backtest completed in {duration:.2f} seconds.")
+
+    # Archive audit logs if a real bucket is configured
+    if config.audit.s3_bucket_name and config.audit.s3_bucket_name != "your-phoenix-project-audit-logs-bucket":
+        archive_logs_to_s3(source_dir="ai_audit_logs", bucket_name=config.audit.s3_bucket_name)
     
     logger.info("--- Operation Concluded ---")
 
