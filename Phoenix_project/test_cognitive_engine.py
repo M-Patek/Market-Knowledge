@@ -17,7 +17,13 @@ def mock_config():
         "capital_modifier_normal_vix": 0.9, "capital_modifier_low_vix": 1.0,
         "initial_cash": 100000, "commission_rate": 0.001,
         "log_level": "INFO", "gemini_config": {"enable": False, "mode": "mock", "api_key_env_var": "FAKE_KEY", "model_name": "fake", "prompts": {}, "audit_log_retention_days": 30, "max_concurrent_requests": 5},
-        "ai_mode": "off", "walk_forward": {}, "max_total_allocation": 1.0
+        "ai_mode": "off", "walk_forward": {}, "max_total_allocation": 1.0,
+        # Add dummy values for new config sections to pass validation
+        "execution_model": {"impact_coefficient": 0.1， "max_volume_share": 0.25},
+        "position_sizer": {"method": "fixed_fraction", "parameters": {"fraction_per_position": 0.1}},
+        "optimizer": {"study_name": "test", "n_trials": 1, "parameters": {}},
+        "observability": {"metrics_port": 8001},
+        "audit": {"s3_bucket_name": "none"}
     }
     return StrategyConfig(**config_dict)
 
