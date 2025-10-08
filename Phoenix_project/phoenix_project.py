@@ -728,10 +728,10 @@ async def main():
 
     logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
 
-    start_metrics_server(config.observability。metrics_port)
+    start_metrics_server(config.observability.metrics_port)
 
     ai_client: Optional[AIClient] = None
-    if config.gemini_config.enable:
+    if config.gemini_config。enable:
         try:
             # Ensure compatibility with both Pydantic v1 and v2
             if hasattr(config.gemini_config, 'model_dump'):
