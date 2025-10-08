@@ -27,11 +27,15 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install black ruff # Install linting/formatting tools
+        pip install black ruff mypy # Install linting/formatting/typing tools
 
     - name: Lint with Ruff
       run: |
         ruff check .
+
+    - name: Type Check with MyPy
+      run: |
+        mypy .
 
     - name: Check formatting with Black
       run: |
