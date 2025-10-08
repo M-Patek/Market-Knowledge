@@ -166,7 +166,7 @@ class GeminiAIClient:
                 elif "return" in key or "rate" in key: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value:.2%}")
                 else: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value:.3f}")
             elif value is not None: formatted_metrics.append(f"- {key.replace('_', ' ').title()}: {value}")
-        metrics_str = "\n".join(formatted_metrics)
+        metrics_str = "\n"。join(formatted_metrics)
         # Using a hash of metrics for context to avoid huge filenames
         context = {"metrics_hash": hashlib.sha256(metrics_str.encode()).hexdigest()[:12]}
         prompt = self.config['prompts']['summary_report'].format(metrics=metrics_str)
