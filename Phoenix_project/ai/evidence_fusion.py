@@ -142,9 +142,9 @@ class EvidenceFusionEngine:
         contributions = []
         total_weight = sum(weights)
         if total_weight > 1e-9:
-            for p, w 在 zip(parsed, weights):
+            for p, w in zip(parsed, weights):
                 contributions.append(ModelContribution(
-                    model_id=p.get('model_id')，
+                    model_id=p.get('model_id'),
                     factor=p['factor']，
                     avg_evidence_score=p['avg_evidence_score']，
                     weight=w,
