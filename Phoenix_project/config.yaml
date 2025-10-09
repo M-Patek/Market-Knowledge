@@ -41,35 +41,10 @@ initial_cash: 1000000.0
 commission_rate: 0.001
 log_level: "INFO"
 
-# 5. Gemini AI Advisor Settings
-gemini_config:
+# 5. AI Ensemble Settings
+ai_ensemble_config:
   enable: true
-  mode: "mock"
-  api_key_env_var: "GEMINI_API_KEY"
-  model_name: "gemini-1.5-flash-latest"
-  request_timeout: 90
-  audit_log_retention_days: 30 # Set to 0 to disable cleanup
-  max_concurrent_requests: 5  # Max parallel requests to the API
-  prompts:
-    market_sentiment: >
-      你是一位专业的金融市场分析师。请分析以下今天的财经新闻标题，并以-1.0（极度悲观）到+1.0（极度乐观）的范围给出一个总体的市场情绪得分。
-      请仅返回一个符合规范的JSON对象，格式为：{"sentiment_score": <得分>, "reasoning": "<简要分析理由>"}.
-      新闻标题：
-      {headlines}
-    asset_analysis: >
-      分析资产 {ticker} 最近的重大新闻、财报预期或分析师评级。是否存在任何可能在短期内影响其价格的、非技术性的积极或消极因素？
-      请给出一个调整系数，范围从0.5（有重大利空）到1.5（有重大利好），正常情况为1.0。同时，请提供一个0.0（完全不确定）到1.0（非常确定）之间的可信度评分。
-      请仅返回一个符合规范的JSON对象，格式为：{"adjustment_factor": <系数>, "confidence": <可信度>, "reasoning": "<简要分析理由>"}.
-    batch_asset_analysis: >
-      你是一位专业的金融市场分析师。请对以下资产列表进行独立的定性分析：{tickers}。
-      对每一个资产，请评估其短期内的非技术性积极或消极因素，并提供一个调整系数（0.5-1.5）和可信度评分（0.0-1.0）。
-      请仅返回一个符合规范的、单一的JSON对象，其中每个键是资产的ticker，值是其对应的分析对象。
-      例如: {{"QQQ": {{"adjustment_factor": 1.1, "confidence": 0.8, "reasoning": "..."}}, "SPY": {{...}} }}
-    summary_report: >
-      你是一位名为'凤凰元帅'的AI交易模型的总指挥。请根据以下整个回测周期的表现和关键决策数据，撰写一份给项目主管的“战后总结报告”。报告需要用指挥官的口吻，分析策略的优势、劣劣势，并解释在关键时间点（如市场大跌时）我们是如何利用VIX和宏观情绪分析来调整风险敞口的。
-      你的分析需要富有洞察力且易于理解。
-      回测数据:
-      {metrics}
+  config_file_path: "config/ai_clients.yaml" # Path to the detailed AI ensemble configuration
 
 # [Refactored] Data Sources & Network Configuration
 data_sources:
