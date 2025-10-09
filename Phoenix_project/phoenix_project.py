@@ -1,4 +1,4 @@
-# Phoenix Project - Final Optimized Version (Phoenix Resurrected)
+# Phoenix Project - Final Corrected Version (Phoenix Resurrected)
 # A collaborative masterpiece by Gemini & AI, guided by our Master.
 # This version features a robust Pydantic configuration, resilient and concurrent data fetching
 # with a multi-provider fallback system, an intelligent cache, professional logging, and a comprehensive HTML reporting system.
@@ -19,12 +19,12 @@ from io import StringIO
 from typing import List, Dict, Optional, Any, Literal
 from pathlib import Path
 
-# --- 新增的库 ---
+# --- Libraries for Data Sources ---
 import requests
 from alpha_vantage.timeseries import TimeSeries
 from twelvedata import TDClient
 from tiingo import TiingoClient
-# -----------------
+# ------------------------------------
 
 from pydantic import BaseModel, Field, field_validator, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -41,7 +41,7 @@ import pandas as pd
 import yfinance as yf
 
 
-# --- [重构] Configuration Models ---
+# --- [Refactored] Configuration Models ---
 class GeminiConfig(BaseModel):
     enable: bool = False
     mode: Literal["mock", "production"] = "mock"
@@ -91,10 +91,6 @@ class DataSourcesConfig(BaseModel):
     network: NetworkConfig
 
 class StrategyConfig(BaseModel):
-    """
-    Central configuration for the Phoenix Project.
-    Uses Pydantic for robust, self-validating configuration.
-    """
     start_date: date
     end_date: date
     asset_universe: List[str] = Field(..., min_items=1)
@@ -160,9 +156,7 @@ class DataManager:
         api_key = self.ds_config.providers.get("tiingo", ProviderConfig()).api_key
         if not api_key or "YOUR_KEY" in api_key:
             return None
-        # Tiingo's client library can accept a pre-configured session
-        tiingo_config = {'api_key': api_key, 'session': self.session}
-        return TiingoClient(tiingo_config)
+        return TiingoClient({'api_key': api_key, 'session': self.session})
 
     # --- Individual Data Fetcher Methods ---
 
@@ -174,7 +168,8 @@ class DataManager:
             
         try:
             all_dfs = []
-            ts = TimeSeries(key=api_key, output_format='pandas', session=self.session)
+            # [修正]：移除了不支持的 session 参数
+            ts = TimeSeries(key=api_key, output_format='pandas') 
             for ticker in tickers:
                 self.logger.debug(f"Fetching {ticker} from Alpha Vantage...")
                 data, _ = await asyncio.to_thread(ts.get_daily_adjusted, symbol=ticker, outputsize='full')
@@ -184,7 +179,7 @@ class DataManager:
                 data = data[(data.index.date >= start) & (data.index.date <= end)]
                 data.columns = pd.MultiIndex.from_product([data.columns, [ticker]])
                 all_dfs.append(data)
-                await asyncio.sleep(15) # Respect free tier API limit (5 calls/min)
+                await asyncio.sleep(15)
             
             if not all_dfs: return None
             final_df = pd.concat(all_dfs, axis=1).sort_index()
@@ -201,6 +196,7 @@ class DataManager:
             return None
 
         try:
+            # TDClient 不直接支持 session, 但其内部使用 requests, 会受全局代理影响(如果设置)
             td = TDClient(apikey=api_key)
             all_dfs = []
             for ticker in tickers:
@@ -216,7 +212,7 @@ class DataManager:
                 all_dfs.append(df)
             
             if not all_dfs: return None
-            final_df = pd.concat(all_dfs, axis=1).sort_index(ascending=False) # API returns newest first
+            final_df = pd.concat(all_dfs, axis=1).sort_index(ascending=False)
             final_df.index = pd.to_datetime(final_df.index)
             final_df.index.name = 'Date'
             return final_df
@@ -230,18 +226,25 @@ class DataManager:
             return None
         
         try:
-            self.logger.debug(f"Fetching {len(tickers)} tickers from Tiingo...")
-            df = await asyncio.to_thread(
-                self.tiingo_client.get_dataframe, tickers,
-                frequency='daily',
-                startDate=start.isoformat(), endDate=end.isoformat()
-            )
-            df = df.pivot_table(index='date', columns='ticker', values=['open', 'high', 'low', 'close', 'volume'])
-            df = df.swaplevel(0, 1, axis=1).sort_index(axis=1)
-            df.columns = pd.MultiIndex.from_tuples([(ticker, val.capitalize()) for ticker, val in df.columns])
-            df.index = pd.to_datetime(df.index)
-            df.index.name = 'Date'
-            return df
+            self.logger.debug(f"Fetching {len(tickers)} tickers from Tiingo one by one...")
+            all_dfs = []
+            for ticker in tickers:
+                # [修正]: 逐个获取股票的 OHLCV 数据
+                df = await asyncio.to_thread(
+                    self.tiingo_client.get_dataframe, ticker,
+                    frequency='daily',
+                    startDate=start.isoformat(), endDate=end.isoformat()
+                )
+                df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+                df.columns = pd.MultiIndex.from_product([df.columns, [ticker]])
+                all_dfs.append(df)
+
+            if not all_dfs: return None
+            final_df = pd.concat(all_dfs, axis=1).sort_index()
+            final_df.index = pd.to_datetime(final_df.index)
+            final_df.index.name = 'Date'
+            return final_df
         except Exception as e:
             self.logger.error(f"Tiingo fetch failed: {e}")
             return None
@@ -289,7 +292,7 @@ class DataManager:
             
             if data is not None and not data.empty:
                 self.logger.info(f"Successfully fetched data from {provider.upper()}.")
-                data.columns = pd.MultiIndex.from_tuples([(ticker, val.capitalize()) for ticker, val in data.columns])
+                data.columns = pd.MultiIndex.from_tuples([(val[0], val[1].capitalize()) for val in data.columns])
                 await self._write_cache_direct(cache_path, data, provider, params)
                 return data
             else:
@@ -704,9 +707,7 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai
 
     master_dates = [dt.to_pydatetime().date() for dt in all_aligned_data["asset_universe_df"].index]
     sentiment_lookup = {}
-    sentiment_audits = []
     asset_analysis_lookup = {}
-    asset_audits = []
     run_audit_files = []
     if ai_client and config.ai_mode != "off":
         sentiment_lookup, sentiment_audits = await precompute_sentiments(ai_client, master_dates)
@@ -781,12 +782,12 @@ async def main():
     
     from optimizer import Optimizer
     logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
-    start_metrics_server(config.observability。metrics_port)
+    start_metrics_server(config.observability.metrics_port)
 
     ai_client: Optional[AIClient] = None
     if config.gemini_config。enable:
         try:
-            gem_cfg = config.gemini_config。model_dump()
+            gem_cfg = config.gemini_config.model_dump()
             ai_client = MockAIClient(gem_cfg) if gem_cfg['mode'] == 'mock' else GeminiAIClient(gem_cfg)
             logger.info(f"AI Client has been enabled and initialized in '{config.gemini_config。mode}' mode.")
         except Exception as e:
