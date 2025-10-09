@@ -1,7 +1,7 @@
 # Phoenix Project - Final Optimized Version (Phoenix Resurrected)
-# A collaborative masterpiece by Gemini & GPT, guided by our Master.
-# This version features a robust Pydantic configuration, resilient and concurrent data fetching,
-# an intelligent auto-invalidating cache, professional logging, and a comprehensive HTML reporting system.
+# A collaborative masterpiece by Gemini & AI, guided by our Master.
+# This version features a robust Pydantic configuration, resilient and concurrent data fetching
+# with a multi-provider fallback system, an intelligent cache, professional logging, and a comprehensive HTML reporting system.
 
 import time
 import os
@@ -19,6 +19,13 @@ from io import StringIO
 from typing import List, Dict, Optional, Any, Literal
 from pathlib import Path
 
+# --- 新增的库 ---
+import requests
+from alpha_vantage.timeseries import TimeSeries
+from twelvedata import TDClient
+from tiingo import TiingoClient
+# -----------------
+
 from pydantic import BaseModel, Field, field_validator, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pythonjsonlogger import jsonlogger
@@ -34,9 +41,8 @@ import pandas as pd
 import yfinance as yf
 
 
-# --- [Optimized] Configuration Models ---
+# --- [重构] Configuration Models ---
 class GeminiConfig(BaseModel):
-    """Configuration for the Gemini AI Advisor service."""
     enable: bool = False
     mode: Literal["mock", "production"] = "mock"
     api_key_env_var: str
@@ -47,29 +53,42 @@ class GeminiConfig(BaseModel):
     prompts: Dict[str, str]
 
 class ExecutionConfig(BaseModel):
-    """Configuration for the execution model."""
     impact_coefficient: float = Field(..., gt=0)
     max_volume_share: float = Field(..., gt=0, le=1.0)
     min_trade_notional: float = Field(default=1.0, gt=0)
 
 class ObservabilityConfig(BaseModel):
-    """Configuration for observability settings."""
     metrics_port: int = Field(..., gt=1023)
 
 class AuditConfig(BaseModel):
-    """Configuration for audit settings."""
     s3_bucket_name: str
 
 class PositionSizerConfig(BaseModel):
-    """Configuration for the position sizer."""
     method: str
     parameters: Dict[str, Any] = {}
 
 class OptimizerConfig(BaseModel):
-    """Configuration for the Optuna optimizer."""
     study_name: str
     n_trials: int
     parameters: Dict[str, Any]
+
+# --- [新增] Data Source & Network Models ---
+class ProviderConfig(BaseModel):
+    api_key: Optional[str] = None
+
+class ProxyConfig(BaseModel):
+    enabled: bool = False
+    http: Optional[str] = None
+    https: Optional[str] = None
+
+class NetworkConfig(BaseModel):
+    user_agent: Optional[str] = None
+    proxy: ProxyConfig = Field(default_factory=ProxyConfig)
+
+class DataSourcesConfig(BaseModel):
+    priority: List[str]
+    providers: Dict[str, ProviderConfig]
+    network: NetworkConfig
 
 class StrategyConfig(BaseModel):
     """
@@ -93,7 +112,8 @@ class StrategyConfig(BaseModel):
     commission_rate: float = Field(..., ge=0)
     log_level: str
     gemini_config: GeminiConfig
-    ai_mode: Literal["off"， "raw", "processed"] = "processed"
+    data_sources: DataSourcesConfig
+    ai_mode: Literal["off", "raw", "processed"] = "processed"
     walk_forward: Dict[str, Any]
     execution_model: ExecutionConfig
     position_sizer: PositionSizerConfig
@@ -108,136 +128,197 @@ class StrategyConfig(BaseModel):
             raise ValueError('end_date must be strictly after start_date')
         return v
 
-# --- [Optimized] Custom Exception for Data Layer ---
+# --- Custom Exception for Data Layer ---
 class DataFetchError(Exception):
-    """Custom exception for non-retryable data fetching errors."""
     pass
 
-# --- Data Management Layer ---
+# --- [重大重构] Data Management Layer ---
 class DataManager:
-    """
-    Handles all data fetching, caching, and pre-processing with a resilient asynchronous engine.
-    """
     def __init__(self, config: StrategyConfig, cache_dir: str = "data_cache"):
         self.config = config
+        self.ds_config = config.data_sources
         self.cache_dir = cache_dir
         self.logger = logging.getLogger("PhoenixProject.DataManager")
         os.makedirs(self.cache_dir, exist_ok=True)
-        self.logger。info(f"DataManager initialized. Cache directory set to '{self.cache_dir}'.")
+        self.logger.info(f"DataManager initialized. Cache directory: '{self.cache_dir}'.")
+        self.session = self._create_session()
+        self.tiingo_client = self._create_tiingo_client()
 
-    def _generate_cache_filename(self, prefix: str, params: Dict) -> str:
-        param_string = json.dumps(params, sort_keys=True, default=str)
-        param_hash = hashlib.sha256(param_string.encode())。hexdigest()[:16]
-        return f"{prefix}_{param_hash}.parquet"
+    def _create_session(self) -> requests.Session:
+        session = requests.Session()
+        network_config = self.ds_config.network
+        if network_config.user_agent:
+            session.headers['User-Agent'] = network_config.user_agent
+            self.logger.info("Global User-Agent set for all requests.")
+        if network_config.proxy.enabled:
+            proxies = {'http': network_config.proxy.http, 'https': network_config.proxy.https}
+            session.proxies = proxies
+            self.logger.info("Global proxy enabled for all requests.")
+        return session
 
-    async def _write_cache_direct(self, cache_path: str, data: pd.DataFrame | pd.Series, source: str, params: Dict):
-        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
-        try:
-            if isinstance(data, pd.Series):
-                data.to_frame(name=data.name or 'value').reset_index().to_parquet(tmp_path, engine='pyarrow', index=False)
-            else:
-                data.reset_index().to_parquet(tmp_path, engine='pyarrow', index=False)
-            os.替换(tmp_path, cache_path)
-            self.logger.info(f"Saved fresh data to cache: {cache_path}")
-            meta_path = Path(cache_path).with_suffix('.meta.json')
-            param_hash = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
-            metadata = { "params_hash": param_hash, "created_utc": datetime.utcnow().isoformat(), "pandas_version": pd.__version__, "pyarrow_version": pyarrow.__version__, "source": source, "params": {k: str(v) for k, v in params.items()} }
-            with open(meta_path, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, indent=2)
-        except Exception as e:
-            self.logger.error(f"Failed to write cache file {cache_path}: {e}")
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-    async def _fetch_with_cache_async(self, cache_filename: str, source: str, params: Dict, fetch_coro, *args, **kwargs) -> Optional[pd.DataFrame | pd.Series]:
-        cache_path = os.path.join(self.cache_dir, cache_filename)
-        if os.path.exists(cache_path):
-            self.logger.info(f"Loading data from cache: {cache_path}")
-            CACHE_HITS.inc()
-            try:
-                df = pd.read_parquet(cache_path)
-                if 'Date' in df.columns: df = df.set_index('Date')
-                if 'timestamp' in df.columns: df = df.set_index('timestamp')
-                return df.squeeze() if len(df.columns) == 1 else df
-            except Exception as e:
-                self.logger.error(f"Failed to load from cache {cache_path}: {e}. Refetching.")
-        self.logger.info(f"Cache not found for '{cache_filename}'. Fetching fresh data...")
-        CACHE_MISSES.inc()
-        data = await fetch_coro(*args, **kwargs)
-        if data is None or data.empty:
-            self.logger.warning(f"Fetching function for '{cache_filename}' returned no data.")
+    def _create_tiingo_client(self) -> Optional[TiingoClient]:
+        api_key = self.ds_config.providers.get("tiingo", ProviderConfig()).api_key
+        if not api_key or "YOUR_KEY" in api_key:
             return None
-        await self._write_cache_direct(cache_path, data, source, params)
-        return data
+        # Tiingo's client library can accept a pre-configured session
+        tiingo_config = {'api_key': api_key, 'session': self.session}
+        return TiingoClient(tiingo_config)
 
-    def _normalize_yfinance_df(self, df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
-        if not isinstance(df.columns, pd.MultiIndex):
-            if len(tickers) == 1:
-                df.columns = pd.MultiIndex.from_product([df.columns, tickers])
-        return df
+    # --- Individual Data Fetcher Methods ---
 
-    async def async_get_yfinance_data(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        self.logger.info(f"Fetching data for tickers: {tickers} via yfinance...")
+    async def _fetch_from_alpha_vantage(self, tickers: List[str], start: date, end: date) -> Optional[pd.DataFrame]:
+        api_key = self.ds_config.providers.get("alpha_vantage", ProviderConfig()).api_key
+        if not api_key or "YOUR_KEY" in api_key:
+            self.logger.warning("Alpha Vantage API key not provided. Skipping.")
+            return None
+            
+        try:
+            all_dfs = []
+            ts = TimeSeries(key=api_key, output_format='pandas', session=self.session)
+            for ticker in tickers:
+                self.logger.debug(f"Fetching {ticker} from Alpha Vantage...")
+                data, _ = await asyncio.to_thread(ts.get_daily_adjusted, symbol=ticker, outputsize='full')
+                data = data.rename(columns={'1. open': 'Open', '2. high': 'High', '3. low': 'Low', '4. close': 'Close', '6. volume': 'Volume'})
+                data = data[['Open', 'High', 'Low', 'Close', 'Volume']]
+                data.index = pd.to_datetime(data.index)
+                data = data[(data.index.date >= start) & (data.index.date <= end)]
+                data.columns = pd.MultiIndex.from_product([data.columns, [ticker]])
+                all_dfs.append(data)
+                await asyncio.sleep(15) # Respect free tier API limit (5 calls/min)
+            
+            if not all_dfs: return None
+            final_df = pd.concat(all_dfs, axis=1).sort_index()
+            final_df.index.name = 'Date'
+            return final_df
+        except Exception as e:
+            self.logger.error(f"Alpha Vantage fetch failed: {e}")
+            return None
+
+    async def _fetch_from_twelvedata(self, tickers: List[str], start: date, end: date) -> Optional[pd.DataFrame]:
+        api_key = self.ds_config.providers.get("twelvedata", ProviderConfig()).api_key
+        if not api_key or "YOUR_KEY" in api_key:
+            self.logger.warning("Twelve Data API key not provided. Skipping.")
+            return None
+
+        try:
+            td = TDClient(apikey=api_key)
+            all_dfs = []
+            for ticker in tickers:
+                self.logger.debug(f"Fetching {ticker} from Twelve Data...")
+                ts = await asyncio.to_thread(
+                    td.time_series, symbol=ticker, interval="1day",
+                    start_date=start.isoformat(), end_date=end.isoformat(), outputsize=5000
+                )
+                df = ts.as_pandas()
+                df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+                df.columns = pd.MultiIndex.from_product([df.columns, [ticker]])
+                all_dfs.append(df)
+            
+            if not all_dfs: return None
+            final_df = pd.concat(all_dfs, axis=1).sort_index(ascending=False) # API returns newest first
+            final_df.index = pd.to_datetime(final_df.index)
+            final_df.index.name = 'Date'
+            return final_df
+        except Exception as e:
+            self.logger.error(f"Twelve Data fetch failed: {e}")
+            return None
+
+    async def _fetch_from_tiingo(self, tickers: List[str], start: date, end: date) -> Optional[pd.DataFrame]:
+        if not self.tiingo_client:
+            self.logger.warning("Tiingo client not initialized (API key missing). Skipping.")
+            return None
+        
+        try:
+            self.logger.debug(f"Fetching {len(tickers)} tickers from Tiingo...")
+            df = await asyncio.to_thread(
+                self.tiingo_client.get_dataframe, tickers,
+                frequency='daily',
+                startDate=start.isoformat(), endDate=end.isoformat()
+            )
+            df = df.pivot_table(index='date', columns='ticker', values=['open', 'high', 'low', 'close', 'volume'])
+            df = df.swaplevel(0, 1, axis=1).sort_index(axis=1)
+            df.columns = pd.MultiIndex.from_tuples([(ticker, val.capitalize()) for ticker, val in df.columns])
+            df.index = pd.to_datetime(df.index)
+            df.index.name = 'Date'
+            return df
+        except Exception as e:
+            self.logger.error(f"Tiingo fetch failed: {e}")
+            return None
+
+    async def _fetch_from_yfinance(self, tickers: List[str], start: date, end: date) -> Optional[pd.DataFrame]:
+        self.logger.info(f"Attempting fallback to yfinance for tickers: {tickers}...")
         try:
             df = await asyncio.to_thread(
-                yf.download,
-                tickers=tickers,
-                start=start,
-                end=end,
-                auto_adjust=True,
-                progress=False,
-                group_by='ticker'
+                yf.download, tickers=tickers, start=start, end=end,
+                auto_adjust=True, progress=False, group_by='ticker', session=self.session
             )
-            if df.empty:
-                self.logger.warning(f"yfinance returned no data for tickers: {tickers}")
-                return None
-            df = self._normalize_yfinance_df(df, tickers)
-            return df.sort_index()
+            if df.empty: return None
+            
+            if len(tickers) == 1:
+                df.columns = pd.MultiIndex.from_product([df.columns, tickers])
+            
+            df.index.name = 'Date'
+            return df.rename(columns=lambda c: c.capitalize(), level=0)
         except Exception as e:
-            self.logger.error(f"yfinance failed to download data for {tickers}: {e}")
-            raise DataFetchError(f"yfinance download failed for {tickers}: {e}") from e
+            self.logger.error(f"yfinance fallback fetch failed: {e}")
+            return None
 
-    async def get_vix_data(self) -> Optional[pd.Series]:
-        params = {'tickers': ['^VIX'], 'start': self.config.start_date, 'end': self.config.end_date}
-        cache_filename = self._generate_cache_filename("vix_data", params)
-        df = await self._fetch_with_cache_async(cache_filename, "yfinance", params, self.async_get_yfinance_data, **params)
-        return df['Close']['^VIX'] if df is not None and ('Close', '^VIX') in df.columns else None
-
-    async def get_treasury_yield_data(self) -> Optional[pd.Series]:
-        params = {'tickers': ['^TNX'], 'start': self.config.start_date, 'end': self.config.end_date}
-        cache_filename = self._generate_cache_filename("treasury_yield_data", params)
-        df = await self._fetch_with_cache_async(cache_filename, "yfinance", params, self.async_get_yfinance_data, **params)
-        return df['Close']['^TNX'] if df is not None and ('Close', '^TNX') in df.columns else None
-
+    # --- Main Data Orchestration ---
+    
     async def get_asset_universe_data(self) -> Optional[pd.DataFrame]:
         params = {'tickers': sorted(self.config.asset_universe), 'start': self.config.start_date, 'end': self.config.end_date}
         cache_filename = self._generate_cache_filename("asset_universe_data", params)
-        return await self._fetch_with_cache_async(cache_filename, "yfinance", params, self.async_get_yfinance_data, **params)
-
-    async def get_market_breadth_data(self) -> Optional[pd.Series]:
-        params = {'tickers': sorted(self.config.market_breadth_tickers), 'start': self.config.start_date, 'end': self.config.end_date, 'sma': self.config.sma_period}
-        cache_filename = self._generate_cache_filename("market_breadth_indicator", params)
         cache_path = os.path.join(self.cache_dir, cache_filename)
+
         if os.path.exists(cache_path):
-            self.logger.info(f"Loading market breadth Series from cache: {cache_path}")
-            df = pd.read_parquet(cache_path)
-            return df.squeeze()
+            self.logger.info(f"Loading asset universe data from cache: {cache_path}")
+            CACHE_HITS.inc()
+            return pd.read_parquet(cache_path).set_index('Date')
 
-        self.logger.info("Calculating market breadth...")
-        price_params = {k: v for k, v in params.items() if k not in ['sma']}
-        price_cache_filename = self._generate_cache_filename("market_breadth_prices", price_params)
-        all_prices_df_container = await self._fetch_with_cache_async(price_cache_filename, "yfinance", price_params,
-            self.async_get_yfinance_data,
-            tickers=self.config.market_breadth_tickers, start=self.config.start_date, end=self.config.end_date
-        )
+        self.logger.info("Asset universe cache not found. Fetching fresh data from providers...")
+        CACHE_MISSES.inc()
 
-        if all_prices_df_container is None or 'Close' not in all_prices_df_container.columns.get_level_values(0): return None
+        data = None
+        for provider in self.ds_config.priority:
+            self.logger.info(f"--- Attempting data fetch with provider: {provider.upper()} ---")
+            if provider == "alpha_vantage": data = await self._fetch_from_alpha_vantage(**params)
+            elif provider == "twelvedata": data = await self._fetch_from_twelvedata(**params)
+            elif provider == "tiingo": data = await self._fetch_from_tiingo(**params)
+            elif provider == "yfinance": data = await self._fetch_from_yfinance(**params)
+            
+            if data is not None and not data.empty:
+                self.logger.info(f"Successfully fetched data from {provider.upper()}.")
+                data.columns = pd.MultiIndex.from_tuples([(ticker, val.capitalize()) for ticker, val in data.columns])
+                await self._write_cache_direct(cache_path, data, provider, params)
+                return data
+            else:
+                self.logger.warning(f"Provider {provider.upper()} failed to return data. Trying next provider...")
+        
+        self.logger.critical("All data providers failed. Could not fetch asset universe data.")
+        return None
+
+    async def get_vix_data(self) -> Optional[pd.Series]:
+        df = await self._fetch_from_yfinance(['^VIX'], self.config.start_date, self.config.end_date)
+        return df['Close']['^VIX'] if df is not None and not df.empty else None
+
+    async def get_treasury_yield_data(self) -> Optional[pd.Series]:
+        df = await self._fetch_from_yfinance(['^TNX'], self.config.start_date, self.config.end_date)
+        return df['Close']['^TNX'] if df is not None and not df.empty else None
+    
+    async def get_market_breadth_data(self) -> Optional[pd.Series]:
+        params = {'tickers': sorted(self.config.market_breadth_tickers), 'start': self.config.start_date, 'end': self.config.end_date}
+        all_prices_df_container = await self._fetch_from_yfinance(**params)
+        
+        if all_prices_df_container is None or 'Close' not in all_prices_df_container.columns.get_level_values(0):
+            self.logger.warning("Could not fetch market breadth data.")
+            return None
+        
         all_prices_df = all_prices_df_container['Close']
         smas = all_prices_df.rolling(window=self.config.sma_period).mean()
         is_above_sma = all_prices_df > smas
         breadth_series = (is_above_sma.sum(axis=1) / all_prices_df.notna().sum(axis=1)).fillna(0)
         breadth_series.name = 'market_breadth_indicator'
-        await self._write_cache_direct(cache_path, breadth_series, source="computed_market_breadth", params=params)
         return breadth_series
 
     async def get_aligned_data(self) -> Optional[Dict[str, pd.DataFrame | pd.Series]]:
@@ -254,16 +335,36 @@ class DataManager:
         data_streams = dict(zip(tasks.keys(), results))
         sanitized_streams = {}
         for name, series in data_streams.items():
-            if series is not None:
-                 aligned_series = series.reindex(master_index)
-                 sanitized_streams[name] = aligned_series.ffill().bfill()
-                 if sanitized_streams[name].isnull().any(): self.logger.warning(f"{name} data still contains NaNs after sanitization.")
+            if series is not None and not series.empty:
+                 aligned_series = series.reindex(master_index).ffill().bfill()
+                 sanitized_streams[name] = aligned_series
+                 if aligned_series.isnull().any(): self.logger.warning(f"{name} data still contains NaNs after sanitization.")
             else:
-                 sanitized_streams[name] = pd.Series(index=master_index, dtype=float).fillna(0)
+                 sanitized_streams[name] = pd.Series(0, index=master_index, dtype=float)
                  self.logger.warning(f"Data for '{name}' could not be fetched. Using a series of zeros.")
 
         self.logger.info("--- Data alignment and sanitization complete ---")
         return {"asset_universe_df": asset_df, **sanitized_streams}
+    
+    def _generate_cache_filename(self, prefix: str, params: Dict) -> str:
+        param_string = json.dumps(params, sort_keys=True, default=str)
+        param_hash = hashlib.sha256(param_string.encode()).hexdigest()[:16]
+        return f"{prefix}_{param_hash}.parquet"
+
+    async def _write_cache_direct(self, cache_path: str, data: pd.DataFrame | pd.Series, source: str, params: Dict):
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+        try:
+            data.reset_index().to_parquet(tmp_path, engine='pyarrow', index=False)
+            os.replace(tmp_path, cache_path)
+            self.logger.info(f"Saved fresh data to cache: {cache_path}")
+            meta_path = Path(cache_path).with_suffix('.meta.json')
+            param_hash = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
+            metadata = { "params_hash": param_hash, "created_utc": datetime.utcnow().isoformat(), "source": source, "params": {k: str(v) for k, v in params.items()} }
+            with open(meta_path, 'w', encoding='utf-8') as f: json.dump(metadata, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Failed to write cache file {cache_path}: {e}")
+            if os.path.exists(tmp_path): os.remove(tmp_path)
+
 
 # --- Cognitive Engine Layer ---
 class CognitiveEngine:
@@ -414,40 +515,40 @@ class RomanLegionStrategy(bt.Strategy):
         self.breadth_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.market_breadth_data.items()}
 
     def start(self):
-        self.logger。info(f"{self.datas[0]。datetime。date(0)。isoformat()}: [Legion Commander]: Awaiting daily orders...")
+        self.logger.info(f"{self.datas[0].datetime.date(0).isoformat()}: [Legion Commander]: Awaiting daily orders...")
 
-    def 下一处(self):
+    def next(self):
         if len(self.datas[0]) < self.config.sma_period: return
         current_date = self.datas[0].datetime.date(0)
-        self.logger。info(f"--- {current_date.isoformat()}: Daily Rebalancing Briefing ---")
+        self.logger.info(f"--- {current_date.isoformat()}: Daily Rebalancing Briefing ---")
         current_vix = self.vix_lookup.get(current_date)
         current_yield = self.yield_lookup.get(current_date)
         current_breadth = self.breadth_lookup.get(current_date)
         if current_vix is None:
             self.logger.warning(f"Critical data VIX missing for {current_date}, halting for the day.")
             return
-        self.logger。info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f if current_yield else 'N/A'}%, Market Breadth: {current_breadth:.2% if current_breadth else 'N/A'}")
+        self.logger.info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f if current_yield else 'N/A'}%, Market Breadth: {current_breadth:.2% if current_breadth else 'N/A'}")
         candidate_analysis = [{
             "ticker": ticker,
-            "opportunity_score": self.cognitive_engine。calculate_opportunity_score(
+            "opportunity_score": self.cognitive_engine.calculate_opportunity_score(
                 d.close[0], self.sma_indicators[ticker][0], self.rsi_indicators[ticker][0])
-        } for ticker, d 在 self.data_map。items()]
+        } for ticker, d in self.data_map.items()]
 
-        battle_plan = self.cognitive_engine。determine_allocations(candidate_analysis, current_vix, current_date)
+        battle_plan = self.cognitive_engine.determine_allocations(candidate_analysis, current_vix, current_date)
         self.execution_model.rebalance(self, battle_plan)
 
     def notify_order(self, order):
-        if order.status 在 [order.Completed]:
+        if order.status in [order.Completed]:
             TRADES_EXECUTED.inc()
             dt = self.datas[0].datetime.date(0).isoformat()
             if order.isbuy(): self.logger.info(f"{dt}: BUY EXECUTED, {order.data._name}, Size: {order.executed.size}, Price: {order.executed.price:.2f}")
             elif order.issell(): self.logger.info(f"{dt}: SELL EXECUTED, {order.data._name}, Size: {order.executed.size}, Price: {order.executed.price:.2f}")
-        elif order.status 在 [order.Canceled, order.Margin, order.Rejected]:
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.logger.warning(f"{self.datas[0].datetime.date(0).isoformat()}: Order for {order.data._name} failed: {order.getstatusname()}")
 
 # --- Reporting Engine ---
 async def generate_ai_report(ai_client: Optional[AIClient], context: Dict) -> tuple[str | None, str | None]:
-    if not ai_client: return 无, None
+    if not ai_client: return None, None
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating AI Marshal's Report...")
     try:
@@ -461,22 +562,22 @@ async def generate_ai_report(ai_client: Optional[AIClient], context: Dict) -> tu
 async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, ai_client: Optional[AIClient] = None, audit_files: List[str] = None, report_filename="phoenix_report.html"):
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating HTML after-action report...")
-    trade_analyzer = getattr(strat.analyzers, 'trade_analyzer'， 无)
+    trade_analyzer = getattr(strat.analyzers, 'trade_analyzer', None)
     ta = trade_analyzer.get_analysis() if trade_analyzer else {}
-    total_trades = ta.get('total', {})。get('total', 0)
+    total_trades = ta.get('total', {}).get('total', 0)
     winning_trades = ta.get('won', {}).get('total', 0)
-    losing_trades = ta.get('lost'， {}).get('total', 0)
+    losing_trades = ta.get('lost', {}).get('total', 0)
     win_rate = (winning_trades / total_trades) if total_trades > 0 else 0.0
-    sharpe_analyzer = getattr(strat.analyzers, 'sharpe_ratio', 无)
+    sharpe_analyzer = getattr(strat.analyzers, 'sharpe_ratio', None)
     sharpe_analysis = sharpe_analyzer.get_analysis() if sharpe_analyzer else {}
-    sharpe_ratio = sharpe_analysis.get('sharperatio'， 无)
+    sharpe_ratio = sharpe_analysis.get('sharperatio', None)
     returns_analyzer = getattr(strat.analyzers, 'returns', None)
     returns_analysis = returns_analyzer.get_analysis() if returns_analyzer else {}
-    drawdown_analyzer = getattr(strat.analyzers, 'drawdown'， 无)
+    drawdown_analyzer = getattr(strat.analyzers, 'drawdown', None)
     dd_analysis = drawdown_analyzer.get_analysis() if drawdown_analyzer else {}
     context = {
-        "final_value": cerebro.broker.getvalue()， "total_return": returns_analysis.get('rtot', 0.0)，
-        "sharpe_ratio": sharpe_ratio, "max_drawdown": dd_analysis.get('max'， {})。get('drawdown'， 0.0)，
+        "final_value": cerebro.broker.getvalue(), "total_return": returns_analysis.get('rtot', 0.0),
+        "sharpe_ratio": sharpe_ratio, "max_drawdown": dd_analysis.get('max', {}).get('drawdown', 0.0),
         "total_trades": total_trades, "winning_trades": winning_trades, "losing_trades": losing_trades, "win_rate": win_rate, "report_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "plot_filename": "phoenix_plot.png"
     }
     context['ai_summary_report'], summary_audit_file = await generate_ai_report(ai_client, context)
@@ -494,7 +595,7 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
         else: raise RuntimeError("Cerebro plot returned no figures.")
     except Exception as e:
         logger.error(f"Failed to save plot: {e}")
-        context['plot_filename'] = 无
+        context['plot_filename'] = None
     try:
         env = Environment(loader=FileSystemLoader('.'))
         template = env.get_template("report_template.html")
@@ -616,9 +717,9 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai
     try:
         all_data_df = all_aligned_data["asset_universe_df"]
         if all_data_df is None or all_data_df.empty: raise ValueError("Asset universe data is empty.")
-        unique_tickers = all_data_df.columns.get_level_values(1).unique()
+        unique_tickers = all_data_df.columns.get_level_values(0).unique()
         for ticker in unique_tickers:
-            ticker_df = all_data_df.xs(ticker, level=1, axis=1).copy()
+            ticker_df = all_data_df[ticker].copy()
             ticker_df.columns = [col.lower() for col in ticker_df.columns]
             ticker_df.dropna(inplace=True)
             if not ticker_df.empty:
@@ -680,7 +781,7 @@ async def main():
     
     from optimizer import Optimizer
     logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
-    start_metrics_server(config.observability.metrics_port)
+    start_metrics_server(config.observability。metrics_port)
 
     ai_client: Optional[AIClient] = None
     if config.gemini_config。enable:
