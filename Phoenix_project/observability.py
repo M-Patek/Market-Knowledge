@@ -22,6 +22,23 @@ AI_CALL_LATENCY = Histogram(
     buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 90.0, float("inf")]
 )
 
+# Data Provider Metrics
+PROVIDER_REQUESTS_TOTAL = Counter(
+    "phoenix_provider_requests_total",
+    "Total number of requests to a data provider.",
+    ["provider"]
+)
+PROVIDER_ERRORS_TOTAL = Counter(
+    "phoenix_provider_errors_total",
+    "Total number of errors from a data provider.",
+    ["provider"]
+)
+PROVIDER_LATENCY_SECONDS = Histogram(
+    "phoenix_provider_latency_seconds",
+    "Latency of requests to a data provider.",
+    ["provider"]
+)
+
 # Backtest Execution Metrics
 BACKTEST_DURATION = Gauge(
     "phoenix_backtest_duration_seconds",
