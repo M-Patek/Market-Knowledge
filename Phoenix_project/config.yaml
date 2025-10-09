@@ -71,6 +71,33 @@ gemini_config:
       回测数据:
       {metrics}
 
+# [Refactored] Data Sources & Network Configuration
+data_sources:
+    priority:
+      - "alpha_vantage"
+      - "twelvedata"
+      - "tiingo"
+      - "yfinance" # Fallback provider
+    providers:
+      alpha_vantage:
+        api_key_env_var: "ALPHA_VANTAGE_API_KEY"
+      twelvedata:
+        api_key_env_var: "TWELVEDATA_API_KEY"
+      tiingo:
+        api_key_env_var: "TIINGO_API_KEY"
+    network:
+      user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+      proxy:
+        enabled: false
+        http: null
+        https: null
+      request_timeout: 30 # Seconds to wait for a provider response
+      retry_attempts: 3 # Number of retry attempts on failure
+      retry_backoff_factor: 2 # Exponential backoff factor for retries
+    health_probes:
+      failure_threshold: 3 # Number of consecutive failures before cooldown
+      cooldown_minutes: 15 # Time in minutes to disable a failing provider
+
 # 6. Execution & Experimentation Settings
 ai_mode: "processed"
 max_total_allocation: 0.95
@@ -87,6 +114,7 @@ walk_forward:
 execution_model:
   impact_coefficient: 0.1     # Price impact constant for slippage model
   max_volume_share: 0.25      # Max % of a bar's volume an order can consume
+  min_trade_notional: 1.0     # Minimum trade notional value
 
 # 9. Position Sizing Settings
 position_sizer:
