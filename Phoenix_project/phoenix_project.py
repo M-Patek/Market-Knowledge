@@ -34,24 +34,20 @@ from sizing.base import IPositionSizer
 from sizing.fixed_fraction import FixedFractionSizer
 from execution_model import VolumeShareSlippageModel
 from audit_manager import archive_logs_to_s3
+from ai.evidence_fusion import EvidenceFusionEngine, FusedResponseModel
 from observability import (BACKTEST_DURATION, TRADES_EXECUTED, start_metrics_server, CACHE_HITS, CACHE_MISSES,
                            PROVIDER_REQUESTS_TOTAL, PROVIDER_ERRORS_TOTAL, PROVIDER_LATENCY_SECONDS)
-from ai.client import AIClient, GeminiAIClient, MockAIClient, MalformedResponseError
+from ai.client import EnsembleAIClient
+from ai.prompt_renderer import render_prompt
 import backtrader as bt
 import pandas as pd
 import yfinance as yf
 
 
 # --- [Refactored] Configuration Models ---
-class GeminiConfig(BaseModel):
-    enable: bool = False
-    mode: Literal["mock", "production"] = "mock"
-    api_key_env_var: str
-    model_name: str
-    request_timeout: int = 90
-    audit_log_retention_days: int = 30
-    max_concurrent_requests: int = 5
-    prompts: Dict[str, str]
+class AIEnsembleConfig(BaseModel):
+    enable: bool
+    config_file_path: str
 
 class ExecutionConfig(BaseModel):
     impact_coefficient: float = Field(..., gt=0)
@@ -116,7 +112,7 @@ class StrategyConfig(BaseModel):
     initial_cash: float = Field(..., gt=0)
     commission_rate: float = Field(..., ge=0)
     log_level: str
-    gemini_config: GeminiConfig
+    ai_ensemble_config: AIEnsembleConfig
     data_sources: DataSourcesConfig
     ai_mode: Literal["off", "raw", "processed"] = "processed"
     walk_forward: Dict[str, Any]
@@ -458,7 +454,7 @@ class DataManager:
 
 # --- Cognitive Engine Layer ---
 class CognitiveEngine:
-    def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[date, float]] = None, asset_analysis_data: Optional[Dict[date, Dict]] = None, ai_mode: str = "processed"):
+    def __init__(self, config: StrategyConfig, asset_analysis_data: Optional[Dict[date, Dict]] = None, sentiment_data: Optional[Dict[date, float]] = None, ai_mode: str = "processed"):
         self.config = config
         self.logger = logging.getLogger("PhoenixProject.CognitiveEngine")
         self.risk_manager = RiskManager(config, sentiment_data)
@@ -559,16 +555,18 @@ class PortfolioConstructor:
         self.logger.info("PortfolioConstructor is identifying high-quality opportunities...")
         adjusted_candidates = []
         daily_asset_analysis = self.asset_analysis_data.get(current_date, {})
+        
         for candidate in candidate_analysis:
             ticker = candidate["ticker"]
             original_score = candidate["opportunity_score"]
             final_factor = 1.0
             confidence = 0.0
-            if self.mode in ["raw", "processed"]:
-                raw_analysis = daily_asset_analysis.get(ticker, {})
-                reported_factor, confidence = self._sanitize_ai_output(raw_analysis)
-                if self.mode == "raw": final_factor = reported_factor
-                else: final_factor = self._effective_factor(ticker, reported_factor, confidence)
+            
+            if self.mode != 'off':
+                fused_response_data = daily_asset_analysis.get(ticker)
+                if fused_response_data:
+                    final_factor = fused_response_data.get('final_factor', 1.0)
+                    confidence = 1.0 - fused_response_data.get('dispersion', 1.0) # Use dispersion as an inverse proxy for confidence
             adjusted_score = candidate["opportunity_score"] * final_factor
             adjusted_candidates.append({**candidate, "adjusted_score": adjusted_score, "ai_factor": final_factor, "ai_confidence": confidence})
             if final_factor != 1.0 and self.mode != 'off': self.logger.info(f"AI Insight for {ticker} (Mode: {self.mode}): Conf={confidence:.2f}, FinalFactor={final_factor:.3f}. Score: {original_score:.2f} -> {adjusted_score:.2f}")
@@ -596,7 +594,7 @@ class RomanLegionStrategy(bt.Strategy):
             max_volume_share=self.config.execution_model.max_volume_share,
             min_trade_notional=self.config.execution_model.min_trade_notional
         )
-        self.cognitive_engine = CognitiveEngine(self.config, self.p.sentiment_data, self.p.asset_analysis_data, ai_mode=self.config.ai_mode)
+        self.cognitive_engine = CognitiveEngine(self.config, self.p.asset_analysis_data, sentiment_data=self.p.sentiment_data, ai_mode=self.config.ai_mode)
         self.data_map = {d._name: d for d in self.datas}
         self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.config.sma_period) for d in self.datas}
         self.rsi_indicators = {d._name: bt.indicators.RSI(d.close, period=self.config.rsi_period) for d in self.datas}
@@ -637,19 +635,7 @@ class RomanLegionStrategy(bt.Strategy):
             self.logger.warning(f"{self.datas[0].datetime.date(0).isoformat()}: Order for {order.data._name} failed: {order.getstatusname()}")
 
 # --- Reporting Engine ---
-async def generate_ai_report(ai_client: Optional[AIClient], context: Dict) -> tuple[str | None, str | None]:
-    if not ai_client: return None, None
-    logger = logging.getLogger("PhoenixProject.ReportGenerator")
-    logger.info("Generating AI Marshal's Report...")
-    try:
-        report_text, audit_path = await ai_client.generate_summary_report(context)
-        logger.info("Successfully generated AI Marshal's Report.")
-        return report_text, audit_path
-    except Exception as e:
-        logger.error(f"Failed to generate AI report: {e}")
-        return "## Marshal's Debriefing Failed ##\n\nAn error occurred during communication with the AI Command. The quantitative report below remains accurate.", None
-
-async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, ai_client: Optional[AIClient] = None, audit_files: List[str] = None, report_filename="phoenix_report.html"):
+async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, audit_files: List[str] = None, report_filename="phoenix_report.html"):
     logger = logging.getLogger("PhoenixProject.ReportGenerator")
     logger.info("Generating HTML after-action report...")
     trade_analyzer = getattr(strat.analyzers, 'trade_analyzer', None)
@@ -670,10 +656,10 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
         "sharpe_ratio": sharpe_ratio, "max_drawdown": dd_analysis.get('max', {}).get('drawdown', 0.0),
         "total_trades": total_trades, "winning_trades": winning_trades, "losing_trades": losing_trades, "win_rate": win_rate, "report_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "plot_filename": "phoenix_plot.png"
     }
-    context['ai_summary_report'], summary_audit_file = await generate_ai_report(ai_client, context)
+    context['ai_summary_report'] = "Ensemble analysis complete. Review audit logs for detailed AI interactions."
     
     all_audit_files = audit_files or []
-    if summary_audit_file: all_audit_files.append(os.path.basename(summary_audit_file))
+    # if summary_audit_file: all_audit_files.append(os.path.basename(summary_audit_file))
     context['audit_files'] = sorted(list(set(all_audit_files)))
     try:
         plot_path = Path(report_filename).with_suffix('.png')
@@ -695,111 +681,76 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
     except Exception as e: logger.error(f"Failed to generate HTML report: {e}")
 
 # --- AI Pre-computation Helpers ---
-def fetch_mock_news_for_date(date_obj: date) -> List[str]:
-    base_headlines = ["Global markets show mixed signals...", "Tech sector rally continues...", "New geopolitical tensions...", "Federal Reserve hints at a more hawkish stance..."]
-    if date_obj.weekday() == 0: base_headlines.append("Weekend uncertainty weighs on market open.")
-    elif date_obj.weekday() == 4: base_headlines.append("Positive jobs report boosts investor confidence.")
-    random.shuffle(base_headlines)
-    return base_headlines[:3]
+def fetch_mock_docs_for_ticker(ticker: str) -> List[Dict[str, Any]]:
+    # In a real system, this would be a sophisticated RAG pipeline
+    return [
+        {
+            "id": f"NEWS-{ticker}-1",
+            "content": f"'{ticker}' shows strong performance in recent quarter. Analyst consensus is 'Buy'."
+        }
+    ]
 
-async def precompute_sentiments(ai_client: AIClient, dates: List[date]) -> tuple[Dict[date, float], List[str]]:
-    logger = logging.getLogger("PhoenixProject.SentimentPrecomputer")
-    cache_file = Path("data_cache") / "sentiment_cache.json"    
-    cached_sentiments_str = {}
-    if cache_file.exists():        
-        logger.info(f"Found sentiment cache file: {cache_file}")
-        try:
-            with open(cache_file, 'r') as f: cached_sentiments_str = json.load(f)
-        except json.JSONDecodeError:
-            logger.warning(f"Cache file {cache_file} is corrupted. Re-computing all sentiments.")
-            cached_sentiments_str = {}
-
-    cached_dates = {date.fromisoformat(k) for k in cached_sentiments_str.keys()}
-    required_dates = set(dates)
-    missing_dates = sorted(list(required_dates - cached_dates))
-    all_audit_files = []
-    if missing_dates:
-        logger.info(f"Sentiment cache miss for {len(missing_dates)} days. Fetching incrementally...")
-        semaphore = getattr(ai_client, 'semaphore', None)
-        async def fetch_single_sentiment(date_obj: date, sem: asyncio.Semaphore | None):
-            async with sem if sem else asyncio.Semaphore():
-                try:
-                    mock_headlines = fetch_mock_news_for_date(date_obj)
-                    analysis, audit_path = await ai_client.get_market_sentiment(mock_headlines)
-                    logger.info(f"Sentiment for {date_obj.isoformat()}: {analysis.get('sentiment_score', 0.0):.2f}")
-                    return date_obj, analysis.get('sentiment_score', 0.0), audit_path
-                except (MalformedResponseError, Exception) as e:
-                    logger.error(f"Could not compute sentiment for {date_obj.isoformat()}: {e}. Defaulting to neutral (0.0).")
-                    return date_obj, 0.0, None
-
-        tasks = [fetch_single_sentiment(date_obj, semaphore) for date_obj in missing_dates]
-        new_results = await asyncio.gather(*tasks)
-
-        for d, score, audit_path in new_results:
-            if d: cached_sentiments_str[d.isoformat()] = score
-            if audit_path: all_audit_files.append(os.path.basename(audit_path))
-
-        with open(cache_file, 'w') as f: json.dump(cached_sentiments_str, f, indent=2)
-        logger.info(f"Updated and saved sentiment cache to: {cache_file}")
-    else:
-        logger.info("Sentiment cache is fully populated. No new data needed.")
-    return {dt: cached_sentiments_str[dt.isoformat()] for dt in required_dates}, all_audit_files
-
-async def precompute_asset_analyses(ai_client: AIClient, dates: List[date], asset_universe: List[str]) -> tuple[Dict[date, Dict], List[str]]:
+async def precompute_asset_analyses(
+    ensemble_client: EnsembleAIClient,
+    fusion_engine: EvidenceFusionEngine,
+    dates: List[date],
+    asset_universe: List[str]
+) -> Dict[date, Dict]:
     logger = logging.getLogger("PhoenixProject.AssetAnalysisPrecomputer")
     cache_file = Path("data_cache") / "asset_analysis_cache.json"
     cached_data_str = {}
     if cache_file.exists():
         logger.info(f"Found asset analysis cache file: {cache_file}")
         try:
-            with open(cache_file, 'r') as f: cached_data_str = json.load(f)
+            with open(cache_file, 'r') as f:
+                cached_data_str = json.load(f)
         except json.JSONDecodeError:
             logger.warning(f"Cache file {cache_file} is corrupted. Re-computing all asset analyses.")
             cached_data_str = {}
+    
     cached_dates = {date.fromisoformat(k) for k in cached_data_str.keys()}
     required_dates = set(dates)
     missing_dates = sorted(list(required_dates - cached_dates))
-    all_audit_files = []
+    
     if missing_dates:
         logger.info(f"Asset analysis cache miss for {len(missing_dates)} days. Fetching incrementally...")
-        semaphore = getattr(ai_client, 'semaphore', None)
-        async def fetch_single_analysis(date_obj: date, sem: asyncio.Semaphore | None):
-            async with sem if sem else asyncio.Semaphore():
-                try:
-                    daily_batch_analysis, audit_path = await ai_client.get_batch_asset_analysis(asset_universe, date_obj)
-                    logger.info(f"Successfully computed batch analysis for {date_obj.isoformat()}.")
-                    return date_obj, daily_batch_analysis, audit_path
-                except Exception as e:
-                    logger.error(f"Could not compute batch analysis for {date_obj.isoformat()}: {e}. Defaulting all tickers to neutral for this day.")
-                    default_analysis = {ticker: {"adjustment_factor": 1.0, "confidence": 0.0, "reasoning": "Batch computation failed"} for ticker in asset_universe}
-                    return date_obj, default_analysis, None
 
-        tasks = [fetch_single_analysis(date_obj, semaphore) for date_obj in missing_dates]
+        async def fetch_and_fuse_for_date(date_obj: date):
+            daily_fused_results = {}
+            for ticker in asset_universe:
+                mock_docs = fetch_mock_docs_for_ticker(ticker)
+                
+                ensemble_responses = await ensemble_client.get_ensemble_asset_analysis(ticker, mock_docs)
+                fused_response = fusion_engine.fuse(ensemble_responses)
+                
+                # Store a serializable version of the FusedResponse
+                daily_fused_results[ticker] = fused_response.dict()
+            
+            return date_obj, daily_fused_results
+
+        tasks = [fetch_and_fuse_for_date(d) for d in missing_dates]
         new_results = await asyncio.gather(*tasks)
 
-        for d, analysis, audit_path in new_results:
-            if d: cached_data_str[d.isoformat()] = analysis
-            if audit_path: all_audit_files.append(os.path.basename(audit_path))
+        for d, analysis in new_results:
+            if d:
+                cached_data_str[d.isoformat()] = analysis
 
-        with open(cache_file, 'w') as f: json.dump(cached_data_str, f)
+        with open(cache_file, 'w') as f: json.dump(cached_data_str, f, default=str) # Use default=str for datetime
         logger.info(f"Updated and saved asset analysis cache to: {cache_file}")
     else:
         logger.info("Asset analysis cache is fully populated. No new data needed.")
-    return {dt: cached_data_str[dt.isoformat()] for dt in required_dates}, all_audit_files
+
+    return {date.fromisoformat(dt_str): analysis for dt_str, analysis in cached_data_str.items() if date.fromisoformat(dt_str) in required_dates}
 
 # --- Main Execution Engine ---
-async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai_client: Optional[AIClient] = None):
+async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ensemble_client: Optional[EnsembleAIClient] = None, fusion_engine: Optional[EvidenceFusionEngine] = None):
     logger = logging.getLogger("PhoenixProject")
     logger.info(f"--- Launching 'Phoenix Project' in SINGLE BACKTEST mode (AI: {config.ai_mode.upper()}) ---")
 
     master_dates = [dt.to_pydatetime().date() for dt in all_aligned_data["asset_universe_df"].index]
-    sentiment_lookup = {}
     asset_analysis_lookup = {}
-    run_audit_files = []
-    if ai_client and config.ai_mode != "off":
-        sentiment_lookup, sentiment_audits = await precompute_sentiments(ai_client, master_dates)
-        asset_analysis_lookup, asset_audits = await precompute_asset_analyses(ai_client, master_dates, config.asset_universe)
-        run_audit_files.extend(sentiment_audits + asset_audits)
+    if ensemble_client and fusion_engine and config.ai_mode != "off":
+        asset_analysis_lookup = await precompute_asset_analyses(ensemble_client, fusion_engine, master_dates, config.asset_universe)
 
     cerebro = bt.Cerebro()
     try:
@@ -824,7 +775,7 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai
     cerebro.addstrategy(
         RomanLegionStrategy, config=config, vix_data=all_aligned_data["vix"],
         treasury_yield_data=all_aligned_data["treasury_yield"], market_breadth_data=all_aligned_data["market_breadth"],
-        sentiment_data=sentiment_lookup, asset_analysis_data=asset_analysis_lookup
+        sentiment_data={}, asset_analysis_data=asset_analysis_lookup
     )
     cerebro.broker.setcash(config.initial_cash)
     cerebro.broker.setcommission(commission=config.commission_rate)
@@ -835,7 +786,7 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ai
 
     results = cerebro.run()
     strat = results[0]
-    await generate_html_report(cerebro, strat, ai_client, run_audit_files, report_filename=f"phoenix_report_{config.ai_mode}_single.html")
+    await generate_html_report(cerebro, strat, report_filename=f"phoenix_report_{config.ai_mode}_single.html")
 
 async def main():
     try:
@@ -855,13 +806,13 @@ async def main():
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
     logger = logging.getLogger("PhoenixProject")
     logger.setLevel(log_level)
-    logger.handlers。clear()
+    logger.handlers.clear()
 
     formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(run_id)s %(message)s')
     log_dir = "logs"; os.makedirs(log_dir, exist_ok=True)
     log_filename = f"phoenix_project_{datetime.当前()。strftime('%Y%m%d')}.log"
     stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter)
-    file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(os.path。join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
 
     for handler in [stream_handler, file_handler]:
         handler.addFilter(RunIdFilter())
@@ -869,16 +820,18 @@ async def main():
     
     from optimizer import Optimizer
     logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
-    start_metrics_server(config.observability.metrics_port)
+    start_metrics_server(config.observability。metrics_port)
 
-    ai_client: Optional[AIClient] = None
-    if config.gemini_config。enable:
+    ensemble_client: Optional[EnsembleAIClient] = None
+    fusion_engine: Optional[EvidenceFusionEngine] = None
+
+    if config.ai_ensemble_config。enable:
         try:
-            gem_cfg = config.gemini_config。model_dump()
-            ai_client = MockAIClient(gem_cfg) if gem_cfg['mode'] == 'mock' else GeminiAIClient(gem_cfg)
-            logger.info(f"AI Client has been enabled and initialized in '{config.gemini_config.mode}' mode.")
+            ensemble_config_path = config.ai_ensemble_config。config_file_path
+            fusion_engine = EvidenceFusionEngine(config_file_path=ensemble_config_path)
+            ensemble_client = EnsembleAIClient(config_file_path=ensemble_config_path, run_id=run_id)
         except Exception as e:
-            logger.error(f"Failed to initialize AI Client: {e}. Continuing without AI features.")
+            logger.error(f"Failed to initialize AI Ensemble: {e}. Continuing without AI features.")
 
     start_time = time.time()
     try:
@@ -889,10 +842,10 @@ async def main():
             return
 
         if config.walk_forward.get('enabled', False):
-            optimizer = Optimizer(config, all_aligned_data, ai_client)
+            optimizer = Optimizer(config, all_aligned_data, ai_client=None) # TODO: Update optimizer to handle new AI structure
             optimizer.run_optimization()
         else:
-            await run_single_backtest(config, all_aligned_data, ai_client)
+            await run_single_backtest(config, all_aligned_data, ensemble_client, fusion_engine)
     finally:
         duration = time.time() - start_time
         BACKTEST_DURATION.set(duration)
@@ -905,3 +858,4 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+
