@@ -34,7 +34,8 @@ from sizing.base import IPositionSizer
 from sizing.fixed_fraction import FixedFractionSizer
 from execution_model import VolumeShareSlippageModel
 from audit_manager import archive_logs_to_s3
-from observability import BACKTEST_DURATION, TRADES_EXECUTED, start_metrics_server, CACHE_HITS, CACHE_MISSES
+from observability import (BACKTEST_DURATION, TRADES_EXECUTED, start_metrics_server, CACHE_HITS, CACHE_MISSES,
+                           PROVIDER_REQUESTS_TOTAL, PROVIDER_ERRORS_TOTAL, PROVIDER_LATENCY_SECONDS)
 from ai.client import AIClient, GeminiAIClient, MockAIClient, MalformedResponseError
 import backtrader as bt
 import pandas as pd
@@ -74,7 +75,7 @@ class OptimizerConfig(BaseModel):
 
 # --- [新增] Data Source & Network Models ---
 class ProviderConfig(BaseModel):
-    api_key: Optional[str] = None
+    api_key_env_var: Optional[str] = None
 
 class ProxyConfig(BaseModel):
     enabled: bool = False
@@ -84,11 +85,19 @@ class ProxyConfig(BaseModel):
 class NetworkConfig(BaseModel):
     user_agent: Optional[str] = None
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
+    request_timeout: int = 30
+    retry_attempts: int = 3
+    retry_backoff_factor: int = 2
+
+class HealthProbesConfig(BaseModel):
+    failure_threshold: int
+    cooldown_minutes: int
 
 class DataSourcesConfig(BaseModel):
     priority: List[str]
     providers: Dict[str, ProviderConfig]
     network: NetworkConfig
+    health_probes: HealthProbesConfig
 
 class StrategyConfig(BaseModel):
     start_date: date
@@ -137,6 +146,10 @@ class DataManager:
         self.logger = logging.getLogger("PhoenixProject.DataManager")
         os.makedirs(self.cache_dir, exist_ok=True)
         self.logger.info(f"DataManager initialized. Cache directory: '{self.cache_dir}'.")
+        self._provider_health = {
+            provider: {"failures": 0, "cooldown_until": None}
+            for provider in self.ds_config.priority
+        }
         self.session = self._create_session()
         self.tiingo_client = self._create_tiingo_client()
 
@@ -153,23 +166,48 @@ class DataManager:
         return session
 
     def _create_tiingo_client(self) -> Optional[TiingoClient]:
-        api_key = self.ds_config.providers.get("tiingo", ProviderConfig()).api_key
-        if not api_key or "YOUR_KEY" in api_key:
+        env_var = self.ds_config.providers.get("tiingo", ProviderConfig()).api_key_env_var
+        if not env_var: return None
+        api_key = os.getenv(env_var)
+        if not api_key:
+            self.logger.warning(f"Tiingo API key env var '{env_var}' not set. Skipping.")
             return None
         return TiingoClient({'api_key': api_key, 'session': self.session})
 
-    # --- Individual Data Fetcher Methods ---
+    def _is_provider_healthy(self, provider: str) -> bool:
+        health = self._provider_health.get(provider)
+        if not health:
+            return True # Assume healthy if not tracked
+        if health["cooldown_until"] and datetime.utcnow() < health["cooldown_until"]:
+            self.logger.warning(f"Provider '{provider}' is in cooldown until {health['cooldown_until'].isoformat()}Z. Skipping.")
+            return False
+        return True
 
+    def _record_provider_failure(self, provider: str):
+        health = self._provider_health[provider]
+        health["failures"] += 1
+        if health["failures"] >= self.ds_config.health_probes.failure_threshold:
+            cooldown = timedelta(minutes=self.ds_config.health_probes.cooldown_minutes)
+            health["cooldown_until"] = datetime.utcnow() + cooldown
+            self.logger.critical(f"Provider '{provider}' exceeded failure threshold. Placing it in cooldown for {cooldown.total_seconds()/60} minutes.")
+
+    def _record_provider_success(self, provider: str):
+        self._provider_health[provider]["failures"] = 0
+        self._provider_health[provider]["cooldown_until"] = None
+
+    # --- Individual Data Fetcher Methods ---
+    @retry(wait=wait_exponential(multiplier=2, min=2, max=30), stop=stop_after_attempt(3))
     async def _fetch_from_alpha_vantage(self, tickers: List[str], start: date, end: date) -> Optional[pd.DataFrame]:
-        api_key = self.ds_config.providers.get("alpha_vantage", ProviderConfig()).api_key
-        if not api_key or "YOUR_KEY" in api_key:
-            self.logger.warning("Alpha Vantage API key not provided. Skipping.")
+        env_var = self.ds_config.providers.get("alpha_vantage", ProviderConfig()).api_key_env_var
+        if not env_var: return None
+        api_key = os.getenv(env_var)
+        if not api_key:
+            self.logger.warning(f"Alpha Vantage API key env var '{env_var}' not set. Skipping.")
             return None
             
         try:
             all_dfs = []
-            # [修正]：移除了不支持的 session 参数
-            ts = TimeSeries(key=api_key, output_format='pandas') 
+            ts = TimeSeries(key=api_key, output_format='pandas', timeout=self.ds_config.network.request_timeout) 
             for ticker in tickers:
                 self.logger.debug(f"Fetching {ticker} from Alpha Vantage...")
                 data, _ = await asyncio.to_thread(ts.get_daily_adjusted, symbol=ticker, outputsize='full')
@@ -189,14 +227,16 @@ class DataManager:
             self.logger.error(f"Alpha Vantage fetch failed: {e}")
             return None
 
+    @retry(wait=wait_exponential(multiplier=2, min=2, max=30), stop=stop_after_attempt(3))
     async def _fetch_from_twelvedata(self, tickers: List[str], start: date, end: date) -> Optional[pd.DataFrame]:
-        api_key = self.ds_config.providers.get("twelvedata", ProviderConfig()).api_key
-        if not api_key or "YOUR_KEY" in api_key:
-            self.logger.warning("Twelve Data API key not provided. Skipping.")
+        env_var = self.ds_config.providers.get("twelvedata", ProviderConfig()).api_key_env_var
+        if not env_var: return None
+        api_key = os.getenv(env_var)
+        if not api_key:
+            self.logger.warning(f"Twelve Data API key env var '{env_var}' not set. Skipping.")
             return None
 
         try:
-            # TDClient 不直接支持 session, 但其内部使用 requests, 会受全局代理影响(如果设置)
             td = TDClient(apikey=api_key)
             all_dfs = []
             for ticker in tickers:
@@ -220,6 +260,7 @@ class DataManager:
             self.logger.error(f"Twelve Data fetch failed: {e}")
             return None
 
+    @retry(wait=wait_exponential(multiplier=2, min=2, max=30), stop=stop_after_attempt(3))
     async def _fetch_from_tiingo(self, tickers: List[str], start: date, end: date) -> Optional[pd.DataFrame]:
         if not self.tiingo_client:
             self.logger.warning("Tiingo client not initialized (API key missing). Skipping.")
@@ -229,7 +270,6 @@ class DataManager:
             self.logger.debug(f"Fetching {len(tickers)} tickers from Tiingo one by one...")
             all_dfs = []
             for ticker in tickers:
-                # [修正]: 逐个获取股票的 OHLCV 数据
                 df = await asyncio.to_thread(
                     self.tiingo_client.get_dataframe, ticker,
                     frequency='daily',
@@ -249,11 +289,12 @@ class DataManager:
             self.logger.error(f"Tiingo fetch failed: {e}")
             return None
 
+    @retry(wait=wait_exponential(multiplier=2, min=2, max=30), stop=stop_after_attempt(3))
     async def _fetch_from_yfinance(self, tickers: List[str], start: date, end: date) -> Optional[pd.DataFrame]:
         self.logger.info(f"Attempting fallback to yfinance for tickers: {tickers}...")
         try:
             df = await asyncio.to_thread(
-                yf.download, tickers=tickers, start=start, end=end,
+                yf.download, tickers=tickers, start=start, end=end, timeout=self.ds_config.network.request_timeout,
                 auto_adjust=True, progress=False, group_by='ticker', session=self.session
             )
             if df.empty: return None
@@ -268,38 +309,84 @@ class DataManager:
             return None
 
     # --- Main Data Orchestration ---
-    
     async def get_asset_universe_data(self) -> Optional[pd.DataFrame]:
-        params = {'tickers': sorted(self.config.asset_universe), 'start': self.config.start_date, 'end': self.config.end_date}
-        cache_filename = self._generate_cache_filename("asset_universe_data", params)
-        cache_path = os.path.join(self.cache_dir, cache_filename)
+        self.logger.info("--- Starting per-ticker data acquisition for asset universe ---")
+        all_ticker_dfs = []
+        tickers_to_process = sorted(self.config.asset_universe)
 
-        if os.path.exists(cache_path):
-            self.logger.info(f"Loading asset universe data from cache: {cache_path}")
-            CACHE_HITS.inc()
-            return pd.read_parquet(cache_path).set_index('Date')
-
-        self.logger.info("Asset universe cache not found. Fetching fresh data from providers...")
-        CACHE_MISSES.inc()
-
-        data = None
-        for provider in self.ds_config.priority:
-            self.logger.info(f"--- Attempting data fetch with provider: {provider.upper()} ---")
-            if provider == "alpha_vantage": data = await self._fetch_from_alpha_vantage(**params)
-            elif provider == "twelvedata": data = await self._fetch_from_twelvedata(**params)
-            elif provider == "tiingo": data = await self._fetch_from_tiingo(**params)
-            elif provider == "yfinance": data = await self._fetch_from_yfinance(**params)
+        for ticker in tickers_to_process:
+            params = {'ticker': ticker, 'start': self.config.start_date, 'end': self.config.end_date}
+            cache_filename = self._generate_cache_filename(f"asset_data_{ticker}", params)
+            cache_path = os.path.join(self.cache_dir, cache_filename)
             
-            if data is not None and not data.empty:
-                self.logger.info(f"Successfully fetched data from {provider.upper()}.")
-                data.columns = pd.MultiIndex.from_tuples([(val[0], val[1].capitalize()) for val in data.columns])
-                await self._write_cache_direct(cache_path, data, provider, params)
-                return data
+            cached_df = None
+            fetch_start_date = self.config.start_date
+
+            if os.path.exists(cache_path):
+                self.logger.debug(f"Reading cache for '{ticker}' to check for incremental update.")
+                cached_df = pd.read_parquet(cache_path).set_index('Date')
+                last_cached_date = cached_df.index.max().date()
+                
+                if last_cached_date >= self.config.end_date:
+                    self.logger.info(f"Cache for '{ticker}' is up-to-date. Loading from cache.")
+                    CACHE_HITS.inc()
+                    all_ticker_dfs.append(cached_df)
+                    continue
+                
+                self.logger.info(f"Cache for '{ticker}' is outdated (last date: {last_cached_date}). Fetching incrementally.")
+                fetch_start_date = last_cached_date + timedelta(days=1)
             else:
-                self.logger.warning(f"Provider {provider.upper()} failed to return data. Trying next provider...")
+                self.logger.info(f"Cache miss for '{ticker}'. Fetching fresh data...")
+                CACHE_MISSES.inc()
+
+            ticker_data = None
+            fetch_params = {'tickers': [ticker], 'start': fetch_start_date, 'end': self.config.end_date}
+
+            for provider in [p for p in self.ds_config.priority if self._is_provider_healthy(p)]:
+                start_time = time.time()
+                PROVIDER_REQUESTS_TOTAL.labels(provider=provider).inc()
+                self.logger.info(f"Attempting to fetch '{ticker}' with provider: {provider.upper()}")
+                try:
+                    if provider == "alpha_vantage": data = await self._fetch_from_alpha_vantage(**fetch_params)
+                    elif provider == "twelvedata": data = await self._fetch_from_twelvedata(**fetch_params)
+                    elif provider == "tiingo": data = await self._fetch_from_tiingo(**fetch_params)
+                    elif provider == "yfinance": data = await self._fetch_from_yfinance(**fetch_params)
+
+                    if data is not None and not data.empty:
+                        PROVIDER_LATENCY_SECONDS.labels(provider=provider).observe(time.time() - start_time)
+                        self.logger.info(f"Successfully fetched data for '{ticker}' from {provider.upper()}.")
+                        self._record_provider_success(provider)
+                        data.columns = pd.MultiIndex.from_tuples([(val[0], val[1].capitalize()) for val in data.columns])
+                        
+                        if cached_df is not None:
+                            combined_df = pd.concat([cached_df, data])
+                        else:
+                            combined_df = data
+                        await self._write_cache_direct(cache_path, combined_df, provider, params)
+                        ticker_data = data
+                        break 
+                    else:
+                        raise DataFetchError(f"Provider {provider.upper()} returned no data for {ticker}.")
+                except Exception as e:
+                    self.logger.error(f"Provider {provider.upper()} failed for '{ticker}': {e}")
+                    PROVIDER_ERRORS_TOTAL.labels(provider=provider).inc()
+                    PROVIDER_LATENCY_SECONDS.labels(provider=provider).observe(time.time() - start_time)
+                    self._record_provider_failure(provider)
+            
+            if ticker_data is not None:
+                all_ticker_dfs.append(pd.concat([cached_df, ticker_data]) if cached_df is not None else ticker_data)
+            elif cached_df is not None:
+                all_ticker_dfs.append(cached_df)
+            else:
+                self.logger.critical(f"All providers failed for ticker '{ticker}'. It will be excluded from this run.")
         
-        self.logger.critical("All data providers failed. Could not fetch asset universe data.")
-        return None
+        if not all_ticker_dfs:
+            self.logger.critical("Could not fetch data for ANY ticker in the universe.")
+            return None
+        
+        final_df = pd.concat(all_ticker_dfs, axis=1).sort_index()
+        self.logger.info("Successfully acquired and combined data for all available tickers.")
+        return final_df
 
     async def get_vix_data(self) -> Optional[pd.Series]:
         df = await self._fetch_from_yfinance(['^VIX'], self.config.start_date, self.config.end_date)
@@ -349,7 +436,7 @@ class DataManager:
         self.logger.info("--- Data alignment and sanitization complete ---")
         return {"asset_universe_df": asset_df, **sanitized_streams}
     
-    def _generate_cache_filename(self, prefix: str, params: Dict) -> str:
+    def _generate_cache_filename(self, prefix: str, params: Dict[str, Any]) -> str:
         param_string = json.dumps(params, sort_keys=True, default=str)
         param_hash = hashlib.sha256(param_string.encode()).hexdigest()[:16]
         return f"{prefix}_{param_hash}.parquet"
@@ -772,7 +859,7 @@ async def main():
 
     formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(run_id)s %(message)s')
     log_dir = "logs"; os.makedirs(log_dir, exist_ok=True)
-    log_filename = f"phoenix_project_{datetime.now().strftime('%Y%m%d')}.log"
+    log_filename = f"phoenix_project_{datetime.当前()。strftime('%Y%m%d')}.log"
     stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter)
     file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
 
@@ -787,9 +874,9 @@ async def main():
     ai_client: Optional[AIClient] = None
     if config.gemini_config。enable:
         try:
-            gem_cfg = config.gemini_config.model_dump()
+            gem_cfg = config.gemini_config。model_dump()
             ai_client = MockAIClient(gem_cfg) if gem_cfg['mode'] == 'mock' else GeminiAIClient(gem_cfg)
-            logger.info(f"AI Client has been enabled and initialized in '{config.gemini_config。mode}' mode.")
+            logger.info(f"AI Client has been enabled and initialized in '{config.gemini_config.mode}' mode.")
         except Exception as e:
             logger.error(f"Failed to initialize AI Client: {e}. Continuing without AI features.")
 
