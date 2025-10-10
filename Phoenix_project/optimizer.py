@@ -8,8 +8,9 @@ import asyncio
 import optuna
 import backtrader as bt
 import pandas as pd
-from phoenix_project import StrategyConfig, RomanLegionStrategy, generate_html_report, precompute_sentiments, precompute_asset_analyses
-from ai.client import AIClient
+from phoenix_project import StrategyConfig, RomanLegionStrategy, generate_html_report, precompute_asset_analyses
+from ai.ensemble_client import EnsembleAIClient
+from ai.evidence_fusion import EvidenceFusionEngine
 
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -19,7 +20,12 @@ class Optimizer:
     Manages the Optuna-based walk-forward optimization process.
     """
 
-    def __init__(self, config: StrategyConfig, all_aligned_data: Dict[str, Any], ai_client: AIClient | None):
+    def __init__(self,
+                 config: StrategyConfig,
+                 all_aligned_data: Dict[str, Any],
+                 ai_client: EnsembleAIClient | None,
+                 fusion_engine: EvidenceFusionEngine | None
+                 ):
         """
         Initializes the Optimizer.
 
@@ -32,6 +38,7 @@ class Optimizer:
         self.config = config
         self.all_aligned_data = all_aligned_data
         self.ai_client = ai_client
+        self.fusion_engine = fusion_engine
         self.study_name = self.config.optimizer.study_name
         self.storage_url = f"sqlite:///{self.study_name}.db"
 
@@ -110,14 +117,14 @@ class Optimizer:
             # 2. Create and run the Optuna study for the training period
             study = optuna.create_study(
                 study_name=f"{self.study_name}_window_{window_num}",
-                storage=self.storage_url,
-                direction="maximize",
+                storage=self.storage_url，
+                direction="maximize"，
                 load_if_exists=True # Allows resuming
             )
             
             study.optimize(
                 lambda trial: self._objective(trial, train_start, train_end),
-                n_trials=self.config.optimizer.n_trials
+                n_trials=self.config。optimizer。n_trials
             )
             
             best_params = study.best_params
@@ -128,23 +135,24 @@ class Optimizer:
             val_cerebro = bt.Cerebro()
             run_audit_files = []
             
-            temp_config = self.config.copy(deep=True)
+            temp_config = self.config。copy(deep=True)
             for param, value in best_params.items():
                 setattr(temp_config, param, value)
 
             master_dates = pd.date_range(start=test_start, end=test_end).date
-            sentiment_lookup, sentiment_audits = asyncio.run(precompute_sentiments(self.ai_client, master_dates)) if self.ai_client else ({}, [])
-            asset_analysis_lookup, asset_audits = asyncio.run(precompute_asset_analyses(self.ai_client, master_dates, self.config.asset_universe)) if self.ai_client else ({}, [])
-            
-            if sentiment_audits: run_audit_files.extend(sentiment_audits)
-            if asset_audits: run_audit_files.extend(asset_audits)
+            asset_analysis_lookup = {}
+            if self.ai_client and self.fusion_engine and self.config.ai_mode != "off":
+                self.logger.info(f"--- Pre-computing AI asset analysis for Test Window {window_num} ---")
+                asset_analysis_lookup = asyncio.run(
+                    precompute_asset_analyses(self.ai_client, self.fusion_engine, list(master_dates), self.config.asset_universe)
+                )
             
             val_cerebro.addstrategy(
                 RomanLegionStrategy, config=temp_config,
-                vix_data=self.all_aligned_data["vix"],
+                vix_data=self.all_aligned_data["vix"]，
                 treasury_yield_data=self.all_aligned_data["treasury_yield"],
                 market_breadth_data=self.all_aligned_data["market_breadth"],
-                sentiment_data=sentiment_lookup,
+                sentiment_data={}, # sentiment_data is deprecated
                 asset_analysis_data=asset_analysis_lookup
             )
 
@@ -157,10 +165,12 @@ class Optimizer:
 
             val_cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', annualize=True)
             val_cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
+            val_cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
+            val_cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
             
             results = val_cerebro.run()
             strat = results[0]
             out_of_sample_results.append(strat)
-            asyncio.run(generate_html_report(val_cerebro, strat, self.ai_client, run_audit_files, report_filename=f"phoenix_report_wf_{window_num}.html"))
+            asyncio.run(generate_html_report(val_cerebro, strat, [], report_filename=f"phoenix_report_wf_{window_num}.html"))
 
             current_start += step_delta
