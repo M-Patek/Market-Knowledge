@@ -16,6 +16,7 @@ import pyarrow
 import json
 import random
 from io import StringIO
+from filelock import FileLock
 from typing import List, Dict, Optional, Any, Literal
 from pathlib import Path
 
@@ -32,12 +33,15 @@ from pythonjsonlogger import jsonlogger
 from jinja2 import Environment, FileSystemLoader
 from sizing.base import IPositionSizer
 from sizing.fixed_fraction import FixedFractionSizer
-from execution_model import VolumeShareSlippageModel
+from execution.order_manager import OrderManager
+from execution.adapters import BacktraderBrokerAdapter
 from audit_manager import archive_logs_to_s3
 from ai.evidence_fusion import EvidenceFusionEngine, FusedResponseModel
+from strategy_handler import StrategyDataHandler
+from cognitive.engine import CognitiveEngine
 from observability import (BACKTEST_DURATION, TRADES_EXECUTED, start_metrics_server, CACHE_HITS, CACHE_MISSES,
                            PROVIDER_REQUESTS_TOTAL, PROVIDER_ERRORS_TOTAL, PROVIDER_LATENCY_SECONDS)
-from ai.client import EnsembleAIClient
+from ai.ensemble_client import EnsembleAIClient
 from ai.prompt_renderer import render_prompt
 import backtrader as bt
 import pandas as pd
@@ -305,77 +309,73 @@ class DataManager:
             return None
 
     # --- Main Data Orchestration ---
-    async def get_asset_universe_data(self) -> Optional[pd.DataFrame]:
-        self.logger.info("--- Starting per-ticker data acquisition for asset universe ---")
-        all_ticker_dfs = []
-        tickers_to_process = sorted(self.config.asset_universe)
+    async def _fetch_and_cache_ticker_data(self, ticker: str) -> Optional[pd.DataFrame]:
+        """Handles fetching, caching, and fallback for a single ticker."""
+        params = {'ticker': ticker, 'start': self.config.start_date, 'end': self.config.end_date}
+        cache_filename = self._generate_cache_filename(f"asset_data_{ticker}", params)
+        cache_path = os.path.join(self.cache_dir, cache_filename)
 
-        for ticker in tickers_to_process:
-            params = {'ticker': ticker, 'start': self.config.start_date, 'end': self.config.end_date}
-            cache_filename = self._generate_cache_filename(f"asset_data_{ticker}", params)
-            cache_path = os.path.join(self.cache_dir, cache_filename)
+        cached_df = None
+        fetch_start_date = self.config.start_date
+
+        if os.path.exists(cache_path):
+            self.logger.debug(f"Reading cache for '{ticker}' to check for incremental update.")
+            cached_df = pd.read_parquet(cache_path).set_index('Date')
+            last_cached_date = cached_df.index.max().date()
             
-            cached_df = None
-            fetch_start_date = self.config.start_date
+            if last_cached_date >= self.config.end_date:
+                self.logger.info(f"Cache for '{ticker}' is up-to-date. Loading from cache.")
+                CACHE_HITS.inc()
+                return cached_df
+            
+            self.logger.info(f"Cache for '{ticker}' is outdated (last date: {last_cached_date}). Fetching incrementally.")
+            fetch_start_date = last_cached_date + timedelta(days=1)
+        else:
+            self.logger.info(f"Cache miss for '{ticker}'. Fetching fresh data...")
+            CACHE_MISSES.inc()
 
-            if os.path.exists(cache_path):
-                self.logger.debug(f"Reading cache for '{ticker}' to check for incremental update.")
-                cached_df = pd.read_parquet(cache_path).set_index('Date')
-                last_cached_date = cached_df.index.max().date()
-                
-                if last_cached_date >= self.config.end_date:
-                    self.logger.info(f"Cache for '{ticker}' is up-to-date. Loading from cache.")
-                    CACHE_HITS.inc()
-                    all_ticker_dfs.append(cached_df)
-                    continue
-                
-                self.logger.info(f"Cache for '{ticker}' is outdated (last date: {last_cached_date}). Fetching incrementally.")
-                fetch_start_date = last_cached_date + timedelta(days=1)
-            else:
-                self.logger.info(f"Cache miss for '{ticker}'. Fetching fresh data...")
-                CACHE_MISSES.inc()
+        fetch_params = {'tickers': [ticker], 'start': fetch_start_date, 'end': self.config.end_date}
 
-            ticker_data = None
-            fetch_params = {'tickers': [ticker], 'start': fetch_start_date, 'end': self.config.end_date}
+        for provider in [p for p in self.ds_config.priority if self._is_provider_healthy(p)]:
+            start_time = time.time()
+            PROVIDER_REQUESTS_TOTAL.labels(provider=provider).inc()
+            self.logger.info(f"Attempting to fetch '{ticker}' with provider: {provider.upper()}")
+            try:
+                data = None
+                if provider == "alpha_vantage": data = await self._fetch_from_alpha_vantage(**fetch_params)
+                elif provider == "twelvedata": data = await self._fetch_from_twelvedata(**fetch_params)
+                elif provider == "tiingo": data = await self._fetch_from_tiingo(**fetch_params)
+                elif provider == "yfinance": data = await self._fetch_from_yfinance(**fetch_params)
 
-            for provider in [p for p in self.ds_config.priority if self._is_provider_healthy(p)]:
-                start_time = time.time()
-                PROVIDER_REQUESTS_TOTAL.labels(provider=provider).inc()
-                self.logger.info(f"Attempting to fetch '{ticker}' with provider: {provider.upper()}")
-                try:
-                    if provider == "alpha_vantage": data = await self._fetch_from_alpha_vantage(**fetch_params)
-                    elif provider == "twelvedata": data = await self._fetch_from_twelvedata(**fetch_params)
-                    elif provider == "tiingo": data = await self._fetch_from_tiingo(**fetch_params)
-                    elif provider == "yfinance": data = await self._fetch_from_yfinance(**fetch_params)
-
-                    if data is not None and not data.empty:
-                        PROVIDER_LATENCY_SECONDS.labels(provider=provider).observe(time.time() - start_time)
-                        self.logger.info(f"Successfully fetched data for '{ticker}' from {provider.upper()}.")
-                        self._record_provider_success(provider)
-                        data.columns = pd.MultiIndex.from_tuples([(val[0], val[1].capitalize()) for val in data.columns])
-                        
-                        if cached_df is not None:
-                            combined_df = pd.concat([cached_df, data])
-                        else:
-                            combined_df = data
-                        await self._write_cache_direct(cache_path, combined_df, provider, params)
-                        ticker_data = data
-                        break 
-                    else:
-                        raise DataFetchError(f"Provider {provider.upper()} returned no data for {ticker}.")
-                except Exception as e:
-                    self.logger.error(f"Provider {provider.upper()} failed for '{ticker}': {e}")
-                    PROVIDER_ERRORS_TOTAL.labels(provider=provider).inc()
+                if data is not None and not data.empty:
                     PROVIDER_LATENCY_SECONDS.labels(provider=provider).observe(time.time() - start_time)
-                    self._record_provider_failure(provider)
-            
-            if ticker_data is not None:
-                all_ticker_dfs.append(pd.concat([cached_df, ticker_data]) if cached_df is not None else ticker_data)
-            elif cached_df is not None:
-                all_ticker_dfs.append(cached_df)
-            else:
-                self.logger.critical(f"All providers failed for ticker '{ticker}'. It will be excluded from this run.")
+                    self.logger.info(f"Successfully fetched data for '{ticker}' from {provider.upper()}.")
+                    self._record_provider_success(provider)
+                    
+                    combined_df = pd.concat([cached_df, data]) if cached_df is not None else data
+                    await self._write_cache_direct(cache_path, combined_df, provider, params)
+                    return combined_df
+                else:
+                    raise DataFetchError(f"Provider {provider.upper()} returned no data for {ticker}.")
+            except Exception as e:
+                self.logger.error(f"Provider {provider.upper()} failed for '{ticker}': {e}")
+                PROVIDER_ERRORS_TOTAL.labels(provider=provider).inc()
+                PROVIDER_LATENCY_SECONDS.labels(provider=provider).observe(time.time() - start_time)
+                self._record_provider_failure(provider)
         
+        if cached_df is not None:
+            self.logger.warning(f"All providers failed for '{ticker}'. Using stale cached data.")
+            return cached_df
+            
+        self.logger.critical(f"All providers failed for ticker '{ticker}' and no cache exists. It will be excluded.")
+        return None
+
+    async def get_asset_universe_data(self) -> Optional[pd.DataFrame]:
+        self.logger.info(f"--- Starting CONCURRENT data acquisition for {len(self.config.asset_universe)} assets ---")
+        tasks = [self._fetch_and_cache_ticker_data(ticker) for ticker in sorted(self.config.asset_universe)]
+        results = await asyncio.gather(*tasks)
+        
+        all_ticker_dfs = [df for df in results if df is not None]
         if not all_ticker_dfs:
             self.logger.critical("Could not fetch data for ANY ticker in the universe.")
             return None
@@ -440,143 +440,20 @@ class DataManager:
     async def _write_cache_direct(self, cache_path: str, data: pd.DataFrame | pd.Series, source: str, params: Dict):
         tmp_path = f"{cache_path}.{os.getpid()}.tmp"
         try:
-            data.reset_index().to_parquet(tmp_path, engine='pyarrow', index=False)
-            os.replace(tmp_path, cache_path)
-            self.logger.info(f"Saved fresh data to cache: {cache_path}")
-            meta_path = Path(cache_path).with_suffix('.meta.json')
-            param_hash = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
-            metadata = { "params_hash": param_hash, "created_utc": datetime.utcnow().isoformat(), "source": source, "params": {k: str(v) for k, v in params.items()} }
-            with open(meta_path, 'w', encoding='utf-8') as f: json.dump(metadata, f, indent=2)
+            lock_path = f"{cache_path}.lock"
+            lock = FileLock(lock_path)
+            with lock:
+                data.reset_index().to_parquet(tmp_path, engine='pyarrow', index=False)
+                os.replace(tmp_path, cache_path)
+                self.logger.info(f"Saved fresh data to cache: {cache_path}")
+                meta_path = Path(cache_path).with_suffix('.meta.json')
+                param_hash = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
+                metadata = { "params_hash": param_hash, "created_utc": datetime.utcnow().isoformat(), "source": source, "params": {k: str(v) for k, v in params.items()} }
+                with open(meta_path, 'w', encoding='utf-8') as f: json.dump(metadata, f, indent=2)
         except Exception as e:
             self.logger.error(f"Failed to write cache file {cache_path}: {e}")
             if os.path.exists(tmp_path): os.remove(tmp_path)
 
-
-# --- Cognitive Engine Layer ---
-class CognitiveEngine:
-    def __init__(self, config: StrategyConfig, asset_analysis_data: Optional[Dict[date, Dict]] = None, sentiment_data: Optional[Dict[date, float]] = None, ai_mode: str = "processed"):
-        self.config = config
-        self.logger = logging.getLogger("PhoenixProject.CognitiveEngine")
-        self.risk_manager = RiskManager(config, sentiment_data)
-        self.portfolio_constructor = PortfolioConstructor(config, asset_analysis_data, mode=config.ai_mode)
-        self.position_sizer = self._create_sizer(config.position_sizer)
-
-    def _create_sizer(self, sizer_config: PositionSizerConfig) -> IPositionSizer:
-        method = sizer_config.method
-        params = sizer_config.parameters
-        self.logger.info(f"Initializing position sizer: '{method}' with params: {params}")
-        if method == "fixed_fraction":
-            return FixedFractionSizer(**params)
-        else:
-            raise ValueError(f"Unknown position sizer method: {method}")
-
-    def determine_allocations(self, candidate_analysis: List[Dict], current_vix: float, current_date: date) -> List[Dict]:
-        self.logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
-        capital_modifier = self.risk_manager.get_capital_modifier(current_vix, current_date)
-        worthy_targets = self.portfolio_constructor.identify_opportunities(candidate_analysis, current_date)
-        effective_max_allocation = self.config.max_total_allocation * capital_modifier
-        battle_plan = self.position_sizer.size_positions(worthy_targets, effective_max_allocation)
-        
-        self.logger.info("--- [Cognitive Engine's Final Battle Plan] ---")
-        final_total_allocation = sum(d['capital_allocation_pct'] for d in battle_plan)
-        self.logger.info(f"Final planned capital deployment: {final_total_allocation:.2%}")
-        for deployment in battle_plan: self.logger.info(f"- Asset: {deployment['ticker']}, Deploy Capital: {deployment['capital_allocation_pct']:.2%}")
-        return battle_plan
-
-    def calculate_opportunity_score(self, current_price: float, current_sma: float, current_rsi: float) -> float:
-        return self.portfolio_constructor.calculate_opportunity_score(current_price, current_sma, current_rsi)
-
-class RiskManager:
-    def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[date, float]] = None):
-        self.config = config
-        self.sentiment_data = sentiment_data if sentiment_data is not None else {}
-        self.logger = logging.getLogger("PhoenixProject.RiskManager")
-        if self.sentiment_data: self.logger.info(f"RiskManager initialized with {len(self.sentiment_data)} days of sentiment data.")
-
-    def get_capital_modifier(self, current_vix: float, current_date: date) -> float:
-        self.logger.info(f"Assessing risk for {current_date.isoformat()}. VIX: {current_vix:.2f}")
-        if current_vix > self.config.vix_high_threshold:
-            base_modifier = self.config.capital_modifier_high_vix
-            self.logger.info(f"VIX indicates High Fear. Base modifier: {base_modifier:.2f}")
-        elif current_vix < self.config.vix_low_threshold:
-            base_modifier = self.config.capital_modifier_low_vix
-            self.logger.info(f"VIX indicates Low Fear. Base modifier: {base_modifier:.2f}")
-        else:
-            base_modifier = self.config.capital_modifier_normal_vix
-            self.logger.info(f"VIX indicates Normal Fear. Base modifier: {base_modifier:.2f}")
-        if not self.sentiment_data: return base_modifier
-        sentiment_score = self.sentiment_data.get(current_date, 0.0)
-        sentiment_adjustment = 1.0 + (sentiment_score * 0.2)
-        final_modifier = base_modifier * sentiment_adjustment
-        final_modifier = max(0.0, min(1.1, final_modifier))
-        self.logger.info(f"Gemini Sentiment Score: {sentiment_score:.2f}. Final Capital Modifier: {final_modifier:.2%}")
-        return final_modifier
-
-class PortfolioConstructor:
-    def __init__(self, config: StrategyConfig, asset_analysis_data: Optional[Dict[date, Dict]] = None, mode: str = "processed"):
-        self.config = config
-        self.asset_analysis_data = asset_analysis_data or {}
-        self.logger = logging.getLogger("PhoenixProject.PortfolioConstructor")
-        self.mode = mode
-        self._ema_state = {}
-        self.ema_alpha = 0.2
-        self.global_scale = 1.0
-
-    def calculate_opportunity_score(self, current_price: float, current_sma: float, current_rsi: float) -> float:
-        if current_sma <= 0: return 0.0
-        momentum_score = 50 + 50 * ((current_price / current_sma) - 1)
-        if momentum_score > 50 and current_rsi > self.config.rsi_overbought_threshold:
-            overbought_intensity = (current_rsi - self.config.rsi_overbought_threshold) / (100 - self.config.rsi_overbought_threshold)
-            penalty_factor = 1.0 - (overbought_intensity * 0.5)
-            final_score = momentum_score * penalty_factor
-        else:
-            final_score = momentum_score
-        return max(0.0, min(100.0, final_score))
-        
-    def _sanitize_ai_output(self, raw: Dict) -> tuple[float, float]:
-        try:
-            f = float(raw.get("adjustment_factor", 1.0))
-            c = float(raw.get("confidence", 0.0))
-        except (ValueError, TypeError): return 1.0, 0.0
-        f = max(0.3, min(2.0, f))
-        c = max(0.0, min(1.0, c))
-        return f, c
-
-    def _effective_factor(self, ticker: str, reported_factor: float, confidence: float) -> float:
-        effective = 1.0 + confidence * (reported_factor - 1.0)
-        prev = self._ema_state.get(ticker, 1.0)
-        smoothed = prev * (1 - self.ema_alpha) + effective * self.ema_alpha
-        self._ema_state[ticker] = smoothed
-        final = smoothed * self.global_scale
-        final = max(0.5, min(1.2, final))
-        return final
-
-    def identify_opportunities(self, candidate_analysis: List[Dict], current_date: date) -> List[Dict]:
-        self.logger.info("PortfolioConstructor is identifying high-quality opportunities...")
-        adjusted_candidates = []
-        daily_asset_analysis = self.asset_analysis_data.get(current_date, {})
-        
-        for candidate in candidate_analysis:
-            ticker = candidate["ticker"]
-            original_score = candidate["opportunity_score"]
-            final_factor = 1.0
-            confidence = 0.0
-            
-            if self.mode != 'off':
-                fused_response_data = daily_asset_analysis.get(ticker)
-                if fused_response_data:
-                    final_factor = fused_response_data.get('final_factor', 1.0)
-                    confidence = 1.0 - fused_response_data.get('dispersion', 1.0) # Use dispersion as an inverse proxy for confidence
-            adjusted_score = candidate["opportunity_score"] * final_factor
-            adjusted_candidates.append({**candidate, "adjusted_score": adjusted_score, "ai_factor": final_factor, "ai_confidence": confidence})
-            if final_factor != 1.0 and self.mode != 'off': self.logger.info(f"AI Insight for {ticker} (Mode: {self.mode}): Conf={confidence:.2f}, FinalFactor={final_factor:.3f}. Score: {original_score:.2f} -> {adjusted_score:.2f}")
-        
-        worthy_targets = [res for res in adjusted_candidates if res["adjusted_score"] > self.config.opportunity_score_threshold]
-        if not worthy_targets:
-            self.logger.info("PortfolioConstructor: No opportunities met the threshold.")
-        else:
-            self.logger.info(f"PortfolioConstructor: Identified {len(worthy_targets)} high-quality opportunities.")
-        return worthy_targets
 
 # --- Strategy Execution Layer ---
 class RomanLegionStrategy(bt.Strategy):
@@ -589,41 +466,34 @@ class RomanLegionStrategy(bt.Strategy):
         self.logger = logging.getLogger("PhoenixProject.Strategy")
         if self.p.config is None: raise ValueError("StrategyConfig object not provided!")
         self.config = self.p.config
-        self.execution_model = VolumeShareSlippageModel(
+        
+        # Setup the new Execution Layer
+        broker_adapter = BacktraderBrokerAdapter(self.broker)
+        self.order_manager = OrderManager(
+            broker_adapter=broker_adapter,
             impact_coefficient=self.config.execution_model.impact_coefficient,
             max_volume_share=self.config.execution_model.max_volume_share,
             min_trade_notional=self.config.execution_model.min_trade_notional
         )
+        
         self.cognitive_engine = CognitiveEngine(self.config, self.p.asset_analysis_data, sentiment_data=self.p.sentiment_data, ai_mode=self.config.ai_mode)
-        self.data_map = {d._name: d for d in self.datas}
-        self.sma_indicators = {d._name: bt.indicators.SimpleMovingAverage(d.close, period=self.config.sma_period) for d in self.datas}
-        self.rsi_indicators = {d._name: bt.indicators.RSI(d.close, period=self.config.rsi_period) for d in self.datas}
-        self.vix_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.vix_data.items()}
-        self.yield_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.treasury_yield_data.items()}
-        self.breadth_lookup = {pd.Timestamp(k).date(): float(v) for k, v in self.p.market_breadth_data.items()}
+        self.data_handler = StrategyDataHandler(
+            self, self.config, self.p.vix_data, self.p.treasury_yield_data, self.p.market_breadth_data
+        )
 
     def start(self):
         self.logger.info(f"{self.datas[0].datetime.date(0).isoformat()}: [Legion Commander]: Awaiting daily orders...")
 
     def next(self):
         if len(self.datas[0]) < self.config.sma_period: return
-        current_date = self.datas[0].datetime.date(0)
-        self.logger.info(f"--- {current_date.isoformat()}: Daily Rebalancing Briefing ---")
-        current_vix = self.vix_lookup.get(current_date)
-        current_yield = self.yield_lookup.get(current_date)
-        current_breadth = self.breadth_lookup.get(current_date)
-        if current_vix is None:
-            self.logger.warning(f"Critical data VIX missing for {current_date}, halting for the day.")
-            return
-        self.logger.info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f if current_yield else 'N/A'}%, Market Breadth: {current_breadth:.2% if current_breadth else 'N/A'}")
-        candidate_analysis = [{
-            "ticker": ticker,
-            "opportunity_score": self.cognitive_engine.calculate_opportunity_score(
-                d.close[0], self.sma_indicators[ticker][0], self.rsi_indicators[ticker][0])
-        } for ticker, d in self.data_map.items()]
 
-        battle_plan = self.cognitive_engine.determine_allocations(candidate_analysis, current_vix, current_date)
-        self.execution_model.rebalance(self, battle_plan)
+        daily_data = self.data_handler.get_daily_data_packet(self.cognitive_engine)
+        if not daily_data:
+            return
+        
+        self.logger.info(f"--- {daily_data.current_date.isoformat()}: Daily Rebalancing Briefing ---")
+        battle_plan = self.cognitive_engine.determine_allocations(daily_data.candidate_analysis, daily_data.current_vix, daily_data.current_date)
+        self.order_manager.rebalance(self, battle_plan)
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
@@ -756,9 +626,9 @@ async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, en
     try:
         all_data_df = all_aligned_data["asset_universe_df"]
         if all_data_df is None or all_data_df.empty: raise ValueError("Asset universe data is empty.")
-        unique_tickers = all_data_df.columns.get_level_values(0).unique()
+        unique_tickers = all_data_df.columns.get_level_values(1).unique()
         for ticker in unique_tickers:
-            ticker_df = all_data_df[ticker].copy()
+            ticker_df = all_data_df.xs(ticker, level=1, axis=1).copy()
             ticker_df.columns = [col.lower() for col in ticker_df.columns]
             ticker_df.dropna(inplace=True)
             if not ticker_df.empty:
@@ -806,13 +676,13 @@ async def main():
     log_level = getattr(logging, config.log_level.upper(), logging.INFO)
     logger = logging.getLogger("PhoenixProject")
     logger.setLevel(log_level)
-    logger.handlers.clear()
+    logger.handlers。clear()
 
     formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(run_id)s %(message)s')
     log_dir = "logs"; os.makedirs(log_dir, exist_ok=True)
-    log_filename = f"phoenix_project_{datetime.当前()。strftime('%Y%m%d')}.log"
+    log_filename = f"phoenix_project_{datetime.now().strftime('%Y%m%d')}.log"
     stream_handler = logging.StreamHandler(); stream_handler.setFormatter(formatter)
-    file_handler = RotatingFileHandler(os.path。join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(os.path.join(log_dir, log_filename), maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'); file_handler.setFormatter(formatter)
 
     for handler in [stream_handler, file_handler]:
         handler.addFilter(RunIdFilter())
@@ -820,12 +690,12 @@ async def main():
     
     from optimizer import Optimizer
     logger.info("Phoenix Project logging system initialized in JSON format.", extra={'run_id': run_id})
-    start_metrics_server(config.observability。metrics_port)
+    start_metrics_server(config.observability.metrics_port)
 
     ensemble_client: Optional[EnsembleAIClient] = None
     fusion_engine: Optional[EvidenceFusionEngine] = None
 
-    if config.ai_ensemble_config。enable:
+    if config.ai_ensemble_config.enable:
         try:
             ensemble_config_path = config.ai_ensemble_config。config_file_path
             fusion_engine = EvidenceFusionEngine(config_file_path=ensemble_config_path)
@@ -842,7 +712,7 @@ async def main():
             return
 
         if config.walk_forward.get('enabled', False):
-            optimizer = Optimizer(config, all_aligned_data, ai_client=None) # TODO: Update optimizer to handle new AI structure
+            optimizer = Optimizer(config, all_aligned_data, ai_client=ensemble_client, fusion_engine=fusion_engine)
             optimizer.run_optimization()
         else:
             await run_single_backtest(config, all_aligned_data, ensemble_client, fusion_engine)
