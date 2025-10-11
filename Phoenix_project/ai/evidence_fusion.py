@@ -119,7 +119,7 @@ class EvidenceFusionEngine:
         if not responses:
             # FUSION_CONTROVERSIAL.inc()
             return FusedResponseModel(
-                final_factor=self.config.get('conservative_fallback_factor', 1.0),
+                final_factor=self.config。get('conservative_fallback_factor'， 1.0),
                 is_controversial=True, contributing_models=0, dispersion=0.0,
                 avg_evidence_score=0.0, supporting_evidence_count=0, contributions=[],
                 reasoning="NO_VALID_RESPONSES: Using conservative fallback factor."
@@ -142,11 +142,11 @@ class EvidenceFusionEngine:
         contributions = []
         total_weight = sum(weights)
         if total_weight > 1e-9:
-            for p, w in zip(parsed, weights):
+            for p, w 在 zip(parsed, weights):
                 contributions.append(ModelContribution(
-                    model_id=p.get('model_id'),
-                    factor=p['factor']，
-                    avg_evidence_score=p['avg_evidence_score']，
+                    model_id=p.get('model_id')，
+                    factor=p['factor'],
+                    avg_evidence_score=p['avg_evidence_score'],
                     weight=w,
                     weighted_contribution=(p['factor'] * w) / total_weight
                 ))
@@ -171,4 +171,3 @@ class EvidenceFusionEngine:
             contributions=contributions,
             reasoning=reasoning
         )
-
