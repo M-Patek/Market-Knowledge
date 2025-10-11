@@ -1,122 +1,135 @@
-# Phoenix Project - Strategy Configuration
-# ------------------------------------------
-# This file centralizes all parameters for the backtest.
-
-# 1. Backtest Timeframe & Universe
+Phoenix Project - Strategy Configuration
+------------------------------------------
+This file centralizes all parameters for the backtest.
+1. Backtest Timeframe & Universe
 start_date: 2022-01-01
 end_date: 2024-12-31
 asset_universe:
-  - 'QQQ'
-  - 'SPY'
-  - 'GLD'
-  - 'TLT'
-  - 'IWM'
 
-# 1.5. Market Breadth Tickers
+'QQQ'
+
+'SPY'
+
+'GLD'
+
+'TLT'
+
+'IWM'
+
+1.5. Market Breadth Tickers
 market_breadth_tickers:
-  - 'SPY'
-  - 'QQQ'
-  - 'AAPL'
-  - 'MSFT'
-  - 'GOOGL'
-  - 'AMZN'
-  - 'NVDA'
-  - 'TSLA'
 
-# 2. Strategy Parameters
+'SPY'
+
+'QQQ'
+
+'AAPL'
+
+'MSFT'
+
+'GOOGL'
+
+'AMZN'
+
+'NVDA'
+
+'TSLA'
+
+2. Strategy Parameters
 sma_period: 50
 rsi_period: 14
 rsi_overbought_threshold: 70.0
 opportunity_score_threshold: 55.0
 
-# 3. Risk Management Parameters (VIX-based)
+3. Risk Management Parameters (VIX-based)
 vix_high_threshold: 30.0
 vix_low_threshold: 20.0
 capital_modifier_high_vix: 0.5
 capital_modifier_normal_vix: 0.9
 capital_modifier_low_vix: 1.0
 
-# 4. Cerebro Engine Settings
+4. Cerebro Engine Settings
 initial_cash: 1000000.0
 commission_rate: 0.001
 log_level: "INFO"
 
-# 5. AI Ensemble Settings
+5. AI Ensemble Settings
 ai_ensemble_config:
-  enable: true
-  config_file_path: "config/ai_clients.yaml" # Path to the detailed AI ensemble configuration
+enable: true
+config_file_path: "config/ai_clients.yaml" # Path to the detailed AI ensemble configuration
 
-# [Refactored] Data Sources & Network Configuration
+[Refactored] Data Sources & Network Configuration
 data_sources:
-    priority:
-      - "alpha_vantage"
-      - "twelvedata"
-      - "tiingo"
-      - "yfinance" # Fallback provider
-    providers:
-      alpha_vantage:
-        api_key_env_var: "ALPHA_VANTAGE_API_KEY"
-      twelvedata:
-        api_key_env_var: "TWELVEDATA_API_KEY"
-      tiingo:
-        api_key_env_var: "TIINGO_API_KEY"
-    network:
-      user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-      proxy:
-        enabled: false
-        http: null
-        https: null
-      request_timeout: 30 # Seconds to wait for a provider response
-      retry_attempts: 3 # Number of retry attempts on failure
-      retry_backoff_factor: 2 # Exponential backoff factor for retries
-    health_probes:
-      failure_threshold: 3 # Number of consecutive failures before cooldown
-      cooldown_minutes: 15 # Time in minutes to disable a failing provider
+priority:
+- "alpha_vantage"
+- "twelvedata"
+- "tiingo"
+- "yfinance" # Fallback provider
+providers:
+alpha_vantage:
+api_key_env_var: "ALPHA_VANTAGE_API_KEY"
+twelvedata:
+api_key_env_var: "TWELVEDATA_API_KEY"
+tiingo:
+api_key_env_var: "TIINGO_API_KEY"
+network:
+user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+proxy:
+enabled: false
+http: null
+https: null
+request_timeout: 30 # Seconds to wait for a provider response
+retry_attempts: 3 # Number of retry attempts on failure
+retry_backoff_factor: 2 # Exponential backoff factor for retries
+health_probes:
+failure_threshold: 3 # Number of consecutive failures before cooldown
+cooldown_minutes: 15 # Time in minutes to disable a failing provider
 
-# 6. Execution & Experimentation Settings
+6. Execution & Experimentation Settings
 ai_mode: "processed"
 max_total_allocation: 0.95
 
-# 7. Walk-Forward Optimization Settings
+7. Walk-Forward Optimization Settings
 walk_forward:
-  enabled: true
-  # 所有值均为日历日
-  train_days: 730  # 约2年用于训练
-  test_days: 365   # 约1年用于样本外验证
-  step_days: 365   # 将窗口向前滑动1年
+enabled: true
 
-# 8. Execution Model Settings
+All values are in calendar days
+train_days: 730  # ~2 years for training
+test_days: 365   # ~1 year for out-of-sample validation
+step_days: 365   # Slide window forward by 1 year
+
+8. Execution Model Settings
 execution_model:
-  impact_coefficient: 0.1     # Price impact constant for slippage model
-  max_volume_share: 0.25      # Max % of a bar's volume an order can consume
-  min_trade_notional: 1.0     # Minimum trade notional value
+impact_coefficient: 0.1     # Price impact constant for slippage model
+max_volume_share: 0.25      # Max % of a bar's volume an order can consume
+min_trade_notional: 1.0     # Minimum trade notional value
 
-# 9. Position Sizing Settings
+9. Position Sizing Settings
 position_sizer:
-  method: "fixed_fraction" # Available: "fixed_fraction", "volatility_parity"
-  parameters:
-    fraction_per_position: 0.10 # Allocate 10% to each selected asset
+method: "fixed_fraction" # Available: "fixed_fraction", "volatility_parity"
+parameters:
+fraction_per_position: 0.10 # Allocate 10% to each selected asset
 
-# 10. Optimizer Settings
+10. Optimizer Settings
 optimizer:
-  study_name: "phoenix_walk_forward_study"
-  n_trials: 50 # Number of optimization trials per walk-forward window
-  parameters:
-    sma_period:
-      type: "int"
-      low: 30
-      high: 80
-      step: 10
-    rsi_period:
-      type: "int"
-      low: 10
-      high: 20
-      step: 2
+study_name: "phoenix_walk_forward_study"
+n_trials: 50 # Number of optimization trials per walk-forward window
+parameters:
+sma_period:
+type: "int"
+low: 30
+high: 80
+step: 10
+rsi_period:
+type: "int"
+low: 10
+high: 20
+step: 2
 
-# 11. Observability Settings
+11. Observability Settings
 observability:
-  metrics_port: 8000 # Port for the Prometheus metrics server
+metrics_port: 8000 # Port for the Prometheus metrics server
 
-# 12. Audit & Compliance Settings
+12. Audit & Compliance Settings
 audit:
-  s3_bucket_name: "your-phoenix-project-audit-logs-bucket" # S3 bucket for archiving AI audit logs
+s3_bucket_name: "your-phoenix-project-audit-logs-bucket" # S3 bucket for archiving AI audit logs
