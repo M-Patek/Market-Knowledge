@@ -7,7 +7,7 @@ analyst:
 enable: true
 model_name: "gemini-1.5-pro-latest"
 api_key_env_var: "GEMINI_API_KEY"
-prompt_template: "prompts/Analyst Prompt Template"
+prompt_template: "prompts/analyst.json"
 timeout_seconds: 90
 max_concurrent: 5
 temperature: 0.1
@@ -19,7 +19,7 @@ fact_checker:
 enable: true
 model_name: "gemini-1.5-flash-latest"
 api_key_env_var: "GEMINI_API_KEY"
-prompt_template: "prompts/Fact-Checker Prompt Template"
+prompt_template: "prompts/fact_checker.json"
 timeout_seconds: 60
 max_concurrent: 10
 temperature: 0.2
