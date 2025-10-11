@@ -118,10 +118,10 @@ def validate_response_against_retrieved_docs(response: AssetAnalysisModel, retri
     if missing:
         raise ValidationErrorWithContext('Some evidence.doc_id values are not in retrieved_docs', {'missing_doc_ids': missing})
     # Additional checks: discretize scores
-    for e 在 response.evidence:
+    for e in response.evidence:
         if e.score not in (0.0, 0.25, 0.5, 0.75, 1.0):
             # warn but allow — depending on strictness; here we raise to enforce discreteness
-            raise ValidationErrorWithContext('Evidence.score must be one of the discrete values (0.0,0.25,0.5,0.75,1.0)'， {'value': e.score, 'evidence': e.dict()})
+            raise ValidationErrorWithContext('Evidence.score must be one of the discrete values (0.0,0.25,0.5,0.75,1.0)', {'value': e.score, 'evidence': e.dict()})
     # Passed
     return True
 
@@ -131,8 +131,8 @@ def make_neutral_response(ticker: str) -> AssetAnalysisModel:
     return AssetAnalysisModel(
         ticker=ticker,
         adjustment_factor=1.0,
-        confidence=0.0,
-        evidence=[],
+        confidence=0.0，
+        evidence=[]，
         reasoning='NO_EVIDENCE: no verifiable documents provided',
         audit_id=str(uuid.uuid4()),
         model_version='local-demo'
@@ -172,4 +172,3 @@ if __name__ == '__main__':
         print('Pydantic validation error:', e)
     except ValidationErrorWithContext as e:
         print('Business validation error:', e, e.details)
-
