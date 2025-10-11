@@ -19,7 +19,8 @@ CACHE_MISSES = Counter(
 AI_CALL_LATENCY = Histogram(
     "phoenix_ai_call_latency_seconds",
     "Latency of calls to the AI API, in seconds.",
-    buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 90.0, float("inf")]
+    buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 90.0, float("inf")],
+    labels=['client']
 )
 
 # Data Provider Metrics
