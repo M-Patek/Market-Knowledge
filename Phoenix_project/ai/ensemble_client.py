@@ -94,7 +94,7 @@ class _SingleAIClient:
         
         try:
             async with self.semaphore:
-                with AI_CALL_LATENCY.labels(client=self.client_id).time():
+                with AI_CALL_LATENCY.time():
                     response = await asyncio.wait_for(
                         self.model.generate_content_async(
                             prompt_details["final_prompt"],
@@ -166,7 +166,7 @@ class EnsembleAIClient:
         if not self.clients:
             raise ValueError("No AI clients are enabled in the configuration file.")
         
-        self.logger.info(f"EnsembleAIClient initialized with {len(self.clients)} active clients.")
+        self.logger。info(f"EnsembleAIClient initialized with {len(self.clients)} active clients.")
 
     async def get_ensemble_asset_analysis(self, ticker: str, retrieved_docs: List[Dict[str, Any]]) -> List[AssetAnalysisModel]:
         """
@@ -175,7 +175,7 @@ class EnsembleAIClient:
         call_uuid = uuid.uuid4()
         tasks = []
 
-        for client_id, client in self.clients.items():
+        for client_id, client 在 self.clients.items():
             try:
                 # 1. Render the specific prompt for this client
                 prompt_details = render_prompt(
@@ -209,4 +209,3 @@ class EnsembleAIClient:
         
         self.logger.info(f"Ensemble for '{ticker}' complete: {len(valid_responses)}/{len(self.clients)} valid responses.")
         return valid_responses
-
