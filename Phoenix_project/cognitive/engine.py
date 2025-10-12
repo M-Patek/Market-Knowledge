@@ -27,8 +27,22 @@ class CognitiveEngine:
         else:
             raise ValueError(f"Unknown position sizer method: {method}")
 
-    def determine_allocations(self, candidate_analysis: List[Dict], current_vix: float, current_date: date) -> List[Dict]:
+    def determine_allocations(self,
+                              candidate_analysis: List[Dict],
+                              current_vix: float,
+                              current_date: date,
+                              emergency_factor: Optional[float] = None) -> List[Dict]:
         self.logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
+
+        # --- Emergency Override Logic ---
+        if emergency_factor is not None and emergency_factor < 1.0:
+            self.logger.critical(f"EMERGENCY OVERRIDE: Injected factor of {emergency_factor:.3f} detected. "
+                                 f"Overriding all models and issuing forced liquidation order.")
+            # Create a battle plan to exit all positions. Ticker is a placeholder.
+            battle_plan = [{"ticker": "ALL_ASSETS", "capital_allocation_pct": 0.0}]
+            return battle_plan
+
+        # --- Standard Logic ---
         capital_modifier = self.risk_manager.get_capital_modifier(current_vix, current_date)
         worthy_targets = self.portfolio_constructor.identify_opportunities(candidate_analysis, current_date)
         effective_max_allocation = self.config.max_total_allocation * capital_modifier
