@@ -487,42 +487,40 @@ async def generate_html_report(cerebro: bt.Cerebro, strat: RomanLegionStrategy, 
     pass
 
 # --- AI Pre-computation Helpers ---
-def fetch_mock_docs_for_ticker(ticker: str) -> List[Dict[str, Any]]:
-    # In a real system, this would be a sophisticated RAG pipeline
-    # that provides detailed, fine-grained provenance for each retrieved document.
-    fetch_time = datetime.utcnow()
-    return [
-        {
-            # --- [NEW] Enriched Provenance Metadata ---
-            "source_id": f"NEWS-SRC-123-{ticker}",
-            "content": f"'{ticker}' shows strong performance in the recent quarter. Multiple analysts have upgraded the stock to 'Buy', citing strong sales growth.",
-            "source": "Major Financial News Wire",
-            "license": "Commercial Use",
-            "retrieval_rank": 1,
-            "fetch_time": fetch_time.isoformat(),
-            "timestamp": (fetch_time - timedelta(hours=2)).isoformat() # Simulate the news being 2 hours old
-        }
-    ]
-
-
 async def precompute_asset_analyses(
-    ensemble_client: EnsembleAIClient,
-    fusion_engine: BayesianFusionEngine,
+    reasoning_ensemble: ReasoningEnsemble,
+    retriever: HybridRetriever,
     dates: List[date],
     asset_universe: List[str]
 ) -> Dict[date, Dict]:
-    # Implementation...
-    pass
+    """Pre-computes all AI analyses for all assets for all dates to prevent repeated API calls."""
+    logger = logging.getLogger("PhoenixProject.AIPrecomputation")
+    logger.info(f"Starting AI pre-computation for {len(dates)} dates and {len(asset_universe)} assets.")
+    master_lookup = {d: {} for d in dates}
+
+    for single_date in dates:
+        for ticker in asset_universe:
+            logger.debug(f"Analyzing {ticker} for date {single_date.isoformat()}...")
+            # In a real system, the query would be more sophisticated, perhaps incorporating the date.
+            query = f"What is the near-term outlook for {ticker}?"
+            evidence_list = await retriever.retrieve(query=query, ticker=ticker)
+            hypothesis = f"Assess the investment-worthiness of {ticker} for the near-term."
+
+            analysis_result = await reasoning_ensemble.analyze(hypothesis, evidence_list)
+            master_lookup[single_date][ticker] = analysis_result
+
+    logger.info("AI pre-computation complete.")
+    return master_lookup
 
 # --- Main Execution Engine ---
-async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, ensemble_client: Optional[EnsembleAIClient] = None, bayesian_fusion_engine: Optional[BayesianFusionEngine] = None):
+async def run_single_backtest(config: StrategyConfig, all_aligned_data: Dict, reasoning_ensemble: Optional[ReasoningEnsemble] = None, retriever: Optional[HybridRetriever] = None):
     logger = logging.getLogger("PhoenixProject")
     logger.info(f"--- Launching 'Phoenix Project' in SINGLE BACKTEST mode (AI: {config.ai_mode.upper()}) ---")
 
     master_dates = [dt.to_pydatetime().date() for dt in all_aligned_data["asset_universe_df"].index]
     asset_analysis_lookup = {}
-    if ensemble_client and bayesian_fusion_engine and config.ai_mode != "off":
-        asset_analysis_lookup = await precompute_asset_analyses(ensemble_client, bayesian_fusion_engine, master_dates, config.asset_universe)
+    if reasoning_ensemble and retriever and config.ai_mode != "off":
+        asset_analysis_lookup = await precompute_asset_analyses(reasoning_ensemble, retriever, master_dates, config.asset_universe)
 
     cerebro = bt.Cerebro()
     try:
@@ -606,13 +604,22 @@ async def main():
     ensemble_client: Optional[EnsembleAIClient] = None
     bayesian_fusion_engine: Optional[BayesianFusionEngine] = None
     reasoning_ensemble: Optional[ReasoningEnsemble] = None
+    retriever: Optional[HybridRetriever] = None
 
     if config.ai_ensemble_config.enable:
         try:
-            ensemble_config_path = config.ai_ensemble_config。config_file_path
+            ensemble_config_path = config.ai_ensemble_config.config_file_path
             embedding_client = EmbeddingClient()
             bayesian_fusion_engine = BayesianFusionEngine(embedding_client=embedding_client)
             
+            # [NEW] Initialize all RAG components
+            vector_db = VectorDBClient()
+            temporal_db = TemporalDBClient()
+            tabular_db = TabularDBClient()
+            with open(ensemble_config_path, 'r') as f:
+                ai_config = yaml.safe_load(f)
+            retriever = HybridRetriever(vector_db, temporal_db, tabular_db, embedding_client, ai_config.get('retriever'， {}))
+
             # Initialize all reasoners
             bayesian_reasoner = BayesianReasoner(bayesian_fusion_engine)
             symbolic_reasoner = SymbolicRuleReasoner()
@@ -645,10 +652,10 @@ async def main():
             snapshot_manager.create_snapshot(run_id, required_files)
 
         if config.walk_forward.get('enabled', False):
-            optimizer = Optimizer(config, all_aligned_data, ai_client=ensemble_client, fusion_engine=bayesian_fusion_engine)
+            optimizer = Optimizer(config, all_aligned_data, reasoning_ensemble=reasoning_ensemble, retriever=retriever)
             optimizer.run_optimization()
         else:
-            await run_single_backtest(config, all_aligned_data, ensemble_client, bayesian_fusion_engine)
+            await run_single_backtest(config, all_aligned_data, reasoning_ensemble, retriever)
     finally:
         duration = time.time() - start_time
         BACKTEST_DURATION.set(duration)
@@ -661,4 +668,3 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-
