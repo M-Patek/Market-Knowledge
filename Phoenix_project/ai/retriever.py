@@ -5,16 +5,31 @@ This module is responsible for fetching a broad set of candidate documents
 and then intelligently re-ranking them to find the most relevant, timely,
 and authoritative evidence for the AI cognitive layer.
 """
+import os
 import logging
 import asyncio
 import itertools
+import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
+from pydantic import BaseModel, Field
 
+import google.generativeai as genai
 from .vector_db_client import VectorDBClient
 from .embedding_client import EmbeddingClient
 from .temporal_db_client import TemporalDBClient
 from .tabular_db_client import TabularDBClient
+
+# --- [NEW] Pydantic model for the deconstructed query contract ---
+class TabularQuery(BaseModel):
+    ticker: str
+    metric: str
+
+class DeconstructedQuery(BaseModel):
+    """The structured output from the query deconstruction LLM call."""
+    semantic_query: str = Field(description="An optimized query string for the vector database.")
+    temporal_entities: List[str] = Field(description="A list of key entities for temporal filtering.")
+    tabular_queries: List[TabularQuery] = Field(description="A list of precise queries for the tabular database.")
 
 class HybridRetriever:
     """
@@ -44,6 +59,17 @@ class HybridRetriever:
         
         # Re-ranking parameters
         self.rerank_config = rerank_config
+
+        # --- [NEW] Initialize the generative model for query deconstruction ---
+        try:
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key: raise ValueError("GEMINI_API_KEY not set.")
+            genai.configure(api_key=api_key)
+            self.deconstructor_model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize deconstructor model: {e}")
+            self.deconstructor_model = None
+
         self.logger.info("HybridRetriever initialized.")
 
     async def _recall_from_vector(self, query: str, top_k: int) -> List[Dict[str, Any]]:
@@ -79,28 +105,74 @@ class HybridRetriever:
         results = self.tabular_client.query_by_metric(ticker, metric)
         return results if results is not None else []
 
+    async def _deconstruct_query(self, query: str, ticker: str) -> Optional[DeconstructedQuery]:
+        """Uses an LLM to deconstruct a natural language query into a structured object."""
+        if not self.deconstructor_model:
+            self.logger.error("Deconstructor model not available.")
+            return None
+
+        prompt = f"""
+        You are an expert financial query dispatcher. Your task is to deconstruct a user's query into a structured JSON object for a hybrid retrieval system.
+
+        **Databases:**
+        1.  **VectorDB:** For semantic search on unstructured text (news, filings). Needs a concise `semantic_query`.
+        2.  **TemporalDB:** For time-based searches. Needs a list of key `temporal_entities`.
+        3.  **TabularDB:** For structured financial metrics. Needs a list of `tabular_queries` with a `ticker` and a specific `metric`.
+
+        **User Query:** "{query}"
+        **Primary Ticker:** "{ticker}"
+
+        **Instructions:**
+        - The `semantic_query` should be a keyword-rich version of the original query.
+        - The `temporal_entities` should include the primary ticker and any other key entities mentioned (people, organizations, events).
+        - The `tabular_queries` should ONLY be populated if the user asks for specific, known financial metrics (e.g., "revenue", "debt", "net income", "EPS"). If they ask for general concepts like "profitability", do not guess a metric; leave the list empty.
+        - Respond ONLY with a single, valid JSON object that adheres to the following Pydantic schema. Do not include any other text or markdown.
+
+        **JSON Schema:**
+        {DeconstructedQuery.schema_json(indent=2)}
+        """
+        try:
+            response = await self.deconstructor_model.generate_content_async(
+                prompt,
+                generation_config={"response_mime_type": "application/json"}
+            )
+            parsed_json = json.loads(response.text)
+            return DeconstructedQuery.model_validate(parsed_json)
+        except Exception as e:
+            self.logger.error(f"Failed to deconstruct query: {e}")
+            return None
 
     async def recall(self, query: str, ticker: str, top_k: int = 50) -> List[Dict[str, Any]]:
         """
         Performs the initial recall stage by querying all indexes in parallel.
         """
-        self.logger.info("Initiating parallel recall from all indexes...")
+        self.logger.info("Initiating intelligent query deconstruction...")
+        deconstructed = await self._deconstruct_query(query, ticker)
+
+        if not deconstructed:
+            # Fallback to simple logic if deconstruction fails
+            self.logger.warning("Query deconstruction failed. Falling back to simple recall.")
+            deconstructed = DeconstructedQuery(
+                semantic_query=query,
+                temporal_entities=[ticker],
+                tabular_queries=[]
+            )
+
+        self.logger.info(f"Deconstructed query: {deconstructed.dict()}")
         tasks = []
 
         # Task for Vector DB (semantic search on the query text)
         if self.vector_db_client.is_healthy():
-            tasks.append(self._recall_from_vector(query, top_k))
+            tasks.append(self._recall_from_vector(deconstructed.semantic_query, top_k))
 
-        # --- Simple entity/metric extraction for other indexes ---
-        # In a real system, this would use a proper NLP model (e.g., NER)
-        # For now, we'll assume the ticker is a key entity and look for a common metric.
-        entities_in_query = [ticker]
-        if "revenue" in query.lower():
-            if self.tabular_client.is_healthy():
-                tasks.append(self._recall_from_tabular(ticker, "Revenue"))
+        # Tasks for Tabular DB
+        if self.tabular_client.is_healthy():
+            for tq in deconstructed.tabular_queries:
+                tasks.append(self._recall_from_tabular(tq.ticker, tq.metric))
         
+        # Task for Temporal DB
         if self.temporal_client.is_healthy():
-             tasks.append(self._recall_from_temporal(entities_in_query))
+             tasks.append(self._recall_from_temporal(deconstructed.temporal_entities))
 
         if not tasks:
             self.logger.warning("No healthy index clients available for recall.")
