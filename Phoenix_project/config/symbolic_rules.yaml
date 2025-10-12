@@ -1,0 +1,33 @@
+# Phoenix Project - Symbolic Rule Engine Configuration
+# ---------------------------------------------------
+# This file defines deterministic rules that provide safety overrides and encode
+# explicit, non-negotiable domain knowledge into the reasoning process.
+# If a rule's conditions are met, it will produce a high-confidence, deterministic output.
+
+rules:
+  - name: "Multiple Negative SEC Filings"
+    description: "If more than two SEC filings with a negative score are found, flag as high risk."
+    conditions:
+      - evidence_type: "sec_filing"
+        score_operator: "less_than"
+        score_threshold: 0.3
+        count_operator: "greater_than"
+        count_threshold: 2
+    conclusion:
+      risk_flag: "High"
+      rule_triggered: "multiple_negative_sec_filings"
+      confidence: 1.0 # Deterministic rules have maximum confidence
+
+  - name: "Major Positive Analyst Upgrade"
+    description: "If a major analyst rating is found with a very high score, flag as a positive catalyst."
+    conditions:
+      - evidence_type: "analyst_rating"
+        score_operator: "greater_than_or_equal_to"
+        score_threshold: 0.9
+        count_operator: "greater_than_or_equal_to"
+        count_threshold: 1
+    conclusion:
+      catalyst_flag: "Positive"
+      rule_triggered: "major_positive_analyst_upgrade"
+      confidence: 1.0
+
