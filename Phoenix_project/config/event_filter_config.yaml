@@ -1,0 +1,61 @@
+# Phoenix Project - Systemic Event Filter Configuration
+# -----------------------------------------------------------
+# This file defines the keyword sets for the first-stage, high-speed event filter.
+# Its purpose is to eliminate noise and only pass potentially significant macro-economic
+# or geopolitical events to the AI cognitive layer for analysis.
+
+# Set A: High-risk action words. An event MUST contain at least one of these.
+RiskActionKeywords:
+  - "tariffs"
+  - "collapse"
+  - "rate hike"
+  - "recession"
+  - "war"
+  - "invasion"
+  - "sanctions"
+  - "default"
+  - "crisis"
+  - "downgrade"
+  - "crash"
+  - "bubble"
+  - "emergency meeting"
+
+# Set B: Core systemic entities. An event MUST also contain at least one of these.
+SystemicEntityKeywords:
+  - "Trump"
+  - "Federal Reserve"
+  - "Fed"
+  - "ECB"
+  - "PBOC"
+  - "China"
+  - "White House"
+  - "US Treasury"
+  - "OPEC"
+  - "Wall Street"
+  - "geopolitical"
+
+# Set C: Exclusion words. If an event contains any of these, it is immediately discarded.
+ExclusionKeywords:
+  - "local elections"
+  - "school boards"
+  - "municipal"
+  - "city council"
+  - "sports"
+  - "entertainment"
+  # Add names of irrelevant small countries or minor political figures here
+  - "chad"
+  - "somalia"
+  - "vanuatu"
+
+# The minimum adjustment factor from the AI's fused response required to trigger an emergency action.
+# For example, 0.95 means a 5% negative adjustment is needed to trigger.
+EventTriggerThreshold:
+  min_factor: 0.95
+  max_factor: 1.05
+
+# Confidence and dispersion thresholds for the secondary AI validation stage.
+AIValidationThresholds:
+  min_avg_evidence_score: 0.3
+  min_confidence: 0.2
+  max_dispersion: 0.3
+
