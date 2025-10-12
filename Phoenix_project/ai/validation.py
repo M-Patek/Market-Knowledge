@@ -136,8 +136,8 @@ def make_neutral_response(ticker: str) -> AssetAnalysisModel:
     return AssetAnalysisModel(
         ticker=ticker,
         adjustment_factor=1.0,
-        confidence=0.0，
-        evidence=[]，
+        confidence=0.0,
+        evidence=[],
         reasoning='NO_EVIDENCE: no verifiable documents provided',
         audit_id=str(uuid.uuid4()),
         model_version='local-demo'
