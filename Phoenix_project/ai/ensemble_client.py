@@ -17,6 +17,8 @@ import uuid
 import asyncio
 import logging
 import yaml
+import aiofiles
+import aiofiles.os
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
@@ -49,8 +51,6 @@ class _SingleAIClient:
         if not api_key:
             raise ValueError(f"API key env var '{self.config['api_key_env_var']}' not set for client '{self.client_id}'.")
         
-        # NOTE: In a real multi-provider system, you would abstract this part.
-        # For now, we assume all models are from the same provider (e.g., Google GenAI).
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(self.config['model_name'])
         self.semaphore = asyncio.Semaphore(self.config['max_concurrent'])
@@ -114,27 +114,26 @@ class _SingleAIClient:
             validated_model = AssetAnalysisModel.model_validate(model_data)
             validate_response_against_retrieved_docs(validated_model, prompt_meta.get("retrieved_doc_ids", []))
             
-            self._write_audit(audit_id, run_id, ticker, prompt_details, raw_text, validated_model.dict(), success=True)
+            await self._write_audit(audit_id, run_id, ticker, prompt_details, raw_text, validated_model.dict(), success=True)
             self.record_success()
             return validated_model
 
         except (json.JSONDecodeError, ValidationErrorWithContext) as e:
             self.logger.error(f"Validation failed for '{self.client_id}': {e}. Raw Text: '{raw_text}'")
-            self._write_audit(audit_id, run_id, ticker, prompt_details, raw_text, success=False, error=str(e))
+            await self._write_audit(audit_id, run_id, ticker, prompt_details, raw_text, success=False, error=str(e))
             return None
         except Exception as e:
             self.logger.error(f"API call failed for '{self.client_id}': {e}")
             self.record_failure()
-            self._write_audit(audit_id, run_id, ticker, prompt_details, raw_text, success=False, error=str(e))
+            await self._write_audit(audit_id, run_id, ticker, prompt_details, raw_text, success=False, error=str(e))
             raise
 
-    def _write_audit(self, audit_id: str, run_id: str, ticker: str, prompt_details: dict, raw_response: str, parsed_response: Optional[dict] = None, success: bool = False, error: Optional[str] = None):
-        # This function should implement atomic, structured logging as per the plan
-        # For brevity, this is a simplified version.
+    async def _write_audit(self, audit_id: str, run_id: str, ticker: str, prompt_details: dict, raw_response: str, parsed_response: Optional[dict] = None, success: bool = False, error: Optional[str] = None):
+        """Asynchronously writes a detailed audit log to a JSON file."""
         log_dir = os.path.join("ai_audit_logs", datetime.utcnow().strftime('%Y-%m-%d'))
-        os.makedirs(log_dir, exist_ok=True)
+        await aiofiles.os.makedirs(log_dir, exist_ok=True)
         filepath = os.path.join(log_dir, f"{audit_id}.json")
-        
+
         record = {
             "audit_id": audit_id, "run_id": run_id, "client_id": self.client_id,
             "ticker": ticker, "timestamp_utc": datetime.utcnow().isoformat(),
@@ -144,8 +143,12 @@ class _SingleAIClient:
             "parsed_response": parsed_response,
             "model_config": {"name": self.config['model_name'], **self.runtime_settings}
         }
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(record, f, indent=2, ensure_ascii=False)
+
+        try:
+            async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(record, indent=2, ensure_ascii=False))
+        except Exception as e:
+            self.logger.error(f"Asynchronous file write for audit log '{filepath}' failed: {e}")
 
 # --- Main Ensemble Client ---
 
@@ -175,11 +178,11 @@ class EnsembleAIClient:
         call_uuid = uuid.uuid4()
         tasks = []
 
-        for client_id, client 在 self.clients.items():
+        for client_id, client in self.clients.items():
             try:
                 # 1. Render the specific prompt for this client
                 prompt_details = render_prompt(
-                    template_path=client.config['prompt_template'],
+                    template_path=client.config['prompt_template']，
                     ticker=ticker,
                     retrieved_docs=retrieved_docs
                 )
