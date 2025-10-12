@@ -56,14 +56,24 @@ class PortfolioConstructor:
             confidence = 0.0
             
             if self.mode != 'off':
-                fused_response_data = daily_asset_analysis.get(ticker)
-                if fused_response_data:
-                    final_factor = fused_response_data.get('final_factor', 1.0)
-                    confidence = 1.0 - fused_response_data.get('dispersion', 1.0) # Use dispersion as an inverse proxy for confidence
-            adjusted_score = candidate["opportunity_score"] * final_factor
+                # [NEW] Adapt to the ReasoningEnsemble's output structure
+                ensemble_analysis = daily_asset_analysis.get(ticker)
+                if ensemble_analysis:
+                    final_conclusion = ensemble_analysis.get("final_conclusion", {})
+                    probability = final_conclusion.get("final_probability")
+
+                    if probability is not None:
+                        # Translate probability (0.0 to 1.0) to an adjustment factor.
+                        # A simple linear scaling: 0.5 prob -> 1.0 factor, 1.0 prob -> 1.3 factor, 0.0 prob -> 0.7 factor.
+                        final_factor = 0.7 + (probability * 0.6)
+                        # Confidence can be how far the probability is from a neutral 0.5
+                        confidence = abs(probability - 0.5) * 2.0
+
+            adjusted_score = original_score * final_factor
             adjusted_candidates.append({**candidate, "adjusted_score": adjusted_score, "ai_factor": final_factor, "ai_confidence": confidence})
-            if final_factor != 1.0 and self.mode != 'off': self.logger.info(f"AI Insight for {ticker} (Mode: {self.mode}): Conf={confidence:.2f}, FinalFactor={final_factor:.3f}. Score: {original_score:.2f} -> {adjusted_score:.2f}")
-        
+            if abs(final_factor - 1.0) > 1e-9 and self.mode != 'off':
+                self.logger.info(f"AI Insight for {ticker} (Mode: {self.mode}): Prob={probability:.3f}, Conf={confidence:.2f}, FinalFactor={final_factor:.3f}. Score: {original_score:.2f} -> {adjusted_score:.2f}")
+
         worthy_targets = [res for res in adjusted_candidates if res["adjusted_score"] > self.config.opportunity_score_threshold]
         if not worthy_targets:
             self.logger.info("PortfolioConstructor: No opportunities met the threshold.")
