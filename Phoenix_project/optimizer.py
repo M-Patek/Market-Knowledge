@@ -2,15 +2,15 @@
 
 import logging
 from typing import Dict, Any
-import datetime
+from datetime import date
 from datetime import timedelta
 import asyncio
 import optuna
 import backtrader as bt
 import pandas as pd
 from phoenix_project import StrategyConfig, RomanLegionStrategy, generate_html_report, precompute_asset_analyses, StrategyConfig
-from ai.ensemble_client import EnsembleAIClient
-from ai.bayesian_fusion_engine import BayesianFusionEngine
+from ai.reasoning_ensemble import ReasoningEnsemble
+from ai.retriever import HybridRetriever
 
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -23,26 +23,26 @@ class Optimizer:
     def __init__(self,
                  config: StrategyConfig,
                  all_aligned_data: Dict[str, Any],
-                 ai_client: EnsembleAIClient | None,
-                 fusion_engine: BayesianFusionEngine | None
-                 ):
+                 reasoning_ensemble: ReasoningEnsemble | None,
+                 retriever: HybridRetriever | None):
         """
         Initializes the Optimizer.
 
         Args:
             config: The main strategy configuration object.
             all_aligned_data: The complete, aligned dataset for the backtest period.
-            ai_client: The AI client for report generation and pre-computation.
+            reasoning_ensemble: The fully initialized reasoning ensemble.
+            retriever: The fully initialized hybrid retriever.
         """
         self.logger = logging.getLogger("PhoenixProject.Optimizer")
         self.config = config
         self.all_aligned_data = all_aligned_data
-        self.ai_client = ai_client
-        self.fusion_engine = fusion_engine
+        self.reasoning_ensemble = reasoning_ensemble
+        self.retriever = retriever
         self.study_name = self.config.optimizer.study_name
         self.storage_url = f"sqlite:///{self.study_name}.db"
 
-    def _create_backtest_instance(self, config: StrategyConfig, start_date: datetime.date, end_date: datetime.date, asset_analysis_data: Dict = None) -> bt.Cerebro:
+    def _create_backtest_instance(self, config: StrategyConfig, start_date: date, end_date: date, asset_analysis_data: Dict = None) -> bt.Cerebro:
         """Helper function to create and configure a Cerebro instance."""
         cerebro = bt.Cerebro(stdstats=False)
         cerebro.broker.setcash(config.initial_cash)
@@ -64,9 +64,30 @@ class Optimizer:
         )
 
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio', annualize=True)
+        # Add a custom analyzer to store AI outputs
+        cerebro.addanalyzer(bt.analyzers.PyFolio, _name='pyfolio')
         return cerebro
 
-    def _objective(self, trial: optuna.trial.Trial, start_date: datetime.date, end_date: datetime.date) -> float:
+    def _generate_true_outcomes(self, ai_outputs: Dict[date, Dict], price_data: pd.DataFrame, horizon: int = 5) -> (List[List[Any]], List[int]):
+        """Generates training data for the MetaLearner."""
+        historical_outputs = []
+        true_outcomes = []
+
+        for day, ticker_outputs in ai_outputs.items():
+            for ticker, analysis in ticker_outputs.items():
+                # Check future price movement to determine the "true outcome"
+                try:
+                    current_price = price_data.xs(ticker, level=1, axis=1).loc[pd.Timestamp(day)]['Close']
+                    future_price = price_data.xs(ticker, level=1, axis=1).loc[pd.Timestamp(day) + pd.Timedelta(days=horizon)]['Close']
+                    outcome = 1 if future_price > current_price else 0
+
+                    historical_outputs.append(analysis.get("individual_reasoner_outputs", []))
+                    true_outcomes.append(outcome)
+                except KeyError:
+                    continue # Date not in index, skip
+        return historical_outputs, true_outcomes
+
+    def _objective(self, trial: optuna.trial.Trial, start_date: date, end_date: date) -> float:
         """The function for Optuna to optimize, which runs a single backtest."""
         try:
             # 1. Suggest hyperparameters from the config file
@@ -86,9 +107,24 @@ class Optimizer:
             for param, value in params_to_tune.items():
                 setattr(temp_config, param, value)
 
-            # 3. Create and run the backtest using the helper
-            cerebro = self._create_backtest_instance(temp_config, start_date, end_date)
+            # 3. Pre-compute AI analysis for the training period
+            master_dates = pd.date_range(start=start_date, end=end_date).date
+            asset_analysis_lookup = {}
+            if self.reasoning_ensemble and self.retriever and self.config.ai_mode != "off":
+                 asset_analysis_lookup = asyncio.run(
+                    precompute_asset_analyses(self.reasoning_ensemble, self.retriever, list(master_dates), self.config.asset_universe)
+                )
+
+            # 4. Create and run the backtest
+            cerebro = self._create_backtest_instance(temp_config, start_date, end_date, asset_analysis_lookup)
             results = cerebro.run()
+            
+            # 5. [NEW] Train the MetaLearner using the results of this run
+            if self.reasoning_ensemble:
+                historical_data, true_outcomes = self._generate_true_outcomes(asset_analysis_lookup, self.all_aligned_data["asset_universe_df"])
+                if historical_data and true_outcomes:
+                    self.reasoning_ensemble.meta_learner.train(historical_data, true_outcomes)
+
             sharpe_ratio = results[0].analyzers.sharpe_ratio.get_analysis().get('sharperatio', 0.0)
             return sharpe_ratio if sharpe_ratio is not None else 0.0
 
@@ -105,8 +141,8 @@ class Optimizer:
         test_delta = timedelta(days=wf_config['test_days'])
         step_delta = timedelta(days=wf_config['step_days'])
 
-        full_start_date = self.config.start_date
-        full_end_date = self.config.end_date
+        full_start_date = self.config。start_date
+        full_end_date = self.config。end_date
 
         out_of_sample_results = []
         current_start = full_start_date
@@ -125,7 +161,7 @@ class Optimizer:
             study = optuna.create_study(
                 study_name=f"{self.study_name}_window_{window_num}",
                 storage=self.storage_url,
-                direction="maximize",
+                direction="maximize"，
                 load_if_exists=True # Allows resuming
             )
 
@@ -146,10 +182,10 @@ class Optimizer:
 
             master_dates = pd.date_range(start=test_start, end=test_end).date
             asset_analysis_lookup = {}
-            if self.ai_client and self.fusion_engine and self.config.ai_mode != "off":
+            if self.reasoning_ensemble and self.retriever and self.config.ai_mode != "off":
                 self.logger.info(f"--- Pre-computing AI asset analysis for Test Window {window_num} ---")
                 asset_analysis_lookup = asyncio.run(
-                    precompute_asset_analyses(self.ai_client, self.fusion_engine, list(master_dates), self.config.asset_universe)
+                    precompute_asset_analyses(self.reasoning_ensemble, self.retriever, list(master_dates), self.config.asset_universe)
                 )
 
             val_cerebro = self._create_backtest_instance(temp_config, test_start, test_end, asset_analysis_lookup)
