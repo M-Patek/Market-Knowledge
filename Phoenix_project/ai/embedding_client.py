@@ -6,7 +6,7 @@ third-party service like OpenAI.
 import os
 import json
 import logging
-from openai import OpenAI
+import google.generativeai as genai
 import numpy as np
 from ts2vec import TS2Vec
 from typing import List, Dict, Any, Union
@@ -16,7 +16,7 @@ class EmbeddingClient:
     """
     A client for generating text embeddings using the OpenAI API.
     """
-    def __init__(self, model_name: str = "text-embedding-3-large"):
+    def __init__(self, model_name: str = "gemini-embedding-001"):
         """
         Initializes the OpenAI client.
 
@@ -38,16 +38,15 @@ class EmbeddingClient:
             self.logger.error(f"Could not load model version info from '{model_version_path}': {e}")
 
         try:
-            api_key = os.getenv("OPENAI_API_KEY")
+            api_key = os.getenv("GEMINI_API_KEY")
             if not api_key:
-                raise ValueError("OPENAI_API_KEY environment variable not set.")
+                raise ValueError("GEMINI_API_KEY environment variable not set.")
             
-            self.client = OpenAI(api_key=api_key)
+            genai.configure(api_key=api_key)
             self.logger.info(f"EmbeddingClient initialized with model '{self.model_name}'.")
 
         except Exception as e:
-            self.logger.error(f"Failed to initialize OpenAI client for embeddings: {e}")
-            self.client = None
+            self.logger.error(f"Failed to initialize GenerativeAI client for embeddings: {e}")
 
     @retry(wait=wait_random_exponential(multiplier=1, min=2, max=30), stop=stop_after_attempt(3))
     def create_embeddings(self, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -61,23 +60,20 @@ class EmbeddingClient:
         Returns:
             A list of the original documents, each updated with a 'vector' key.
         """
-        if not self.client:
-            self.logger.error("EmbeddingClient is not initialized. Cannot create embeddings.")
-            return []
-        
         texts = [doc.get('content', '') for doc in documents]
         if not texts:
             return []
 
         try:
-            response = self.client.embeddings.create(
-                input=texts,
-                model=self.model_name
+            result = genai.embed_content(
+                model=f"models/{self.model_name}",
+                content=texts,
+                task_type="retrieval_document"
             )
             
             # Attach the generated vector to each original document object
-            for doc, embedding_data in zip(documents, response.data):
-                doc['vector'] = embedding_data.embedding
+            for doc, embedding in zip(documents, result['embedding']):
+                doc['vector'] = embedding
                 # [NEW] Tag the document with the model version
                 if self.model_version_info:
                     doc['embedding_model_version'] = self.model_version_info.get('version')
@@ -85,7 +81,7 @@ class EmbeddingClient:
             return documents
 
         except Exception as e:
-            self.logger.error(f"Failed to create embeddings via OpenAI API: {e}")
+            self.logger.error(f"Failed to create embeddings via GenerativeAI API: {e}")
             raise
 
     def create_time_series_embeddings(self, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -105,7 +101,7 @@ class EmbeddingClient:
             # The model is loaded once and cached in memory for efficiency.
             if not hasattr(self, '_ts2vec_model'):
                 # This path is a placeholder. A real implementation would download or load a trained model.
-                self.logger.warning("Loading a placeholder TS2Vec model. For production, use a trained model.")
+                self.logger。warning("Loading a placeholder TS2Vec model. For production, use a trained model.")
                 # self._ts2vec_model = TS2Vec.load_from_checkpoint('path/to/pretrained/ts2vec/model.ckpt')
                 # For now, we create a dummy model that outputs random vectors of the correct dimension
                 class DummyTS2Vec:
@@ -113,7 +109,7 @@ class EmbeddingClient:
                         return np.random.rand(data.shape[0], 320) # A common TS2Vec output dimension
                 self._ts2vec_model = DummyTS2Vec()
 
-            for doc in documents:
+            for doc 在 documents:
                 ts_data = doc.get("time_series_data")
                 if isinstance(ts_data, np.ndarray):
                     # TS2Vec expects a 3D array (batch, timestamp, feature)
@@ -121,15 +117,15 @@ class EmbeddingClient:
                         ts_data = np.expand_dims(ts_data, axis=0)
                     
                     # Generate the embedding for the time series
-                    embedding = self._ts2vec_model.encode(ts_data, encoding_window='full_series')
+                    embedding = self._ts2vec_model。encode(ts_data, encoding_window='full_series')
                     doc['vector'] = embedding.flatten().tolist()
                 else:
-                    self.logger.warning(f"Document '{doc.get('source_id')}' is missing valid 'time_series_data'.")
+                    self.logger。warning(f"Document '{doc.get('source_id')}' is missing valid 'time_series_data'.")
 
             return documents
         except Exception as e:
-            self.logger.error(f"Failed to create time-series embeddings: {e}")
-            self.logger.warning("Returning documents without time-series vectors due to an error.")
+            self.logger。error(f"Failed to create time-series embeddings: {e}")
+            self.logger。warning("Returning documents without time-series vectors due to an error.")
             return documents
 
     def _convert_tabular_to_text(self, tabular_row: Dict[str, Any]) -> str:
