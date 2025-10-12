@@ -23,20 +23,28 @@ class EvidenceItem(BaseModel):
     finding: str
     score: float = Field(..., ge=0.0, le=1.0)
     provenance_confidence: float = Field(..., ge=0.0, le=1.0)
-    timestamp: datetime
-    doc_id: Optional[str] = None
+    timestamp: Optional[datetime] = None # When the event occurred
     url: Optional[HttpUrl] = None
+
+    # --- [NEW] Fine-grained Provenance Metadata ---
+    source_id: Optional[str] = Field(None, description="The unique identifier of the source document or API record.")
+    fetch_time: Optional[datetime] = Field(None, description="The UTC timestamp when the evidence was retrieved.")
+    license: Optional[str] = Field(None, description="The license or usage terms of the source data.")
+    retrieval_rank: Optional[int] = Field(None, description="The rank of this item in the retrieval results.")
 
     class Config:
         schema_extra = {
             'example': {
                 'type': 'sec_filing',
-                'source': 'DOC-2025-10-01-1',
+                'source': 'SEC EDGAR',
                 'finding': 'Company reported 12% YoY subscription revenue growth in Q3',
                 'score': 1.0,
                 'provenance_confidence': 1.0,
                 'timestamp': '2025-10-01T12:00:00Z',
-                'doc_id': 'DOC-2025-10-01-1',
+                'source_id': 'doc-xyz-123',
+                'fetch_time': '2025-10-12T12:00:00Z',
+                'license': 'Public Domain',
+                'retrieval_rank': 1,
                 'url': 'https://example.com/sec/abc-q3'
             }
         }
@@ -58,7 +66,7 @@ class AssetAnalysisModel(BaseModel):
             return []
         return v
 
-    @root_validator
+    @root_validator(pre=False, skip_on_failure=True)
     def no_evidence_requires_neutral_or_low_confidence(cls, values):
         evidence = values.get('evidence') or []
         confidence = values.get('confidence')
@@ -102,27 +110,24 @@ class ValidationErrorWithContext(Exception):
 
 def validate_response_against_retrieved_docs(response: AssetAnalysisModel, retrieved_doc_ids: List[str]):
     """
-    Ensure every evidence.doc_id in response exists in retrieved_doc_ids.
-    Also enforce additional business rules (e.g., if evidence is empty then neutral rules applied)
+    Ensure every evidence.source_id in response exists in retrieved_doc_ids.
+    Also enforce additional business rules.
     Raises ValidationErrorWithContext on failure.
     """
     missing = []
     for e in response.evidence:
-        if e.doc_id:
-            if e.doc_id not in retrieved_doc_ids:
-                missing.append(e.doc_id)
+        if e.source_id:
+            if e.source_id not in retrieved_doc_ids:
+                missing.append(e.source_id)
         else:
-            # If doc_id not provided, it's allowed only if URL is present and URL can be matched
             if not e.url:
                 missing.append(None)
     if missing:
-        raise ValidationErrorWithContext('Some evidence.doc_id values are not in retrieved_docs', {'missing_doc_ids': missing})
-    # Additional checks: discretize scores
+        raise ValidationErrorWithContext('Some evidence.source_id values are not in retrieved_docs', {'missing_doc_ids': missing})
+    
     for e in response.evidence:
         if e.score not in (0.0, 0.25, 0.5, 0.75, 1.0):
-            # warn but allow — depending on strictness; here we raise to enforce discreteness
             raise ValidationErrorWithContext('Evidence.score must be one of the discrete values (0.0,0.25,0.5,0.75,1.0)', {'value': e.score, 'evidence': e.dict()})
-    # Passed
     return True
 
 
@@ -149,12 +154,12 @@ if __name__ == '__main__':
         'evidence': [
             {
                 'type': 'sec_filing',
-                'source': 'DOC-2025-10-01-1',
+                'source': 'SEC',
                 'finding': 'Subscription revenue up 12% YoY',
                 'score': 1.0,
                 'provenance_confidence': 1.0,
                 'timestamp': '2025-10-01T12:00:00Z',
-                'doc_id': 'DOC-2025-10-01-1'
+                'source_id': 'DOC-2025-10-01-1'
             }
         ],
         'reasoning': 'Subscription growth supports a modest up-weight.',
@@ -162,9 +167,9 @@ if __name__ == '__main__':
         'model_version': 'demo-1'
     }
     try:
-        resp = AssetAnalysisModel.parse_obj(example)
+        resp = AssetAnalysisModel.model_validate(example)
         print('Parsed response OK:')
-        print(resp.json(indent=2, ensure_ascii=False))
+        print(resp.json(indent=2))
         # Validate against retrieved doc ids
         validate_response_against_retrieved_docs(resp, ['DOC-2025-10-01-1', 'DOC-2025-10-02-1'])
         print('Validation against retrieved_docs passed')
