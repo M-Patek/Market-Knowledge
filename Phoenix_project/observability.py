@@ -39,7 +39,17 @@ PROVIDER_LATENCY_SECONDS = Histogram(
     "Latency of requests to a data provider.",
     ["provider"]
 )
+PROVIDER_DATA_FRESHNESS_SECONDS = Gauge(
+    "phoenix_provider_data_freshness_seconds",
+    "The difference in seconds between when data was observed and its latest available timestamp.",
+    ["provider"]
+)
 
+# --- [NEW] Probabilistic Reasoning Metrics ---
+PROBABILITY_CALIBRATION_BRIER_SCORE = Gauge(
+    "phoenix_probability_calibration_brier_score",
+    "The Brier score loss, measuring the accuracy of probabilistic predictions."
+)
 # Backtest Execution Metrics
 BACKTEST_DURATION = Gauge(
     "phoenix_backtest_duration_seconds",
