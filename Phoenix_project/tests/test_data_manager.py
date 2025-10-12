@@ -119,7 +119,7 @@ async def test_concurrent_provider_failure_and_fallback(data_manager):
 @pytest.mark.asyncio
 async def test_circuit_breaker_opens_and_skips_provider(data_manager):
     """Tests that the circuit breaker opens after consecutive failures and skips the provider."""
-    failure_threshold = data_manager.ds_config。health_probes。failure_threshold
+    failure_threshold = data_manager.ds_config.health_probes.failure_threshold
     
     with patch.object(data_manager, '_fetch_from_alpha_vantage', new_callable=AsyncMock, side_effect=Exception("API Failure")), \
          patch.object(data_manager, '_fetch_from_twelvedata', new_callable=AsyncMock) as mock_fallback:
