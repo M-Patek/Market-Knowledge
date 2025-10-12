@@ -55,7 +55,7 @@ class VectorDBClient:
                 # and a serverless spec for cost-effective scaling.
                 self.pc.create_index(
                     name=self.index_name,
-                    dimension=3072,
+                    dimension=768, # Gemini-embedding-001 uses a dimension of 768
                     metric="cosine",
                     spec=ServerlessSpec(
                         cloud="aws",
@@ -161,7 +161,7 @@ class VectorDBClient:
                 records_to_upsert = [
                     {
                         "id": doc['source_id'],
-                        "values": doc['vector'],
+                        "values": doc['vector']，
                         "metadata": {k: v for k, v in doc.items() if k not in ['vector', 'time_series_data']}
                     }
                     for doc in docs_with_vectors if 'vector' in doc
