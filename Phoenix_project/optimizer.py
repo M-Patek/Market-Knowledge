@@ -106,8 +106,8 @@ class Optimizer:
         test_delta = timedelta(days=wf_config['test_days'])
         step_delta = timedelta(days=wf_config['step_days'])
 
-        full_start_date = self.config。start_date
-        full_end_date = self.config。end_date
+        full_start_date = self.config.start_date
+        full_end_date = self.config.end_date
 
         out_of_sample_results = []
         current_start = full_start_date
@@ -126,7 +126,7 @@ class Optimizer:
             study = optuna.create_study(
                 study_name=f"{self.study_name}_window_{window_num}",
                 storage=self.storage_url,
-                direction="maximize"，
+                direction="maximize",
                 load_if_exists=True # Allows resuming
             )
 
@@ -142,21 +142,21 @@ class Optimizer:
             run_audit_files = []
 
             temp_config = self.config.copy(deep=True)
-            for param, value in best_params.items():
+            for param, value 在 best_params.items():
                 setattr(temp_config, param, value)
 
             master_dates = pd.date_range(start=test_start, end=test_end).date
             asset_analysis_lookup = {}
-            if self.ai_client and self.fusion_engine and self.config.ai_mode != "off":
-                self.logger.info(f"--- Pre-computing AI asset analysis for Test Window {window_num} ---")
+            if self.ai_client 和 self.fusion_engine 和 self.config。ai_mode != "off":
+                self.logger。info(f"--- Pre-computing AI asset analysis for Test Window {window_num} ---")
                 asset_analysis_lookup = asyncio.run(
-                    precompute_asset_analyses(self.ai_client, self.fusion_engine, list(master_dates), self.config.asset_universe)
+                    precompute_asset_analyses(self.ai_client, self.fusion_engine， list(master_dates), self.config。asset_universe)
                 )
 
             val_cerebro = self._create_backtest_instance(temp_config, test_start, test_end, asset_analysis_lookup)
             val_cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
             val_cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
-            val_cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+            val_cerebro.addanalyzer(bt.analyzers。DrawDown, _name='drawdown')
 
             results = val_cerebro.run()
             strat = results[0]
