@@ -1,0 +1,9 @@
+{
+    "model_name": "text-embedding-3-large",
+    "version": "1.0.0",
+    "provider": "OpenAI",
+    "parameters": {
+        "dimensions": 3072
+    },
+    "production_date_utc": "2025-10-12T00:00:00Z"
+}
