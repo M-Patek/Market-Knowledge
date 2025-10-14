@@ -44,7 +44,7 @@ def render_prompt(template_path: str, ticker: str, retrieved_docs: List[Dict[str
         # We use a simple .format() here, but a more complex engine like Jinja2 could be used.
         full_prompt_structure = {
             "role": template_data.get("role"),
-            "task": template_data.get("task")。format(ticker=ticker),
+            "task": template_data.get("task").format(ticker=ticker),
             "rules": template_data.get("rules"),
             "output_format": template_data.get("output_format"),
             "context": context_str
