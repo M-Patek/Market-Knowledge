@@ -12,7 +12,6 @@ import pandas as pd
 from statsmodels.tsa.stattools import grangercausalitytests
 from typing import Protocol, List, Dict, Any, NamedTuple
 from pydantic import BaseModel
-from sklearn.linear_model import LogisticRegression
 
 from ai.validation import EvidenceItem
 from .bayesian_fusion_engine import BayesianFusionEngine
@@ -206,9 +205,22 @@ class MetaLearner:
     to produce a final, synthesized decision.
     """
     def __init__(self):
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
+        from sklearn.svm import SVC
+
         self.logger = logging.getLogger("PhoenixProject.MetaLearner")
-        # We use a simple, interpretable Logistic Regression model as the meta-learner.
-        self.model = LogisticRegression()
+        
+        # Define the 'AI Jury' - a diverse set of base models
+        estimators = [
+            ('rf', RandomForestClassifier(n_estimators=10, random_state=42)),
+            ('gb', GradientBoostingClassifier(n_estimators=10, random_state=42)),
+            ('svc', SVC(probability=True, random_state=42))
+        ]
+
+        # The 'Chief Judge' (meta-model) learns from the jury's predictions.
+        # We use a StackingClassifier to orchestrate this process.
+        self.model = StackingClassifier(estimators=estimators, final_estimator=LogisticRegression())
         self.is_trained = False
 
     def _featurize(self, reasoner_outputs: List[ReasoningOutput]) -> np.ndarray:
@@ -231,7 +243,7 @@ class MetaLearner:
         self.is_trained = True
         self.logger.info("MetaLearner training complete.")
         # Log the learned weights (coefficients) for interpretability
-        self.logger.info(f"Learned reasoner weights (coefficients): {self.model.coef_}")
+        self.logger.info(f"Learned reasoner weights (coefficients): {self.model.final_estimator_.coef_}")
 
     def predict(self, reasoner_outputs: List[ReasoningOutput]) -> Dict[str, Any]:
         """
@@ -244,7 +256,7 @@ class MetaLearner:
 
         features = self._featurize(reasoner_outputs)
         # Predict the probability of the positive class (1)
-        final_prob = self.model.predict_proba(features)[0, 1]
+        final_prob = self.model。predict_proba(features)[0, 1]
         return {"final_probability": final_prob, "source": "meta_learner"}
 
 
