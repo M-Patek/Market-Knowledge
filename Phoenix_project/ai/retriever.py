@@ -201,23 +201,30 @@ class HybridRetriever:
         """
         Re-ranks a list of candidates based on a weighted formula.
         """
+        # Fetch reranking parameters once before the loop
+        weights = self.rerank_config.get('weights', {})
+        w_similarity = weights.get('similarity', 0.6)
+        w_freshness = weights.get('freshness', 0.3)
+        w_source = weights.get('source', 0.1)
+        freshness_decay_rate = self.rerank_config.get('freshness_decay_rate', 0.05)
+        source_weights = self.rerank_config.get('source_type_weights', {})
+
         scored_candidates = []
         for cand in candidates:
-            score = self._calculate_rerank_score(cand)
+            score = self._calculate_rerank_score(
+                cand, w_similarity, w_freshness, w_source,
+                freshness_decay_rate, source_weights
+            )
             cand['final_rerank_score'] = score
             scored_candidates.append(cand)
         
         # Sort candidates by the final score in descending order
         return sorted(scored_candidates, key=lambda x: x['final_rerank_score'], reverse=True)
 
-    def _calculate_rerank_score(self, candidate: Dict[str, Any]) -> float:
+    def _calculate_rerank_score(self, candidate: Dict[str, Any], w_similarity: float, w_freshness: float, w_source: float, freshness_decay_rate: float, source_weights: Dict[str, float]) -> float:
         """
         Calculates the final weighted score for a single candidate document.
         """
-        weights = self.rerank_config.get('weights', {})
-        w_similarity = weights.get('similarity', 0.6)
-        w_freshness = weights.get('freshness', 0.3)
-        w_source = weights.get('source', 0.1)
 
         # 1. Similarity Score (already normalized between 0 and 1 by Pinecone)
         similarity_score = candidate.get('vector_similarity_score', 0.0)
@@ -237,14 +244,12 @@ class HybridRetriever:
                     available_at = available_at.replace(tzinfo=timezone.utc)
 
                 age_days = (datetime.now(timezone.utc) - available_at).total_seconds() / 86400
-                decay_rate = self.rerank_config.get('freshness_decay_rate', 0.05)
-                freshness_score = (1 - decay_rate) ** age_days
+                freshness_score = (1 - freshness_decay_rate) ** age_days
             except (ValueError, TypeError):
                 pass # Use 0.0 if timestamp is invalid
 
         # 3. Source Weight Score (looked up from config)
         source_type = candidate.get('source_type') or candidate.get('type')
-        source_weights = self.rerank_config.get('source_type_weights', {})
         source_score = source_weights.get(source_type, 0.5) # Default score for unknown sources
 
         # Final weighted score
