@@ -30,6 +30,34 @@ class SnapshotManager:
                 h.update(chunk)
         return h.hexdigest()
 
+    def _create_snapshot_directory(self, snapshot_path: Path):
+        """Creates the directory for the new snapshot."""
+        snapshot_path.mkdir(parents=True, exist_ok=False)
+        self.logger.info(f"Created new snapshot directory: '{snapshot_path}'")
+
+    def _copy_files_and_build_manifest_list(self, required_files: List[str], snapshot_path: Path) -> List[Dict[str, str]]:
+        """Copies required files to the snapshot and returns a list for the manifest."""
+        manifest_files = []
+        for filename in required_files:
+            source_path = self.cache_dir / filename
+            dest_path = snapshot_path / filename
+
+            if source_path.exists():
+                shutil.copy2(source_path, dest_path)
+                file_hash = self._calculate_file_hash(dest_path)
+                manifest_files.append({
+                    "filename": filename,
+                    "sha256_hash": file_hash
+                })
+            else:
+                self.logger.warning(f"Required data file '{filename}' not found in cache. Skipping.")
+        return manifest_files
+
+    def _write_manifest(self, manifest_path: Path, manifest_data: Dict[str, Any]):
+        """Writes the manifest JSON file."""
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest_data, f, indent=2)
+
     def create_snapshot(self, run_id: str, required_files: List[str]) -> str:
         """
         Creates a new, immutable snapshot of all data required for a specific run.
@@ -44,34 +72,16 @@ class SnapshotManager:
         snapshot_id = f"snapshot_{run_id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         snapshot_path = self.base_dir / snapshot_id
         try:
-            snapshot_path.mkdir(parents=True, exist_ok=False)
-            self.logger.info(f"Created new snapshot directory: '{snapshot_path}'")
+            self._create_snapshot_directory(snapshot_path)
 
             manifest = {
                 "snapshot_id": snapshot_id,
                 "created_utc": datetime.utcnow().isoformat(),
                 "run_id": run_id,
-                "files": []
+                "files": self._copy_files_and_build_manifest_list(required_files, snapshot_path)
             }
 
-            for filename in required_files:
-                source_path = self.cache_dir / filename
-                dest_path = snapshot_path / filename
-
-                if source_path.exists():
-                    shutil.copy2(source_path, dest_path)
-                    file_hash = self._calculate_file_hash(dest_path)
-                    manifest["files"].append({
-                        "filename": filename,
-                        "sha256_hash": file_hash
-                    })
-                else:
-                    self.logger.warning(f"Required data file '{filename}' not found in cache. Skipping.")
-
-            # Write the manifest file
-            manifest_path = snapshot_path / "manifest.json"
-            with open(manifest_path, 'w', encoding='utf-8') as f:
-                json.dump(manifest, f, indent=2)
+            self._write_manifest(snapshot_path / "manifest.json", manifest)
 
             self.logger.info(f"Successfully created data snapshot with ID: '{snapshot_id}'")
             return snapshot_id
