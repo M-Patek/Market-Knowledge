@@ -49,34 +49,42 @@ class ContradictionDetector:
         if len(evidence_list) < 2:
             return []
 
-        # 1. Generate embeddings for all evidence findings
-        docs_to_embed = [{"content": ev.finding, "_original_item": ev} for ev in evidence_list]
+        # 1. Generate embeddings for all evidence findings that have content
+        docs_to_embed = [{"content": ev.finding, "_original_item": ev} for ev in evidence_list if ev.finding]
         embedded_docs = self.embedding_client.create_embeddings(docs_to_embed)
 
         # Filter out any that failed embedding
         valid_evidence = [doc for doc in embedded_docs if 'vector' in doc]
+        if len(valid_evidence) < 2:
+            return []
 
         contradictions = []
-        # 2. Compare every pair of evidence items
-        for doc_a, doc_b in itertools.combinations(valid_evidence, 2):
-            vec_a = np.array(doc_a['vector'])
-            vec_b = np.array(doc_b['vector'])
-            
-            similarity = self._cosine_similarity(vec_a, vec_b)
+        
+        # 2. Perform vectorized cosine similarity calculation
+        embeddings = np.array([doc['vector'] for doc in valid_evidence])
+        # Normalize each vector to unit length
+        norm_embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+        # Calculate the cosine similarity matrix
+        similarity_matrix = np.dot(norm_embeddings, norm_embeddings.T)
 
-            if similarity > self.similarity_threshold:
-                # The findings are semantically similar, now check for score opposition
-                item_a = doc_a['_original_item']
-                item_b = doc_b['_original_item']
+        # 3. Find pairs above the threshold and check for score opposition
+        # We use np.triu_indices to only check the upper triangle of the matrix, avoiding self-comparison and duplicates
+        indices_row, indices_col = np.where(similarity_matrix > self.similarity_threshold)
 
-                is_a_positive = item_a.score >= self.positive_threshold
-                is_b_positive = item_b.score >= self.positive_threshold
-                is_a_negative = item_a.score <= self.negative_threshold
-                is_b_negative = item_b.score <= self.negative_threshold
+        for i, j in zip(indices_row, indices_col):
+            if i >= j: continue # Only consider pairs where i < j
 
-                if (is_a_positive and is_b_negative) or (is_a_negative and is_b_positive):
-                    self.logger.warning(f"CONTRADICTION DETECTED (Similarity: {similarity:.2f}): "
-                                        f"'{item_a.finding}' vs '{item_b.finding}'")
-                    contradictions.append((item_a, item_b))
+            item_i = valid_evidence[i]['_original_item']
+            item_j = valid_evidence[j]['_original_item']
+
+            is_i_positive = item_i.score >= self.positive_threshold
+            is_j_positive = item_j.score >= self.positive_threshold
+            is_i_negative = item_i.score <= self.negative_threshold
+            is_j_negative = item_j.score <= self.negative_threshold
+
+            if (is_i_positive and is_j_negative) or (is_i_negative and is_j_positive):
+                self.logger.warning(f"CONTRADICTION DETECTED (Similarity: {similarity_matrix[i, j]:.2f}): "
+                                    f"'{item_i.finding}' vs '{item_j.finding}'")
+                contradictions.append((item_i, item_j))
         
         return contradictions
