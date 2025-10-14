@@ -55,16 +55,18 @@ class StrategyDataHandler:
         Prepares and returns a data packet for the current day if all data is valid.
         """
         current_date = self.strategy.datas[0].datetime.date(0)
+        current_timestamp = pd.Timestamp(current_date)
 
-        try:
-            # Use direct, efficient lookup on the Series
-            current_vix = self.vix_data.loc[pd.Timestamp(current_date)]
-            current_yield = self.treasury_yield_data.loc[pd.Timestamp(current_date)]
-            current_breadth = self.market_breadth_data.loc[pd.Timestamp(current_date)]
-        except KeyError:
-            self.logger.warning(f"Critical data VIX missing for {current_date}, halting for the day.")
+        # Explicitly check for the existence of data for the current date
+        if current_timestamp not in self.vix_data.index or \
+           current_timestamp not in self.treasury_yield_data.index or \
+           current_timestamp not in self.market_breadth_data.index:
+            self.logger.warning(f"Missing critical external data (VIX, Yield, or Breadth) for {current_date}. Halting for the day.")
             return None
 
+        current_vix = self.vix_data.loc[current_timestamp]
+        current_yield = self.treasury_yield_data.loc[current_timestamp]
+        current_breadth = self.market_breadth_data.loc[current_timestamp]
         self.logger.info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f if current_yield else 'N/A'}%, Market Breadth: {current_breadth:.2% if current_breadth else 'N/A'}")
 
         candidate_analysis = [{
