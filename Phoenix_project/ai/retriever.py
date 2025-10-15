@@ -1,276 +1,199 @@
-# ai/retriever.py
-"""
-Implements the two-stage (recall -> re-rank) hybrid retrieval system.
-This module is responsible for fetching a broad set of candidate documents
-and then intelligently re-ranking them to find the most relevant, timely,
-and authoritative evidence for the AI cognitive layer.
-"""
-import os
 import logging
 import asyncio
-import itertools
-import json
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timezone, timedelta
-from pydantic import BaseModel, Field
-
+from datetime import datetime, date, timezone
 import google.generativeai as genai
+
 from .vector_db_client import VectorDBClient
-from .embedding_client import EmbeddingClient
 from .temporal_db_client import TemporalDBClient
 from .tabular_db_client import TabularDBClient
-
-# --- [NEW] Pydantic model for the deconstructed query contract ---
-class TabularQuery(BaseModel):
-    ticker: str
-    metric: str
-
-class DeconstructedQuery(BaseModel):
-    """The structured output from the query deconstruction LLM call."""
-    semantic_query: str = Field(description="An optimized query string for the vector database.")
-    temporal_entities: List[str] = Field(description="A list of key entities for temporal filtering.")
-    tabular_queries: List[TabularQuery] = Field(description="A list of precise queries for the tabular database.")
+from .embedding_client import EmbeddingClient
 
 class HybridRetriever:
     """
-    Orchestrates the recall and re-rank stages of evidence retrieval.
+    Orchestrates a multi-pronged retrieval strategy across different data sources
+    (vector, temporal, tabular) and fuses the results.
     """
-    def __init__(self,
-                 vector_db_client: VectorDBClient,
-                 temporal_db_client: TemporalDBClient,
-                 tabular_db_client: TabularDBClient,
-                 embedding_client: EmbeddingClient,
-                 rerank_config: Dict[str, Any]):
-        """
-        Initializes the retriever with clients for the various indexes.
-
-        Args:
-            vector_db_client: The client for the vector database (Pinecone).
-            temporal_db_client: The client for the temporal index (Elasticsearch).
-            tabular_db_client: The client for the tabular index (PostgreSQL).
-            embedding_client: The client for generating query embeddings.
-            rerank_config: Configuration for the re-ranking algorithm.
-        """
+    def __init__(self, vector_db_client: VectorDBClient, temporal_db_client: TemporalDBClient, tabular_db_client: TabularDBClient, rerank_config: Dict[str, Any]):
         self.logger = logging.getLogger("PhoenixProject.HybridRetriever")
-        self.vector_db_client = vector_db_client
+        self.vector_client = vector_db_client
         self.temporal_client = temporal_db_client
         self.tabular_client = tabular_db_client
-        self.embedding_client = embedding_client
-        
-        # Re-ranking parameters
-        self.rerank_config = rerank_config
+        self.embedding_client = EmbeddingClient()
+        # RRF and Re-ranking parameters
+        self.retriever_config = rerank_config # The whole retriever config section
+        self.rrf_k = self.retriever_config.get('rrf_k', 60)
 
         # --- [NEW] Initialize the generative model for query deconstruction ---
         try:
-            api_key = os.getenv("GEMINI_API_KEY")
-            if not api_key: raise ValueError("GEMINI_API_KEY not set.")
-            genai.configure(api_key=api_key)
+            # Assuming the genai client is already configured elsewhere
             self.deconstructor_model = genai.GenerativeModel("gemini-1.5-flash-latest")
         except Exception as e:
             self.logger.error(f"Failed to initialize deconstructor model: {e}")
             self.deconstructor_model = None
-
-        self.logger.info("HybridRetriever initialized.")
+        self.logger.info(f"HybridRetriever initialized with RRF k={self.rrf_k}.")
 
     async def _recall_from_vector(self, query: str, top_k: int) -> List[Dict[str, Any]]:
         """Recall from the vector database."""
-        query_doc = {"content": query}
-        doc_with_vector = self.embedding_client.create_embeddings([query_doc])
-        if not doc_with_vector or 'vector' not in doc_with_vector[0]:
-            self.logger.error("Failed to generate query embedding for vector recall.")
-            return []
-        query_vector = doc_with_vector[0]['vector']
-        
-        results = self.vector_db_client.index.query(
-            vector=query_vector, top_k=top_k, include_metadata=True
-        )
-        
-        candidates = []
-        for match in results.get('matches', []):
-            candidate = match['metadata']
-            candidate['vector_similarity_score'] = match.get('score', 0.0)
-            candidates.append(candidate)
-        return candidates
+        return self.vector_client.query(query, top_k=top_k)
 
-    async def _recall_from_temporal(self, entities: List[str], days_back: int = 90) -> List[Dict[str, Any]]:
+    async def _recall_from_temporal(self, ticker: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
         """Recall from the temporal database."""
-        if not self.temporal_client.is_healthy(): return []
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days_back)
-        return self.temporal_client.query_by_time_and_entities(start_date, end_date, entities)
+        # This is a placeholder for a more sophisticated temporal query
+        return self.temporal_client.query_by_date(ticker, start_date, end_date)
 
-    async def _recall_from_tabular(self, ticker: str, metric: str) -> List[Dict[str, Any]]:
+    async def _recall_from_tabular(self, ticker: str) -> List[Dict[str, Any]]:
         """Recall from the tabular database."""
-        if not self.tabular_client.is_healthy(): return []
-        results = self.tabular_client.query_by_metric(ticker, metric)
-        return results if results is not None else []
+        # This is a placeholder for a more sophisticated tabular query
+        return self.tabular_client.query_by_ticker(ticker)
 
-    async def _deconstruct_query(self, query: str, ticker: str) -> Optional[DeconstructedQuery]:
-        """Uses an LLM to deconstruct a natural language query into a structured object."""
+    async def _deconstruct_query(self, query: str) -> Dict[str, Any]:
+        """
+        [NEW] Uses a generative model to break down a natural language query
+        into structured components for targeted retrieval.
+        """
         if not self.deconstructor_model:
-            self.logger.error("Deconstructor model not available.")
-            return None
-
+            self.logger.warning("Deconstructor model not available. Using simple keyword extraction.")
+            return {"keywords": query.split(), "ticker": None, "date_range": None}
+        
         prompt = f"""
-        You are an expert financial query dispatcher. Your task is to deconstruct a user's query into a structured JSON object for a hybrid retrieval system.
+        Deconstruct the following financial query into a structured JSON object.
+        Identify keywords, any specific stock tickers (if present), and any date or time ranges.
+        If a date is mentioned, provide a start and end date in YYYY-MM-DD format.
+        If no ticker or date is found, the value should be null.
 
-        **Databases:**
-        1.  **VectorDB:** For semantic search on unstructured text (news, filings). Needs a concise `semantic_query`.
-        2.  **TemporalDB:** For time-based searches. Needs a list of key `temporal_entities`.
-        3.  **TabularDB:** For structured financial metrics. Needs a list of `tabular_queries` with a `ticker` and a specific `metric`.
+        QUERY: "{query}"
 
-        **User Query:** "{query}"
-        **Primary Ticker:** "{ticker}"
-
-        **Instructions:**
-        - The `semantic_query` should be a keyword-rich version of the original query.
-        - The `temporal_entities` should include the primary ticker and any other key entities mentioned (people, organizations, events).
-        - The `tabular_queries` should ONLY be populated if the user asks for specific, known financial metrics (e.g., "revenue", "debt", "net income", "EPS"). If they ask for general concepts like "profitability", do not guess a metric; leave the list empty.
-        - Respond ONLY with a single, valid JSON object that adheres to the following Pydantic schema. Do not include any other text or markdown.
-
-        **JSON Schema:**
-        {DeconstructedQuery.schema_json(indent=2)}
+        JSON:
         """
         try:
-            response = await self.deconstructor_model.generate_content_async(
-                prompt,
-                generation_config={"response_mime_type": "application/json"}
-            )
-            parsed_json = json.loads(response.text)
-            return DeconstructedQuery.model_validate(parsed_json)
+            response = await self.deconstructor_model.generate_content_async(prompt)
+            # Basic parsing, a real implementation would have more robust error handling
+            clean_response = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean_response)
         except Exception as e:
-            self.logger.error(f"Failed to deconstruct query: {e}")
-            return None
+            self.logger.error(f"Failed to deconstruct query with LLM: {e}. Falling back to simple extraction.")
+            # Fallback for safety
+            return {"keywords": query.split(), "ticker": None, "date_range": None}
 
-    async def recall(self, query: str, ticker: str, top_k: int = 50) -> List[Dict[str, Any]]:
+    async def recall(self, query: str, ticker: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Performs the initial recall stage by querying all indexes in parallel.
+        Performs the first-stage retrieval from all available data sources in parallel
+        and fuses them using Reciprocal Rank Fusion.
         """
-        self.logger.info("Initiating intelligent query deconstruction...")
-        deconstructed = await self._deconstruct_query(query, ticker)
-
-        if not deconstructed:
-            # Fallback to simple logic if deconstruction fails
-            self.logger.warning("Query deconstruction failed. Falling back to simple recall.")
-            deconstructed = DeconstructedQuery(
-                semantic_query=query,
-                temporal_entities=[ticker],
-                tabular_queries=[]
-            )
-
-        self.logger.info(f"Deconstructed query: {deconstructed.dict()}")
-        tasks = []
-
-        # Task for Vector DB (semantic search on the query text)
-        if self.vector_db_client.is_healthy():
-            tasks.append(self._recall_from_vector(deconstructed.semantic_query, top_k))
-
-        # Tasks for Tabular DB
-        if self.tabular_client.is_healthy():
-            for tq in deconstructed.tabular_queries:
-                tasks.append(self._recall_from_tabular(tq.ticker, tq.metric))
+        self.logger.info(f"Initiating recall stage for query: '{query}'")
         
-        # Task for Temporal DB
-        if self.temporal_client.is_healthy():
-             tasks.append(self._recall_from_temporal(deconstructed.temporal_entities))
-
-        if not tasks:
-            self.logger.warning("No healthy index clients available for recall.")
-            return []
+        # --- [NEW] Query Deconstruction ---
+        # deconstructed_query = await self._deconstruct_query(query)
+        # keywords = " ".join(deconstructed_query.get("keywords", []))
+        # query_ticker = deconstructed_query.get("ticker") or ticker
+        # For now, we'll keep it simple as the deconstructor is not fully integrated
+        keywords = query
+        query_ticker = ticker
+        
+        # --- Parallel Recall ---
+        tasks = []
+        if self.vector_client:
+            tasks.append(self._recall_from_vector(keywords, top_k=20))
+        if self.temporal_client and query_ticker:
+            # Placeholder date range for temporal query
+            end_date = date.today()
+            start_date = date(end_date.year - 1, end_date.month, end_date.day)
+            tasks.append(self._recall_from_temporal(query_ticker, start_date, end_date))
+        if self.tabular_client and query_ticker:
+            tasks.append(self._recall_from_tabular(query_ticker))
 
         # Execute all recall tasks concurrently
         results_from_all_indexes = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # --- Fusion Logic ---
-        # Use a dictionary to merge results and ensure uniqueness by source_id
-        fused_candidates = {}
+        # --- [NEW] Reciprocal Rank Fusion (RRF) Logic ---
+        rrf_scores = {}
+        master_doc_lookup = {}
+
         for result_set in results_from_all_indexes:
             if isinstance(result_set, list):
-                for doc in result_set:
+                for rank, doc in enumerate(result_set):
                     source_id = doc.get('source_id')
                     if not source_id: continue
-                    # Merge results, prioritizing the version with more detail (e.g., from vector search)
-                    if source_id not in fused_candidates or 'vector_similarity_score' in doc:
-                        fused_candidates[source_id] = doc
-        
-        final_candidates = list(fused_candidates.values())
-        self.logger.info(f"Recall stage complete. Fused {len(final_candidates)} unique candidates from all indexes.")
+                    
+                    # Store the most complete version of the document
+                    if source_id not in master_doc_lookup or 'vector_similarity_score' in doc:
+                        master_doc_lookup[source_id] = doc
+
+                    # Add to the RRF score
+                    rrf_scores[source_id] = rrf_scores.get(source_id, 0.0) + (1.0 / (self.rrf_k + rank + 1))
+
+        # Combine the docs and their RRF scores
+        fused_candidates = {}
+        for source_id, score in rrf_scores.items():
+            if source_id in master_doc_lookup:
+                doc = master_doc_lookup[source_id]
+                doc['rrf_score'] = score
+                fused_candidates[source_id] = doc
+
+        final_candidates = sorted(fused_candidates.values(), key=lambda x: x['rrf_score'], reverse=True)
+        self.logger.info(f"Recall stage complete. Fused and ranked {len(final_candidates)} unique candidates using RRF.")
         return final_candidates
 
     def rerank(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Re-ranks a list of candidates based on a weighted formula.
         """
-        # Fetch reranking parameters once before the loop
-        weights = self.rerank_config.get('weights', {})
-        w_similarity = weights.get('similarity', 0.6)
-        w_freshness = weights.get('freshness', 0.3)
+        # This now acts as a second-stage re-ranker on the RRF results
+        weights = self.retriever_config.get('weights', {})
+        w_rrf = weights.get('rrf', 0.7) # Give high weight to the RRF score
+        w_freshness = weights.get('freshness', 0.2)
         w_source = weights.get('source', 0.1)
-        freshness_decay_rate = self.rerank_config.get('freshness_decay_rate', 0.05)
-        source_weights = self.rerank_config.get('source_type_weights', {})
+        freshness_decay_rate = self.retriever_config.get('freshness_decay_rate', 0.05)
+        source_weights = self.retriever_config.get('source_type_weights', {})
 
         scored_candidates = []
         for cand in candidates:
-            score = self._calculate_rerank_score(
-                cand, w_similarity, w_freshness, w_source,
-                freshness_decay_rate, source_weights
-            )
-            cand['final_rerank_score'] = score
+            final_score = self._calculate_final_score(cand, w_rrf, w_freshness, w_source, freshness_decay_rate, source_weights)
+            cand['final_score'] = final_score
             scored_candidates.append(cand)
-        
-        # Sort candidates by the final score in descending order
-        return sorted(scored_candidates, key=lambda x: x['final_rerank_score'], reverse=True)
 
-    def _calculate_rerank_score(self, candidate: Dict[str, Any], w_similarity: float, w_freshness: float, w_source: float, freshness_decay_rate: float, source_weights: Dict[str, float]) -> float:
+        # Sort by the new final score
+        return sorted(scored_candidates, key=lambda x: x['final_score'], reverse=True)
+
+    def _calculate_final_score(self, candidate: Dict[str, Any], w_rrf: float, w_freshness: float, w_source: float, freshness_decay_rate: float, source_weights: Dict[str, float]) -> float:
         """
         Calculates the final weighted score for a single candidate document.
         """
-
-        # 1. Similarity Score (already normalized between 0 and 1 by Pinecone)
-        similarity_score = candidate.get('vector_similarity_score', 0.0)
+        # 1. RRF Score (now the primary score from the fusion stage)
+        rrf_score = candidate.get('rrf_score', 0.0)
 
         # 2. Freshness Score (calculated with exponential decay)
         freshness_score = 0.0
-        available_at_str = candidate.get('available_at') or candidate.get('timestamp')
-        if available_at_str:
-            try:
-                # Handle potential timezone differences
-                if isinstance(available_at_str, datetime):
-                     available_at = available_at_str
-                else:
-                     available_at = datetime.fromisoformat(available_at_str)
+        try:
+            doc_date_str = candidate.get('metadata', {}).get('document_date')
+            if doc_date_str:
+                doc_date = datetime.fromisoformat(doc_date_str.replace("Z", "+00:00")).astimezone(timezone.utc).date()
+                days_old = (date.today() - doc_date).days
+                # Exponential decay formula
+                freshness_score = 1.0 * (1 - freshness_decay_rate) ** days_old
+        except Exception as e:
+            self.logger.warning(f"Could not parse date for freshness score calculation: {e}")
 
-                if available_at.tzinfo is None:
-                    available_at = available_at.replace(tzinfo=timezone.utc)
-
-                age_days = (datetime.now(timezone.utc) - available_at).total_seconds() / 86400
-                freshness_score = (1 - freshness_decay_rate) ** age_days
-            except (ValueError, TypeError):
-                pass # Use 0.0 if timestamp is invalid
-
-        # 3. Source Weight Score (looked up from config)
-        source_type = candidate.get('source_type') or candidate.get('type')
+        # 3. Source Authority Score
+        source_type = candidate.get('metadata', {}).get('source_type', 'Other')
         source_score = source_weights.get(source_type, 0.5) # Default score for unknown sources
 
         # Final weighted score
         final_score = (
-            w_similarity * similarity_score +
+            w_rrf * rrf_score +
             w_freshness * freshness_score +
             w_source * source_score
         )
         return final_score
 
-    async def retrieve(self, query: str, ticker: str, top_k_final: int = 10) -> List[Dict[str, Any]]:
+    async def retrieve(self, query: str, ticker: Optional[str] = None, top_k: int = 10) -> List[Dict[str, Any]]:
         """
-        Executes the full two-stage retrieval process.
+        The main public method to perform the full retrieval and re-ranking pipeline.
         """
-        self.logger.info(f"Executing two-stage retrieval for query: '{query[:50]}...'")
-        # 1. Recall Stage
-        candidates = await self.recall(query, ticker)
-        if not candidates:
-            return []
-        
-        # 2. Re-rank Stage
-        reranked_results = self.rerank(candidates)
-        
-        return reranked_results[:top_k_final]
+        self.logger.info(f"--- [Hybrid Retriever]: Full retrieval pipeline initiated for query: '{query}' ---")
+        recalled_candidates = await self.recall(query, ticker)
+        reranked_results = self.rerank(recalled_candidates)
+        final_top_k = reranked_results[:top_k]
+        self.logger.info(f"Retrieval pipeline complete. Returning top {len(final_top_k)} results.")
+        return final_top_k
