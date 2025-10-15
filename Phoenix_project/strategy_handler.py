@@ -1,81 +1,94 @@
 # strategy_handler.py
 import logging
+from ai.market_state_predictor import MarketStatePredictor
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 import pandas as pd
 import backtrader as bt
+from datetime import date
 
 from phoenix_project import StrategyConfig
+from cognitive.engine import CognitiveEngine
+from execution.order_manager import OrderManager
 
 @dataclass
 class DailyDataPacket:
-    """A simple container for all data needed by the strategy for a single day."""
-    current_date: Any
+    current_date: date
     current_vix: Optional[float]
     current_yield: Optional[float]
     current_breadth: Optional[float]
+    market_state: Optional[int]
+    market_state_confidence: Optional[float]
+    # Each dict will now include 'volatility'
     candidate_analysis: list
 
 class StrategyDataHandler:
     """
-    Manages all data feeds, indicators, and external data lookups for the strategy.
+    Acts as a data provider and pre-processor for the main strategy logic.
     Its purpose is to decouple data management from the core strategy decision-making logic.
     """
-    def __init__(self, strategy: bt.Strategy, config: StrategyConfig, vix_data: pd.Series, treasury_yield_data: pd.Series, market_breadth_data: pd.Series):
+    def __init__(self, strategy: bt.Strategy, config: StrategyConfig, vix_data: pd.Series, treasury_yield_data: pd.Series, market_breadth_data: pd.Series, market_state_predictor: Optional[MarketStatePredictor] = None):
         self.strategy = strategy
         self.config = config
         self.logger = logging.getLogger("PhoenixProject.StrategyDataHandler")
+        self.market_state_predictor = market_state_predictor
 
         self.data_map = {d._name: d for d in self.strategy.datas}
         self.vix_data = vix_data
         self.treasury_yield_data = treasury_yield_data
         self.market_breadth_data = market_breadth_data
-
-        # Initialize all indicators in a structured way
-        self.indicators = self._initialize_indicators()
-
-        self.logger.info("StrategyDataHandler initialized and has prepared all indicators.")
-
-    def _initialize_indicators(self) -> Dict[str, Dict[str, Any]]:
-        """Creates and organizes all indicators for each data feed."""
+        self.indicators = self._setup_indicators()
+    
+    def _setup_indicators(self) -> Dict[str, Dict[str, Any]]:
+        """Initialize all indicators for all data feeds."""
         indicators = {}
-        for name, data in self.data_map.items():
-            indicators[name] = {
+        for ticker, data in self.data_map.items():
+            indicators[ticker] = {
                 'sma': bt.indicators.SimpleMovingAverage(
                     data.close, period=self.config.sma_period
                 ),
                 'rsi': bt.indicators.RSI(
                     data.close, period=self.config.rsi_period
+                ),
+                # [NEW] Add a volatility indicator (e.g., standard deviation of returns)
+                'volatility': bt.indicators.StandardDeviation(
+                    data.close, period=self.config.position_sizer.parameters.get('volatility_period', 20)
                 )
             }
         return indicators
 
-    def get_daily_data_packet(self, cognitive_engine) -> Optional[DailyDataPacket]:
-        """
-        Prepares and returns a data packet for the current day if all data is valid.
-        """
-        current_date = self.strategy.datas[0].datetime.date(0)
-        current_timestamp = pd.Timestamp(current_date)
-
-        # Explicitly check for the existence of data for the current date
-        if current_timestamp not in self.vix_data.index or \
-           current_timestamp not in self.treasury_yield_data.index or \
-           current_timestamp not in self.market_breadth_data.index:
-            self.logger.warning(f"Missing critical external data (VIX, Yield, or Breadth) for {current_date}. Halting for the day.")
+    def get_daily_data_packet(self, cognitive_engine: CognitiveEngine) -> Optional[DailyDataPacket]:
+        """Assembles all necessary data for the current day into a single packet."""
+        try:
+            current_date = self.strategy.datetime.date()
+            current_timestamp = pd.Timestamp(current_date)
+        except IndexError:
+            self.logger.warning("Could not get current date from strategy datetime.")
             return None
 
+        # Fetch macro data
         current_vix = self.vix_data.loc[current_timestamp]
         current_yield = self.treasury_yield_data.loc[current_timestamp]
         current_breadth = self.market_breadth_data.loc[current_timestamp]
         self.logger.info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f if current_yield else 'N/A'}%, Market Breadth: {current_breadth:.2% if current_breadth else 'N/A'}")
+
+        market_state, market_state_confidence = 1, 0.0 # Default to neutral
+        if self.market_state_predictor:
+            macro_features = pd.DataFrame([{
+                'vix': current_vix,
+                'yield': current_yield,
+                'breadth': current_breadth
+            }])
+            market_state, market_state_confidence = self.market_state_predictor.predict(macro_features)
 
         candidate_analysis = [{
             "ticker": ticker,
             "opportunity_score": cognitive_engine.calculate_opportunity_score(
                 d.close[0],
                 self.indicators[ticker]['sma'][0],
-                self.indicators[ticker]['rsi'][0]
-            )
+                self.indicators[ticker]['rsi'][0],
+            ),
+            "volatility": self.indicators[ticker]['volatility'][0]
         } for ticker, d in self.data_map.items()]
 
         return DailyDataPacket(
@@ -83,5 +96,33 @@ class StrategyDataHandler:
             current_vix=current_vix,
             current_yield=current_yield,
             current_breadth=current_breadth,
+            market_state=market_state,
+            market_state_confidence=market_state_confidence,
             candidate_analysis=candidate_analysis
         )
+
+
+class RomanLegionStrategy(bt.Strategy):
+    def __init__(self, config: StrategyConfig, vix_data, treasury_yield_data, market_breadth_data, sentiment_data, asset_analysis_data, market_state_predictor: Optional[MarketStatePredictor] = None):
+        self.config = config
+        self.logger = logging.getLogger("PhoenixProject.RomanLegionStrategy")
+        self.cognitive_engine = CognitiveEngine(config, asset_analysis_data, sentiment_data)
+        self.order_manager = OrderManager(self, **config.execution_model.dict())
+        self.data_handler = StrategyDataHandler(self, config, vix_data, treasury_yield_data, market_breadth_data, market_state_predictor)
+        
+    def next(self):
+        daily_data = self.data_handler.get_daily_data_packet(self.cognitive_engine)
+        if not daily_data:
+            return
+
+        self.logger.info(f"--- {daily_data.current_date.isoformat()}: Daily Rebalancing Briefing ---")
+        battle_plan = self.cognitive_engine.determine_allocations(daily_data.candidate_analysis, daily_data.current_date)
+        self.order_manager.rebalance(self, battle_plan)
+
+    def notify_order(self, order):
+        self.order_manager.handle_order_notification(order)
+
+    def stop(self):
+        self.logger.info("--- [Strategy Stop]: Finalizing operations ---")
+        # Any final logic can go here
+        pass
