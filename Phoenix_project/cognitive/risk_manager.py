@@ -6,27 +6,37 @@ from datetime import date
 from phoenix_project import StrategyConfig
 
 class RiskManager:
-    def __init__(self, config: StrategyConfig, sentiment_data: Optional[Dict[date, float]] = None):
+    """
+    Manages overall portfolio risk by adjusting capital allocation based on the
+    MetaLearner's cognitive uncertainty.
+    """
+    def __init__(self, config: StrategyConfig):
+        """
+        Initializes the RiskManager.
+        Args:
+            config: A dictionary containing the 'risk_manager' configuration.
+        """
         self.config = config
-        self.sentiment_data = sentiment_data if sentiment_data is not None else {}
+        self.risk_config = self.config.risk_manager
         self.logger = logging.getLogger("PhoenixProject.RiskManager")
-        if self.sentiment_data: self.logger.info(f"RiskManager initialized with {len(self.sentiment_data)} days of sentiment data.")
+        self.logger.info(f"RiskManager initialized for Dynamic Risk Budgeting with max_uncertainty={self.risk_config.max_uncertainty} and min_modifier={self.risk_config.min_capital_modifier}")
 
-    def get_capital_modifier(self, current_vix: float, current_date: date) -> float:
-        self.logger.info(f"Assessing risk for {current_date.isoformat()}. VIX: {current_vix:.2f}")
-        if current_vix > self.config.vix_high_threshold:
-            base_modifier = self.config.capital_modifier_high_vix
-            self.logger.info(f"VIX indicates High Fear. Base modifier: {base_modifier:.2f}")
-        elif current_vix < self.config.vix_low_threshold:
-            base_modifier = self.config.capital_modifier_low_vix
-            self.logger.info(f"VIX indicates Low Fear. Base modifier: {base_modifier:.2f}")
+    def get_capital_modifier(self, meta_learner_uncertainty: float) -> float:
+        """
+        Determines the capital allocation modifier based on the MetaLearner's
+        posterior variance (uncertainty). Higher uncertainty leads to a lower modifier.
+        """
+        if meta_learner_uncertainty < 0:
+            self.logger.warning(f"Received negative uncertainty ({meta_learner_uncertainty}). Clamping to 0.")
+            meta_learner_uncertainty = 0
+
+        if meta_learner_uncertainty >= self.risk_config.max_uncertainty or self.risk_config.max_uncertainty == 0:
+            modifier = self.risk_config.min_capital_modifier
         else:
-            base_modifier = self.config.capital_modifier_normal_vix
-            self.logger.info(f"VIX indicates Normal Fear. Base modifier: {base_modifier:.2f}")
-        if not self.sentiment_data: return base_modifier
-        sentiment_score = self.sentiment_data.get(current_date, 0.0)
-        sentiment_adjustment = 1.0 + (sentiment_score * 0.2)
-        final_modifier = base_modifier * sentiment_adjustment
-        final_modifier = max(0.0, min(1.1, final_modifier))
-        self.logger.info(f"Gemini Sentiment Score: {sentiment_score:.2f}. Final Capital Modifier: {final_modifier:.2%}")
+            # Linearly scale the modifier from 1.0 (at uncertainty 0) down to min_modifier (at max_uncertainty)
+            slope = (self.risk_config.min_capital_modifier - 1.0) / self.risk_config.max_uncertainty
+            modifier = 1.0 + slope * meta_learner_uncertainty
+
+        final_modifier = max(self.risk_config.min_capital_modifier, min(modifier, 1.0))
+        self.logger.info(f"MetaLearner uncertainty is {meta_learner_uncertainty:.4f}. Capital modifier set to {final_modifier:.2%}")
         return final_modifier
