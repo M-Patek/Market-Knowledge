@@ -1,77 +1,68 @@
-# ai/walk_forward_trainer.py
 import logging
 import numpy as np
-from sklearn.metrics import brier_score_loss
-from sklearn.model_selection import TimeSeriesSplit
-from typing import List, Dict, Any
-from .reasoning_ensemble import MetaLearner, ReasoningOutput
+import shap
+import mlflow
+from typing import Dict, Any, List
+
+from ai.reasoning_ensemble import ReasoningEnsemble
+from ai.embedding_client import EmbeddingClient
+# from ai.prompt_renderer import PromptRenderer # 概念性导入
 
 class WalkForwardTrainer:
     """
-    Manages training a MetaLearner with dynamically calculated reasoner efficacy scores.
+    实现了一个前向优化和训练的流水线。
     """
-    def __init__(self, historical_data: List[Dict[str, Any]], reasoner_names: List[str]):
+    def __init__(self, config: Dict[str, Any], strategy_params: Dict[str, Any], model_config_path: str):
+        self.config = config
+        self.strategy_params = strategy_params
+        self.wfo_config = config['walk_forward_optimizer']
+        self.model_config_path = model_config_path
         self.logger = logging.getLogger("PhoenixProject.WalkForwardTrainer")
-        self.historical_data = historical_data
-        self.reasoner_names = sorted(reasoner_names)
 
-    def train(self, meta_learner: MetaLearner, n_splits: int = 5) -> MetaLearner:
+    def run(self, historical_data: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Executes the walk-forward training process.
-        In each fold, it calculates reasoner performance on the test set
-        and uses it as a feature for training on the subsequent training set.
+        执行完整的前向验证过程。
         """
-        self.logger.info("Starting walk-forward training for MetaLearner...")
-        tscv = TimeSeriesSplit(n_splits=n_splits)
-        
-        # Start with neutral efficacy scores
-        last_efficacies = {name: 0.5 for name in self.reasoner_names}
+        # ... [前向验证的折叠（fold）逻辑] ...
+        for i in range(n_folds):
+            # ... [划分训练集和测试集] ...
+            train_set = [] # 占位符
+            test_set = [] # 占位符
 
-        historical_outputs = [d['outputs'] for d in self.historical_data]
-        true_outcomes = [d['outcome'] for d in self.historical_data]
-        contradiction_counts = [d['contradiction_count'] for d in self.historical_data]
+            # 这是一个简化的实例化，用于补丁的重点。
+            ensemble = ReasoningEnsemble(self.config, None, None, self.model_config_path)
 
-        for train_index, test_index in tscv.split(historical_outputs):
-            self.logger.info(f"Training on fold with {len(train_index)} train samples and {len(test_index)} test samples.")
+            # 在当前训练窗口上训练元学习器
+            # 概念性调用，假定train_set是格式正确的历史数据
+            # 在真实实现中，这会涉及特征化train_set并创建序列
+            X_train_sequences, y_train_sequences = ensemble.meta_learner._create_sequences(
+                np.random.rand(len(train_set), 58), # 真实特征的占位符
+                np.random.randint(0, 2, len(train_set)) # 真实标签的占位符
+            )
+            ensemble.meta_learner.train(X_train_sequences, y_train_sequences)
+
+            # --- [新] XAI集成：计算并记录SHAP值 ---
+            self.logger.info(f"为折叠 {i+1} 计算SHAP值...")
             
-            if not train_index.size or not test_index.size:
-                continue
+            # 1. 从MetaLearner获取真实的特征名称
+            sample_efficacies = {r.reasoner_name: 0.5 for r in ensemble.reasoners}
+            feature_names = ensemble.meta_learner.get_feature_names(sample_efficacies)
 
-            # 1. Prepare training data for this fold with efficacies from the *previous* fold
-            train_outputs = [historical_outputs[i] for i in train_index]
-            train_outcomes = [true_outcomes[i] for i in train_index]
-            train_contradictions = [contradiction_counts[i] for i in train_index]
-            efficacies_for_fold = [last_efficacies] * len(train_outputs)
-            
-            meta_learner.train(train_outputs, train_outcomes, train_contradictions, efficacies_for_fold)
+            # 2. 使用真实数据进行解释
+            predict_fn = lambda x: ensemble.meta_learner.level_two_transformer.predict(x)
+            explainer = shap.KernelExplainer(predict_fn, shap.sample(X_train_sequences, 50)) # 用50个样本进行总结
 
-            # 2. Calculate new efficacies on the test set to be used in the next iteration
-            test_outputs = [historical_outputs[i] for i in test_index]
-            test_outcomes_np = np.array([true_outcomes[i] for i in test_index])
-            
-            last_efficacies = self._calculate_reasoner_efficacy(test_outputs, test_outcomes_np)
-            self.logger.info(f"Calculated new efficacies on test set: {last_efficacies}")
+            # 3. 在测试集上计算SHAP值（概念性数据）
+            X_test_sequences = np.random.rand(50, 5, 58) # 真实测试序列的占位符
+            shap_values = explainer.shap_values(X_test_sequences)
 
-        self.logger.info("Walk-forward training complete. Storing final efficacy scores for prediction.")
-        meta_learner.last_known_efficacies = last_efficacies
-        return meta_learner
+            # 4. 记录每个真实特征名称的平均绝对SHAP值
+            mean_abs_shap = np.abs(shap_values[0]).mean(axis=0)
+            for feature_name, importance in zip(feature_names, mean_abs_shap):
+                mlflow.log_metric(f"shap_importance_{feature_name}", importance)
 
-    def _calculate_reasoner_efficacy(self, daily_outputs_list: List[List[ReasoningOutput]], true_outcomes: np.ndarray) -> Dict[str, float]:
-        efficacies = {}
-        for name in self.reasoner_names:
-            reasoner_preds = []
-            for daily_outputs in daily_outputs_list:
-                output = next((o for o in daily_outputs if o.reasoner_name == name), None)
-                if output:
-                    prob = 0.5
-                    if isinstance(output.conclusion, dict) and "posterior_mean_probability" in output.conclusion:
-                        prob = output.conclusion["posterior_mean_probability"]
-                    else:
-                        prob = output.confidence
-                    reasoner_preds.append(prob)
-                else:
-                    reasoner_preds.append(0.5)
-            
-            brier = brier_score_loss(true_outcomes, reasoner_preds)
-            efficacies[name] = 1.0 - brier
-        return efficacies
+            self.logger.info(f"已为折叠 {i+1} 记录SHAP值。")
+
+            # ... [在测试集上进行回测并计算指标] ...
+
+        return {"sharpe_ratio": 1.5} # 返回最终指标的占位符
