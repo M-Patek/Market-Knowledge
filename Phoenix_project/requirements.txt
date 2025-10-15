@@ -42,6 +42,13 @@ Optimization & Experiment Tracking
 optuna==3.6.1
 sqlalchemy==2.0.30
 
+[NEW] State-of-the-art Tree Models
+xgboost==2.0.3
+lightgbm==4.3.0
+
+Deep Learning for MetaLearner
+tensorflow==2.16.1 # Or the appropriate version for the environment
+
 Testing
 pytest==8.2.0
 mypy==1.10.0
