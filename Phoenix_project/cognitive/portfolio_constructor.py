@@ -1,82 +1,73 @@
 # cognitive/portfolio_constructor.py
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 from datetime import date
-
+import pandas as pd
+from pydantic import BaseModel
 from phoenix_project import StrategyConfig
 
 class PortfolioConstructor:
-    def __init__(self, config: StrategyConfig, asset_analysis_data: Dict[date, Dict] | None = None, mode: str = "processed"):
-        self.config = config
-        self.asset_analysis_data = asset_analysis_data or {}
+    """
+    Transforms raw model predictions into a structured, actionable portfolio state.
+    """
+    def __init__(self, config: StrategyConfig, asset_analysis_data: Optional[Dict[date, Dict]] = None, mode: str = "processed"):
+        """
+        Initializes the PortfolioConstructor with strategy configurations.
+        Args:
+            config: A dictionary containing the 'portfolio_constructor' configuration.
+        """
         self.logger = logging.getLogger("PhoenixProject.PortfolioConstructor")
+        self.config = config
+        self.asset_analysis_data = asset_analysis_data if asset_analysis_data is not None else {}
         self.mode = mode
-        self._ema_state = {}
-        self.ema_alpha = 0.2
-        self.global_scale = 1.0
-
-    def calculate_opportunity_score(self, current_price: float, current_sma: float, current_rsi: float) -> float:
-        if current_sma <= 0: return 0.0
-        momentum_score = 50 + 50 * ((current_price / current_sma) - 1)
-        if momentum_score > 50 and current_rsi > self.config.rsi_overbought_threshold:
-            overbought_intensity = (current_rsi - self.config.rsi_overbought_threshold) / (100 - self.config.rsi_overbought_threshold)
-            penalty_factor = 1.0 - (overbought_intensity * 0.5)
-            final_score = momentum_score * penalty_factor
-        else:
-            final_score = momentum_score
-        return max(0.0, min(100.0, final_score))
-        
-    def _sanitize_ai_output(self, raw: Dict) -> tuple[float, float]:
-        try:
-            f = float(raw.get("adjustment_factor", 1.0))
-            c = float(raw.get("confidence", 0.0))
-        except (ValueError, TypeError): return 1.0, 0.0
-        f = max(0.3, min(2.0, f))
-        c = max(0.0, min(1.0, c))
-        return f, c
-
-    def _effective_factor(self, ticker: str, reported_factor: float, confidence: float) -> float:
-        effective = 1.0 + confidence * (reported_factor - 1.0)
-        prev = self._ema_state.get(ticker, 1.0)
-        smoothed = prev * (1 - self.ema_alpha) + effective * self.ema_alpha
-        self._ema_state[ticker] = smoothed
-        final = smoothed * self.global_scale
-        final = max(0.5, min(1.2, final))
-        return final
+        self.portfolio_state = {}
+        self.score_weights = self.config.portfolio_constructor.score_weights
+        self.ema_span = self.config.portfolio_constructor.ema_span
+        self.logger.info(f"PortfolioConstructor initialized with weights={self.score_weights} and ema_span={self.ema_span}.")
 
     def identify_opportunities(self, candidate_analysis: List[Dict], current_date: date) -> List[Dict]:
-        self.logger.info("PortfolioConstructor is identifying high-quality opportunities...")
-        adjusted_candidates = []
-        daily_asset_analysis = self.asset_analysis_data.get(current_date, {})
+        self.logger.info("Identifying opportunities from daily candidate analysis...")
+        if not candidate_analysis:
+            self.logger.warning("No candidate analysis provided.")
+            return []
+
+        if self.mode != 'off' and not self.asset_analysis_data:
+            self.logger.error("AI mode is enabled but no pre-computed asset analysis data was provided.")
+            return []
+
+        daily_asset_analysis = self.asset_analysis_data.get(current_date, {}) if self.mode != 'off' else {}
         
+        worthy_targets = []
         for candidate in candidate_analysis:
-            ticker = candidate["ticker"]
-            original_score = candidate["opportunity_score"]
-            final_factor = 1.0
-            confidence = 0.0
+            ticker = candidate['ticker']
+            opportunity_score = candidate.get('opportunity_score', 0.0)
             
-            if self.mode != 'off':
-                # [NEW] Adapt to the ReasoningEnsemble's output structure
-                ensemble_analysis = daily_asset_analysis.get(ticker)
-                if ensemble_analysis:
-                    final_conclusion = ensemble_analysis.get("final_conclusion", {})
-                    probability = final_conclusion.get("final_probability")
-
-                    if probability is not None:
-                        # Translate probability (0.0 to 1.0) to an adjustment factor.
-                        # A simple linear scaling: 0.5 prob -> 1.0 factor, 1.0 prob -> 1.3 factor, 0.0 prob -> 0.7 factor.
-                        final_factor = 0.7 + (probability * 0.6)
-                        # Confidence can be how far the probability is from a neutral 0.5
-                        confidence = abs(probability - 0.5) * 2.0
-
-            adjusted_score = original_score * final_factor
-            adjusted_candidates.append({**candidate, "adjusted_score": adjusted_score, "ai_factor": final_factor, "ai_confidence": confidence})
-            if abs(final_factor - 1.0) > 1e-9 and self.mode != 'off':
-                self.logger.info(f"AI Insight for {ticker} (Mode: {self.mode}): Prob={probability:.3f}, Conf={confidence:.2f}, FinalFactor={final_factor:.3f}. Score: {original_score:.2f} -> {adjusted_score:.2f}")
-
-        worthy_targets = [res for res in adjusted_candidates if res["adjusted_score"] > self.config.opportunity_score_threshold]
-        if not worthy_targets:
-            self.logger.info("PortfolioConstructor: No opportunities met the threshold.")
-        else:
-            self.logger.info(f"PortfolioConstructor: Identified {len(worthy_targets)} high-quality opportunities.")
+            final_conclusion = daily_asset_analysis.get(ticker, {}).get('final_conclusion', {})
+            confidence_score = final_conclusion.get('final_probability', 0.5) if final_conclusion else 0.5
+            
+            # Combine the scores
+            final_score = self._calculate_final_score(opportunity_score, confidence_score)
+            
+            if final_score >= self.config.opportunity_score_threshold:
+                self.logger.info(f"'{ticker}' identified as a worthy target. Final Score: {final_score:.2f}, Opportunity Score: {opportunity_score:.2f}, AI Confidence: {confidence_score:.2f}")
+                worthy_targets.append({
+                    "ticker": ticker,
+                    "final_score": final_score,
+                    "volatility": candidate.get("volatility")
+                })
+        
+        # Sort by score to prioritize the best opportunities
+        worthy_targets.sort(key=lambda x: x['final_score'], reverse=True)
+        self.logger.info(f"Identified {len(worthy_targets)} worthy targets for {current_date.isoformat()}.")
         return worthy_targets
+
+    def _calculate_final_score(self, alpha_score: float, confidence_score: float) -> float:
+        """
+        Calculates the final, blended score for an asset.
+        """
+        # Weighted average of alpha and confidence
+        alpha_weight = self.score_weights.get("alpha_score", 0.5)
+        confidence_weight = self.score_weights.get("confidence_score", 0.5)
+        
+        final_score = (alpha_score * alpha_weight) + (confidence_score * confidence_weight)
+        return final_score
