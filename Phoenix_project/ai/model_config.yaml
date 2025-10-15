@@ -1,0 +1,14 @@
+# Phoenix Project - AI 模型架构配置
+# ---------------------------------------------------
+# 此文件集中了MetaLearner神经网络模型的所有超参数。
+
+level_one_cnn:
+  filters: 64
+  kernel_size: 2
+
+level_two_transformer:
+  head_size: 256
+  num_heads: 4
+  ff_dim: 4
+  num_transformer_blocks: 4
+  dropout: 0.1
