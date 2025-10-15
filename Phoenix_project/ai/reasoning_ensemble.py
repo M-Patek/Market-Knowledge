@@ -14,6 +14,11 @@ from typing import Protocol, List, Dict, Any, NamedTuple
 from pydantic import BaseModel
 
 from ai.validation import EvidenceItem
+from .walk_forward_trainer import WalkForwardTrainer
+from .contradiction_detector import ContradictionDetector
+from .embedding_client import EmbeddingClient
+from .probability_calibrator import ProbabilityCalibrator
+import tensorflow as tf
 from .bayesian_fusion_engine import BayesianFusionEngine
 
 # --- 1. Standard Interface & Data Contracts ---
@@ -45,9 +50,17 @@ class BayesianReasoner:
         stats = fusion_result.get("summary_statistics")
         
         if stats:
+            posterior_dist = fusion_result.get("posterior_distribution", {})
             return ReasoningOutput(
                 reasoner_name=self.reasoner_name,
-                conclusion={"posterior_mean_probability": stats["mean_probability"]},
+                conclusion={
+                    "posterior_mean_probability": stats["mean_probability"],
+                    # [NEW] Expose posterior and prior parameters for meta-feature calculation.
+                    "posterior_alpha": posterior_dist.get("alpha"),
+                    "posterior_beta": posterior_dist.get("beta"),
+                    "prior_alpha": self.engine.base_prior_alpha,
+                    "prior_beta": self.engine.base_prior_beta
+                },
                 confidence=1.0 - stats["std_dev"], # Use std dev as an inverse proxy for confidence
                 supporting_evidence_ids=[e.source_id for e in evidence if e.source_id]
             )
@@ -205,58 +218,221 @@ class MetaLearner:
     to produce a final, synthesized decision.
     """
     def __init__(self):
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
+        from sklearn.ensemble import StackingClassifier
         from sklearn.svm import SVC
+        # [NEW] Import deep learning components. This will require adding tensorflow to requirements.txt.
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import LSTM, Dense, Input
+        # [REINFORCEMENT] Import state-of-the-art tree models.
+        import xgboost as xgb
+        import lightgbm as lgb
 
         self.logger = logging.getLogger("PhoenixProject.MetaLearner")
         
         # Define the 'AI Jury' - a diverse set of base models
         estimators = [
-            ('rf', RandomForestClassifier(n_estimators=10, random_state=42)),
-            ('gb', GradientBoostingClassifier(n_estimators=10, random_state=42)),
+            ('xgb', xgb.XGBClassifier(n_estimators=10, random_state=42, use_label_encoder=False, eval_metric='logloss')),
+            ('lgb', lgb.LGBMClassifier(n_estimators=10, random_state=42)),
             ('svc', SVC(probability=True, random_state=42))
         ]
+        self.base_estimators = StackingClassifier(estimators=estimators, final_estimator=lgb.LGBMClassifier()) # Keep a simple final estimator for the base layer
 
-        # The 'Chief Judge' (meta-model) learns from the jury's predictions.
-        # We use a StackingClassifier to orchestrate this process.
-        self.model = StackingClassifier(estimators=estimators, final_estimator=LogisticRegression())
+        # [REPLACEMENT] The 'Chief Judge' is now a time-aware deep learning model.
+        # It will learn from the sequence of predictions made by the base estimators.
+        self.model = Sequential([
+            # TODO: The input shape should be dynamically determined by the number of features.
+            # For now, this is a placeholder. A more robust implementation would calculate this.
+            Input(shape=(5, 3 * 3 + 4)), # (n_timesteps, n_reasoners * n_base_features + n_meta_features)
+            LSTM(16, activation='relu'),
+            Dense(8, activation='relu'),
+            Dense(1, activation='sigmoid')
+        ])
+        self.model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+        # [NEW] Add the calibrator as the final step in the cognitive pipeline.
+        self.calibrator = ProbabilityCalibrator(method='isotonic')
+        # [NEW] Store the last known efficacies for prediction.
+        self.last_known_efficacies = {}
         self.is_trained = False
 
-    def _featurize(self, reasoner_outputs: List[ReasoningOutput]) -> np.ndarray:
-        """Converts the diverse outputs of the ensemble into a flat feature vector."""
+    def _featurize(self, reasoner_output: ReasoningOutput) -> List[float]:
+        """Converts a single reasoner's output into a feature vector."""
         features = []
-        # A simple featurization: use the confidence score of each reasoner.
-        # In a more advanced system, this would be much more sophisticated.
-        for output in sorted(reasoner_outputs, key=lambda x: x.reasoner_name):
-            features.append(output.confidence)
-        return np.array(features).reshape(1, -1)
+        # Start with a base feature, the confidence score.
+        features.append(reasoner_output.confidence)
+        
+        # [NEW] Extract deeper features based on reasoner type, per master's plan.
+        if reasoner_output.reasoner_name == "BayesianReasoner" and isinstance(reasoner_output.conclusion, dict):
+            prob = reasoner_output.conclusion.get("posterior_mean_probability", 0.5)
+            features.append(prob) # Add the posterior probability
+            features.append(abs(prob - 0.5) * 2) # Add a measure of conviction
+        else:
+            features.extend([0.5, 0.0]) # Add neutral features for other types
 
-    def train(self, historical_outputs: List[List[ReasoningOutput]], true_outcomes: List[int]):
+        return features
+
+    def _create_sequences(self, features: np.ndarray, labels: np.ndarray, n_timesteps: int = 5) -> (np.ndarray, np.ndarray):
+        """
+        [NEW] Helper function to transform time-series data into sequences for the LSTM.
+        """
+        X, y = [], []
+        for i in range(len(features) - n_timesteps + 1):
+            X.append(features[i:(i + n_timesteps)])
+            y.append(labels[i + n_timesteps - 1])
+        return np.array(X), np.array(y)
+
+    def train(
+        self,
+        historical_outputs: List[List[ReasoningOutput]],
+        true_outcomes: List[int],
+        contradiction_counts: List[int],
+        historical_efficacies: List[Dict[str, float]]):
         """
         Trains the meta-learner on historical reasoner outputs and their true outcomes.
+        [NEW] Includes an adversarial training loop for robustness.
         """
         self.logger.info(f"Training MetaLearner on {len(historical_outputs)} historical data points...")
-        X = np.vstack([self._featurize(outputs) for outputs in historical_outputs])
-        y = np.array(true_outcomes)
-        self.model.fit(X, y)
-        self.is_trained = True
-        self.logger.info("MetaLearner training complete.")
-        # Log the learned weights (coefficients) for interpretability
-        self.logger.info(f"Learned reasoner weights (coefficients): {self.model.final_estimator_.coef_}")
+        # 1. Featurize the full history
+        # We create a flat feature matrix where each row is a day and columns are features from all reasoners.
+        daily_features = []
+        sorted_reasoner_names = sorted(list(historical_efficacies[0].keys())) if historical_efficacies else []
+        
+        for i, daily_outputs in enumerate(historical_outputs):
+            day_feature_vector = []
+            reasoner_probs = []
+            sorted_outputs = sorted(daily_outputs, key=lambda x: x.reasoner_name)
+            for output in sorted_outputs:
+                day_feature_vector.extend(self._featurize(output))
+                # Collect probabilities for dispersion calculation
+                if output.reasoner_name == "BayesianReasoner" and isinstance(output.conclusion, dict):
+                    reasoner_probs.append(output.conclusion.get("posterior_mean_probability", 0.5))
+                else:
+                    reasoner_probs.append(output.confidence) # Use confidence as a proxy
 
-    def predict(self, reasoner_outputs: List[ReasoningOutput]) -> Dict[str, Any]:
+            # [NEW] Meta-Feature 1: Dispersion Penalty
+            dispersion = np.std(reasoner_probs) if reasoner_probs else 0
+            day_feature_vector.append(dispersion)
+            
+            # [NEW] Meta-Feature 2: Bayesian Prior Bias
+            bayesian_out = next((o for o in daily_outputs if o.reasoner_name == "BayesianReasoner"), None)
+            bayesian_bias = 0.0
+            if bayesian_out and isinstance(bayesian_out.conclusion, dict) and bayesian_out.conclusion.get("posterior_alpha"):
+                prior_ratio = bayesian_out.conclusion["prior_alpha"] / bayesian_out.conclusion["prior_beta"]
+                posterior_ratio = bayesian_out.conclusion["posterior_alpha"] / bayesian_out.conclusion["posterior_beta"]
+                bayesian_bias = (posterior_ratio / prior_ratio) - 1.0 if prior_ratio > 0 else 0.0
+            day_feature_vector.append(bayesian_bias)
+            
+            # [NEW] Meta-Feature 3: Contradiction Count
+            day_feature_vector.append(contradiction_counts[i])
+            
+            # [NEW] Meta-Feature 4: Reasoner Historical Efficacy
+            efficacies = historical_efficacies[i]
+            for name in sorted_reasoner_names:
+                day_feature_vector.append(efficacies.get(name, 0.5))
+
+            daily_features.append(day_feature_vector)
+        
+        X_flat = np.array(daily_features)
+        y = np.array(true_outcomes)
+
+        # 2. Create sequences
+        n_timesteps = 5 # This should be configurable
+        X_sequences, y_sequences = self._create_sequences(X_flat, y, n_timesteps)
+
+        # 3. Train the LSTM model with an Adversarial Loop
+        if X_sequences.shape[0] > 0:
+            self.logger.info("Starting adversarial training loop...")
+            # Convert to TensorFlow tensors
+            dataset = tf.data.Dataset.from_tensor_slices((X_sequences, y_sequences)).batch(4)
+            epsilon = 0.01 # Perturbation magnitude
+            optimizer = tf.keras.optimizers.Adam()
+            loss_fn = tf.keras.losses.BinaryCrossentropy()
+
+            for epoch in range(20): # Number of epochs
+                for step, (x_batch, y_batch) in enumerate(dataset):
+                    with tf.GradientTape() as tape:
+                        tape.watch(x_batch)
+                        prediction = self.model(x_batch, training=True)
+                        loss = loss_fn(y_batch, prediction)
+                    # Get gradients of loss wrt the input
+                    gradient = tape.gradient(loss, x_batch)
+                    # Create the adversarial perturbation
+                    perturbation = epsilon * tf.sign(gradient)
+                    x_adversarial = x_batch + perturbation
+                    # Train on the adversarial example
+                    with tf.GradientTape() as inner_tape:
+                        prediction = self.model(x_adversarial, training=True)
+                        loss = loss_fn(y_batch, prediction)
+                    grads = inner_tape.gradient(loss, self.model.trainable_variables)
+                    optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+
+            self.logger.info("Adversarial training complete. Now training probability calibrator...")
+
+            # [NEW] 4. Train the ProbabilityCalibrator on the LSTM's predictions
+            uncalibrated_probs = self.model.predict(X_sequences, verbose=0).flatten().tolist()
+            self.calibrator.train(uncalibrated_probs, y_sequences.tolist())
+        else:
+            self.logger.warning("Not enough data to train MetaLearner LSTM or Calibrator.")
+
+        self.is_trained = True
+
+    def predict(
+        self,
+        reasoner_outputs: List[List[ReasoningOutput]],
+        contradiction_count: int,
+        reasoner_efficacies: Dict[str, float]
+    ) -> Dict[str, Any]:
         """
         Uses the trained model to produce a final, synthesized probability.
         """
         if not self.is_trained:
             # Fallback logic: if not trained, return an unweighted average of confidences.
-            avg_confidence = np.mean([o.confidence for o in reasoner_outputs]) if reasoner_outputs else 0
+            avg_confidence = np.mean([o.confidence for o in reasoner_outputs[0]]) if reasoner_outputs and reasoner_outputs[0] else 0
             return {"final_probability": avg_confidence, "source": "unweighted_average"}
+        
+        # The 'predict' method now expects a sequence of recent outputs.
+        # The caller (e.g., the backtest engine) would be responsible for passing this sequence.
+        
+        sorted_reasoner_names = sorted(list(reasoner_efficacies.keys()))
+        daily_features_sequence = []
+        for daily_outputs in reasoner_outputs: # Assuming reasoner_outputs is List[List[ReasoningOutput]]
+            day_feature_vector = []
+            reasoner_probs = []
+            for output in sorted(daily_outputs, key=lambda x: x.reasoner_name):
+                day_feature_vector.extend(self._featurize(output))
+                if output.reasoner_name == "BayesianReasoner" and isinstance(output.conclusion, dict):
+                    reasoner_probs.append(output.conclusion.get("posterior_mean_probability", 0.5))
+                else:
+                    reasoner_probs.append(output.confidence)
+            
+            # Calculate and append meta-features, same as in training.
+            dispersion = np.std(reasoner_probs) if reasoner_probs else 0
+            day_feature_vector.append(dispersion)
+            
+            bayesian_out = next((o for o in daily_outputs if o.reasoner_name == "BayesianReasoner"), None)
+            bayesian_bias = 0.0
+            if bayesian_out and isinstance(bayesian_out.conclusion, dict) and bayesian_out.conclusion.get("posterior_alpha"):
+                prior_ratio = bayesian_out.conclusion["prior_alpha"] / bayesian_out.conclusion["prior_beta"]
+                posterior_ratio = bayesian_out.conclusion["posterior_alpha"] / bayesian_out.conclusion["posterior_beta"]
+                bayesian_bias = (posterior_ratio / prior_ratio) - 1.0 if prior_ratio > 0 else 0.0
+            day_feature_vector.append(bayesian_bias)
+            
+            # [NEW] Meta-Feature 3: Contradiction Count
+            day_feature_vector.append(contradiction_count)
 
-        features = self._featurize(reasoner_outputs)
-        # Predict the probability of the positive class (1)
-        final_prob = self.model。predict_proba(features)[0, 1]
+            # [NEW] Meta-Feature 4: Reasoner Historical Efficacy
+            # We use the same efficacy scores for each day in the short prediction sequence.
+            for name in sorted_reasoner_names:
+                day_feature_vector.append(reasoner_efficacies.get(name, 0.5))
+            
+            daily_features_sequence.append(day_feature_vector)
+
+        features_3d = np.array(daily_features_sequence).reshape(1, len(daily_features_sequence), -1)
+        uncalibrated_prob = self.model.predict(features_3d, verbose=0)[0][0]
+
+        # [NEW] Apply the trained calibrator to the final output
+        calibrated_prob = self.calibrator.calibrate([uncalibrated_prob])
+        final_prob = calibrated_prob[0] if calibrated_prob else uncalibrated_prob
+
         return {"final_probability": final_prob, "source": "meta_learner"}
 
 
@@ -266,15 +442,28 @@ class ReasoningEnsemble:
     """
     Orchestrates a collection of specialized reasoners to run in parallel.
     """
-    def __init__(self, *reasoners: IReasoner):
+    def __init__(self, embedding_client: EmbeddingClient, *reasoners: IReasoner):
         """
         Initializes the ensemble with a list of reasoner instances.
         """
+        # TODO: The calling script (phoenix_project.py) must be updated to pass the embedding_client.
         self.logger = logging.getLogger("PhoenixProject.ReasoningEnsemble")
         self.reasoners = reasoners
         # [NEW] The ensemble now has a meta-learner
         self.meta_learner = MetaLearner()
+        # [NEW] The ensemble now has a contradiction detector to assess evidence quality.
+        self.contradiction_detector = ContradictionDetector(embedding_client)
         self.logger.info(f"ReasoningEnsemble initialized with {len(self.reasoners)} reasoners.")
+
+    def train(self, historical_data: List[Dict[str, Any]]):
+        """
+        [NEW] Centralizes the complex training process for the ensemble's meta-learner.
+        """
+        self.logger.info("Initiating training for the ReasoningEnsemble's MetaLearner...")
+        reasoner_names = [r.reasoner_name for r in self.reasoners]
+        trainer = WalkForwardTrainer(historical_data, reasoner_names)
+        self.meta_learner = trainer.train(self.meta_learner)
+        self.logger.info("MetaLearner training complete.")
 
     async def analyze(self, hypothesis: str, evidence: List[EvidenceItem]) -> Dict[str, Any]:
         """
@@ -282,6 +471,11 @@ class ReasoningEnsemble:
         and returns a final conclusion.
         """
         self.logger.info(f"Dispatching analysis to all {len(self.reasoners)} reasoners...")
+        
+        # [NEW] Step 1: Detect contradictions in the source evidence to use as a meta-feature.
+        contradictions = self.contradiction_detector.detect(evidence)
+        contradiction_count = len(contradictions)
+        self.logger.info(f"Found {contradiction_count} contradictory evidence pairs.")
         
         tasks = [
             reasoner.reason(hypothesis, evidence) for reasoner in self.reasoners
@@ -298,7 +492,13 @@ class ReasoningEnsemble:
 
         # --- [NEW] Meta-Learning Stage ---
         # Use the meta-learner to synthesize a final conclusion
-        final_conclusion = self.meta_learner.predict(final_outputs)
+        # The historical sequence for prediction would need to be passed in a real scenario.
+        # For now, we assume `final_outputs` represents the most recent data point in a sequence.
+        final_conclusion = self.meta_learner.predict(
+            [final_outputs],
+            contradiction_count=contradiction_count,
+            reasoner_efficacies=self.meta_learner.last_known_efficacies
+        )
 
         self.logger.info(f"Ensemble analysis complete. Final conclusion: {final_conclusion}")
         return {
