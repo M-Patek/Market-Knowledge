@@ -1,69 +1,67 @@
-import yaml
+import logging
 import optuna
-import tempfile
-import mlflow
-from ai.walk_forward_trainer import WalkForwardTrainer
-from data_manager import DataManager
+import numpy as np
+from typing import Dict, Any
 
-class Optimizer:
-    def __init__(self, config_path='config.yaml'):
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-        self.data_manager = DataManager(self.config['data_manager'])
-        # 合并策略和模型超参数空间
-        self.hyperparameter_space = {
-            **self.config['optimizer']['strategy_hyperparameter_space'],
-            **self.config['optimizer']['model_hyperparameter_space']
+from .ai.walk_forward_trainer import WalkForwardTrainer
+
+class HyperparameterOptimizer:
+    """
+    使用Optuna和向前滚动窗口验证来寻找最优的模型超参数。
+    """
+    def __init__(self, data, config: Dict[str, Any]):
+        self.logger = logging.getLogger("PhoenixProject.HyperparameterOptimizer")
+        self.data = data
+        self.config = config
+        self.optimizer_config = self.config.get('optimizer', {})
+
+    def objective(self, trial: optuna.Trial) -> float:
+        """
+        Optuna的目标函数。为给定的超参数试验运行一次完整的
+        向前滚动窗口验证。
+        """
+        # 1. 动态定义超参数搜索空间
+        trial_params = {
+            "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
+            "num_heads": trial.suggest_int("num_heads", 2, 8, step=2),
+            "ff_dim": trial.suggest_int("ff_dim", 32, 128, step=32),
         }
+        
+        self.logger.info(f"开始试验 {trial.number}，参数: {trial_params}")
+        
+        # 2. 运行完整的向前滚动窗口训练
+        trainer = WalkForwardTrainer(self.data, trial_params, self.config)
+        metrics = trainer.run() # 预期返回 {"sharpe_ratio": X, "avg_variance": Y}
 
-    def _objective(self, trial):
-        # [新] 启动一个MLflow运行来跟踪实验
-        with mlflow.start_run():
-            params = {}
-            for param, bounds in self.hyperparameter_space.items():
-                if bounds['type'] == 'int':
-                    params[param] = trial.suggest_int(param, bounds['min'], bounds['max'])
-                elif bounds['type'] == 'float':
-                    params[param] = trial.suggest_float(param, bounds['min'], bounds['max'], log=bounds.get('log', False))
-            
-            # [新] 记录本次试验的所有参数
-            mlflow.log_params(params)
+        sharpe_ratio = metrics.get("sharpe_ratio")
+        avg_variance = metrics.get("avg_variance")
 
-            # 为本次试验创建一个临时的模型配置
-            model_config = self._create_trial_model_config(params)
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml', dir='ai') as tmp_file:
-                yaml.dump(model_config, tmp_file)
-                model_config_path = tmp_file.name
+        if sharpe_ratio is None or avg_variance is None or not np.isfinite(sharpe_ratio):
+            self.logger.warning(f"试验 {trial.number} 得到无效指标。返回-10。")
+            return -10.0 # 为失败的试验返回一个很差的分数
 
-            historical_data = self.data_manager.load_historical_data('btcusdt')
-            
-            trainer = WalkForwardTrainer(self.config, params, model_config_path=model_config_path)
-            results = trainer.run(historical_data)
-
-            # [新] 记录本次试验的主要指标
-            sharpe_ratio = results.get('sharpe_ratio', 0.0)
-            mlflow.log_metric("sharpe_ratio", sharpe_ratio)
-            
-            return sharpe_ratio
-
-    def _create_trial_model_config(self, params):
-        """[新] 从试验参数创建一个模型配置字典。"""
-        return {
-            'level_one_cnn': {
-                'filters': params['cnn_filters'],
-                'kernel_size': 2 # 暂时保持固定
-            },
-            'level_two_transformer': {
-                'head_size': 256, # 固定
-                'num_heads': 4, # 固定
-                'ff_dim': 4, # 固定
-                'num_transformer_blocks': params['transformer_blocks'],
-                'dropout': params['transformer_dropout']
-            }
-        }
+        # 复合目标函数：夏普比率 - λ * 平均后验方差
+        variance_penalty_lambda = self.optimizer_config.get('variance_penalty_lambda', 2.0)
+        objective_value = sharpe_ratio - (variance_penalty_lambda * avg_variance)
+        
+        self.logger.info(f"试验 {trial.number}: 夏普={sharpe_ratio:.4f}, 平均方差={avg_variance:.4f} -> 目标值={objective_value:.4f}")
+        return objective_value
 
     def run(self):
-        study = optuna.create_study(direction='maximize')
-        study.optimize(self._objective, n_trials=self.config['optimizer']['n_trials'])
-        print("最佳试验:", study.best_trial.params)
-        return study.best_trial.params
+        """
+        启动超参数优化过程。
+        """
+        self.logger.info("--- 开始贝叶斯超参数优化 ---")
+        study = optuna.create_study(direction="maximize")
+        study.optimize(
+            self.objective,
+            n_trials=self.optimizer_config.get('n_trials', 50),
+            timeout=self.optimizer_config.get('timeout_seconds', 7200)
+        )
+
+        self.logger.info("优化完成。")
+        self.logger.info(f"最佳试验: {study.best_trial.number}")
+        self.logger.info(f"最佳目标值: {study.best_value}")
+        self.logger.info(f"最佳参数: {study.best_params}")
+        
+        return study.best_params
