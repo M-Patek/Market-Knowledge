@@ -31,6 +31,7 @@ class EvidenceItem(BaseModel):
     fetch_time: Optional[datetime] = Field(None, description="The UTC timestamp when the evidence was retrieved.")
     license: Optional[str] = Field(None, description="The license or usage terms of the source data.")
     retrieval_rank: Optional[int] = Field(None, description="The rank of this item in the retrieval results.")
+    data_fingerprint: Optional[str] = Field(None, description="SHA256 hash of the source content for immutable traceability.")
 
     class Config:
         schema_extra = {
@@ -45,7 +46,8 @@ class EvidenceItem(BaseModel):
                 'fetch_time': '2025-10-12T12:00:00Z',
                 'license': 'Public Domain',
                 'retrieval_rank': 1,
-                'url': 'https://example.com/sec/abc-q3'
+                'url': 'https://example.com/sec/abc-q3',
+                'data_fingerprint': 'a1b2c3d4...'
             }
         }
 
