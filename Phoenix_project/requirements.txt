@@ -56,6 +56,8 @@ lightgbm==4.3.0
 
 google-generativeai==0.7.1
 pinecone-client==3.2.2 # 示例向量数据库客户端
+sentence-transformers==2.7.0 # For Cross-Encoder
+torch==2.3.0 # For Cross-Encoder
 
 --- MetaLearner深度学习 ---
 
@@ -63,6 +65,7 @@ pinecone-client==3.2.2 # 示例向量数据库客户端
 
 tensorflow==2.16.1
 tensorflow-gnn==0.6.0 # 用于图神经网络
+shap==0.45.0 # For model explainability
 
 --- 优化与实验跟踪 ---
 
