@@ -9,6 +9,7 @@ from datetime import date
 
 from phoenix_project import StrategyConfig
 from cognitive.engine import CognitiveEngine
+from features.store import SimpleFeatureStore # [V2.0] Import the feature store
 from execution.order_manager import OrderManager
 
 @dataclass
@@ -27,35 +28,17 @@ class StrategyDataHandler:
     Acts as a data provider and pre-processor for the main strategy logic.
     Its purpose is to decouple data management from the core strategy decision-making logic.
     """
-    def __init__(self, strategy: bt.Strategy, config: StrategyConfig, vix_data: pd.Series, treasury_yield_data: pd.Series, market_breadth_data: pd.Series, market_state_predictor: Optional[MarketStatePredictor] = None):
+    def __init__(self, strategy: bt.Strategy, config: StrategyConfig, vix_data: pd.Series, treasury_yield_data: pd.Series, market_breadth_data: pd.Series, feature_store: SimpleFeatureStore, market_state_predictor: Optional[MarketStatePredictor] = None):
         self.strategy = strategy
         self.config = config
         self.logger = logging.getLogger("PhoenixProject.StrategyDataHandler")
         self.market_state_predictor = market_state_predictor
+        self.feature_store = feature_store # [V2.0] Use the feature store
 
         self.data_map = {d._name: d for d in self.strategy.datas}
         self.vix_data = vix_data
         self.treasury_yield_data = treasury_yield_data
         self.market_breadth_data = market_breadth_data
-        self.indicators = self._setup_indicators()
-    
-    def _setup_indicators(self) -> Dict[str, Dict[str, Any]]:
-        """Initialize all indicators for all data feeds."""
-        indicators = {}
-        for ticker, data in self.data_map.items():
-            indicators[ticker] = {
-                'sma': bt.indicators.SimpleMovingAverage(
-                    data.close, period=self.config.sma_period
-                ),
-                'rsi': bt.indicators.RSI(
-                    data.close, period=self.config.rsi_period
-                ),
-                # [NEW] Add a volatility indicator (e.g., standard deviation of returns)
-                'volatility': bt.indicators.StandardDeviation(
-                    data.close, period=self.config.position_sizer.parameters.get('volatility_period', 20)
-                )
-            }
-        return indicators
 
     def get_daily_data_packet(self, cognitive_engine: CognitiveEngine) -> Optional[DailyDataPacket]:
         """Assembles all necessary data for the current day into a single packet."""
@@ -81,15 +64,20 @@ class StrategyDataHandler:
             }])
             market_state, market_state_confidence = self.market_state_predictor.predict(macro_features)
 
-        candidate_analysis = [{
-            "ticker": ticker,
-            "opportunity_score": cognitive_engine.calculate_opportunity_score(
-                d.close[0],
-                self.indicators[ticker]['sma'][0],
-                self.indicators[ticker]['rsi'][0],
-            ),
-            "volatility": self.indicators[ticker]['volatility'][0]
-        } for ticker, d in self.data_map.items()]
+        candidate_analysis = []
+        for ticker, d in self.data_map.items():
+            # [V2.0] Get features from the centralized feature store
+            # We convert the backtrader data lines to a pandas DataFrame
+            df = pd.DataFrame({'close': d.close.get(size=self.config.sma_period + 1)})
+            features = self.feature_store.get_features(ticker, df)
+            
+            candidate_analysis.append({
+                "ticker": ticker,
+                "opportunity_score": cognitive_engine.calculate_opportunity_score(
+                    d.close[0], features.get('sma'), features.get('rsi')
+                ),
+                "volatility": features.get('volatility')
+            })
 
         return DailyDataPacket(
             current_date=current_date,
@@ -126,3 +114,4 @@ class RomanLegionStrategy(bt.Strategy):
         self.logger.info("--- [Strategy Stop]: Finalizing operations ---")
         # Any final logic can go here
         pass
+
