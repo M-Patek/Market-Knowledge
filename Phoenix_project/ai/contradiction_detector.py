@@ -4,9 +4,10 @@ Implements a service for adversarial validation and contradiction detection
 within a set of evidence.
 """
 import logging
-import itertools
+import asyncio
 import numpy as np
 from typing import List, Dict, Any, Tuple
+import google.generativai as genai
 
 from .embedding_client import EmbeddingClient
 from ai.validation import EvidenceItem
@@ -34,12 +35,18 @@ class ContradictionDetector:
         self.similarity_threshold = similarity_threshold
         self.positive_threshold = positive_threshold
         self.negative_threshold = negative_threshold
+        # [NEW] Initialize a high-capability model for arbitration
+        try:
+            self.arbitrator_model = genai.GenerativeModel("gemini-1.5-pro-latest")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Arbitrator LLM model: {e}")
+            self.arbitrator_model = None
 
     def _cosine_similarity(self, vec_a: np.ndarray, vec_b: np.ndarray) -> float:
         """Calculates the cosine similarity between two vectors."""
         return np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
 
-    def detect(self, evidence_list: List[EvidenceItem]) -> List[Tuple[EvidenceItem, EvidenceItem]]:
+    async def detect(self, evidence_list: List[EvidenceItem]) -> List[Tuple[EvidenceItem, EvidenceItem]]:
         """
         Detects pairs of contradictory evidence in a given list.
 
@@ -51,14 +58,14 @@ class ContradictionDetector:
 
         # 1. Generate embeddings for all evidence findings that have content
         docs_to_embed = [{"content": ev.finding, "_original_item": ev} for ev in evidence_list if ev.finding]
-        embedded_docs = self.embedding_client.create_embeddings(docs_to_embed)
+        embedded_docs = self.embedding_client.create_text_embeddings(docs_to_embed)
 
         # Filter out any that failed embedding
         valid_evidence = [doc for doc in embedded_docs if 'vector' in doc]
         if len(valid_evidence) < 2:
             return []
 
-        contradictions = []
+        potential_contradictions = []
         
         # 2. Perform vectorized cosine similarity calculation
         embeddings = np.array([doc['vector'] for doc in valid_evidence])
@@ -83,8 +90,36 @@ class ContradictionDetector:
             is_j_negative = item_j.score <= self.negative_threshold
 
             if (is_i_positive and is_j_negative) or (is_i_negative and is_j_positive):
-                self.logger.warning(f"CONTRADICTION DETECTED (Similarity: {similarity_matrix[i, j]:.2f}): "
-                                    f"'{item_i.finding}' vs '{item_j.finding}'")
-                contradictions.append((item_i, item_j))
-        
-        return contradictions
+                self.logger.info(f"Potential contradiction found (Sim: {similarity_matrix[i, j]:.2f}). Sending to LLM Arbitrator.")
+                potential_contradictions.append((item_i, item_j))
+
+        # 3. [NEW] Use LLM to arbitrate potential contradictions
+        if not self.arbitrator_model or not potential_contradictions:
+            return []
+
+        tasks = [self._arbitrate_pair(item_i, item_j) for item_i, item_j in potential_contradictions]
+        arbitration_results = await asyncio.gather(*tasks)
+
+        # Filter for pairs that the LLM confirmed as contradictory
+        confirmed_contradictions = [pair for pair, is_contradictory in zip(potential_contradictions, arbitration_results) if is_contradictory]
+        if confirmed_contradictions:
+            self.logger.warning(f"LLM Arbitrator confirmed {len(confirmed_contradictions)} contradictions.")
+
+        return confirmed_contradictions
+
+    async def _arbitrate_pair(self, item1: EvidenceItem, item2: EvidenceItem) -> bool:
+        """Uses an LLM to determine if two evidence items are truly contradictory."""
+        prompt = f"""
+Analyze the following two pieces of evidence. Do they represent a direct logical contradiction?
+Your response MUST be a single word: Contradiction, Neutral, or Entailment.
+
+Evidence A: "{item1.finding}" (Score: {item1.score})
+Evidence B: "{item2.finding}" (Score: {item2.score})
+"""
+        try:
+            response = await self.arbitrator_model.generate_content_async(prompt)
+            decision = response.text.strip()
+            return decision == "Contradiction"
+        except Exception as e:
+            self.logger.error(f"LLM arbitration call failed: {e}")
+            return False
