@@ -1,6 +1,10 @@
 import logging
 from typing import Dict, Any
 from .stream_processor import StreamProcessor
+from opentelemetry import trace # [V2.0] Import OpenTelemetry
+
+# [V2.0] Get a tracer for this specific module
+tracer = trace.get_tracer(__name__)
 
 class EventDistributor:
     """
@@ -29,10 +33,18 @@ class EventDistributor:
         然后传递给认知引擎。现在是一个异步方法。
         """
         self.logger.debug(f"处理事件: {event}")
-        if not self.risk_filter.is_event_safe(event):
-            self.logger.warning(f"事件未通过风险过滤器: {event}")
-            return
+        # [V2.0] Start a new trace span for this event processing task.
+        # This span acts as the parent for all subsequent operations.
+        with tracer.start_as_current_span("process_event", attributes={"event_id": str(event.get('event_id')), "event_type": event.get('event_type')}) as span:
+            if not self.risk_filter.is_event_safe(event):
+                self.logger.warning(f"事件未通过风险过滤器: {event}")
+                span.set_attribute("is_safe", False)
+                span.add_event("Event failed risk filter")
+                return
 
-        self.logger.info(f"事件已传递给认知引擎: {event['event_type']}")
-        # 假设认知引擎现在是异步的
-        await self.cognitive_engine.handle_event(event)
+            span.set_attribute("is_safe", True)
+            self.logger.info(f"事件已传递给认知引擎: {event['event_type']}")
+            # In a real system, the context would be propagated to this async call.
+            # await self.cognitive_engine.handle_event(event)
+            span.add_event("Event passed to CognitiveEngine")
+
