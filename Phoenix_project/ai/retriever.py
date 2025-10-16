@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import hashlib
 from typing import List, Dict, Any, Optional
 from datetime import datetime, date, timezone
 import google.generativeai as genai
@@ -10,6 +11,7 @@ from .temporal_db_client import TemporalDBClient
 from .tabular_db_client import TabularDBClient
 from .relation_extractor import RelationExtractor, KnowledgeGraph
 from .embedding_client import EmbeddingClient
+from sentence_transformers import CrossEncoder
 
 # --- 用于结构化LLM输出的Pydantic模型 ---
 class DeconstructedQuery(BaseModel):
@@ -38,6 +40,14 @@ class HybridRetriever:
         self.embedding_client = EmbeddingClient()
         self.retriever_config = rerank_config
         self.rrf_k = self.retriever_config.get('rrf_k', 60)
+        self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        
+        # [NEW] Initialize a separate, simple generative model for HyDE
+        try:
+            self.hyde_model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize HyDE model: {e}")
+            self.hyde_model = None
         
         # 初始化关系提取器
         self.relation_extractor = RelationExtractor()
@@ -55,7 +65,21 @@ class HybridRetriever:
 
     async def _recall_from_vector(self, query: str, top_k: int) -> List[Dict[str, Any]]:
         """从向量数据库召回。"""
-        return self.vector_client.query(query, top_k=top_k)
+        hyde_vector = None
+        if self.hyde_model:
+            try:
+                # 1. Generate a hypothetical document
+                prompt = f"Please write a short, hypothetical paragraph that would be the perfect answer to the financial query: '{query}'"
+                response = await self.hyde_model.generate_content_async(prompt)
+                hypothetical_doc = response.text
+                self.logger.info(f"Generated Hypothetical Document for HyDE: '{hypothetical_doc[:100]}...'")
+                # 2. Embed the hypothetical document
+                hyde_vector = self.embedding_client.create_query_embedding(hypothetical_doc)
+            except Exception as e:
+                self.logger.error(f"HyDE generation failed: {e}. Falling back to standard query embedding.")
+
+        # 3. Query using the HyDE vector, or fall back to the original query's vector
+        return self.vector_client.query(query, top_k=top_k, query_vector=hyde_vector)
 
     async def _recall_from_temporal(self, ticker: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
         """从时序数据库召回。"""
@@ -99,7 +123,7 @@ class HybridRetriever:
         
         tasks = []
         if self.vector_client:
-            tasks.append(self._recall_from_vector(keywords, top_k=20))
+            tasks.append(self._recall_from_vector(keywords, top_k=50)) # Increased for better reranking
         if self.temporal_client and query_ticker:
             end_date = date.today()
             start_date = date(end_date.year - 1, end_date.month, end_date.day)
@@ -125,45 +149,38 @@ class HybridRetriever:
             if source_id in master_doc_lookup:
                 doc = master_doc_lookup[source_id]
                 doc['rrf_score'] = score
+                
+                # [NEW] Generate and inject the data fingerprint
+                content = doc.get('content', '')
+                if content:
+                    doc['data_fingerprint'] = hashlib.sha256(content.encode('utf-8')).hexdigest()
+                    
                 fused_candidates[source_id] = doc
 
         final_candidates = sorted(fused_candidates.values(), key=lambda x: x['rrf_score'], reverse=True)
         self.logger.info(f"召回阶段完成。使用RRF融合并排序了 {len(final_candidates)} 个唯一候选。")
         return final_candidates
 
-    def rerank(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """根据加权公式对候选列表进行重排。"""
-        weights = self.retriever_config.get('weights', {})
-        w_rrf = weights.get('rrf', 0.7)
-        w_freshness = weights.get('freshness', 0.2)
-        w_source = weights.get('source', 0.1)
-        freshness_decay_rate = self.retriever_config.get('freshness_decay_rate', 0.05)
-        source_weights = self.retriever_config.get('source_type_weights', {})
+    def rerank(self, query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """使用Cross-Encoder模型对候选列表进行深度语义重排。"""
+        if not candidates or not query:
+            return candidates
 
-        scored_candidates = []
-        for cand in candidates:
-            final_score = self._calculate_final_score(cand, w_rrf, w_freshness, w_source, freshness_decay_rate, source_weights)
-            cand['final_score'] = final_score
-            scored_candidates.append(cand)
+        # 准备模型输入：[query, document_content]
+        model_inputs = [[query, doc.get('content', '')] for doc in candidates]
+        
+        # 使用Cross-Encoder计算语义相关性分数
+        self.logger.info(f"Reranking {len(model_inputs)} candidates with CrossEncoder...")
+        semantic_scores = self.cross_encoder.predict(model_inputs, show_progress_bar=False)
 
-        return sorted(scored_candidates, key=lambda x: x['final_score'], reverse=True)
+        # 将分数添加到候选文档中
+        for doc, score in zip(candidates, semantic_scores):
+            doc['semantic_rerank_score'] = float(score)
 
-    def _calculate_final_score(self, candidate: Dict[str, Any], w_rrf: float, w_freshness: float, w_source: float, freshness_decay_rate: float, source_weights: Dict[str, float]) -> float:
-        """为单个候选文档计算最终的加权分数。"""
-        rrf_score = candidate.get('rrf_score', 0.0)
-        freshness_score = 0.0
-        try:
-            doc_date_str = candidate.get('metadata', {}).get('document_date')
-            if doc_date_str:
-                doc_date = datetime.fromisoformat(doc_date_str.replace("Z", "+00:00")).astimezone(timezone.utc).date()
-                days_old = (date.today() - doc_date).days
-                freshness_score = 1.0 * (1 - freshness_decay_rate) ** days_old
-        except Exception as e:
-            self.logger.warning(f"无法为新鲜度分数计算解析日期: {e}")
-        source_type = candidate.get('metadata', {}).get('source_type', 'Other')
-        source_score = source_weights.get(source_type, 0.5)
-        final_score = (w_rrf * rrf_score + w_freshness * freshness_score + w_source * source_score)
-        return final_score
+        # 根据新的语义分数降序排序
+        reranked_results = sorted(candidates, key=lambda x: x['semantic_rerank_score'], reverse=True)
+        self.logger.info(f"使用Cross-Encoder重排了 {len(reranked_results)} 个候选。")
+        return reranked_results
 
     async def retrieve(self, query: str, ticker: Optional[str] = None, top_k: int = 10) -> Dict[str, Any]:
         """
@@ -171,7 +188,7 @@ class HybridRetriever:
         """
         self.logger.info(f"--- [混合检索器]: 为查询 '{query}' 启动完整检索流程 ---")
         recalled_candidates = await self.recall(query, ticker)
-        reranked_results = self.rerank(recalled_candidates)
+        reranked_results = self.rerank(query, recalled_candidates)
         final_top_k = reranked_results[:top_k]
         
         # 从最终证据中提取关系图
