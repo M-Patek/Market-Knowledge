@@ -1,7 +1,11 @@
-# Stage 1: Builder stage to install dependencies
-FROM python:3.11 as builder
+# Stage 1: Builder stage to compile dependencies on an Alpine base
+FROM python:3.11-alpine as builder
 
 WORKDIR /usr/src/app
+
+# [V2.0] Install build-base which contains compilers (gcc, etc.) needed for some Python packages
+# that lack pre-compiled wheels for Alpine's musl libc.
+RUN apk add --no-cache build-base
 
 # Create a virtual environment
 RUN python -m venv /opt/venv
@@ -14,8 +18,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Stage 2: Final, slim image
-FROM python:3.11-slim
+# Stage 2: Final, deeply optimized production image
+FROM python:3.11-alpine
 
 WORKDIR /usr/src/app
 
@@ -30,3 +34,4 @@ COPY . .
 
 # Command to run the application
 CMD ["python", "phoenix_project.py"]
+
