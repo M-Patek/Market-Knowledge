@@ -89,7 +89,7 @@ class BayesianFusionEngine:
         failures = evidence.provenance_confidence * (1.0 - evidence.score)
         return successes, failures
 
-    def fuse(self, hypothesis: str, evidence_list: List[EvidenceItem]) -> Dict[str, Any]:
+    async def fuse(self, hypothesis: str, evidence_list: List[EvidenceItem]) -> Dict[str, Any]:
         """
         Updates the prior belief with a list of evidence to produce a posterior distribution.
 
@@ -103,7 +103,7 @@ class BayesianFusionEngine:
         self.logger.info(f"Fusing {len(evidence_list)} pieces of evidence for hypothesis: '{hypothesis}'")
 
         # --- [NEW] Adversarial Validation Step ---
-        contradictions = self.contradiction_detector.detect(evidence_list)
+        contradictions = await self.contradiction_detector.detect(evidence_list)
         if contradictions:
             return {
                 "hypothesis": hypothesis,
