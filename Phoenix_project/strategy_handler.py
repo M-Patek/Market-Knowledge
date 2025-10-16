@@ -94,9 +94,12 @@ class RomanLegionStrategy(bt.Strategy):
     def __init__(self, config: StrategyConfig, vix_data, treasury_yield_data, market_breadth_data, sentiment_data, asset_analysis_data, market_state_predictor: Optional[MarketStatePredictor] = None):
         self.config = config
         self.logger = logging.getLogger("PhoenixProject.RomanLegionStrategy")
+        # [V2.0] Initialize the feature store first
+        self.feature_store = SimpleFeatureStore(config.dict())
         self.cognitive_engine = CognitiveEngine(config, asset_analysis_data, sentiment_data)
-        self.order_manager = OrderManager(self, **config.execution_model.dict())
-        self.data_handler = StrategyDataHandler(self, config, vix_data, treasury_yield_data, market_breadth_data, market_state_predictor)
+        self.order_manager = OrderManager(self.broker, **config.execution_model.dict())
+        # [V2.0] Pass the feature_store to the data handler
+        self.data_handler = StrategyDataHandler(self, config, vix_data, treasury_yield_data, market_breadth_data, self.feature_store, market_state_predictor)
         
     def next(self):
         daily_data = self.data_handler.get_daily_data_packet(self.cognitive_engine)
