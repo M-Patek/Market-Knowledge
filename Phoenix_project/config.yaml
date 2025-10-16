@@ -13,6 +13,12 @@ rsi_period: 14
 rsi_overbought_threshold: 70.0
 opportunity_score_threshold: 55.0
 
+# [V2.0] Database configuration
+database:
+  # This is a default, non-functional value.
+  # The actual production URL will be injected from an environment variable.
+  url_env_var: "POSTGRES_DB_URL"
+
 # [NEW] 3. Risk Management (Dynamic Risk Budgeting)
 risk_manager:
   max_uncertainty: 0.05       # Uncertainty level at which capital modifier hits minimum
@@ -69,3 +75,4 @@ market_state_predictor:
   model_params:
     n_estimators: 100
     learning_rate: 0.1
+
