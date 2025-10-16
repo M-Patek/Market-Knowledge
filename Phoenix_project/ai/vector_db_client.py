@@ -65,17 +65,20 @@ class VectorDBClient:
         
         self.index = self.pc.Index(self.index_name)
 
-    def query(self, query: str, top_k: int = 10, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
+    def query(self, query: str, top_k: int = 10, namespace: Optional[str] = None, query_vector: Optional[List[float]] = None) -> List[Dict[str, Any]]:
         """
         Queries the vector database with a given text string.
+        Can optionally accept a pre-computed vector (e.g., from HyDE).
         """
         if not self.index:
             self.logger.error("Index not initialized. Cannot query.")
             return []
 
         try:
-            query_vector = self.embedding_client.create_query_embedding(query)
             if query_vector is None:
+                query_vector = self.embedding_client.create_query_embedding(query)
+            if query_vector is None:
+                self.logger.error("Failed to obtain a query vector.")
                 return []
 
             results = self.index.query(
@@ -91,7 +94,8 @@ class VectorDBClient:
                 res = {
                     "source_id": match.get('id'),
                     "vector_similarity_score": match.get('score'),
-                    "metadata": match.get('metadata', {})
+                    "metadata": match.get('metadata', {}),
+                    "content": match.get('metadata', {}).get('content', '') # Assuming content is stored in metadata
                 }
                 formatted_results.append(res)
 
