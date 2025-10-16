@@ -1,6 +1,33 @@
 import logging
 import asyncio
 from typing import Dict, Any, List
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+from opentelemetry.sdk.resources import Resource
+
+def setup_tracing(service_name: str = "PhoenixProject"):
+    """
+    [V2.0] Configures and initializes the OpenTelemetry distributed tracing pipeline.
+    In a real system, the ConsoleSpanExporter would be replaced with an exporter
+    that sends data to a backend like Jaeger, Zipkin, or Datadog.
+    """
+    # Create a resource to identify our service
+    resource = Resource(attributes={"service.name": service_name})
+
+    # Set up a tracer provider
+    provider = TracerProvider(resource=resource)
+
+    # Use a console exporter for demonstration purposes
+    exporter = ConsoleSpanExporter()
+
+    # Use a BatchSpanProcessor to send spans in batches
+    processor = BatchSpanProcessor(exporter)
+    provider.add_span_processor(processor)
+
+    # Set the global tracer provider
+    trace.set_tracer_provider(provider)
+    logging.getLogger("PhoenixProject.Observability").info("OpenTelemetry tracing initialized with ConsoleSpanExporter.")
 
 class Observability:
     """
@@ -62,3 +89,4 @@ class CanaryMonitor:
             self.logger.critical(f"触发回滚: 挑战者方差 ({current_avg_variance:.4f}) 超出阈值 ({variance_threshold:.4f})。")
             self.pipeline_orchestrator.trigger_rollback()
             self.stop_monitoring()
+
