@@ -1,6 +1,7 @@
 import logging
 import random
 from typing import Dict, Any
+from features.store import SimpleFeatureStore # [V2.0] Import the feature store
 
 class PredictionServer:
     """
@@ -8,6 +9,8 @@ class PredictionServer:
     """
     def __init__(self, config: Dict[str, Any]):
         self.logger = logging.getLogger("PhoenixProject.PredictionServer")
+        self.config = config
+        self.feature_store = SimpleFeatureStore(config) # [V2.0] Server has a feature store
         # 管理两个模型
         self.champion_model = self._load_model(config.get('champion_model_path'))
         self.challenger_model = None
@@ -51,6 +54,9 @@ class PredictionServer:
     def predict(self, features: Dict[str, Any]) -> Dict[str, Any]:
         """为给定的特征生成预测。"""
         # 根据金丝雀权重路由流量
+        # [V2.0] In a real system, 'features' would be raw data (e.g., last N price bars)
+        # The server would then call the feature store to get the engineered features.
+        # engineered_features = self.feature_store.get_features("SPY", features)
         if self.challenger_model and random.random() < self.canary_traffic_weight:
             self.logger.debug("路由请求到挑战者 (CHALLENGER)")
             # model_to_use = self.challenger_model
@@ -60,3 +66,4 @@ class PredictionServer:
 
         # 实际预测逻辑的占位符
         return {"prediction": "某个值", "variance": random.uniform(0.01, 0.1), "latency_ms": random.uniform(50, 150)}
+
