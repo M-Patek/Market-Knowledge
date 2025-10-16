@@ -1,56 +1,97 @@
-Core Backtesting & Data Handling
-backtrader==1.9.76.123
-pandas==2.2.2
-pyarrow==16.1.0
+Phoenix_project/requirements.txt
 
-Asynchronous HTTP & Retries
-yfinance==0.2.40
+这是一个全面的项目依赖列表，用于支持数据处理、回测、AI模型训练和生产部署。
+
+--- 核心回测与数据处理 ---
+
+用于数据结构、时间序列分析和核心回测逻辑。
+
+pandas==2.2.2
+numpy==1.26.4
+pyarrow==16.1.0
+backtrader==1.9.76.123
+
+--- 异步HTTP与数据源客户端 ---
+
+用于高效地从各种API获取金融数据。
+
+aiohttp==3.9.5
+requests==2.31.0
 tenacity==8.3.0
-google-generativeai==0.7.1
+yfinance==0.2.40
 alpha-vantage==2.3.1
-pinecone-client==3.2.2
-aiofiles==23.2.1
 twelvedata==1.2.12
 tiingo==0.11.0
 
-Configuration & Validation
+--- 配置、验证与文件处理 ---
+
+用于加载配置、验证数据模型和处理文件。
+
 pydantic==2.7.1
 PyYAML==6.0.1
+python-dotenv==1.0.1
 jsonschema==4.22.0
 filelock==3.15.4
+aiofiles==23.2.1
 
-Reporting
-Jinja2==3.1.4
+--- AI与机器学习 ---
 
-(Optional, but good to have for plotting)
-matplotlib==3.9.0
+科学计算、统计模型和机器学习库。
 
-Monitoring & Observability
-prometheus-client==0.2.0
-python-json-logger==2.0.7
-boto3==1.34.8
-psycopg2-binary==2.9.9
-elasticsearch==8.13.0
-
-Scientific & ML
-scipy==1.13.1
-ts2vec==1.2.3
-statsmodels==0.14.2
 scikit-learn==1.5.0
-deep-forest # Note: This library might not have a stable version pinned yet
+scipy==1.13.1
+statsmodels==0.14.2
+scikit-garden==0.1.3 # 用于深度森林推理器
 
-Optimization & Experiment Tracking
-optuna==3.6.1
-sqlalchemy==2.0.30
+--- 梯度提升模型 ---
 
-[NEW] State-of-the-art Tree Models
+业界领先的树模型实现。
+
 xgboost==2.0.3
 lightgbm==4.3.0
 
-Deep Learning for MetaLearner
-tensorflow==2.16.1 # Or the appropriate version for the environment
+--- RAG与LLM推理器 ---
 
-Testing
+用于支持语言模型、向量数据库和RAG流程。
+
+google-generativeai==0.7.1
+pinecone-client==3.2.2 # 示例向量数据库客户端
+
+--- MetaLearner深度学习 ---
+
+用于构建和训练核心的Transformer模型。
+
+tensorflow==2.16.1
+tensorflow-gnn==0.6.0 # 用于图神经网络
+
+--- 优化与实验跟踪 ---
+
+用于超参数优化和数据库交互。
+
+optuna==3.6.1
+sqlalchemy==2.0.30
+
+--- 监控与可观测性 ---
+
+用于生产环境中的日志记录、指标监控和云服务交互。
+
+prometheus-client==0.2.0
+python-json-logger==2.0.7
+boto3==1.34.8 # 用于AWS服务
+psycopg2-binary==2.9.9 # 用于PostgreSQL
+elasticsearch==8.13.0 # 用于日志/数据存储
+
+--- 报告与可视化 ---
+
+用于生成报告和绘图。
+
+Jinja2==3.1.4
+matplotlib==3.9.0 # 可选，用于绘图
+
+--- 测试 ---
+
+用于确保代码质量和可靠性。
+
 pytest==8.2.0
-mypy==1.10.0
 pytest-asyncio==0.23.7
+mypy==1.10.0
