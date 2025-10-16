@@ -1,75 +1,64 @@
-# observability.py
-
 import logging
-from prometheus_client import Counter, Histogram, Gauge, start_http_server
+import asyncio
+from typing import Dict, Any, List
 
-# --- Metric Definitions ---
+class Observability:
+    """
+    处理指标和日志记录的可观测性桩。
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.logger = logging.getLogger("PhoenixProject.Observability")
+        self.config = config
+        self.logger.info("Observability客户端已初始化。")
 
-# DataManager Cache Metrics
-CACHE_HITS = Counter(
-    "phoenix_cache_hits_total",
-    "Total number of data cache hits."
-)
-CACHE_MISSES = Counter(
-    "phoenix_cache_misses_total",
-    "Total number of data cache misses."
-)
+    def log_metric(self, metric_name: str, value: Any, tags: Dict[str, str] = None):
+        """将指标记录到监控后端 (例如, Prometheus, Datadog)。"""
+        self.logger.info(f"指标: {metric_name}={value} | 标签: {tags}")
+        # 在真实系统中，这里会使用监控服务的客户端库。
 
-# AI Client Metrics
-AI_CALL_LATENCY = Histogram(
-    "phoenix_ai_call_latency_seconds",
-    "Latency of calls to the AI API, in seconds.",
-    buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 90.0, float("inf")],
-    labels=['client']
-)
+class CanaryMonitor:
+    """
+    监控挑战者模型的性能与冠军模型的基线，
+    如果表现不佳则触发回滚。
+    """
+    def __init__(self, pipeline_orchestrator, prediction_server, config: Dict[str, Any]):
+        self.logger = logging.getLogger("PhoenixProject.CanaryMonitor")
+        self.pipeline_orchestrator = pipeline_orchestrator
+        self.prediction_server = prediction_server
+        self.config = config.get('canary_monitor', {})
+        # 冠军模型的基线指标
+        self.champion_baseline = {"avg_variance": 0.05, "std_dev_variance": 0.015}
+        self.is_monitoring = False
+        self.challenger_metrics: List[Dict[str, float]] = []
 
-# Data Provider Metrics
-PROVIDER_REQUESTS_TOTAL = Counter(
-    "phoenix_provider_requests_total",
-    "Total number of requests to a data provider.",
-    ["provider"]
-)
-PROVIDER_ERRORS_TOTAL = Counter(
-    "phoenix_provider_errors_total",
-    "Total number of errors from a data provider.",
-    ["provider"]
-)
-PROVIDER_LATENCY_SECONDS = Histogram(
-    "phoenix_provider_latency_seconds",
-    "Latency of requests to a data provider.",
-    ["provider"]
-)
-PROVIDER_DATA_FRESHNESS_SECONDS = Gauge(
-    "phoenix_provider_data_freshness_seconds",
-    "The difference in seconds between when data was observed and its latest available timestamp.",
-    ["provider"]
-)
+    async def start_monitoring(self):
+        """为金丝雀部署启动监控循环。"""
+        self.is_monitoring = True
+        self.logger.info("金丝雀监控器已启动。正在观察挑战者性能...")
+        while self.is_monitoring:
+            await asyncio.sleep(self.config.get('monitoring_interval_seconds', 60))
+            
+            if self.prediction_server.challenger_model:
+                # 这是一个模拟；通常我们会聚合时间间隔内的指标
+                dummy_features = {}
+                challenger_pred = self.prediction_server.predict(dummy_features)
+                self.challenger_metrics.append(challenger_pred)
+                
+                self._check_for_rollback()
 
-# --- [NEW] Probabilistic Reasoning Metrics ---
-PROBABILITY_CALIBRATION_BRIER_SCORE = Gauge(
-    "phoenix_probability_calibration_brier_score",
-    "The Brier score loss, measuring the accuracy of probabilistic predictions."
-)
-# Backtest Execution Metrics
-BACKTEST_DURATION = Gauge(
-    "phoenix_backtest_duration_seconds",
-    "Duration of the last completed backtest run, in seconds."
-)
-TRADES_EXECUTED = Counter(
-    "phoenix_trades_executed_total",
-    "Total number of trades executed by the strategy."
-)
+    def stop_monitoring(self):
+        """停止监控循环。"""
+        self.logger.info("金丝雀监控器已停止。")
+        self.is_monitoring = False
 
-# --- Server Function ---
+    def _check_for_rollback(self):
+        """检查挑战者的指标是否突破了安全阈值。"""
+        if not self.challenger_metrics: return
 
-def start_metrics_server(port: int = 8000):
-    """Starts the Prometheus metrics HTTP server in a daemon thread."""
-    try:
-        start_http_server(port)
-        logging.getLogger("PhoenixProject.Observability").info(
-            f"Prometheus metrics server started on http://localhost:{port}"
-        )
-    except Exception as e:
-        logging.getLogger("PhoenixProject.Observability").error(
-            f"Failed to start Prometheus metrics server: {e}"
-        )
+        current_avg_variance = sum(m['variance'] for m in self.challenger_metrics) / len(self.challenger_metrics)
+        variance_threshold = self.champion_baseline['avg_variance'] + (self.config.get('variance_std_dev_threshold', 2.0) * self.champion_baseline['std_dev_variance'])
+        
+        if current_avg_variance > variance_threshold:
+            self.logger.critical(f"触发回滚: 挑战者方差 ({current_avg_variance:.4f}) 超出阈值 ({variance_threshold:.4f})。")
+            self.pipeline_orchestrator.trigger_rollback()
+            self.stop_monitoring()
