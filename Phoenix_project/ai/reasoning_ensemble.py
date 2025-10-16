@@ -1,6 +1,7 @@
 import tensorflow as tf
 import numpy as np
 import logging
+import shap
 from typing import Dict, Any
 
 # --- Transformer核心构建块 ---
@@ -99,6 +100,7 @@ class MetaLearner:
         self.n_features = model_params.get('n_features', 5)
         self.loss_config = self.config.get('meta_learner', {}).get('loss_params', {})
         self.adv_config = self.config.get('meta_learner', {}).get('adversarial_training', {})
+        self.explainer = None
         self.level_two_transformer = self._build_model()
 
     def _build_model(self):
@@ -124,9 +126,16 @@ class MetaLearner:
         transformer_block = TransformerBlock(embed_dim=self.n_features, num_heads=4, ff_dim=32)
         x = transformer_block([x, context_input])
 
-        # 3. 全局池化与特征融合
-        shared_representation = tf.keras.layers.GlobalAveragePooling1D()(x)
-        fused_representation = tf.keras.layers.Concatenate()([shared_representation, graph_input])
+        # 3. [NEW] Cross-Attention Dynamic Fusion
+        # Project graph embedding to the same dimension as the sequence features
+        projected_graph_emb = tf.keras.layers.Dense(self.n_features)(graph_input)
+        # Reshape graph input to be a sequence of length 1 for the attention mechanism
+        graph_input_reshaped = tf.keras.layers.Reshape((1, self.n_features))(projected_graph_emb)
+        
+        # The sequence representation (Query) attends to the graph embedding (Key/Value).
+        cross_attention_layer = tf.keras.layers.MultiHeadAttention(num_heads=4, key_dim=self.n_features)
+        fused_representation = cross_attention_layer(query=x, value=graph_input_reshaped, key=graph_input_reshaped)
+        fused_representation = tf.keras.layers.GlobalAveragePooling1D()(fused_representation) # Pool the resulting sequence
         
         # 分支1: 主要BDL头
         bdl_head = tf.keras.layers.Dropout(0.1)(fused_representation)
@@ -156,38 +165,66 @@ class MetaLearner:
         )
         return model
 
-    def train(self, features: np.ndarray, labels: np.ndarray, market_uncertainties: np.ndarray, epochs: int = 10, batch_size: int = 32):
+    def train(self, features: Dict[str, np.ndarray], labels: np.ndarray, market_uncertainties: np.ndarray, epochs: int = 10, batch_size: int = 32):
         """包含自适应对抗性训练的自定义训练循环。"""
         self.logger.info("使用自定义对抗循环开始MetaLearner训练...")
-        train_dataset = tf.data.Dataset.from_tensor_slices((features, labels, market_uncertainties)).shuffle(len(features)).batch(batch_size)
+        train_dataset = tf.data.Dataset.from_tensor_slices((features, labels, market_uncertainties)).shuffle(len(labels)).batch(batch_size)
 
         for epoch in range(epochs):
             for step, (x_batch_train, y_batch_train, uncertainty_batch) in enumerate(train_dataset):
-                with tf.GradientTape() as tape:
+                with tf.GradientTape(persistent=True) as tape:
                     predictions = self.level_two_transformer(x_batch_train, training=True)
-                    y_true_dict = {'bdl_output': y_batch_train, 'regime_output': y_batch_train}
+                    y_true_dict = {'bdl_output': y_batch_train, 'regime_output': y_batch_train} # Assuming same label for simplicity
                     loss = self.level_two_transformer.compiled_loss(y_true_dict, predictions)
 
                     if self.adv_config.get('enabled', False):
-                        input_gradient = tape.gradient(loss, x_batch_train)
-                        signed_grad = tf.sign(input_gradient)
+                        # Gradient calculation requires model inputs, not the whole x_batch_train dictionary
+                        trainable_vars = self.level_two_transformer.trainable_variables
+                        # We need to get gradients with respect to inputs, so we watch them
+                        tape.watch(list(x_batch_train.values()))
+                        # Recalculate loss to ensure tape is watching
+                        predictions_for_grad = self.level_two_transformer(x_batch_train, training=True)
+                        loss_for_grad = self.level_two_transformer.compiled_loss(y_true_dict, predictions_for_grad)
+                        
+                        input_gradients = tape.gradient(loss_for_grad, x_batch_train)
+                        
+                        # Apply perturbation only to the sequence input
+                        signed_grad = tf.sign(input_gradients['sequence_input'])
                         base_epsilon = self.adv_config.get('epsilon', 0.02)
                         adaptive_epsilon = base_epsilon * (1.0 - tf.reshape(uncertainty_batch, [-1, 1, 1]))
                         adversarial_perturbation = adaptive_epsilon * signed_grad
-                        x_adversarial = x_batch_train + adversarial_perturbation
+                        
+                        x_adversarial = x_batch_train.copy()
+                        x_adversarial['sequence_input'] = x_batch_train['sequence_input'] + adversarial_perturbation
+                        
                         adv_predictions = self.level_two_transformer(x_adversarial, training=True)
                         adversarial_loss = self.level_two_transformer.compiled_loss(y_true_dict, adv_predictions)
                         loss = (loss + adversarial_loss) / 2.0
                 
                 gradients = tape.gradient(loss, self.level_two_transformer.trainable_variables)
                 self.optimizer.apply_gradients(zip(gradients, self.level_two_transformer.trainable_variables))
+                del tape
+            
+            # [NEW] After each epoch, create/update the SHAP explainer
+            # We take a background sample formatted correctly as a dictionary for the explainer
+            background_features, _, _ = next(iter(train_dataset))
+            self.explainer = shap.DeepExplainer(self.level_two_transformer, background_features)
+
             self.logger.info(f"Epoch {epoch + 1}/{epochs} - Loss: {loss.numpy():.4f}")
 
-    def predict(self, features: np.ndarray, num_mc_samples: int = 50) -> Dict[str, Any]:
+    def predict(self, features: Dict[str, np.ndarray], num_mc_samples: int = 50) -> Dict[str, Any]:
         """使用蒙特卡洛Dropout进行预测以量化不确定性。"""
         mc_predictions = tf.stack([self.level_two_transformer(features, training=True) for _ in range(num_mc_samples)], axis=0)
-        mean_params = tf.reduce_mean(mc_predictions, axis=0)
+        # Correctly average over the Monte Carlo samples (axis=0) for both model outputs
+        mean_outputs = tf.reduce_mean(mc_predictions, axis=0)
+        mean_params = mean_outputs[0] # The bdl_output is the first element
         alpha, beta = mean_params[:, 0], mean_params[:, 1]
         final_prob = alpha / (alpha + beta)
-        posterior_variance = tf.reduce_var(mc_predictions, axis=0)[:, 0]
-        return {"final_probability": final_prob.numpy(), "posterior_variance": posterior_variance.numpy(), "source": "meta_learner"}
+        posterior_variance = tf.math.reduce_variance(mc_predictions[:, 0, :, :], axis=0)[:, 0]
+
+        shap_values = None
+        if self.explainer:
+            # We are interested in the shap values for the first output (bdl_output)
+            shap_values = self.explainer.shap_values(features)[0]
+
+        return {"final_probability": final_prob.numpy(), "posterior_variance": posterior_variance.numpy(), "shap_values": shap_values, "source": "meta_learner"}
