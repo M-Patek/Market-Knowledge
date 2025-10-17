@@ -23,6 +23,14 @@ database:
 risk_manager:
   max_uncertainty: 0.05       # Uncertainty level at which capital modifier hits minimum
   min_capital_modifier: 0.1   # The floor for the capital modifier
+  # [V2.0+] CVaR (Expected Shortfall) Configuration
+  cvar_enabled: true
+  cvar_alpha: 0.95            # Confidence level for CVaR (e.g., 95%)
+  cvar_max_threshold: 0.02    # Max allowable portfolio CVaR (e.g., 2% expected tail loss)
+  # [V2.0+] Dynamic Liquidity Budgeting
+  liquidity_management_enabled: true
+  adv_lookback_period: 20       # Lookback period in days for Average Daily Volume (ADV)
+  max_adv_participation_rate: 0.1 # Max desired participation rate in a stock's ADV (e.g., 10%)
 
 # 4. Cerebro Engine Settings
 initial_cash: 1000000.0
@@ -61,6 +69,17 @@ execution_model:
   max_volume_share: 0.25      # Max % of a bar's volume an order can consume
   min_trade_notional: 1.0     # Minimum trade notional value
   average_spread_bps: 1.5     # Assumed avg bid-ask spread in basis points (0.015%)
+  # [V2.0+] Fill Probability Model for Limit Orders
+  fill_prob_model_enabled: true
+  fill_prob_aggressiveness: 10.0 # Controls how quickly fill probability drops off as the limit price moves away from the market price. Higher is more sensitive.
+  # [V2.0+] Cost Feedback Loop
+  cost_feedback_enabled: true
+  cost_feature_ema_span: 20 # The smoothing period for the Exponential Moving Average of execution costs.
+
+# [V2.0+] Portfolio Optimization Settings
+portfolio_optimizer:
+  method: "scipy_optimize" # Currently supported: "scipy_optimize"
+  objective: "maximize_alpha" # Defines the goal, e.g., maximize AI-adjusted return
 
 # [NEW] 9. Data Quality Monitoring (DQM) Settings
 data_quality_monitoring:
@@ -75,4 +94,3 @@ market_state_predictor:
   model_params:
     n_estimators: 100
     learning_rate: 0.1
-
