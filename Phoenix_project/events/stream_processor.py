@@ -1,5 +1,6 @@
 # events/stream_processor.py
 from collections import deque
+import math
 import numpy as np
 
 # Assuming an observability module exists for alerts
@@ -13,8 +14,8 @@ class RealTimeDQM:
     def __init__(self, window_size=100, z_score_threshold=5.0):
         self.window_size = window_size
         self.z_score_threshold = z_score_threshold
-        self.pct_change_history = {} # Stores deque of recent pct_changes
-        self.last_price = {}         # Stores the last seen price for each ticker
+        # Use a dictionary to store the state for each ticker
+        self.ticker_states = {}
 
     def check_anomaly(self, event):
         """
@@ -26,36 +27,48 @@ class RealTimeDQM:
 
         ticker = event.ticker
         price = event.price
+        state = self.ticker_states.get(ticker)
 
-        if ticker not in self.last_price:
-            self.last_price[ticker] = price
-            self.pct_change_history[ticker] = deque(maxlen=self.window_size)
+        if state is None:
+            # Initialize state for a new ticker
+            self.ticker_states[ticker] = {
+                'history': deque(maxlen=self.window_size),
+                'last_price': price,
+                'sum': 0.0,
+                'sum_sq': 0.0
+            }
             return False # Cannot calculate change for the first data point
 
-        last_price = self.last_price[ticker]
+        last_price = state['last_price']
         pct_change = (price - last_price) / last_price if last_price != 0 else 0
-        
-        history = self.pct_change_history[ticker]
 
-        # Defer statistical judgment until the window is full
-        if len(history) < self.window_size:
-            history.append(pct_change)
-            self.last_price[ticker] = price
-            return False 
+        history = state['history']
+        old_value = 0.0
+        if len(history) == self.window_size:
+            old_value = history[0] # The oldest value that will be pushed out
 
-        # Now, history is a deque of percentage changes, making this more efficient
-        rolling_mean = np.mean(history)
-        rolling_std = np.std(history)
+        # Incrementally update sums
+        state['sum'] += pct_change - old_value
+        state['sum_sq'] += pct_change**2 - old_value**2
+        history.append(pct_change)
+        state['last_price'] = price
+
+        # Defer statistical judgment until the window is sufficiently full
+        n = len(history)
+        if n < self.window_size / 2: # Wait for at least half the window
+            return False
+
+        # Calculate mean and standard deviation from the running sums
+        rolling_mean = state['sum'] / n
+        # Use the more numerically stable formula for variance
+        variance = (state['sum_sq'] / n) - (rolling_mean**2)
+        if variance < 0: variance = 0 # Handle potential floating point inaccuracies
+        rolling_std = math.sqrt(variance)
 
         if rolling_std == 0:
-            history.append(pct_change)
-            self.last_price[ticker] = price
             return False # Avoid division by zero if prices are flat
-            
+
         z_score = (pct_change - rolling_mean) / rolling_std
-        
-        history.append(pct_change)
-        self.last_price[ticker] = price
 
         if abs(z_score) > self.z_score_threshold:
             # alert_manager.trigger_alert('price_anomaly', {'ticker': ticker, 'z_score': z_score})
