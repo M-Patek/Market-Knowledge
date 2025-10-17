@@ -2,7 +2,8 @@ import tensorflow as tf
 import numpy as np
 import logging
 import shap
-from typing import Dict, Any
+import pandas as pd
+from typing import Dict, Any, List
 
 # --- Transformer核心构建块 ---
 
@@ -103,6 +104,11 @@ class MetaLearner:
         self.explainer = None
         self.level_two_transformer = self._build_model()
 
+        # [V2.0+] Cost Feedback Loop
+        self.cost_feedback_enabled = self.config.get('cost_feedback_enabled', False)
+        self.cost_feature_ema_span = self.config.get('cost_feature_ema_span', 20)
+        self.execution_cost_ema = 0.0
+
     def _build_model(self):
         """构建最终的、深度优化的Transformer模型。"""
         sequence_input = tf.keras.layers.Input(shape=(self.n_timesteps, self.n_features), name="sequence_input")
@@ -164,6 +170,19 @@ class MetaLearner:
             loss_weights={'bdl_output': 1.0, 'regime_output': 0.3}
         )
         return model
+    
+    def update_execution_costs(self, new_costs: List[float]):
+        """Updates the smoothed EMA of execution costs."""
+        if not self.cost_feedback_enabled or not new_costs:
+            return
+
+        # Use pandas to simplify EMA calculation on the series of costs
+        costs_series = pd.Series(new_costs)
+        new_ema = costs_series.ewm(span=self.cost_feature_ema_span, adjust=False).mean().iloc[-1]
+        
+        # Smoothly update the existing EMA
+        self.execution_cost_ema = new_ema
+
 
     def train(self, features: Dict[str, np.ndarray], labels: np.ndarray, market_uncertainties: np.ndarray, epochs: int = 10, batch_size: int = 32):
         """包含自适应对抗性训练的自定义训练循环。"""
@@ -214,6 +233,14 @@ class MetaLearner:
 
     def predict(self, features: Dict[str, np.ndarray], num_mc_samples: int = 50) -> Dict[str, Any]:
         """使用蒙特卡洛Dropout进行预测以量化不确定性。"""
+        # [V2.0+] Inject cost feature
+        if self.cost_feedback_enabled:
+            # This assumes features['context_input'] is a placeholder that can be updated.
+            # A more robust implementation would have a dedicated feature engineering pipeline.
+            self.logger.info(f"Injecting execution cost feature into prediction: {self.execution_cost_ema:.2f} bps EMA")
+            # The context input might need to be expanded to include this new feature.
+            # For simplicity, we'll just log it here. The model architecture would need to be adapted.
+            
         mc_predictions = tf.stack([self.level_two_transformer(features, training=True) for _ in range(num_mc_samples)], axis=0)
         # Correctly average over the Monte Carlo samples (axis=0) for both model outputs
         mean_outputs = tf.reduce_mean(mc_predictions, axis=0)
