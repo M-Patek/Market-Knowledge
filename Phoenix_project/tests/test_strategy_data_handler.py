@@ -16,14 +16,14 @@ def mock_strategy_instance(base_config):
     
     # Create dummy data that allows indicators to calculate
     data_df = pd.DataFrame({
-        'open': [100, 101， 102],
-        'high': [105, 106， 107],
-        'low': [99, 100， 101],
-        'close': [102, 103， 104],
-        'volume': [10000, 11000， 12000]
-    }, index=pd.to_datetime(['2023-01-08'， '2023-01-09', '2023-01-10']))
+        'open': [100, 101, 102],
+        'high': [105, 106, 107],
+        'low': [99, 100, 101],
+        'close': [102, 103, 104],
+        'volume': [10000, 11000, 12000]
+    }, index=pd.to_datetime(['2023-01-08', '2023-01-09', '2023-01-10']))
     
-    data_feed = bt.feeds。PandasData(dataname=data_df, name='SPY')
+    data_feed = bt.feeds.PandasData(dataname=data_df, name='SPY')
     cerebro.adddata(data_feed)
     
     # A dummy strategy class to host the handler
