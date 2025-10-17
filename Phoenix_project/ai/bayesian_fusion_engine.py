@@ -17,14 +17,17 @@ class SourceCredibilityStore:
     Manages the dynamic credibility scores for various evidence sources.
     Each source's credibility is modeled as a Beta distribution.
     """
-    def __init__(self, default_alpha: float = 2.0, default_beta: float = 8.0):
+    def __init__(self, config: Dict[str, Any]):
         """
         Initializes the store with a default credibility for unknown sources.
         A default of (2, 8) represents a prior belief that sources are more likely
         to be unreliable than reliable until proven otherwise.
+
+        Args:
+            config: A dictionary that may contain 'default_alpha' and 'default_beta'.
         """
         self.logger = logging.getLogger("PhoenixProject.SourceCredibilityStore")
-        self.default_prior = (default_alpha, default_beta)
+        self.default_prior = (config.get('default_alpha', 2.0), config.get('default_beta', 8.0))
         self.credibility_scores: Dict[str, Tuple[float, float]] = {
             # Pre-seed with some known high-quality sources
             "SEC EDGAR": (10.0, 2.0),
@@ -55,24 +58,26 @@ class BayesianFusionEngine:
     """
     Fuses evidence using a Bayesian framework to produce a posterior probability distribution.
     """
-    def __init__(self, embedding_client: EmbeddingClient, prior_alpha: float = 2.0, prior_beta: float = 2.0):
+    def __init__(self, embedding_client: EmbeddingClient, config: Dict[str, Any]):
         """
         Initializes the engine with a prior belief.
 
         Args:
             embedding_client (EmbeddingClient): Client for generating embeddings needed for contradiction detection.
-            prior_alpha (float): The alpha parameter of the initial Beta distribution.
-                                 Represents initial "successes" or positive evidence.
-            prior_beta (float): The beta parameter of the initial Beta distribution.
-                                Represents initial "failures" or negative evidence.
+            config: A configuration dictionary containing fusion engine settings.
+                    Expected keys: 'prior_alpha', 'prior_beta', 'source_credibility'.
         """
         self.logger = logging.getLogger("PhoenixProject.BayesianFusionEngine")
+
+        prior_alpha = config.get('prior_alpha', 2.0)
+        prior_beta = config.get('prior_beta', 2.0)
+
         if prior_alpha <= 0 or prior_beta <= 0:
             raise ValueError("Prior parameters (alpha, beta) must be positive.")
         self.base_prior_alpha = prior_alpha
         self.base_prior_beta = prior_beta
         # The engine now uses a credibility store and a contradiction detector
-        self.credibility_store = SourceCredibilityStore()
+        self.credibility_store = SourceCredibilityStore(config.get('source_credibility', {}))
         self.embedding_client = embedding_client
         self.contradiction_detector = ContradictionDetector(embedding_client)
         self.logger.info(f"BayesianFusionEngine initialized with prior Beta({prior_alpha}, {prior_beta}).")
