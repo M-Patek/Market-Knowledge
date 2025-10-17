@@ -17,8 +17,9 @@ class Order:
     ticker: str
     side: Literal['BUY', 'SELL']
     size: float
-    order_type: Literal['MARKET', 'LIMIT'] = 'LIMIT'
+    order_type: Literal['Market', 'Limit'] = 'Limit'
     limit_price: float = 0.0
+    fill_probability: float = 1.0 # The base probability of fill, calculated by the OrderManager
     created_at: datetime = datetime.utcnow()
     status: str = 'NEW'
     order_id: str = ''
