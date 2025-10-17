@@ -19,12 +19,28 @@ class CounterfactualTester:
     def _run_backtest_with_perturbations(self, perturbations: dict):
         """
         A helper function to run a single backtest with perturbed data.
+        This is a simplified simulation, not a full backtrader run.
         """
-        total_perturbation = sum(abs(p) for p in perturbations.values())
         cvar_limit = self.config.get('cvar_limit', 0.1)
-        if np.random.rand() < total_perturbation:
-             return {'cvar': cvar_limit + 0.05, 'status': 'fail'}
-        return {'cvar': cvar_limit - 0.02, 'status': 'pass'}
+
+        # 1. Simulate a series of daily returns
+        n_days = 252 # Simulate one year of returns
+        base_mean_return = 0.0005
+        base_std_dev = 0.015
+
+        # 2. Apply the perturbation to the mean return
+        # A simple model: each factor perturbation additively affects the mean.
+        total_perturbation_effect = sum(perturbations.values())
+        perturbed_mean = base_mean_return + total_perturbation_effect
+
+        simulated_returns = np.random.normal(loc=perturbed_mean, scale=base_std_dev, size=n_days)
+
+        # 3. Calculate CVaR from the simulated returns (e.g., 95% CVaR)
+        var_95 = np.percentile(simulated_returns, 5)
+        cvar_95 = simulated_returns[simulated_returns <= var_95].mean()
+
+        status = 'fail' if abs(cvar_95) > cvar_limit else 'pass'
+        return {'cvar': abs(cvar_95), 'status': status}
 
     def run_monte_carlo_stress_test(self, n_simulations=1000):
         """
@@ -60,4 +76,3 @@ class CounterfactualTester:
                 failure_scenarios.append({'simulation_id': i, 'perturbations': perturbations})
 
         self.logger.info(f"Monte Carlo stress test complete. Found {len(failure_scenarios)} failure scenarios.")
-
