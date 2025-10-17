@@ -1,8 +1,10 @@
 # execution/order_manager.py
 import logging
+import math
 from typing import List, Dict, Any
 import backtrader as bt
-from .interfaces import IBrokerAdapter
+
+from .interfaces import IBrokerAdapter, Order
 
 class OrderManager:
     """
@@ -14,13 +16,17 @@ class OrderManager:
                  impact_coefficient: float = 0.1,
                  max_volume_share: float = 0.25,
                  min_trade_notional: float = 100.0,
-                 average_spread_bps: float = 1.5):
+                 average_spread_bps: float = 1.5,
+                 fill_prob_aggressiveness: float = 10.0,
+                 **kwargs): # Absorb extra config fields
         self.logger = logging.getLogger("PhoenixProject.OrderManager")
         self.broker_adapter = broker_adapter
         self.impact_coefficient = impact_coefficient
         self.max_volume_share = max_volume_share
         self.min_trade_notional = min_trade_notional
         self.average_spread_bps = average_spread_bps
+        self.fill_prob_aggressiveness = fill_prob_aggressiveness
+        self.execution_costs: List[float] = [] # [V2.0+] Store execution costs (slippage)
         self.logger.info("OrderManager initialized.")
 
     def _calculate_ideal_size(self, current_value: float, target_value: float, current_price: float) -> float:
@@ -52,6 +58,14 @@ class OrderManager:
         
         # 3. Add both costs to the current price
         return current_price * (1 + price_impact + spread_impact if side == 'BUY' else 1 - price_impact - spread_impact)
+
+    def _calculate_fill_probability(self, side: str, limit_price: float, current_price: float) -> float:
+        """Calculates the probability of a limit order being filled using a sigmoid function."""
+        # How far is our price from the market, in basis points
+        price_diff_bps = ((limit_price - current_price) / current_price) * 10000
+        # For a buy, a higher limit price is more likely to fill (positive diff). For a sell, a lower price is (negative diff).
+        advantage_bps = price_diff_bps if side == 'BUY' else -price_diff_bps
+        return 1 / (1 + math.exp(-self.fill_prob_aggressiveness * (advantage_bps / 100))) # Normalize by 100
 
     def rebalance(self, strategy: bt.Strategy, target_portfolio: List[Dict[str, Any]]) -> None:
         self.logger.info("--- [Order Manager]: Rebalance protocol initiated ---")
@@ -88,9 +102,19 @@ class OrderManager:
 
             side = 'BUY' if final_size > 0 else 'SELL'
             limit_price = self._estimate_limit_price(side, final_size, current_volume, current_price)
+            fill_prob = self._calculate_fill_probability(side, limit_price, current_price)
             
-            self.logger.info(f"Submitting {side} order for '{ticker}': Size={final_size:.2f}, Est. Limit Price={limit_price:.2f}")
-            self.broker_adapter.place_order(strategy, data, size=final_size, price=limit_price)
+            # For now, we always submit a Limit order and let the adapter simulate the fill.
+            order_to_place = Order(
+                ticker=ticker,
+                side=side,
+                size=abs(final_size),
+                order_type='Limit',
+                limit_price=limit_price,
+                fill_probability=fill_prob
+            )
+            self.logger.info(f"Submitting {side} order for '{ticker}': Size={abs(final_size):.2f}, Est. Limit Price={limit_price:.2f}, Est. Fill Prob={fill_prob:.2%}")
+            self.broker_adapter.place_order(strategy, order_to_place)
 
     def handle_order_notification(self, order):
         if order.status in [order.Submitted, order.Accepted]:
@@ -98,10 +122,20 @@ class OrderManager:
             return
 
         if order.status in [order.Completed]:
+            # [V2.0+] Cost Feedback Loop: Capture the cost of this execution
+            slippage_bps = 0.0
+            if order.exectype == order.ExecTypes.Limit and order.created.price:
+                price_diff = order.executed.price - order.created.price
+                # For BUY, a higher exec price is a cost. For SELL, a lower exec price is a cost.
+                cost_sign = 1.0 if order.isbuy() else -1.0
+                slippage_bps = (price_diff / order.created.price) * 10000 * cost_sign
+                self.execution_costs.append(slippage_bps)
+
             self.logger.info(
                 f"ORDER EXECUTED: {order.getstatusname()} - {order.info.ref} - {order.getordername()}: "
                 f"{'BUY' if order.isbuy() else 'SELL'} {order.executed.size} {order.data._name} "
-                f"@ {order.executed.price:.2f}, Value: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}"
+                f"@ {order.executed.price:.2f}, Value: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}, "
+                f"Slippage: {slippage_bps:.2f} bps"
             )
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.logger.error(f"ORDER FAILED: {order.getstatusname()} - {order.info.ref} - {order.data._name}")
