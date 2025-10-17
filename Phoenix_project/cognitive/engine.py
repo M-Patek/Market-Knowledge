@@ -1,7 +1,8 @@
 # cognitive/engine.py
 import logging
-from typing import List, Dict, Optional
+import pandas as pd
 from datetime import date
+from typing import List, Dict, Optional, Any
 
 from phoenix_project import StrategyConfig, PositionSizerConfig
 from sizing.base import IPositionSizer
@@ -32,7 +33,10 @@ class CognitiveEngine:
     def determine_allocations(self,
                               candidate_analysis: List[Dict],
                               current_date: date,
-                              emergency_factor: Optional[float] = None) -> List[Dict]:
+                              total_portfolio_value: float,
+                              historical_returns: Optional[pd.DataFrame] = None,
+                              adv_data: Optional[Dict[str, float]] = None,
+                              emergency_factor: Optional[float] = None) -> List[Dict[str, Any]]:
         self.logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
         
         # --- Emergency Override ---
@@ -55,8 +59,32 @@ class CognitiveEngine:
         # 2. Get the capital modifier based on this uncertainty
         capital_modifier = self.risk_manager.get_capital_modifier(daily_uncertainty)
         effective_max_allocation = self.config.max_total_allocation * capital_modifier
-        battle_plan = self.position_sizer.size_positions(worthy_targets, effective_max_allocation)
         
+        # 3. [V2.0+] Construct the optimal portfolio based on alpha and constraints
+        initial_battle_plan = self.portfolio_constructor.construct_optimal_portfolio(worthy_targets, effective_max_allocation)
+
+        # 4. [V2.0+] Apply liquidity constraints first
+        battle_plan = self.risk_manager.apply_liquidity_constraints(
+            initial_battle_plan, adv_data or {}, total_portfolio_value
+        )
+
+        # 5. [V2.0+] Enforce CVaR constraints on the liquidity-adjusted plan
+        if self.risk_manager.risk_config.cvar_enabled and historical_returns is not None and battle_plan:
+            portfolio_weights = {p['ticker']: p['capital_allocation_pct'] for p in battle_plan}
+            portfolio_cvar = self.risk_manager.calculate_portfolio_cvar(portfolio_weights, historical_returns)
+
+            if portfolio_cvar is not None and portfolio_cvar > self.risk_manager.risk_config.cvar_max_threshold:
+                self.logger.warning(
+                    f"Portfolio CVaR ({portfolio_cvar:.2%}) exceeds threshold "
+                    f"({self.risk_manager.risk_config.cvar_max_threshold:.2%}). Scaling down."
+                )
+                # Simple scaling: reduce allocation proportionally to the CVaR excess
+                scale_factor = self.risk_manager.risk_config.cvar_max_threshold / portfolio_cvar
+                for position in battle_plan:
+                    position['capital_allocation_pct'] *= scale_factor
+                
+                self.logger.info(f"Scaled down allocations by a factor of {scale_factor:.2f}.")
+
         self.logger.info("--- [Cognitive Engine Call: Concluded] ---")
         return battle_plan
 
