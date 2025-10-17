@@ -1,44 +1,82 @@
-# Phoenix_project/events/stream_processor.py
-import asyncio
-import random
-from datetime import datetime, timezone
-import logging
+# events/stream_processor.py
+from collections import deque
+import numpy as np
+
+# Assuming an observability module exists for alerts
+# from observability import alert_manager
+
+class RealTimeDQM:
+    """
+    Performs real-time Data Quality Management on a stream of market data
+    by calculating a rolling Z-Score on percentage price changes.
+    """
+    def __init__(self, window_size=100, z_score_threshold=5.0):
+        self.window_size = window_size
+        self.z_score_threshold = z_score_threshold
+        self.pct_change_history = {} # Stores deque of recent pct_changes
+        self.last_price = {}         # Stores the last seen price for each ticker
+
+    def check_anomaly(self, event):
+        """
+        Checks an event for price anomalies using a rolling Z-Score.
+        Returns True if an anomaly is detected, False otherwise.
+        """
+        if event.type != 'MARKET_DATA':
+            return False
+
+        ticker = event.ticker
+        price = event.price
+
+        if ticker not in self.last_price:
+            self.last_price[ticker] = price
+            self.pct_change_history[ticker] = deque(maxlen=self.window_size)
+            return False # Cannot calculate change for the first data point
+
+        last_price = self.last_price[ticker]
+        pct_change = (price - last_price) / last_price if last_price != 0 else 0
+        
+        history = self.pct_change_history[ticker]
+
+        # Defer statistical judgment until the window is full
+        if len(history) < self.window_size:
+            history.append(pct_change)
+            self.last_price[ticker] = price
+            return False 
+
+        # Now, history is a deque of percentage changes, making this more efficient
+        rolling_mean = np.mean(history)
+        rolling_std = np.std(history)
+
+        if rolling_std == 0:
+            history.append(pct_change)
+            self.last_price[ticker] = price
+            return False # Avoid division by zero if prices are flat
+            
+        z_score = (pct_change - rolling_mean) / rolling_std
+        
+        history.append(pct_change)
+        self.last_price[ticker] = price
+
+        if abs(z_score) > self.z_score_threshold:
+            # alert_manager.trigger_alert('price_anomaly', {'ticker': ticker, 'z_score': z_score})
+            print(f"ALERT: Price anomaly detected for {ticker}. Z-Score: {z_score:.2f}")
+            return True
+        
+        return False
 
 class StreamProcessor:
-    """
-    模拟与实时事件流（如Kafka、Pulsar）的连接。
-    在真实系统中，这将是一个消息总线的消费者客户端。
-    """
-    def __init__(self):
-        self.logger = logging.getLogger("PhoenixProject.StreamProcessor")
-        self.logger.info("StreamProcessor已初始化 (模拟模式)。")
+    def __init__(self, event_queue, dqm_enabled=True):
+        self.event_queue = event_queue
+        self.dqm_validator = RealTimeDQM() if dqm_enabled else None
 
-    async def event_stream(self):
-        """
-        一个异步生成器，产生连续的模拟市场事件流。
-        """
-        self.logger.info("开始监听实时事件...")
-        event_id = 0
-        while True:
-            # 模拟每0.5到2秒随机接收一个新事件
-            await asyncio.sleep(random.uniform(0.5, 2.0))
-            
-            event_type = random.choice(["MARKET_DATA", "NEWS", "MACRO_SIGNAL"])
-            event = {
-                "event_id": event_id,
-                "event_type": event_type,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "payload": self._generate_payload(event_type)
-            }
-            yield event
-            event_id += 1
-
-    def _generate_payload(self, event_type: str) -> dict:
-        """为给定的事件类型生成一个合理的载荷。"""
-        if event_type == "MARKET_DATA":
-            return {"symbol": "SPY", "price": round(random.uniform(500, 550), 2), "volume": random.randint(1000, 10000)}
-        elif event_type == "NEWS":
-            return {"headline": "美联储暗示可能调整利率", "source": "主流新闻媒体"}
-        elif event_type == "MACRO_SIGNAL":
-            return {"indicator": "CPI", "value": round(random.uniform(0.1, 0.3), 2), "status": "初步数据"}
-        return {}
+    def process_event(self, event):
+        if self.dqm_validator:
+            if self.dqm_validator.check_anomaly(event):
+                # If an anomaly is detected, we might choose to drop the event
+                # or forward it to a separate "quarantine" queue.
+                print(f"Quarantining anomalous event: {event}")
+                return # Stop processing this contaminated event
+        
+        # If event is valid, continue with existing logic
+        print(f"Processing valid event: {event}")
+        # ... forward to event distributor etc.
