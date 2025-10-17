@@ -60,8 +60,9 @@ class CognitiveEngine:
         capital_modifier = self.risk_manager.get_capital_modifier(daily_uncertainty)
         effective_max_allocation = self.config.max_total_allocation * capital_modifier
         
-        # 3. [V2.0+] Construct the optimal portfolio based on alpha and constraints
-        initial_battle_plan = self.portfolio_constructor.construct_optimal_portfolio(worthy_targets, effective_max_allocation)
+        # 3. [V2.0+] Use the dedicated position sizer to determine capital allocation
+        # This correctly separates the "what" (worthy_targets) from the "how much" (sizer).
+        initial_battle_plan = self.position_sizer.size_positions(worthy_targets, effective_max_allocation)
 
         # 4. [V2.0+] Apply liquidity constraints first
         battle_plan = self.risk_manager.apply_liquidity_constraints(
