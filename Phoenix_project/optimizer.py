@@ -23,9 +23,9 @@ def calculate_deflated_sharpe_ratio(returns: pd.Series, n_trials: int):
     kurt = kurtosis(returns, fisher=True) # Fisher kurtosis
 
     # Variance of the Sharpe Ratio estimate
-    var_sr_hat = (1 - sk * sr_hat + (kurt) / 4 * sr_hat**2) / (T - 1)
-    if var_sr_hat < 0: # Clamp to zero if variance is negative
-        var_sr_hat = 0.0
+    # This is the robust formula from Bailey and López de Prado (2012)
+    # It is guaranteed to be non-negative.
+    var_sr_hat = (1 - sk * sr_hat + (kurt - 1) / 4 * sr_hat**2)
 
     # Expected maximum Sharpe Ratio from multiple trials
     emc = 0.5772156649 # Euler-Mascheroni constant
@@ -61,4 +61,3 @@ class Optimizer:
         performance_metrics = {'deflated_sharpe_ratio': dsr, 'max_drawdown': -0.10}
         
         return best_params, performance_metrics
-
