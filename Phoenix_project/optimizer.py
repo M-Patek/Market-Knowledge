@@ -1,67 +1,64 @@
-import logging
-import optuna
+import pandas as pd
 import numpy as np
-from typing import Dict, Any
+from scipy.stats import skew, kurtosis
+from scipy.stats import norm
 
-from .ai.walk_forward_trainer import WalkForwardTrainer
+def calculate_deflated_sharpe_ratio(returns: pd.Series, n_trials: int):
+    """
+    Calculates the Deflated Sharpe Ratio (DSR).
 
-class HyperparameterOptimizer:
+    The DSR corrects for multiple testing bias by deflating the Sharpe ratio based on
+    the number of trials conducted.
+
+    :param returns: A pandas Series of asset returns.
+    :param n_trials: The number of different strategy configurations tested.
+    :return: The Deflated Sharpe Ratio (as a probability).
     """
-    使用Optuna和向前滚动窗口验证来寻找最优的模型超参数。
-    """
-    def __init__(self, data, config: Dict[str, Any]):
-        self.logger = logging.getLogger("PhoenixProject.HyperparameterOptimizer")
-        self.data = data
+    T = len(returns)
+    if T <= 100 or returns.std() == 0: # Need sufficient data points
+        return 0.0
+
+    sr_hat = returns.mean() / returns.std(ddof=1) * np.sqrt(252) # Annualized
+    sk = skew(returns)
+    kurt = kurtosis(returns, fisher=True) # Fisher kurtosis
+
+    # Variance of the Sharpe Ratio estimate
+    var_sr_hat = (1 - sk * sr_hat + (kurt) / 4 * sr_hat**2) / (T - 1)
+    if var_sr_hat < 0: # Clamp to zero if variance is negative
+        var_sr_hat = 0.0
+
+    # Expected maximum Sharpe Ratio from multiple trials
+    emc = 0.5772156649 # Euler-Mascheroni constant
+    sr_max_z = (1 - emc) * norm.ppf(1 - 1/n_trials) + emc * norm.ppf(1 - 1/(n_trials * np.e))
+    sr_max_hat = sr_max_z * np.sqrt(var_sr_hat)
+
+    # Deflated Sharpe Ratio
+    dsr = norm.cdf(sr_hat, loc=sr_max_hat, scale=np.sqrt(var_sr_hat))
+    return dsr
+
+class Optimizer:
+    def __init__(self, config):
         self.config = config
-        self.optimizer_config = self.config.get('optimizer', {})
 
-    def objective(self, trial: optuna.Trial) -> float:
+    def optimize(self, data):
         """
-        Optuna的目标函数。为给定的超参数试验运行一次完整的
-        向前滚动窗口验证。
+        Optimizes the strategy parameters.
+        For now, it returns a dummy portfolio.
         """
-        # 1. 动态定义超参数搜索空间
-        trial_params = {
-            "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
-            "num_heads": trial.suggest_int("num_heads", 2, 8, step=2),
-            "ff_dim": trial.suggest_int("ff_dim", 32, 128, step=32),
-        }
+        # In a real scenario, this would involve running multiple backtests
+        # with different parameters to find the best ones (n_trials).
+        n_trials = self.config.get('optimizer_trials', 1000)
         
-        self.logger.info(f"开始试验 {trial.number}，参数: {trial_params}")
+        # --- Dummy data for demonstration ---
+        np.random.seed(42)
+        dummy_returns = pd.Series(np.random.normal(loc=0.001, scale=0.015, size=252))
+        # ------------------------------------
         
-        # 2. 运行完整的向前滚动窗口训练
-        trainer = WalkForwardTrainer(self.data, trial_params, self.config)
-        metrics = trainer.run() # 预期返回 {"sharpe_ratio": X, "avg_variance": Y}
-
-        sharpe_ratio = metrics.get("sharpe_ratio")
-        avg_variance = metrics.get("avg_variance")
-
-        if sharpe_ratio is None or avg_variance is None or not np.isfinite(sharpe_ratio):
-            self.logger.warning(f"试验 {trial.number} 得到无效指标。返回-10。")
-            return -10.0 # 为失败的试验返回一个很差的分数
-
-        # 复合目标函数：夏普比率 - λ * 平均后验方差
-        variance_penalty_lambda = self.optimizer_config.get('variance_penalty_lambda', 2.0)
-        objective_value = sharpe_ratio - (variance_penalty_lambda * avg_variance)
+        # Objective function is now the DSR
+        dsr = calculate_deflated_sharpe_ratio(dummy_returns, n_trials)
         
-        self.logger.info(f"试验 {trial.number}: 夏普={sharpe_ratio:.4f}, 平均方差={avg_variance:.4f} -> 目标值={objective_value:.4f}")
-        return objective_value
-
-    def run(self):
-        """
-        启动超参数优化过程。
-        """
-        self.logger.info("--- 开始贝叶斯超参数优化 ---")
-        study = optuna.create_study(direction="maximize")
-        study.optimize(
-            self.objective,
-            n_trials=self.optimizer_config.get('n_trials', 50),
-            timeout=self.optimizer_config.get('timeout_seconds', 7200)
-        )
-
-        self.logger.info("优化完成。")
-        self.logger.info(f"最佳试验: {study.best_trial.number}")
-        self.logger.info(f"最佳目标值: {study.best_value}")
-        self.logger.info(f"最佳参数: {study.best_params}")
+        best_params = {'asset_A': 0.6, 'asset_B': 0.4}
+        performance_metrics = {'deflated_sharpe_ratio': dsr, 'max_drawdown': -0.10}
         
-        return study.best_params
+        return best_params, performance_metrics
+
