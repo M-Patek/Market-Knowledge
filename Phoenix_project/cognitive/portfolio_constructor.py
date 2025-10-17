@@ -3,6 +3,8 @@ import logging
 from typing import List, Dict, Optional, Any
 from datetime import date
 import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
 from pydantic import BaseModel
 from phoenix_project import StrategyConfig
 
@@ -23,7 +25,12 @@ class PortfolioConstructor:
         self.portfolio_state = {}
         self.score_weights = self.config.portfolio_constructor.score_weights
         self.ema_span = self.config.portfolio_constructor.ema_span
-        self.logger.info(f"PortfolioConstructor initialized with weights={self.score_weights} and ema_span={self.ema_span}.")
+        # [V2.0+] Get optimizer config
+        self.optimizer_config = self.config.portfolio_optimizer
+        self.logger.info(
+            f"PortfolioConstructor initialized. Optimizer method: '{self.optimizer_config.method}'. "
+            f"Weights={self.score_weights} and ema_span={self.ema_span}."
+        )
 
     def identify_opportunities(self, candidate_analysis: List[Dict], current_date: date) -> List[Dict]:
         self.logger.info("Identifying opportunities from daily candidate analysis...")
@@ -71,3 +78,52 @@ class PortfolioConstructor:
         
         final_score = (alpha_score * alpha_weight) + (confidence_score * confidence_weight)
         return final_score
+
+    def construct_optimal_portfolio(self, worthy_targets: List[Dict[str, Any]], max_total_allocation: float) -> List[Dict[str, Any]]:
+        """
+        Constructs an optimal portfolio using a numerical solver.
+
+        Objective: Maximize the total (AI-adjusted) alpha score.
+        Constraints: Sum of weights <= max_total_allocation.
+        """
+        if not worthy_targets:
+            return []
+
+        self.logger.info(f"Constructing optimal portfolio for {len(worthy_targets)} targets with max allocation {max_total_allocation:.2%}.")
+
+        alphas = np.array([target['final_score'] for target in worthy_targets])
+        num_assets = len(worthy_targets)
+
+        def objective_function(weights):
+            return -np.dot(weights, alphas)
+
+        constraints = ({'type': 'ineq', 'fun': lambda weights: max_total_allocation - np.sum(weights)})
+        bounds = tuple((0, max_total_allocation) for _ in range(num_assets))
+        initial_weights = np.array([max_total_allocation / num_assets] * num_assets)
+
+        result = minimize(
+            objective_function,
+            initial_weights,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints
+        )
+
+        if not result.success:
+            self.logger.error(f"Portfolio optimization failed: {result.message}. Returning empty plan.")
+            return []
+
+        optimal_weights = result.x
+        
+        battle_plan = []
+        for i, target in enumerate(worthy_targets):
+            allocation = optimal_weights[i]
+            if allocation > 1e-6: # Only include assets with a non-trivial allocation
+                battle_plan.append({
+                    "ticker": target['ticker'],
+                    "capital_allocation_pct": allocation,
+                    # Carry over volatility for potential downstream use
+                    "volatility": target.get("volatility")
+                })
+
+        return battle_plan
