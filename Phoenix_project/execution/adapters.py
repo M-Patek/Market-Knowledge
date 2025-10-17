@@ -4,6 +4,7 @@ Concrete implementations of the IBrokerAdapter interface.
 This file will contain adapters for backtesting, paper trading, and live brokers.
 """
 import logging
+import random
 import backtrader as bt
 from .interfaces import Order
 
@@ -19,24 +20,37 @@ class BacktraderBrokerAdapter:
 
     def place_order(self, strategy: bt.Strategy, order: Order) -> Order:
         """Places an order using the backtrader engine."""
-        data = strategy.getdatabyname(order.ticker)
-        if order.side == 'BUY':
-            if order.limit_price < data.low[0]:
-                self.logger.warning(f"BUY order for {order.ticker} likely unfilled. Limit Price ${order.limit_price:.2f} is below bar low ${data.low[0]:.2f}.")
+        if order.order_type == 'Market':
+            if order.side == 'BUY':
+                strategy.buy(data=strategy.getdatabyname(order.ticker), size=order.size)
+            else:
+                strategy.sell(data=strategy.getdatabyname(order.ticker), size=order.size)
+            order.status = 'SUBMITTED'
+        elif order.order_type == 'Limit':
+            data = strategy.getdatabyname(order.ticker)
+            next_bar_open = data.open[1]
+
+            # [V2.0+] Adverse Selection Model
+            adverse_selection_penalty = 0.0
+            if next_bar_open > 0: # Avoid division by zero
+                if order.side == 'BUY' and order.limit_price < next_bar_open:
+                    # Penalize if our buy limit is "too good" (far below the open)
+                    adverse_selection_penalty = (next_bar_open - order.limit_price) / next_bar_open
+                elif order.side == 'SELL' and order.limit_price > next_bar_open:
+                    # Penalize if our sell limit is "too good" (far above the open)
+                    adverse_selection_penalty = (order.limit_price - next_bar_open) / next_bar_open
+
+            final_fill_prob = order.fill_probability * (1.0 - adverse_selection_penalty)
+
+            if random.random() < final_fill_prob:
+                if order.side == 'BUY':
+                    strategy.buy(data=data, size=order.size, price=order.limit_price, exectype=bt.Order.Limit)
+                else: # SELL
+                    strategy.sell(data=data, size=order.size, price=order.limit_price, exectype=bt.Order.Limit)
+                order.status = 'SUBMITTED'
+            else:
+                self.logger.warning(f"LIMIT order for {order.ticker} failed simulation (Final Prob: {final_fill_prob:.2f}). Base Prob: {order.fill_probability:.2f}, Adverse Selection Penalty: {adverse_selection_penalty:.2f}")
                 order.status = 'REJECTED'
-                return order
-            strategy.buy(data=data, size=order.size, price=order.limit_price, exectype=bt.Order.Limit)
-            self.logger.info(f"Placed BUY order for {order.ticker}: Size={order.size:.2f}, Est. Limit Price=${order.limit_price:.2f}")
-        
-        elif order.side == 'SELL':
-            if order.limit_price > data.high[0]:
-                self.logger.warning(f"SELL order for {order.ticker} likely unfilled. Limit Price ${order.limit_price:.2f} is above bar high ${data.high[0]:.2f}.")
-                order.status = 'REJECTED'
-                return order
-            strategy.sell(data=data, size=order.size, price=order.limit_price, exectype=bt.Order.Limit)
-            self.logger.info(f"Placed SELL order for {order.ticker}: Size={order.size:.2f}, Est. Limit Price=${order.limit_price:.2f}")
-        
-        order.status = 'SUBMITTED'
         return order
 
     def get_portfolio_value(self) -> float:
