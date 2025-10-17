@@ -1,96 +1,51 @@
-# 1. General Configuration
-project_name: "Phoenix Project"
-version: "2.0.0"
-description: "An advanced AI-driven quantitative trading framework."
-log_level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
+# Phoenix_project/config.yaml
+# Global configuration for the Phoenix Project trading system
 
-# 2. Strategy Parameters
-asset_universe: ["SPY", "QQQ", "GLD", "TLT", "VWO"]
-max_total_allocation: 0.95 # Max % of portfolio value to be invested
-commission_rate: 0.0005 # 0.05%
-sma_period: 50
-rsi_period: 14
-rsi_overbought_threshold: 70.0
-opportunity_score_threshold: 55.0
+# System-wide settings
+system:
+  environment: "development" # "production" or "development"
+  log_level: "INFO"
+  
+# Configuration for data sources
+data_manager:
+  data_cache_dir: "data_cache"
+  hot_tier_days: 365 # Data within the last year is considered "hot"
+  data_providers:
+    # List of data providers, ordered by default priority
+    - name: "primary_provider"
+      api_key: "YOUR_API_KEY"
+      priority: 1 # Fallback priority
+      cost_per_request: 0.01 # Cost in USD per API call
+      daily_limit: 1000 # Max requests per day
+    - name: "alternative_provider"
+      api_key: "YOUR_ALT_KEY"
+      priority: 2
+      incremental_updates: true # Enable/disable intelligent fetching
+      cost_per_request: 0.05
+      daily_limit: 500
 
-# [V2.0] Database configuration
-database:
-  # This is a default, non-functional value.
-  # The actual production URL will be injected from an environment variable.
-  url_env_var: "POSTGRES_DB_URL"
+# Feature store configuration
+feature_store:
+  sma_period: 50
+  rsi_period: 14
 
-# [NEW] 3. Risk Management (Dynamic Risk Budgeting)
-risk_manager:
-  max_uncertainty: 0.05       # Uncertainty level at which capital modifier hits minimum
-  min_capital_modifier: 0.1   # The floor for the capital modifier
-  # [V2.0+] CVaR (Expected Shortfall) Configuration
-  cvar_enabled: true
-  cvar_alpha: 0.95            # Confidence level for CVaR (e.g., 95%)
-  cvar_max_threshold: 0.02    # Max allowable portfolio CVaR (e.g., 2% expected tail loss)
-  # [V2.0+] Dynamic Liquidity Budgeting
-  liquidity_management_enabled: true
-  adv_lookback_period: 20       # Lookback period in days for Average Daily Volume (ADV)
-  max_adv_participation_rate: 0.1 # Max desired participation rate in a stock's ADV (e.g., 10%)
-
-# 4. Cerebro Engine Settings
-initial_cash: 1000000.0
-
-# 5. Data Sources Configuration
-data_sources:
-  start_date: "2018-01-01"
-  end_date: "2023-12-31"
-  cache_dir: "data_cache"
-  # Configuration for each data provider
-  providers:
-    tiingo:
-      api_key_env_var: "TIINGO_API_KEY"
-      # Higher number means higher priority
-      priority: 10
-    yfinance:
-      priority: 5
-
-# 6. Position Sizing Settings
+# Position sizer configuration
 position_sizer:
-  method: "volatility_parity" # Can be "fixed_fraction" or "volatility_parity"
+  type: "volatility_parity" # or "fixed_fraction"
   parameters:
-    volatility_period: 20 # Lookback period for volatility calculation
+    volatility_period: 20
+    risk_target: 0.02 # Target 2% risk per position
+    
+# Strategy handler configuration
+strategy_handler:
+  strategy_name: "MomentumStrategy"
 
-# 7. AI Configuration
-ai_mode: "processed" # "live", "processed", or "off"
-ai_clients_config_path: "config/ai_clients.yaml"
-# Path to a directory where pre-computed AI analyses are stored/loaded from.
-# If a path is provided, the system will use cached data if it exists for the given dates.
-# If the path is null, analyses will be re-computed live (incurs API costs).
-ai_analysis_snapshot_dir: "ai_snapshots"
+# Execution layer configuration
+execution:
+  broker: "backtesting" # "interactive_brokers" or "backtesting"
+  commission: 0.001
+  initial_cash: 100000.0
 
-# 8. Execution Model Configuration
-execution_model:
-  impact_coefficient: 0.1     # Price impact constant for slippage model
-  max_volume_share: 0.25      # Max % of a bar's volume an order can consume
-  min_trade_notional: 1.0     # Minimum trade notional value
-  average_spread_bps: 1.5     # Assumed avg bid-ask spread in basis points (0.015%)
-  # [V2.0+] Fill Probability Model for Limit Orders
-  fill_prob_model_enabled: true
-  fill_prob_aggressiveness: 10.0 # Controls how quickly fill probability drops off as the limit price moves away from the market price. Higher is more sensitive.
-  # [V2.0+] Cost Feedback Loop
-  cost_feedback_enabled: true
-  cost_feature_ema_span: 20 # The smoothing period for the Exponential Moving Average of execution costs.
-
-# [V2.0+] Portfolio Optimization Settings
-portfolio_optimizer:
-  method: "scipy_optimize" # Currently supported: "scipy_optimize"
-  objective: "maximize_alpha" # Defines the goal, e.g., maximize AI-adjusted return
-
-# [NEW] 9. Data Quality Monitoring (DQM) Settings
-data_quality_monitoring:
-  completeness_threshold: 0.98 # Require at least 98% of close prices to be non-null
-  staleness_days_threshold: 3  # Data's latest point cannot be older than 3 days from run time
-  price_change_std_dev_threshold: 5.0 # Reject data if daily change > 5 std devs from the mean
-
-# [NEW] 10. Market State Prediction Model
-market_state_predictor:
-  long_term_ma: 200
-  threshold: 0.05
-  model_params:
-    n_estimators: 100
-    learning_rate: 0.1
+# AI Cognitive Engine settings
+cognitive_engine:
+  prediction_model_path: "models/prediction_model.joblib"
