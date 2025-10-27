@@ -6,8 +6,9 @@ within a set of evidence.
 import logging
 import asyncio
 import numpy as np
+import os
 from typing import List, Dict, Any, Tuple
-import google.generativai as genai
+import google.generativeai as genai
 
 from .embedding_client import EmbeddingClient
 from ai.validation import EvidenceItem
@@ -37,6 +38,10 @@ class ContradictionDetector:
         self.negative_threshold = negative_threshold
         # [NEW] Initialize a high-capability model for arbitration
         try:
+            # Configure API key as requested for cost spreading
+            api_key = os.getenv("GEMINI_FLASH_KEY")
+            if api_key:
+                genai.configure(api_key=api_key)
             self.arbitrator_model = genai.GenerativeModel("gemini-1.5-pro-latest")
         except Exception as e:
             self.logger.error(f"Failed to initialize Arbitrator LLM model: {e}")
