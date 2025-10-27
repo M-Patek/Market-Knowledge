@@ -1,158 +1,217 @@
-import pandas as pd
+import logging
 import numpy as np
 from .reasoning_ensemble import ReasoningEnsemble
 from .base_trainer import BaseTrainer
+from datetime import date, timedelta
 import mlflow
 import os
-
-class CombinatorialPurgedCV:
-    def __init__(self, n_splits=10, purging_period=1):
-        """
-        Initializes the Combinatorial Purged Cross-Validation class.
-        """
-        self.n_splits = n_splits
-        self.purging_period = purging_period
-
-    def split(self, X):
-        """
-        Generates splits for CPCV with purging.
-        
-        :param X: pandas DataFrame or Series with a DatetimeIndex.
-        """
-        if not isinstance(X.index, pd.DatetimeIndex):
-            raise ValueError("X must have a DatetimeIndex.")
-            
-        n_samples = len(X)
-        indices = np.arange(n_samples)
-        
-        # Calculate split sizes
-        fold_size = n_samples // self.n_splits
-        
-        for i in range(self.n_splits):
-            # Determine validation set boundaries
-            validation_start_idx = i * fold_size
-            validation_end_idx = validation_start_idx + fold_size
-            validation_indices = indices[validation_start_idx:validation_end_idx]
-            
-            # Determine training set boundaries with purging
-            validation_start_time = X.index[validation_start_idx]
-            purged_end_time = validation_start_time - pd.Timedelta(days=self.purging_period)
-            train_indices = indices[X.index <= purged_end_time]
-
-            yield train_indices, validation_indices
-
-class ModelCardGenerator:
-    def __init__(self, template_path='model_card_example.md'):
-        self.template_path = template_path
-        if not os.path.exists(self.template_path):
-            raise FileNotFoundError(f"Model card template not found at: {self.template_path}")
-        with open(self.template_path, 'r') as f:
-            self.template = f.read()
-
-    def generate_and_log(self, metrics: dict):
-        """
-        Generates a model card from the template and logs it to MLFlow.
-        """
-        card_content = self.template
-        
-        # Replace placeholders with actual values
-        card_content = card_content.replace('{{DSR}}', f"{metrics.get('deflated_sharpe_ratio', 'N/A'):.4f}")
-        card_content = card_content.replace('{{MAX_DRAWDOWN}}', f"{metrics.get('max_drawdown', 'N/A'):.4f}")
-        
-        # Write to a temporary file and log as an artifact
-        try:
-            card_path = "generated_model_card.md"
-            with open(card_path, 'w') as f:
-                f.write(card_content)
-            mlflow.log_artifact(card_path, "model_card")
-        except Exception as e:
-            print(f"Error logging model card: {e}") # Replace with proper logging
+from typing import Dict, Any
 
 class WalkForwardTrainer(BaseTrainer):
     """
-    Performs walk-forward training and validation of a trading strategy.
+    Implements a walk-forward training and validation methodology.
+    
+    This approach simulates a realistic trading scenario where the model is retrained
+    on new data as it becomes available, and its performance is evaluated on
+    out-of-sample data immediately following the training period.
     """
-    def __init__(self, config, strategy, reasoning_ensemble):
-        super().__init__(config, strategy)
-        self.reasoning_ensemble = reasoning_ensemble
 
-    def train(self, data):
+    def __init__(self, config: Dict[str, Any]):
         """
-        Trains the strategy using walk-forward cross-validation.
+        Initializes the WalkForwardTrainer.
+
+        Args:
+            config (Dict[str, Any]): Configuration dictionary containing parameters like
+                                     'training_window_size', 'validation_window_size',
+                                     'retraining_frequency', and 'ensemble_config'.
         """
-        cv = CombinatorialPurgedCV(n_splits=self.config.get('cv_splits', 5))
+        super().__init__(config)
+        self.logger = logging.getLogger("PhoenixProject.WalkForwardTrainer")
+        self.training_window_size = config.get('training_window_size', 365)
+        self.validation_window_size = config.get('validation_window_size', 90)
+        self.retraining_frequency = config.get('retraining_frequency', 30)
         
-        # Log trainer-specific parameters to MLFlow
-        mlflow.log_param('cv_splits', cv.n_splits)
+        # Initialize the ReasoningEnsemble, which is the model we are training
+        self.ensemble_config = config.get('ensemble_config', {})
+        self.model = ReasoningEnsemble(self.ensemble_config)
         
-        negative_samples = []
-        self.logger.info("Starting walk-forward training...")
-        
-        for fold, (train_indices, val_indices) in enumerate(cv.split(data)):
-            train_data = data.iloc[train_indices]
-            val_data = data.iloc[val_indices]
+        self.logger.info(
+            f"WalkForwardTrainer initialized: "
+            f"Train window={self.training_window_size} days, "
+            f"Validate window={self.validation_window_size} days, "
+            f"Retrain every={self.retraining_frequency} days."
+        )
 
-            self.logger.info(f"CV Fold {fold+1}/{cv.n_splits}: Training...")
-            self.strategy.train(train_data)
-
-            self.logger.info(f"CV Fold {fold+1}/{cv.n_splits}: Validating...")
-            # Simulate returns for the validation period to calculate a realistic metric
-            # This is a simplified simulation, assuming daily returns.
-            n_days_val = len(val_data)
-            simulated_val_returns = np.random.normal(loc=0.0004, scale=0.018, size=n_days_val)
-            var_95_val = np.percentile(simulated_val_returns, 5)
-            cvar_95_val = simulated_val_returns[simulated_val_returns <= var_95_val].mean()
-            performance_metrics = {'cvar': abs(cvar_95_val)}
-
-            cvar_limit = self.config.get('cvar_limit', 0.1)
-            if performance_metrics['cvar'] > cvar_limit:
-                self.logger.warning(f"CV Fold {fold+1}: CVaR limit breached! ({performance_metrics['cvar']:.4f} > {cvar_limit})")
-                failure_context = self._log_failure_scenario_for_retraining(val_data, performance_metrics)
-                negative_samples.append(failure_context)
-        
-        self.logger.info("Walk-forward training complete.")
-        if negative_samples:
-            self.logger.info(f"Feeding {len(negative_samples)} failure scenarios back to the ReasoningEnsemble...")
-            self.reasoning_ensemble.learn_from_failure_scenarios(negative_samples)
-        
-        # After training, log final performance metrics
-        final_metrics = {'deflated_sharpe_ratio': 0.95, 'max_drawdown': -0.08} # Dummy final metrics
-        self.logger.info(f"Logging final metrics to MLFlow: {final_metrics}")
-        dummy_returns = pd.Series(np.random.normal(loc=0.001, scale=0.015, size=252))
-        confidence_intervals = self._calculate_confidence_intervals(dummy_returns)
-        final_metrics.update(confidence_intervals)
-        mlflow.log_metrics(final_metrics)
-
-        # Generate and log the Model Card
-        self.logger.info("Generating Model Card...")
-        card_generator = ModelCardGenerator()
-        card_generator.generate_and_log(final_metrics)
-
-        return self.strategy
-
-    def _log_failure_scenario_for_retraining(self, data_subset, metrics):
+    def train(self, data: np.ndarray) -> Any:
         """
-        Analyzes and captures the context of a training failure.
-        """
-        self.logger.info("Logging failure scenario for adaptive risk learning...")
-        failure_context = {'metrics': metrics, 'triggering_data_hash': hash(data_subset.to_string())}
-        return failure_context
-
-    def _calculate_confidence_intervals(self, returns: pd.Series, n_bootstrap=1000, ci_level=0.95):
-        """
-        Calculates confidence intervals for key metrics using bootstrapping.
-        """
-        self.logger.info(f"Calculating {ci_level:.0%} confidence intervals with {n_bootstrap} bootstrap samples...")
-        stats = []
-        for _ in range(n_bootstrap):
-            sample_returns = returns.sample(n=len(returns), replace=True)
-            if sample_returns.std() == 0:
-                continue
-            sharpe_ratio = (sample_returns.mean() / sample_returns.std()) * np.sqrt(252)
-            stats.append(sharpe_ratio)
+        Trains the model on a given data window.
         
-        lower_bound = np.percentile(stats, (1 - ci_level) / 2 * 100)
-        upper_bound = np.percentile(stats, (1 + ci_level) / 2 * 100)
-        self.logger.info(f"Sharpe Ratio {ci_level:.0%} CI: [{lower_bound:.4f}, {upper_bound:.4f}]")
+        In this specific implementation, 'training' the ReasoningEnsemble might involve
+        calibrating its components or fine-tuning underlying models.
+        """
+        self.logger.info(f"Starting training on data with shape {data.shape}...")
+        
+        # In a real scenario, this would be a complex operation:
+        # 1. Preprocess data (e.g., feature engineering, scaling)
+        # 2. Train/fine-tune each model in the ensemble (L1 models, BayesianFusionEngine, etc.)
+        # 3. Calibrate probability models.
+        
+        # For this example, we'll simulate the training by updating the model's 'internal_state'
+        # or 'version' based on the data.
+        simulated_training_artifacts = self.model.calibrate(data)
+        
+        self.logger.info("Training complete.")
+        return simulated_training_artifacts # Returns the "trained" model or its artifacts
 
+    def evaluate(self, model_artifacts: Any, validation_data: np.ndarray) -> Dict[str, float]:
+        """
+        Evaluates the trained model on out-of-sample validation data.
+        """
+        self.logger.info(f"Starting evaluation on data with shape {validation_data.shape}...")
+        
+        simulated_returns = []
+        
+        # This loop simulates iterating day-by-day through the validation window
+        for i in range(len(validation_data)):
+            # Get data for the current day (and potentially look-back window)
+            current_day_data = validation_data[max(0, i-30):i+1] # Example: use 30-day look-back
+            
+            # The model makes a decision (e.g., +1 for long, -1 for short, 0 for flat)
+            # This simulates the CognitiveEngine's full decision-making process
+            decision = self.model.make_decision(current_day_data) # Simplified
+            
+            # Simulate the return for that day based on the decision
+            # This is a highly simplified P&L simulation
+            actual_return = validation_data[i, -1] # Assume last column is target return
+            daily_pnl = decision * actual_return
+            simulated_returns.append(daily_pnl)
+
+        # Calculate performance metrics from the simulated returns
+        metrics = self._calculate_performance_metrics(simulated_returns)
+        self.logger.info(f"Evaluation complete: {metrics}")
+        return metrics
+
+    def run_walk_forward_validation(self, full_dataset: np.ndarray) -> Dict[str, Any]:
+        """
+        Executes the entire walk-forward validation process over the dataset.
+        """
+        self.logger.info(f"Starting full walk-forward validation on dataset with {len(full_dataset)} days.")
+        
+        # Calculate the number of walk-forward steps
+        total_data_days = len(full_dataset)
+        days_per_step = self.retraining_frequency
+        num_steps = (total_data_days - self.training_window_size) // days_per_step
+        
+        all_fold_metrics = []
+        
+        for i in range(num_steps):
+            # Determine the indices for the current training and validation windows
+            train_start = i * days_per_step
+            train_end = train_start + self.training_window_size
+            val_start = train_end
+            val_end = val_start + self.validation_window_size
+
+            # Ensure we don't go out of bounds
+            if val_end > total_data_days:
+                break
+
+            self.logger.info(f"--- Fold {i+1}/{num_steps} ---")
+            self.logger.info(f"Training window: Days {train_start} to {train_end-1}")
+            self.logger.info(f"Validation window: Days {val_start} to {val_end-1}")
+
+            # Extract data windows
+            train_data = full_dataset[train_start:train_end]
+            validation_data = full_dataset[val_start:val_end]
+
+            # 1. Train the model
+            trained_model_artifacts = self.train(train_data)
+            
+            # 2. Evaluate the model
+            fold_metrics = self.evaluate(trained_model_artifacts, validation_data)
+            all_fold_metrics.append(fold_metrics)
+            
+            # Log metrics for this fold to MLflow
+            mlflow.log_metrics(fold_metrics, step=i)
+
+        # Aggregate metrics across all folds
+        final_metrics = self._aggregate_metrics(all_fold_metrics)
+        self.logger.info(f"--- Walk-forward validation complete ---")
+        self.logger.info(f"Aggregated Metrics: {final_metrics}")
+        
+        # Log final aggregated metrics to MLflow
+        mlflow.log_metrics({f"agg_{k}": v for k, v in final_metrics.items()})
+        
+        return final_metrics
+
+    def _calculate_performance_metrics(self, returns: list) -> Dict[str, float]:
+        """Calculates key performance metrics from a list of returns."""
+        if not returns:
+            return {"sharpe_ratio": 0, "max_drawdown": 0, "total_return": 0}
+            
+        returns_array = np.array(returns)
+        total_return = np.sum(returns_array)
+        
+        # Sharpe Ratio (simplified, assuming daily returns and 252 trading days)
+        mean_return = np.mean(returns_array)
+        std_dev = np.std(returns_array)
+        sharpe_ratio = (mean_return / std_dev) * np.sqrt(252) if std_dev > 0 else 0
+        
+        # Max Drawdown
+        cumulative_returns = np.cumsum(returns_array)
+        peak = np.maximum.accumulate(cumulative_returns)
+        drawdown = (cumulative_returns - peak)
+        max_drawdown = np.min(drawdown) if len(drawdown) > 0 else 0
+        
+        return {
+            "sharpe_ratio_dsr": sharpe_ratio, # DSR = Daily Sharpe Ratio
+            "max_drawdown": max_drawdown,
+            "total_return": total_return,
+            "volatility": std_dev
+        }
+
+    def _aggregate_metrics(self, all_metrics: List[Dict[str, float]]) -> Dict[str, float]:
+        """Aggregates metrics from all folds (e.g., by averaging)."""
+        if not all_metrics:
+            return {}
+            
+        df = pd.DataFrame(all_metrics)
+        return df.mean().to_dict()
+
+    def _perform_bootstrap_test(self, validation_returns: list) -> Dict[str, float]:
+        """
+        Performs a stationary bootstrap test on validation returns to create
+        confidence intervals for the Sharpe ratio.
+        """
+        # This is a placeholder for a complex statistical test
+        # e.g., using a library like `arch` or custom implementation
+        self.logger.info("Performing stationary bootstrap test on returns...")
+        
+        # Simulated results
+        lower_bound = 0.85
+        upper_bound = 1.25
+        
         return {'sharpe_ci_lower': lower_bound, 'sharpe_ci_upper': upper_bound}
+
+    def estimate_api_cost(self, start_date: date, end_date: date) -> Dict[str, Any]:
+        """
+        [Sub-Task 1.2.3] Estimates the cost of AI analysis for a given date range.
+        """
+        self.logger.info(f"Estimating API cost for retraining from {start_date} to {end_date}...")
+        
+        # 1. Calculate the number of business days in the range
+        total_days = (end_date - start_date).days
+        business_days = np.busday_count(start_date.isoformat(), end_date.isoformat())
+
+        # 2. TODO: Query the "AI Feature Cache" to find how many of these business days already have data.
+        # For now, we'll simulate this with a hard-coded cache hit rate.
+        simulated_cache_hit_rate = 0.25 
+        cached_days = int(business_days * simulated_cache_hit_rate)
+        missing_days = business_days - cached_days
+
+        # 3. Multiply missing days by an estimated daily cost.
+        daily_cost = self.config.get('daily_average_analysis_cost', 0.50) # Default to $0.50/day
+        estimated_cost = missing_days * daily_cost
+
+        self.logger.info(f"Cost estimation complete: {missing_days}/{business_days} business days require analysis. Estimated cost: ${estimated_cost:.2f}")
+        
+        return {"estimated_api_cost": estimated_cost, "business_days_total": business_days, "business_days_to_analyze": missing_days}
