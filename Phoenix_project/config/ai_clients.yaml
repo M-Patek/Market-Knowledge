@@ -4,7 +4,7 @@
 # This section defines the API configurations for different AI model providers.
 ai_providers:
   google:
-    api_key_env_var: "GOOGLE_API_KEY"
+    api_key_env_var: "GEMINI_PRO_KEY"
     # Models available from this provider
     models:
       - name: "gemini-1.5-flash-latest"
