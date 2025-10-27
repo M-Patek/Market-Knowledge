@@ -1,106 +1,138 @@
-# Phoenix_project/data_manager.py
 import os
-from datetime import timedelta, date, datetime
+import logging
 from collections import defaultdict
 import pandas as pd
+from datetime import date
 # from storage.s3_client import S3Client
+from typing import List
 
 class DataManager:
     def __init__(self, config, providers, cold_storage_client=None):
+        self.logger = logging.getLogger("PhoenixProject.DataManager")
         self.config = config
-        self.providers = sorted(providers, key=lambda p: p.get_config().get('cost_per_request', float('inf')))
-        self.cache_dir = config.get('data_cache_dir', 'data_cache')
-        self.hot_tier_days = config.get('hot_tier_days', 365)
-        self.usage_stats = defaultdict(lambda: {'count': 0, 'date': date.today()})
-        self.cold_storage = cold_storage_client # The new S3Client instance
+        self.cache_dir = config.get('cache_dir', '/tmp/phoenix_cache')
+        self.providers = providers # Dict of {data_type: provider_instance}
+        self.cold_storage = cold_storage_client
+        self.data_catalog = self._load_data_catalog()
+        
+        # In-memory cache for hot data (e.g., last N days)
+        self.hot_cache = defaultdict(pd.DataFrame)
+        
         os.makedirs(self.cache_dir, exist_ok=True)
+        self.logger.info(f"DataManager initialized. Cache directory set to {self.cache_dir}")
 
-    def _get_available_provider(self):
-        today = date.today()
-        for provider in self.providers:
-            provider_name = provider.get_config()['name']
-            stats = self.usage_stats[provider_name]
-            
-            # Reset daily usage count if a new day has started
-            if stats['date'] != today:
-                stats['count'] = 0
-                stats['date'] = today
+    def _load_data_catalog(self):
+        # In a real system, this would load from a file or DB
+        return {
+            "SPY_1D": {"source": "provider_A", "asset": "SPY", "frequency": "1D"},
+            "QQQ_1H": {"source": "provider_B", "asset": "QQQ", "frequency": "1H"},
+        }
 
-            if stats['count'] < provider.get_config().get('daily_limit', float('inf')):
-                return provider
-        return None # No providers available
+    def _get_hot_cache_path(self, data_key: str) -> str:
+        """Generates a standardized file path for a hot cache key."""
+        return os.path.join(self.cache_dir, f"{data_key}.csv")
 
-    def fetch_historical_data(self, ticker, start_date, end_date):
+    def load_data(self, data_key: str, start_date=None, end_date=None) -> pd.DataFrame:
         """
-        Fetches data, intelligently querying across hot (local cache)
-        and cold (S3) storage tiers.
+        Loads data from the hot cache if available, otherwise fetches from the provider.
         """
-        hot_cache_path = f"{self.cache_dir}/{ticker}.csv"
-        cold_storage_key = f"historical_data/{ticker}.parquet"
-
-        hot_data = pd.DataFrame()
-        cold_data = pd.DataFrame()
-
-        # 1. Try to read from hot cache
+        self.logger.info(f"Requesting data for '{data_key}' from {start_date} to {end_date}.")
+        
+        hot_cache_path = self._get_hot_cache_path(data_key)
+        
+        # 1. Try loading from the local hot cache file
         if os.path.exists(hot_cache_path):
-            hot_data = pd.read_csv(hot_cache_path, index_col=0, parse_dates=True)
+            self.logger.debug(f"Loading '{data_key}' from hot cache file: {hot_cache_path}")
+            try:
+                cached_data = pd.read_csv(hot_cache_path, index_col=0, parse_dates=True)
+                # TODO: Add logic to check if the cached data covers the requested date range
+                return cached_data
+            except Exception as e:
+                self.logger.warning(f"Could not read cache file {hot_cache_path}: {e}. Fetching from provider.")
+                
+        # 2. If not in cache, fetch from the appropriate provider
+        catalog_entry = self.data_catalog.get(data_key)
+        if not catalog_entry:
+            self.logger.error(f"No entry found in data catalog for key: {data_key}")
+            return pd.DataFrame()
 
-        # 2. If data is still missing, try to read from cold storage
-        if self.cold_storage:
-            # This logic would be more complex, checking if the date range falls in the cold tier
-            cold_data = self.cold_storage.read_data(cold_storage_key)
+        provider_name = catalog_entry.get("source")
+        provider = self.providers.get(provider_name)
         
-        # 3. Combine data from both tiers
-        combined_data = pd.concat([cold_data, hot_data]).drop_duplicates()
-        if not combined_data.empty:
-            combined_data = combined_data.sort_index()
-
-        # 4. Fetch any remaining missing data using the incremental update logic
-        last_date_available = combined_data.index.max().date() if not combined_data.empty else None
+        if not provider:
+            self.logger.error(f"No provider instance found for source: {provider_name}")
+            return pd.DataFrame()
+            
+        self.logger.info(f"Fetching '{data_key}' from provider '{provider_name}'...")
+        data = provider.fetch_data(
+            asset=catalog_entry.get("asset"),
+            frequency=catalog_entry.get("frequency"),
+            start=start_date,
+            end=end_date
+        )
         
-        if last_date_available and last_date_available >= end_date.date():
-             print(f"Data for {ticker} is already up to date from cache/cold storage.")
-             return combined_data.loc[start_date:end_date]
+        # 3. Save the fetched data to the hot cache
+        if not data.empty:
+            data.to_csv(hot_cache_path)
+            self.logger.info(f"Saved fetched data for '{data_key}' to hot cache.")
+            
+        return data
 
-        fetch_start_date = last_date_available + timedelta(days=1) if last_date_available else start_date
-        
-        provider = self._get_available_provider()
-        if provider:
-            new_data = provider.fetch(ticker, fetch_start_date, end_date)
-            provider_config = provider.get_config()
-            self.usage_stats[provider_config['name']]['count'] += 1
-            if new_data is not None and not new_data.empty:
-                 combined_data = pd.concat([combined_data, new_data]).drop_duplicates()
-                 # Update the hot cache with the newly fetched data
-                 cutoff = datetime.now().date() - timedelta(days=self.hot_tier_days)
-                 combined_data[combined_data.index.date >= cutoff].to_csv(hot_cache_path)
-
-        return combined_data.loc[start_date:end_date]
-
-    def archive_cold_data(self, ticker):
+    def archive_hot_cache(self, data_key: str, archive_before_date):
         """
-        Migrates data older than the 'hot_tier_days' threshold
-        from the local cache to cold storage.
-        This would be run periodically by a separate maintenance process.
+        Moves old data from the hot cache to cold storage (e.g., S3).
         """
         if not self.cold_storage:
-            print("Cold storage client not configured. Archiving skipped.")
+            self.logger.info("No cold storage client configured. Skipping archival.")
             return
-
-        hot_cache_path = f"{self.cache_dir}/{ticker}.csv"
+            
+        hot_cache_path = self._get_hot_cache_path(data_key)
         if not os.path.exists(hot_cache_path):
+            self.logger.info(f"No hot cache file for '{data_key}'. Skipping archival.")
             return
-
-        hot_data = pd.read_csv(hot_cache_path, index_col=0, parse_dates=True)
-        cutoff_date = date.today() - timedelta(days=self.hot_tier_days)
-
-        data_to_archive = hot_data[hot_data.index.date() < cutoff_date]
-        remaining_hot_data = hot_data[hot_data.index.date() >= cutoff_date]
-
+            
+        full_data = pd.read_csv(hot_cache_path, index_col=0, parse_dates=True)
+        
+        data_to_archive = full_data[full_data.index < archive_before_date]
+        remaining_hot_data = full_data[full_data.index >= archive_before_date]
+        
         if not data_to_archive.empty:
-            print(f"Archiving {len(data_to_archive)} rows of cold data for {ticker} to S3.")
-            cold_storage_key = f"historical_data/{ticker}.parquet"
+            cold_storage_key = f"historical_data/{data_key}/{archive_before_date.year}.parquet"
+            self.logger.info(f"Archiving {len(data_to_archive)} rows of '{data_key}' to {cold_storage_key}...")
+            # In a real system, we'd append to the parquet file or use partitions
             # Logic to append/update data in S3
             self.cold_storage.write_data(cold_storage_key, data_to_archive)
             # Rewrite the hot cache with only recent data
             remaining_hot_data.to_csv(hot_cache_path)
+
+    def save_ai_features(self, features_dataframe: pd.DataFrame):
+        """
+        [Sub-Task 2.1.1] Saves a dataframe of AI features to a partitioned Parquet structure.
+        """
+        if 'timestamp' not in features_dataframe.columns:
+            self.logger.error("AI features dataframe must contain a 'timestamp' column for partitioning.")
+            return
+
+        # Ensure timestamp is a datetime object
+        features_dataframe['timestamp'] = pd.to_datetime(features_dataframe['timestamp'])
+
+        for date_group, group_df in features_dataframe.groupby(pd.Grouper(key='timestamp', freq='D')):
+            if group_df.empty:
+                continue
+            
+            date_obj = date_group.date()
+            partition_path = os.path.join(self.cache_dir, 'features', str(date_obj.year), f"{date_obj.month:02d}", f"{date_obj.day:02d}")
+            os.makedirs(partition_path, exist_ok=True)
+            
+            file_path = os.path.join(partition_path, 'data.parquet')
+            group_df.to_parquet(file_path)
+            self.logger.info(f"Saved {len(group_df)} AI features to '{file_path}'.")
+
+    def load_ai_features(self, date_range: List[date], asset_ids: List[str]) -> pd.DataFrame:
+        """
+        [Sub-Task 2.1.2] Loads AI features from the partitioned Parquet cache for a given date range and assets.
+        """
+        self.logger.info(f"Loading AI features for {len(asset_ids)} assets from {date_range[0]} to {date_range[-1]}...")
+        # TODO: Implement the logic to scan the partitioned directory structure,
+        # read the relevant parquet files, filter by asset_ids, and concatenate them into a single DataFrame.
+        return pd.DataFrame() # Return empty DataFrame for now
