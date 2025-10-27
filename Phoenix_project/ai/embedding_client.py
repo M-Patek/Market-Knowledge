@@ -19,9 +19,9 @@ class EmbeddingClient:
     def _configure_client(self):
         """Configures the generative AI client based on the specified provider."""
         if self.provider == 'google':
-            api_key = os.getenv("GOOGLE_API_KEY")
+            api_key = os.getenv("GEMINI_EMBEDDING_KEY")
             if not api_key:
-                raise ValueError("GOOGLE_API_KEY environment variable not set for Google provider.")
+                raise ValueError("GEMINI_EMBEDDING_KEY environment variable not set for Google provider.")
             genai.configure(api_key=api_key)
             self.logger.info(f"EmbeddingClient configured for Google with model '{self.model_name}'.")
         else:
