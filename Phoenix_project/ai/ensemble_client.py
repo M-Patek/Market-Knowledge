@@ -1,9 +1,6 @@
 import asyncio
-import time
 import logging
 from typing import Dict, Any, List
-from . import llm_client # 这个导入将在重构 execute_llm_call 时被移除
-from observability import CircuitBreaker # 这个导入将在重构 execute_llm_call 时被移除
 from api.gemini_pool_manager import GeminiPoolManager
 
 
