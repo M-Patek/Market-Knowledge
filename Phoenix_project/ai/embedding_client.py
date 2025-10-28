@@ -1,8 +1,6 @@
 # ai/embedding_client.py
-import os
 import logging
 from typing import List, Dict, Any, Optional
-import google.generativeai as genai
 import numpy as np
 from api.gemini_pool_manager import GeminiPoolManager # 导入我们的新池
 
