@@ -1,7 +1,6 @@
 import logging
 from typing import Dict, Any
 
-from cognitive.engine import CognitiveEngine
 from ai.reasoning_ensemble import ReasoningEnsemble # 假设这是模型的基类或类型
 from audit_manager import AuditManager
 
