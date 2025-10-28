@@ -1,37 +1,40 @@
 import logging
 import numpy as np
+import pandas as pd
 from .reasoning_ensemble import ReasoningEnsemble
 from .base_trainer import BaseTrainer
 from datetime import date, timedelta
 import mlflow
 import os
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 class WalkForwardTrainer(BaseTrainer):
     """
-    Implements a walk-forward training and validation methodology.
+    实现了一个步进式训练和验证方法。
     
-    This approach simulates a realistic trading scenario where the model is retrained
-    on new data as it becomes available, and its performance is evaluated on
-    out-of-sample data immediately following the training period.
+    这种方法模拟了一个真实的交易场景，其中模型在
+    新数据可用时进行重新训练，并其性能在
+    紧邻训练期后的样本外数据上进行评估。
     """
 
     def __init__(self, config: Dict[str, Any]):
         """
-        Initializes the WalkForwardTrainer.
+        初始化 WalkForwardTrainer。
 
         Args:
-            config (Dict[str, Any]): Configuration dictionary containing parameters like
+            config (Dict[str, Any]): 配置字典，包含像
                                      'training_window_size', 'validation_window_size',
-                                     'retraining_frequency', and 'ensemble_config'.
+                                     'retraining_frequency', 和 'ensemble_config' 这样的参数。
         """
         super().__init__(config)
         self.logger = logging.getLogger("PhoenixProject.WalkForwardTrainer")
         self.training_window_size = config.get('training_window_size', 365)
         self.validation_window_size = config.get('validation_window_size', 90)
-        self.retraining_frequency = config.get('retraining_frequency', 30)
+        self.retraining_frequency = config.get('retraining_frequency', 30) # 使用配置中的30天
+        # 存储上次成功再训练的日期
+        self.last_retraining_date = config.get('last_retraining_date', date.min)
         
-        # Initialize the ReasoningEnsemble, which is the model we are training
+        # 初始化 ReasoningEnsemble，这是我们正在训练的模型
         self.ensemble_config = config.get('ensemble_config', {})
         self.model = ReasoningEnsemble(self.ensemble_config)
         
@@ -42,62 +45,96 @@ class WalkForwardTrainer(BaseTrainer):
             f"Retrain every={self.retraining_frequency} days."
         )
 
+    def check_retraining_status(self, current_date: date) -> Dict[str, Any]:
+        """
+        根据性能衰减或周期检查是否需要再训练。
+        如果需要，生成一个带成本的 "再训练建议"。
+        (Task 3.1 - Adaptive Retraining Approval Workflow)
+        """
+        self.logger.info(f"Checking retraining status for {current_date}...")
+        
+        # --- 性能衰减检查占位符 ---
+        # performance_decay_trigger = self._check_performance_decay()
+        
+        # --- 检查周期 (使用配置中的 retraining_frequency) ---
+        days_since_last_train = (current_date - self.last_retraining_date).days
+        cycle_trigger = days_since_last_train >= self.retraining_frequency
+
+        if cycle_trigger: # or performance_decay_trigger:
+            self.logger.info(f"Retraining cycle trigger met ({days_since_last_train} days >= {self.retraining_frequency}).")
+            
+            # 定义 *下一个* 训练窗口以估算成本
+            train_start_date = current_date
+            train_end_date = current_date + timedelta(days=self.training_window_size)
+            
+            cost_data = self.estimate_api_cost(train_start_date, train_end_date)
+            
+            return {
+                "recommendation_pending": True,
+                "reason": f"Retraining cycle met ({self.retraining_frequency} days).",
+                "cost_estimate": cost_data
+            }
+
+        return {"recommendation_pending": False}
+
     def train(self, data: np.ndarray) -> Any:
         """
-        Trains the model on a given data window.
+        在给定的数据窗口上训练模型。
         
-        In this specific implementation, 'training' the ReasoningEnsemble might involve
-        calibrating its components or fine-tuning underlying models.
+        在这个具体实现中，'训练' ReasoningEnsemble 可能涉及
+        校准其组件或微调底层模型。
         """
         self.logger.info(f"Starting training on data with shape {data.shape}...")
         
-        # In a real scenario, this would be a complex operation:
-        # 1. Preprocess data (e.g., feature engineering, scaling)
-        # 2. Train/fine-tune each model in the ensemble (L1 models, BayesianFusionEngine, etc.)
-        # 3. Calibrate probability models.
+        # 在真实场景中，这将是一个复杂的操作：
+        # 1. 预处理数据 (例如, 特征工程, 缩放)
+        # 2. 训练/微调集成中的每个模型 (L1 模型, BayesianFusionEngine 等)
+        # 3. 校准概率模型。
         
-        # For this example, we'll simulate the training by updating the model's 'internal_state'
-        # or 'version' based on the data.
+        # 在这个例子中，我们将通过更新模型的 'internal_state'
+        # 或 'version' 来模拟训练。
         simulated_training_artifacts = self.model.calibrate(data)
         
         self.logger.info("Training complete.")
-        return simulated_training_artifacts # Returns the "trained" model or its artifacts
+        # 在成功训练后更新日期
+        self.last_retraining_date = date.today() 
+        return simulated_training_artifacts # 返回 "训练好" 的模型或其产物
 
     def evaluate(self, model_artifacts: Any, validation_data: np.ndarray) -> Dict[str, float]:
         """
-        Evaluates the trained model on out-of-sample validation data.
+        在样本外验证数据上评估训练好的模型。
         """
         self.logger.info(f"Starting evaluation on data with shape {validation_data.shape}...")
         
         simulated_returns = []
         
-        # This loop simulates iterating day-by-day through the validation window
+        # 这个循环模拟了逐日迭代验证窗口
         for i in range(len(validation_data)):
-            # Get data for the current day (and potentially look-back window)
-            current_day_data = validation_data[max(0, i-30):i+1] # Example: use 30-day look-back
+            # 获取当天的数据 (可能还有回看窗口)
+            current_day_data = validation_data[max(0, i-30):i+1] # 示例: 使用30天回看
             
-            # The model makes a decision (e.g., +1 for long, -1 for short, 0 for flat)
-            # This simulates the CognitiveEngine's full decision-making process
-            decision = self.model.make_decision(current_day_data) # Simplified
+            # 模型做出决策 (例如, +1 为多头, -1 为空头, 0 为平仓)
+            # 这模拟了 CognitiveEngine 的完整决策过程
+            decision = self.model.make_decision(current_day_data) # 简化
             
-            # Simulate the return for that day based on the decision
-            # This is a highly simplified P&L simulation
-            actual_return = validation_data[i, -1] # Assume last column is target return
+            # 根据决策模拟当天的回报
+            # 这是一个高度简化的 P&L 模拟
+            actual_return = validation_data[i, -1] # 假设最后一列是目标回报
             daily_pnl = decision * actual_return
             simulated_returns.append(daily_pnl)
 
-        # Calculate performance metrics from the simulated returns
+        # 从模拟回报中计算性能指标
         metrics = self._calculate_performance_metrics(simulated_returns)
         self.logger.info(f"Evaluation complete: {metrics}")
         return metrics
 
     def run_walk_forward_validation(self, full_dataset: np.ndarray) -> Dict[str, Any]:
         """
-        Executes the entire walk-forward validation process over the dataset.
+        在整个数据集上执行完整的步进式验证过程。
         """
         self.logger.info(f"Starting full walk-forward validation on dataset with {len(full_dataset)} days.")
         
-        # Calculate the number of walk-forward steps
+        # 计算步进式验证的步数
         total_data_days = len(full_dataset)
         days_per_step = self.retraining_frequency
         num_steps = (total_data_days - self.training_window_size) // days_per_step
@@ -105,13 +142,13 @@ class WalkForwardTrainer(BaseTrainer):
         all_fold_metrics = []
         
         for i in range(num_steps):
-            # Determine the indices for the current training and validation windows
+            # 确定当前训练和验证窗口的索引
             train_start = i * days_per_step
             train_end = train_start + self.training_window_size
             val_start = train_end
             val_end = val_start + self.validation_window_size
 
-            # Ensure we don't go out of bounds
+            # 确保我们没有越界
             if val_end > total_data_days:
                 break
 
@@ -119,58 +156,58 @@ class WalkForwardTrainer(BaseTrainer):
             self.logger.info(f"Training window: Days {train_start} to {train_end-1}")
             self.logger.info(f"Validation window: Days {val_start} to {val_end-1}")
 
-            # Extract data windows
+            # 提取数据窗口
             train_data = full_dataset[train_start:train_end]
             validation_data = full_dataset[val_start:val_end]
 
-            # 1. Train the model
+            # 1. 训练模型
             trained_model_artifacts = self.train(train_data)
             
-            # 2. Evaluate the model
+            # 2. 评估模型
             fold_metrics = self.evaluate(trained_model_artifacts, validation_data)
             all_fold_metrics.append(fold_metrics)
             
-            # Log metrics for this fold to MLflow
+            # 将此折的指标记录到 MLflow
             mlflow.log_metrics(fold_metrics, step=i)
 
-        # Aggregate metrics across all folds
+        # 聚合所有折的指标
         final_metrics = self._aggregate_metrics(all_fold_metrics)
         self.logger.info(f"--- Walk-forward validation complete ---")
         self.logger.info(f"Aggregated Metrics: {final_metrics}")
         
-        # Log final aggregated metrics to MLflow
+        # 将最终的聚合指标记录到 MLflow
         mlflow.log_metrics({f"agg_{k}": v for k, v in final_metrics.items()})
         
         return final_metrics
 
     def _calculate_performance_metrics(self, returns: list) -> Dict[str, float]:
-        """Calculates key performance metrics from a list of returns."""
+        """从回报列表中计算关键性能指标。"""
         if not returns:
             return {"sharpe_ratio": 0, "max_drawdown": 0, "total_return": 0}
             
         returns_array = np.array(returns)
         total_return = np.sum(returns_array)
         
-        # Sharpe Ratio (simplified, assuming daily returns and 252 trading days)
+        # 夏普比率 (简化, 假设每日回报和252个交易日)
         mean_return = np.mean(returns_array)
         std_dev = np.std(returns_array)
         sharpe_ratio = (mean_return / std_dev) * np.sqrt(252) if std_dev > 0 else 0
         
-        # Max Drawdown
+        # 最大回撤
         cumulative_returns = np.cumsum(returns_array)
         peak = np.maximum.accumulate(cumulative_returns)
         drawdown = (cumulative_returns - peak)
         max_drawdown = np.min(drawdown) if len(drawdown) > 0 else 0
         
         return {
-            "sharpe_ratio_dsr": sharpe_ratio, # DSR = Daily Sharpe Ratio
+            "sharpe_ratio_dsr": sharpe_ratio, # DSR = 每日夏普比率
             "max_drawdown": max_drawdown,
             "total_return": total_return,
             "volatility": std_dev
         }
 
     def _aggregate_metrics(self, all_metrics: List[Dict[str, float]]) -> Dict[str, float]:
-        """Aggregates metrics from all folds (e.g., by averaging)."""
+        """聚合所有折的指标 (例如, 通过平均)。"""
         if not all_metrics:
             return {}
             
@@ -179,14 +216,14 @@ class WalkForwardTrainer(BaseTrainer):
 
     def _perform_bootstrap_test(self, validation_returns: list) -> Dict[str, float]:
         """
-        Performs a stationary bootstrap test on validation returns to create
-        confidence intervals for the Sharpe ratio.
+        在验证回报上执行平稳 bootstrap 测试，以创建
+        夏普比率的置信区间。
         """
-        # This is a placeholder for a complex statistical test
-        # e.g., using a library like `arch` or custom implementation
+        # 这是一个复杂统计测试的占位符
+        # 例如, 使用像 `arch` 这样的库或自定义实现
         self.logger.info("Performing stationary bootstrap test on returns...")
         
-        # Simulated results
+        # 模拟结果
         lower_bound = 0.85
         upper_bound = 1.25
         
@@ -194,22 +231,26 @@ class WalkForwardTrainer(BaseTrainer):
 
     def estimate_api_cost(self, start_date: date, end_date: date) -> Dict[str, Any]:
         """
-        [Sub-Task 1.2.3] Estimates the cost of AI analysis for a given date range.
+        [Sub-Task 1.2.3] 估算给定日期范围内的 AI 分析成本。
+        (由 Task 3.4 的缓存逻辑支持)
         """
         self.logger.info(f"Estimating API cost for retraining from {start_date} to {end_date}...")
         
-        # 1. Calculate the number of business days in the range
+        # 1. 计算范围内的营业日数
         total_days = (end_date - start_date).days
         business_days = np.busday_count(start_date.isoformat(), end_date.isoformat())
 
-        # 2. TODO: Query the "AI Feature Cache" to find how many of these business days already have data.
-        # For now, we'll simulate this with a hard-coded cache hit rate.
-        simulated_cache_hit_rate = 0.25 
+        # 2. TODO: 查询 "AI 特征缓存" (Task 3.4) 找出这些营业日中有多少已经有数据。
+        # (假设 data_manager.load_features_from_parquet 将被调用)
+        #
+        # 这是一个占位符逻辑。一个真实的实现会调用 data_manager。
+        #
+        simulated_cache_hit_rate = 0.90 # 假设由于 Task 3.4，缓存命中率很高
         cached_days = int(business_days * simulated_cache_hit_rate)
         missing_days = business_days - cached_days
 
-        # 3. Multiply missing days by an estimated daily cost.
-        daily_cost = self.config.get('daily_average_analysis_cost', 0.50) # Default to $0.50/day
+        # 3. 将缺失天数乘以估算的每日成本。
+        daily_cost = self.config.get('daily_average_analysis_cost', 0.50) # 默认 $0.50/天
         estimated_cost = missing_days * daily_cost
 
         self.logger.info(f"Cost estimation complete: {missing_days}/{business_days} business days require analysis. Estimated cost: ${estimated_cost:.2f}")
