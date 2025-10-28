@@ -5,7 +5,6 @@ from .reasoning_ensemble import ReasoningEnsemble
 from .base_trainer import BaseTrainer
 from datetime import date, timedelta
 import mlflow
-import os
 from typing import Dict, Any, List
 
 class WalkForwardTrainer(BaseTrainer):
