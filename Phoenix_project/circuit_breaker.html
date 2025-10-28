@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Circuit Breaker Control</title>
+    <style>
+        body { font-family: sans-serif; margin: 2em; background-color: #f4f4f4; }
+        h1 { color: #333; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; background-color: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        th, td { border: 1px solid #ddd; padding: 12px 15px; text-align: left; }
+        th { background-color: #e9e9e9; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        .status-active { color: green; font-weight: bold; }
+        .status-tripped { color: red; font-weight: bold; }
+        .status-cooldown { color: orange; font-weight: bold; }
+        button { padding: 8px 12px; cursor: pointer; border: none; border-radius: 4px; font-weight: bold; }
+        .btn-trip { background-color: #f44336; color: white; }
+        .btn-restore { background-color: #4CAF50; color: white; }
+        #loading { display: none; font-size: 1.2em; }
+    </style>
+</head>
+<body>
+
+    <h1>API Circuit Breaker Status</h1>
+    <p id="loading">Loading data...</p>
+    <table id="statusMatrix">
+        <thead>
+            <tr>
+                <th>API Key (Partial)</th>
+                <th>Status</th>
+                <th>Latency (ms)</th>
+                <th>Error Rate (%)</th>
+                <th>Daily Cost ($)</th>
+                <th>Req. Count</th>
+                <th>Error Count</th>
+                <th>Controls</th>
+            </tr>
+        </thead>
+        <tbody id="matrixBody">
+            <!-- Data will be populated here by JavaScript -->
+        </tbody>
+    </table>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const matrixBody = document.getElementById('matrixBody');
+            const loadingIndicator = document.getElementById('loading');
+
+            async function fetchData() {
+                loadingIndicator.style.display = 'block';
+                try {
+                    const response = await fetch('/api/circuit-breaker/status');
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    const data = await response.json();
+                    populateTable(data);
+                } catch (error) {
+                    console.error('Failed to fetch data:', error);
+                    matrixBody.innerHTML = `<tr><td colspan="8" style="color: red; text-align: center;">Failed to load data.</td></tr>`;
+                } finally {
+                    loadingIndicator.style.display = 'none';
+                }
+            }
+
+            function populateTable(data) {
+                // Clear existing rows
+                matrixBody.innerHTML = '';
+
+                if (Object.keys(data).length === 0) {
+                    matrixBody.innerHTML = `<tr><td colspan="8" style="text-align: center;">No API keys found or configured.</td></tr>`;
+                    return;
+                }
+
+                // Populate new rows
+                for (const key in data) {
+                    const state = data[key];
+                    const metrics = state.metrics;
+                    const row = document.createElement('tr');
+
+                    let statusText = '';
+                    let statusClass = '';
+                    if (state.tripped) {
+                        statusText = 'TRIPPED (Manual)';
+                        statusClass = 'status-tripped';
+                    } else if (!state.active && state.cooldown_until > 0) {
+                        statusText = `COOLDOWN (until ${new Date(state.cooldown_until * 1000).toLocaleTimeString()})`;
+                        statusClass = 'status-cooldown';
+                    } else {
+                        statusText = 'ACTIVE';
+                        statusClass = 'status-active';
+                    }
+
+                    // Note: Displaying partial key for security
+                    const partialKey = `${key.substring(0, 4)}...${key.substring(key.length - 4)}`;
+
+                    row.innerHTML = `
+                        <td>${partialKey}</td>
+                        <td class="${statusClass}">${statusText}</td>
+                        <td>${metrics.latency_ms.toFixed(2)}</td>
+                        <td>${metrics.error_rate.toFixed(2)}</td>
+                        <td>${metrics.daily_cost.toFixed(2)}</td>
+                        <td>${metrics.request_count}</td>
+                        <td>${metrics.error_count}</td>
+                        <td>
+                            <button class="btn-trip" data-key="${key}">Trip</button>
+                            <button class="btn-restore" data-key="${key}">Restore</button>
+                        </td>
+                    `;
+                    matrixBody.appendChild(row);
+                }
+            }
+
+            async function sendControlRequest(url, key) {
+                try {
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ key: key }),
+                    });
+                    
+                    const result = await response.json();
+
+                    if (response.ok) {
+                        alert(result.message); // Show success message
+                        fetchData(); // Refresh data immediately to reflect change
+                    } else {
+                        throw new Error(result.message || result.error || 'Unknown error');
+                    }
+                } catch (error) {
+                    console.error(`Failed to send control request to ${url} for key ${key}:`, error);
+                    alert(`Error: ${error.message}`);
+                }
+            }
+
+            // Event delegation for control buttons
+            matrixBody.addEventListener('click', function(event) {
+                const target = event.target;
+                const key = target.dataset.key;
+
+                if (target.classList.contains('btn-trip')) {
+                    if (confirm(`Are you sure you want to manually TRIP key: ${key}?`)) {
+                        sendControlRequest('/api/circuit-breaker/trip', key);
+                    }
+                } else if (target.classList.contains('btn-restore')) {
+                    if (confirm(`Are you sure you want to manually RESTORE key: ${key}?`)) {
+                        sendControlRequest('/api/circuit-breaker/restore', key);
+                    }
+                }
+            });
+
+            // Initial fetch
+            fetchData();
+            // Refresh data every 5 seconds
+            setInterval(fetchData, 5000);
+        });
+    </script>
+
+</body>
+</html>
