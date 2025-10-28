@@ -1,7 +1,7 @@
 import logging
 import pandas as pd
+import numpy as np
 from typing import Dict, Any, List
-from datetime import date
 from features.base import IFeature
 
 class FeatureStore:
