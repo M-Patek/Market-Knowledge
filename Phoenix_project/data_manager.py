@@ -2,8 +2,6 @@
 import logging
 import os
 import pandas as pd
-import boto3
-from botocore.exceptions import ClientError
 from abc import ABC, abstractmethod
 from datetime import date
 from typing import Dict, Any, List, Optional
