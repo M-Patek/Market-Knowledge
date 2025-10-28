@@ -5,9 +5,7 @@
 import logging
 import asyncio
 import numpy as np
-import os
 from typing import List, Dict, Any, Tuple
-import google.generativeai as genai
 
 from api.gemini_pool_manager import GeminiPoolManager # 导入我们的池
 from .embedding_client import EmbeddingClient
