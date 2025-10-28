@@ -1,81 +1,96 @@
-# features/store.py
-from typing import Dict, Any
-from datetime import date
+import logging
 import pandas as pd
-from .base import IFeatureStore
+from typing import Dict, Any, List
+from datetime import date
+from features.base import IFeature
 
-class _BaseFeatureCalculator:
+class FeatureStore:
     """
-    Houses the core feature calculation logic to be shared across
-    online and offline stores, ensuring no skew.
+    管理所有特征的定义、计算和检索。
     """
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
+    def __init__(self, feature_list: List[IFeature]):
+        """
+        初始化 FeatureStore。
 
-    def _calculate_features(self, pit_data: pd.DataFrame) -> Dict[str, Any]:
-        if pit_data.empty or len(pit_data) < self.config.get('sma_period', 50):
-            return {'sma': None, 'rsi': None, 'volatility': None}
+        Args:
+            feature_list: 一个实现了 IFeature 接口的特征对象列表。
+        """
+        self.logger = logging.getLogger("PhoenixProject.FeatureStore")
+        self.features = {f.name: f for f in feature_list}
+        self.logger.info(f"FeatureStore initialized with {len(self.features)} features: {list(self.features.keys())}")
 
-        close_series = pit_data['close']
+    def add_feature(self, feature: IFeature):
+        """动态添加一个新特征。"""
+        if feature.name in self.features:
+            self.logger.warning(f"Feature '{feature.name}' already exists. Overwriting.")
+        self.features[feature.name] = feature
 
-        sma = close_series.rolling(window=self.config.get('sma_period', 50)).mean().iloc[-1]
-
-        delta = close_series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=self.config.get('rsi_period', 14)).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=self.config.get('rsi_period', 14)).mean()
+    def get_feature_dependencies(self, feature_name: str) -> List[str]:
+        """
+        递归地获取一个特征所需的所有依赖项。
+        """
+        if feature_name not in self.features:
+            raise ValueError(f"Feature '{feature_name}' not found in store.")
         
-        # Avoid division by zero for RSI
-        if loss.iloc[-1] == 0:
-            rsi = 100.0
-        else:
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs)).iloc[-1]
+        deps_set = set()
+        
+        def _find_deps(f_name):
+            if f_name in deps_set:
+                return
+            
+            feat = self.features.get(f_name)
+            if not feat:
+                # 这是一个原始数据源，不是一个计算特征
+                deps_set.add(f_name)
+                return
 
-        volatility_period = self.config.get('position_sizer', {}).get('parameters', {}).get('volatility_period', 20)
-        volatility = close_series.rolling(window=volatility_period).std().iloc[-1]
+            # 添加特征本身及其依赖项
+            deps_set.add(f_name)
+            for dep in feat.dependencies:
+                _find_deps(dep)
 
-        return {
-            'sma': sma,
-            'rsi': rsi,
-            'volatility': volatility
-        }
+        _find_deps(feature_name)
+        return list(deps_set)
 
-class OfflineFeatureStore(_BaseFeatureCalculator, IFeatureStore):
-    """
-    Feature store for offline use (e.g., backtesting, training).
-    It operates on a historical DataFrame passed in memory.
-    """
-    def get_features(self, ticker: str, as_of_date: date, full_history: pd.DataFrame) -> Dict[str, Any]:
-        # Ensure point-in-time correctness by filtering the DataFrame
-        # We use '<' to ensure the data from 'as_of_date' itself is not included.
-        pit_data = full_history[full_history.index < pd.Timestamp(as_of_date)]
-        return self._calculate_features(pit_data)
-
-class OnlineFeatureStore(_BaseFeatureCalculator, IFeatureStore):
-    """
-    Feature store for online use (e.g., real-time prediction).
-    Connects to low-latency sources like Redis or Kafka.
-    """
-    def __init__(self, config: Dict[str, Any], redis_client=None):
+    def generate_features_for_ticker(self, ticker: str, data: pd.DataFrame) -> Dict[str, Any]:
         """
-        In a real implementation, this would establish connections to
-        real-time data stores.
+        为单个代码计算所有已注册的特征。
         """
-        super().__init__(config)
-        self.redis_client = redis_client # Placeholder for a real client
+        if data.empty:
+            self.logger.warning(f"No data provided for {ticker}. Cannot generate features.")
+            return {}
 
-    def get_features(self, ticker: str, as_of_date: date, full_history: pd.DataFrame = None) -> Dict[str, Any]:
+        # 这是一个占位符。一个真实的实现会：
+        # 1. 构建一个依赖图（DAG）
+        # 2. 按拓扑顺序执行特征计算
+        # 3. 从 `data` DataFrame 中提取所需的列
+        
+        features = {}
+        for name, feature in self.features.items():
+            try:
+                # 简化：假设每个特征都可以从原始 DataFrame 计算
+                features[name] = feature.compute(data)
+            except Exception as e:
+                self.logger.error(f"Failed to compute feature '{name}' for {ticker}: {e}")
+                features[name] = None
+        
+        # 返回最近的特征值
+        # 这是一个简化的假设；真实的实现会返回一个时间序列或特定日期的值
+        final_features = {name: val[-1] if isinstance(val, (pd.Series, list, np.ndarray)) else val for name, val in features.items() if val is not None}
+        
+        self.logger.debug(f"Generated {len(final_features)} features for {ticker}.")
+        return final_features
+
+    def generate_features_from_alt_data(self, alt_data_df: pd.DataFrame):
         """
-        For online serving, 'full_history' is ignored. Instead, it would
-        fetch the last N data points from a real-time store (e.g., Redis)
-        to calculate features with low latency.
+        [Task 2.1] 将原始替代数据转换为预测性特征
+        并存储它们。
         """
-        # TODO: Implement actual real-time data fetching logic.
-        # 1. Connect to Redis/Kafka.
-        # 2. Fetch the last ~252 trading days of data for the ticker.
-        # 3. Construct a pandas DataFrame `pit_data`.
-        # 4. Return self._calculate_features(pit_data)
-        raise NotImplementedError(
-            "OnlineFeatureStore.get_features is not yet implemented. "
-            "It must be connected to a real-time data source."
-        )
+        if alt_data_df.empty:
+            self.logger.info("Received empty alternative data DataFrame. No features generated.")
+            return
+        
+        self.logger.info(f"Received {len(alt_data_df)} rows of alternative data. (Placeholder for transformation logic).")
+        # 占位符: 一个真实的实现会运行转换
+        # (例如, self._transform_supply_chain_data(alt_data_df))
+        # 并保存特征。
