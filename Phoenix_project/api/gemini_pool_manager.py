@@ -4,6 +4,11 @@ import os
 import logging
 from collections import deque
 
+# --- Imports for Task 5.2 ---
+import asyncio
+import google.generativeai as genai
+from typing import Dict, Any
+
 class GeminiPoolManager:
     """
     Manages a pool of Gemini API keys, handling rate limits, cooldowns,
@@ -251,3 +256,37 @@ if __name__ == "__main__":
         
     finally:
         pool.stop()
+
+# --- Task 5.2: Tiered Model Strategy & Query Function ---
+
+# Configure LLM tiers for different agents
+# L3 Causal Inference uses the strongest model
+# Fact-checking uses a strong model
+# All other L1 agents use a fast, economical model
+MODEL_TIER_CONFIG: Dict[str, str] = {
+    "metacognitive_agent": "gemini-1.5-pro-latest",
+    "fact_checker_adversary": "gemini-1.5-pro-latest",
+    # "innovation_tracker": "gemini-1.5-flash-latest", # Example
+    # "supply_chain_intel": "gemini-1.5-flash-latest", # Example
+}
+DEFAULT_MODEL = "gemini-1.5-flash-latest"
+
+async def query_model(prompt: str, agent_name: str) -> str:
+    """
+    Task 0.3: The actual function to query the Gemini API.
+    Task 5.2: Implements the Tiered Model Strategy.
+    """
+    logger = logging.getLogger("PhoenixProject.QueryModel")
+    
+    # Task 5.2 Logic: Select model based on agent name
+    model_name = MODEL_TIER_CONFIG.get(agent_name, DEFAULT_MODEL)
+    logger.info(f"Querying for agent '{agent_name}'. Using model: {model_name}")
+
+    try:
+        # Assumes genai.configure(api_key=...) has been called elsewhere
+        model = genai.GenerativeModel(model_name=model_name)
+        response = await model.generate_content_async(prompt)
+        return response.text
+    except Exception as e:
+        logger.error(f"Error during Gemini API call for {agent_name} (model {model_name}): {e}")
+        return f'{{"error": "Failed to generate response: {e}"}}'
