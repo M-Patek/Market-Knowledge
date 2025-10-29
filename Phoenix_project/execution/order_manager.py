@@ -67,31 +67,31 @@ class OrderManager:
         advantage_bps = price_diff_bps if side == 'BUY' else -price_diff_bps
         return 1 / (1 + math.exp(-self.fill_prob_aggressiveness * (advantage_bps / 100))) # Normalize by 100
 
-    def rebalance(self, strategy: bt.Strategy, target_portfolio: List[Dict[str, Any]]) -> None:
-        self.logger.info("--- [Order Manager]: Rebalance protocol initiated ---")
-        
+    def calculate_target_orders(self,
+                                target_portfolio: List[Dict[str, Any]],
+                                total_value: float,
+                                current_positions: Dict[str, Dict[str, float]], # {ticker: {'size': s, 'value': v}}
+                                market_data: Dict[str, Dict[str, float]] # {ticker: {'price': p, 'volume': v}}
+                                ) -> List[Order]:
+        """
+        Calculates the list of orders required to adjust positions *in* the target portfolio.
+        This method is framework-agnostic. It does NOT handle liquidation of assets
+        not present in the target_portfolio; that is left to the caller.
+        """
+        orders_to_place: List[Order] = []
         # Create a dictionary for easy lookup
         target_map = {item['ticker']: item['capital_allocation_pct'] for item in target_portfolio}
-        
-        # Get total portfolio value to calculate target values
-        total_value = strategy.broker.getvalue()
 
-        # Step 1: Liquidate or reduce positions no longer in the target portfolio
-        for data in strategy.datas:
-            ticker = data._name
-            current_position = strategy.getposition(data)
-            if current_position.size != 0 and ticker not in target_map:
-                self.logger.info(f"'{ticker}' no longer a target. Closing position of {current_position.size} shares.")
-                strategy.close(data)
-
-        # Step 2: Adjust positions for assets in the target portfolio
+        # Adjust positions for assets in the target portfolio
         for ticker, target_pct in target_map.items():
-            data = strategy.getdatabyname(ticker)
-            current_price = data.close[0]
-            current_volume = data.volume[0]
+            if ticker not in market_data:
+                self.logger.warning(f"No market data for target '{ticker}'. Skipping order calculation.")
+                continue
             
-            current_position = strategy.getposition(data)
-            current_value = current_position.size * current_price
+            current_price = market_data[ticker]['price']
+            current_volume = market_data[ticker]['volume']
+            current_value = current_positions.get(ticker, {}).get('value', 0.0)
+            
             target_value = total_value * target_pct
             
             ideal_size = self._calculate_ideal_size(current_value, target_value, current_price)
@@ -104,17 +104,57 @@ class OrderManager:
             limit_price = self._estimate_limit_price(side, final_size, current_volume, current_price)
             fill_prob = self._calculate_fill_probability(side, limit_price, current_price)
             
-            # For now, we always submit a Limit order and let the adapter simulate the fill.
-            order_to_place = Order(
+            orders_to_place.append(Order(
                 ticker=ticker,
                 side=side,
                 size=abs(final_size),
                 order_type='Limit',
                 limit_price=limit_price,
                 fill_probability=fill_prob
-            )
-            self.logger.info(f"Submitting {side} order for '{ticker}': Size={abs(final_size):.2f}, Est. Limit Price={limit_price:.2f}, Est. Fill Prob={fill_prob:.2%}")
-            self.broker_adapter.place_order(strategy, order_to_place)
+            ))
+        
+        return orders_to_place
+
+    def rebalance(self, strategy: bt.Strategy, target_portfolio: List[Dict[str, Any]]) -> None:
+        self.logger.info("--- [Order Manager]: Backtrader Rebalance protocol initiated ---")
+
+        target_map = {item['ticker']: item['capital_allocation_pct'] for item in target_portfolio}
+        total_value = strategy.broker.getvalue()
+
+        # Step 1: (Unchanged) Liquidate or reduce positions no longer in the target portfolio
+        for data in strategy.datas:
+            ticker = data._name
+            current_position = strategy.getposition(data)
+            if current_position.size != 0 and ticker not in target_map:
+                self.logger.info(f"'{ticker}' no longer a target. Closing position of {current_position.size} shares.")
+                strategy.close(data)
+
+        # Step 2: (Refactored) Adjust positions for assets in the target portfolio
+        # Gather data for the pure calculation function
+        current_positions = {}
+        market_data = {}
+        for data in strategy.datas:
+            ticker = data._name
+            if ticker not in strategy.getdatanames():
+                continue
+            pos = strategy.getposition(data)
+            # Use data.close[0] for current price, as pos.price is the avg entry price
+            current_price = data.close[0]
+            current_positions[ticker] = {'size': pos.size, 'value': pos.size * current_price}
+            market_data[ticker] = {'price': current_price, 'volume': data.volume[0]}
+
+        # Call the framework-agnostic calculation method
+        orders_to_place = self.calculate_target_orders(
+            target_portfolio=target_portfolio,
+            total_value=total_value,
+            current_positions=current_positions,
+            market_data=market_data
+        )
+
+        # Submit orders via the broker adapter
+        for order in orders_to_place:
+            self.logger.info(f"Submitting {order.side} order for '{order.ticker}': Size={order.size:.2f}, Est. Limit Price={order.limit_price:.2f}, Est. Fill Prob={order.fill_probability:.2%}")
+            self.broker_adapter.place_order(strategy, order)
 
     def handle_order_notification(self, order):
         if order.status in [order.Submitted, order.Accepted]:
