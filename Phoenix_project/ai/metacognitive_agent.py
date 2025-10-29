@@ -1,83 +1,101 @@
-# ai/metacognitive_agent.py
+import asyncio
 import logging
-from typing import Dict, Any, List, Optional
-import json
+from typing import List, Dict, Any
 import yaml
+import json
 
-from api.gemini_pool_manager import GeminiPoolManager
-from audit_manager import AuditManager # 如 Task 2.3 所述
+# Internal dependencies
+from audit_manager import AuditManager
+from api.gemini_pool_manager import query_model # Task 0.3
+
+logger = logging.getLogger("PhoenixProject.MetaCognitiveAgent")
 
 
 class MetaCognitiveAgent:
     """
-    实现 L3 元认知代理 (Task 2.2)。
-    分析最近的决策日志，以发现并输出基于因果模式的新的、透明的
-    启发式规则。
+    The L3 agent responsible for Causal Inference and Heuristic Rule Generation.
+    (Task 2.2 in original doc, Task 4.2 in new spec)
     """
-
-    def __init__(self, pool_manager: GeminiPoolManager, audit_manager: AuditManager):
-        self.logger = logging.getLogger("PhoenixProject.MetaCognitiveAgent")
-        self.pool_manager = pool_manager
+    def __init__(self, audit_manager: AuditManager):
         self.audit_manager = audit_manager
-        self.model_name = "gemini-1.5-pro-latest" # 用于分析的高能力模型
-        self.logger.info("MetaCognitiveAgent initialized.")
+        logger.info("L3 MetaCognitiveAgent initialized.")
 
-    async def run_analysis(self, days_to_analyze: int = 30) -> Optional[Dict[str, Any]]:
+    async def run_analysis(self, lookback_days: int) -> List[Dict[str, Any]]:
         """
-        执行一次高频（例如 3-7 天）分析运行。
-        专注于最近 'days_to_analyze' 周期的日志。
+        Core logic of the L3 agent (Task 4.2).
         """
-        self.logger.info(f"Starting meta-cognitive analysis for the last {days_to_analyze} days.")
-
-        # 1. 获取带有 P&L 基本事实的最近决策日志
-        logs = await self.audit_manager.fetch_logs_with_pnl(days=days_to_analyze)
+        logger.info(f"L3 MetaCognitiveAgent: Starting analysis for last {lookback_days} days.")
+        
+        # 1. Fetch logs with P&L
+        logs = self.audit_manager.fetch_logs_with_pnl(lookback_days)
+        
         if not logs:
-            self.logger.warning("No logs found for the specified period. Ending analysis run.")
-            return None
+            logger.info("L3 MetaCognitiveAgent: No logs with P&L found. Skipping analysis.")
+            return []
+        
+        # 2. Build Causal Inference Prompt
+        prompt = self._build_causal_inference_prompt(logs)
+        
+        # 3. Call LLM
+        raw_yaml_output = await query_model(prompt, agent_name="metacognitive_agent")
+        logger.debug(f"L3 MetaCognitiveAgent raw output: {raw_yaml_output}")
+        
+        # 4. Parse output and return rules
+        rules = self._parse_yaml_rules(raw_yaml_output)
+        
+        logger.info(f"L3 MetaCognitiveAgent: Analysis complete. Generated {len(rules)} new rules.")
+        return rules
 
-        # 2. 使用 LLM 发现因果模式
-        discovered_rules_text = await self._discover_causal_patterns_with_llm(logs)
+    def _build_causal_inference_prompt(self, logs: List[Dict[str, Any]]) -> str:
+        logger.info(f"Building causal inference prompt for {len(logs)} log entries...")
+        
+        # Convert logs to a more compact JSON string for the prompt
+        log_summary = json.dumps(logs, default=str)
 
-        if not discovered_rules_text:
-            self.logger.warning("LLM analysis did not return any rules.")
-            return None
-
-        # 3. 将输出格式化为透明的 L3 规则 (JSON/YAML)
-        try:
-            parsed_rules = yaml.safe_load(discovered_rules_text)
-            self.logger.info(f"Successfully discovered {len(parsed_rules)} new heuristic rules.")
-            return {"status": "analysis_complete", "rules": parsed_rules}
-        except yaml.YAMLError as e:
-            self.logger.error(f"Failed to parse YAML output from LLM: {e}")
-            self.logger.debug(f"Raw LLM output:\n{discovered_rules_text}")
-            return None
-
-    async def _discover_causal_patterns_with_llm(self, logs: List[Dict[str, Any]]) -> Optional[str]:
-        """
-        使用强大的 LLM 分析日志并提取因果的、人类可读的规则。
-        返回 YAML 规则的原始文本块。
-        """
-        # 目前，我们将日志序列化为 JSON 发送给模型。
-        logs_json_string = json.dumps(logs, indent=2, default=str) # 添加 default=str 以处理 datetime
-
+        # Task 4.2: Specialized Causal Inference Prompt
         prompt = f"""
-你是一位专攻因果推断的专家级金融分析师。
-请分析以下 JSON 数据，其中包含决策日志及相应的盈亏（P&L）结果。
-请识别决策参数与财务结果之间强烈的、非显而易见的因果模式。
+You are a Meta-Cognitive Causal Inference Agent. Your task is to analyze a list of historical trading decisions to find recurrent logical patterns that lead to significant profit or loss.
 
-决策日志:
-{logs_json_string}
+**Input Data:**
+A JSON list of decision logs. Each log contains:
+- 'decision_id': A unique identifier.
+- 'l1_evidence_items': A list of evidence objects, EACH with a 'reasoning_chain', 'source', and 'score'.
+- 'l2_fusion_result': The final L2 probability.
+- 'pnl_result': The final profit or loss (the ground truth).
 
-根据你的分析，以有效的 YAML 格式提出 1-3 条新的启发式规则。
-每条规则必须是透明的、人类可读的，并包含一个 0.0 到 1.0 之间的 'confidence_score'。
-你的回答必须 *仅仅* 是 YAML 代码块，以 '---' 或列表开头。
+**Your Mission:**
+1.  Focus on the 'l1_evidence_items' and their 'reasoning_chain' fields.
+2.  Correlate the reasoning, sources, and scores with the final 'pnl_result'.
+3.  Identify 1-3 high-conviction, recurrent patterns of error or success.
+
+**Mandatory Output Format (YAML):**
+You MUST summarize your findings as 1-3 Heuristic Rules in the following YAML format. Do not output ANY text, explanation, or preamble outside of the YAML block.
+
+rules:
+  - name: "Identified Pattern Name (e.g., Macro-Technical Divergence)"
+    description: "A human-readable explanation of the pattern you found. e.g., 'When the 'macro_strategist' is bearish but 'technical_analyst' is bullish, the 'pnl_result' is consistently negative.'"
+    action:
+      type: "adjust_credibility"
+      target_agent: "technical_analyst"
+      adjustment_reason: "punitive_adjustment_on_bearish_macro"
+
+**Logs to Analyze:**
+{log_summary}
+
+Please begin your YAML output now:
 """
-        contents = [{"parts": [{"text": prompt}]}]
+        return prompt
+
+    def _parse_yaml_rules(self, raw_yaml: str) -> List[Dict[str, Any]]:
         try:
-            response = await self.pool_manager.generate_content(
-                model_name=self.model_name, contents=contents
-            )
-            return response.text
-        except Exception as e:
-            self.logger.error(f"LLM call for causal discovery failed: {e}")
-            return None
+            # Ensure we return the list of rules, even if nested under a 'rules' key
+            parsed_data = yaml.safe_load(raw_yaml)
+            if isinstance(parsed_data, dict) and 'rules' in parsed_data:
+                return parsed_data.get('rules', [])
+            elif isinstance(parsed_data, list):
+                return parsed_data
+            logger.warning(f"Could not parse rules from YAML output: {raw_yaml}")
+            return []
+        except yaml.YAMLError as e:
+            logger.error(f"Failed to parse YAML rules: {e}")
+            return []
