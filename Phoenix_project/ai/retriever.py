@@ -6,11 +6,23 @@ from datetime import datetime, date, timezone
 import google.generativeai as genai
 from pydantic import BaseModel, Field
 
-from .vector_db_client import VectorDBClient
-from .temporal_db_client import TemporalDBClient
-from .tabular_db_client import TabularDBClient
-from .relation_extractor import RelationExtractor, KnowledgeGraph
-from .embedding_client import EmbeddingClient
+try:
+    from .vector_db_client import VectorDBClient
+    from .temporal_db_client import TemporalDBClient
+    from .tabular_db_client import TabularDBClient
+    from .relation_extractor import RelationExtractor, KnowledgeGraph
+    from .embedding_client import EmbeddingClient
+except ImportError:
+    # Dummy classes for standalone import
+    class VectorDBClient: pass
+    class TemporalDBClient: pass
+    class TabularDBClient: pass
+    class RelationExtractor:
+        async def extract_graph(self, texts): return {"nodes": [], "edges": []}
+    class KnowledgeGraph(BaseModel): pass
+    class EmbeddingClient:
+        def create_query_embedding(self, doc): return [0.1] * 768
+
 from sentence_transformers import CrossEncoder
 
 # --- 用于结构化LLM输出的Pydantic模型 ---
@@ -37,10 +49,17 @@ class HybridRetriever:
         self.vector_client = vector_db_client
         self.temporal_client = temporal_db_client
         self.tabular_client = tabular_db_client
+        # --- Task 5.2: Caching Layer ---
+        self.cache: Dict[str, Any] = {}
+        self.cache_lock = asyncio.Lock()
         self.embedding_client = EmbeddingClient()
         self.retriever_config = rerank_config
         self.rrf_k = self.retriever_config.get('rrf_k', 60)
-        self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        try:
+            self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        except Exception as e:
+            self.logger.warning(f"Could not load CrossEncoder model. Reranking will be skipped. Error: {e}")
+            self.cross_encoder = None
         
         # [NEW] Initialize a separate, simple generative model for HyDE
         try:
@@ -79,15 +98,21 @@ class HybridRetriever:
                 self.logger.error(f"HyDE generation failed: {e}. Falling back to standard query embedding.")
 
         # 3. Query using the HyDE vector, or fall back to the original query's vector
-        return self.vector_client.query(query, top_k=top_k, query_vector=hyde_vector)
+        if self.vector_client:
+            return self.vector_client.query(query, top_k=top_k, query_vector=hyde_vector)
+        return []
 
     async def _recall_from_temporal(self, ticker: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
         """从时序数据库召回。"""
-        return self.temporal_client.query_by_date(ticker, start_date, end_date)
+        if self.temporal_client:
+            return self.temporal_client.query_by_date(ticker, start_date, end_date)
+        return []
 
     async def _recall_from_tabular(self, ticker: str) -> List[Dict[str, Any]]:
         """从表格数据库召回。"""
-        return self.tabular_client.query_by_ticker(ticker)
+        if self.tabular_client:
+            return self.tabular_client.query_by_ticker(ticker)
+        return []
 
     async def _deconstruct_query(self, query: str) -> DeconstructedQuery:
         """
@@ -130,6 +155,10 @@ class HybridRetriever:
             tasks.append(self._recall_from_temporal(query_ticker, start_date, end_date))
         if self.tabular_client and query_ticker:
             tasks.append(self._recall_from_tabular(query_ticker))
+        
+        if not tasks:
+            self.logger.warning("No DB clients configured for recall. Returning empty list.")
+            return []
 
         results_from_all_indexes = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -138,6 +167,7 @@ class HybridRetriever:
         for result_set in results_from_all_indexes:
             if isinstance(result_set, list):
                 for rank, doc in enumerate(result_set):
+                    if not isinstance(doc, dict): continue # Safety check
                     source_id = doc.get('source_id')
                     if not source_id: continue
                     if source_id not in master_doc_lookup or 'vector_similarity_score' in doc:
@@ -163,7 +193,9 @@ class HybridRetriever:
 
     def rerank(self, query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """使用Cross-Encoder模型对候选列表进行深度语义重排。"""
-        if not candidates or not query:
+        if not candidates or not query or not self.cross_encoder:
+            if not self.cross_encoder:
+                self.logger.warning("CrossEncoder not loaded. Skipping reranking.")
             return candidates
 
         # 准备模型输入：[query, document_content]
@@ -187,17 +219,44 @@ class HybridRetriever:
         执行完整的检索和重排流程的主公共方法。
         """
         self.logger.info(f"--- [混合检索器]: 为查询 '{query}' 启动完整检索流程 ---")
-        recalled_candidates = await self.recall(query, ticker)
-        reranked_results = self.rerank(query, recalled_candidates)
-        final_top_k = reranked_results[:top_k]
         
-        # 从最终证据中提取关系图
-        evidence_texts = [doc.get('content', '') for doc in final_top_k if doc.get('content')]
-        knowledge_graph = await self.relation_extractor.extract_graph(evidence_texts)
+        # --- Task 5.2: Caching Logic ---
+        cache_key = f"{query}|{ticker}|{top_k}"
+        
+        # 1. Check cache (read is cheap, no lock needed)
+        if cache_key in self.cache:
+            self.logger.info(f"CACHE HIT for key: {cache_key}")
+            return self.cache[cache_key]
 
-        self.logger.info(f"检索流程完成。返回前 {len(final_top_k)} 个结果和知识图谱。")
-        
-        return {
-            "evidence_documents": final_top_k,
-            "knowledge_graph": knowledge_graph.dict()
-        }
+        # 2. If miss, acquire lock to prevent cache stampede
+        async with self.cache_lock:
+            # 3. Double-check cache (in case another coroutine just finished)
+            if cache_key in self.cache:
+                self.logger.info(f"CACHE HIT (after lock) for key: {cache_key}")
+                return self.cache[cache_key]
+
+            # 4. If still miss, do the work
+            self.logger.info(f"CACHE MISS for key: {cache_key}. Running retrieval.")
+            recalled_candidates = await self.recall(query, ticker)
+            reranked_results = self.rerank(query, recalled_candidates)
+            final_top_k = reranked_results[:top_k]
+            
+            # 从最终证据中提取关系图
+            evidence_texts = [doc.get('content', '') for doc in final_top_k if doc.get('content')]
+            knowledge_graph_data = await self.relation_extractor.extract_graph(evidence_texts)
+            # Ensure it's a dict, not a Pydantic model
+            if hasattr(knowledge_graph_data, 'dict'):
+                 knowledge_graph = knowledge_graph_data.dict()
+            else:
+                 knowledge_graph = knowledge_graph_data
+
+            self.logger.info(f"检索流程完成。返回前 {len(final_top_k)} 个结果和知识图谱。")
+            
+            result = {
+                "evidence_documents": final_top_k,
+                "knowledge_graph": knowledge_graph
+            }
+
+            # 5. Store in cache and return
+            self.cache[cache_key] = result
+            return result
