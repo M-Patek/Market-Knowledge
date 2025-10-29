@@ -18,36 +18,24 @@ import uuid
 
 
 class EvidenceItem(BaseModel):
-    type: Literal['news', 'sec_filing', 'analyst_rating', 'market_data', 'research', 'other']
+    hypothesis: str
     source: str
-    finding: str
-    score: float = Field(..., ge=0.0, le=1.0)
+    score: float = Field(..., ge=-1.0, le=1.0, description="Score in the range [-1.0, 1.0]")
     provenance_confidence: float = Field(..., ge=0.0, le=1.0)
-    timestamp: Optional[datetime] = None # When the event occurred
-    url: Optional[HttpUrl] = None
-
-    # --- [NEW] Fine-grained Provenance Metadata ---
-    source_id: Optional[str] = Field(None, description="The unique identifier of the source document or API record.")
-    fetch_time: Optional[datetime] = Field(None, description="The UTC timestamp when the evidence was retrieved.")
-    license: Optional[str] = Field(None, description="The license or usage terms of the source data.")
-    retrieval_rank: Optional[int] = Field(None, description="The rank of this item in the retrieval results.")
-    data_fingerprint: Optional[str] = Field(None, description="SHA256 hash of the source content for immutable traceability.")
+    reasoning_chain: str = Field(..., description="Full Chain of Thought text")
+    timestamp: datetime = Field(default_factory=datetime.utcnow, description="Timestamp of evidence generation")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary metadata dictionary")
 
     class Config:
         schema_extra = {
             'example': {
-                'type': 'sec_filing',
-                'source': 'SEC EDGAR',
-                'finding': 'Company reported 12% YoY subscription revenue growth in Q3',
-                'score': 1.0,
-                'provenance_confidence': 1.0,
+                'hypothesis': 'NVDA is likely to beat Q3 earnings expectations.',
+                'source': 'fundamental_analyst',
+                'score': 0.75,
+                'provenance_confidence': 0.8,
+                'reasoning_chain': '1. Analyzed supply chain data... 2. ...therefore, margins are up.',
                 'timestamp': '2025-10-01T12:00:00Z',
-                'source_id': 'doc-xyz-123',
-                'fetch_time': '2025-10-12T12:00:00Z',
-                'license': 'Public Domain',
-                'retrieval_rank': 1,
-                'url': 'https://example.com/sec/abc-q3',
-                'data_fingerprint': 'a1b2c3d4...'
+                'metadata': {'ticker': 'NVDA', 'analyst_id': 'analyst_42'}
             }
         }
 
