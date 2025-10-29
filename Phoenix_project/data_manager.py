@@ -2,6 +2,7 @@
 import logging
 import os
 import pandas as pd
+import numpy as np # Added for mock data
 from abc import ABC, abstractmethod
 from datetime import date
 from typing import Dict, Any, List, Optional
@@ -22,6 +23,24 @@ class BaseAltDataClient(ABC):
     def fetch_data(self, start_date: date, end_date: date) -> pd.DataFrame:
         """获取数据并将其作为时间点正确的 DataFrame 返回。"""
         pass
+
+
+# --- Task 3.2: Concrete Alt Data Client Implementations ---
+
+class MockPatentClient(BaseAltDataClient):
+    """
+    A mock implementation for an alternative data client (e.g., patent search API).
+    Fulfills the architectural requirement of Task 3.2.
+    """
+    def fetch_data(self, start_date: date, end_date: date) -> pd.DataFrame:
+        """Returns a static, mock DataFrame of patent data."""
+        logging.info(f"MockPatentClient: Fetching data from {start_date} to {end_date}")
+        data = {
+            "patent_id": [f"US-PAT-{i}" for i in range(10)],
+            "grant_date": pd.to_datetime(pd.date_range(start=start_date, periods=10, end=end_date)),
+            "ticker_mentioned": ["NVDA"] * 5 + ["AMD"] * 5,
+        }
+        return pd.DataFrame(data)
 
 
 class DataManager:
@@ -81,9 +100,13 @@ class DataManager:
         # 3. 将数据存入缓存 (self.market_data_cache 和 Parquet)
         
         # 模拟数据加载
+        date_range = pd.date_range(start=start_date, end=end_date, freq='B')
+        if date_range.empty:
+             self.logger.warning(f"No date range generated for {start_date} to {end_date}")
+             return None
         data = {
-            "date": pd.to_datetime(pd.date_range(start=start_date, end=end_date, freq='B')),
-            "price": np.random.rand(len(pd.date_range(start=start_date, end=end_date, freq='B'))) * 100 + 500
+            "date": pd.to_datetime(date_range),
+            "price": np.random.rand(len(date_range)) * 100 + 500
         }
         df = pd.DataFrame(data)
         
