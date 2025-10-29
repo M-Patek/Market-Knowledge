@@ -6,6 +6,14 @@ import boto3
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError
 from typing import Dict, Any, List
 
+# Dependency for Task 4.1
+try:
+    from ai.validation import EvidenceItem
+except ImportError:
+    # Handle potential circular dependency or path issue if validation is not available
+    class EvidenceItem: pass # Dummy class
+
+
 class AuditManager:
     """
     处理关键系统决策的日志记录，以实现审计、可追溯性
@@ -28,16 +36,31 @@ class AuditManager:
         # 目前，我们记录到一个专门的记录器。
         self.logger.info(f"SHADOW_LOG: {json.dumps(log_record)}")
 
-    def log_decision_audit_trail(self, decision_lineage: Dict[str, Any]):
+    def log_decision(self, 
+                       decision_id: str, 
+                       evidence_items: List[EvidenceItem], 
+                       fusion_result: Dict[str, Any], 
+                       trading_decision: Dict[str, Any]):
         """
-        [Sub-Task 3.2.1] 记录代表单个认知引擎决策
-        完整谱系的复杂 JSON 对象。
+        Task 4.1: Complete Decision Audit Log.
+        Records the full state of a decision for L3 causal inference.
         """
-        if not decision_lineage.get("decision_id"):
-            self.logger.error("Failed to log audit trail: 'decision_id' is missing.")
+        if not decision_id:
+            self.logger.error("Failed to log decision: 'decision_id' is missing.")
             return
+        
+        # Serialize Pydantic models to dicts for JSON logging
+        serializable_evidence = [item.model_dump(mode='json') if hasattr(item, 'model_dump') else item for item in evidence_items]
 
-        self.logger.info(f"AUDIT_TRAIL: {json.dumps(decision_lineage)}")
+        log_record = {
+            "decision_id": decision_id,
+            "l1_evidence_items": serializable_evidence, # Full list of L1 EvidenceItem objects
+            "l2_fusion_result": fusion_result,         # Full L2 fusion result
+            "final_trading_decision": trading_decision,
+            "pnl_result": None # Initially empty for post-fact backfilling
+        }
+
+        self.logger.info(f"AUDIT_TRAIL: {json.dumps(log_record, default=str)}") # Use default=str for datetimes
 
     def archive_logs_to_s3(self, source_dir: str, bucket_name: str):
         """
