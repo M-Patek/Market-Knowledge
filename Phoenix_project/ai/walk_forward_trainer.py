@@ -7,6 +7,12 @@ from datetime import date, timedelta
 import mlflow
 from typing import Dict, Any, List
 
+# --- DRL (Task 1.2) Imports ---
+from execution.order_manager import OrderManager
+from drl.trading_env import TradingEnv
+from data.data_iterator import NumpyDataIterator as DataIterator
+from stable_baselines3 import PPO
+
 class WalkForwardTrainer(BaseTrainer):
     """
     实现了一个步进式训练和验证方法。
@@ -30,12 +36,18 @@ class WalkForwardTrainer(BaseTrainer):
         self.training_window_size = config.get('training_window_size', 365)
         self.validation_window_size = config.get('validation_window_size', 90)
         self.retraining_frequency = config.get('retraining_frequency', 30) # 使用配置中的30天
+        self.training_mode = config.get('training_mode', 'ensemble') # 'ensemble' or 'drl'
         # 存储上次成功再训练的日期
         self.last_retraining_date = config.get('last_retraining_date', date.min)
         
         # 初始化 ReasoningEnsemble，这是我们正在训练的模型
         self.ensemble_config = config.get('ensemble_config', {})
-        self.model = ReasoningEnsemble(self.ensemble_config)
+        self.drl_config = config.get('drl_config', {})
+        
+        if self.training_mode == 'ensemble':
+            self.model = ReasoningEnsemble(self.ensemble_config)
+        else:
+            self.model = None # DRL agent will be instantiated per-fold
         
         self.logger.info(
             f"WalkForwardTrainer initialized: "
@@ -133,6 +145,10 @@ class WalkForwardTrainer(BaseTrainer):
         """
         self.logger.info(f"Starting full walk-forward validation on dataset with {len(full_dataset)} days.")
         
+        # Divert to DRL workflow if specified
+        if self.training_mode == 'drl':
+            return self.run_drl_walk_forward(full_dataset)
+
         # 计算步进式验证的步数
         total_data_days = len(full_dataset)
         days_per_step = self.retraining_frequency
@@ -179,10 +195,82 @@ class WalkForwardTrainer(BaseTrainer):
         
         return final_metrics
 
+    def run_drl_walk_forward(self, full_dataset: np.ndarray) -> Dict[str, Any]:
+        """
+        (Task 1.2) 在整个数据集上为DRL代理执行完整的步进式验证过程。
+        """
+        self.logger.info(f"Starting DRL walk-forward validation on dataset with {len(full_dataset)} days.")
+
+        total_data_days = len(full_dataset)
+        days_per_step = self.retraining_frequency
+        num_steps = (total_data_days - self.training_window_size) // days_per_step
+        all_fold_metrics = []
+
+        # --- DRL-specific setup from config ---
+        env_params = self.drl_config.get('env_params', {})
+        agent_params = self.drl_config.get('agent_params', {})
+        column_map = self.drl_config.get('column_map', {}) # Defines how to map numpy columns to names
+        train_timesteps = self.drl_config.get('train_timesteps', 10000)
+        # Instantiate a single OrderManager based on config
+        order_manager = OrderManager(**self.drl_config.get('order_manager_config', {}))
+
+        for i in range(num_steps):
+            train_start = i * days_per_step
+            train_end = train_start + self.training_window_size
+            val_start = train_end
+            val_end = val_start + self.validation_window_size
+
+            if val_end > total_data_days:
+                break
+
+            self.logger.info(f"--- DRL Fold {i+1}/{num_steps} ---")
+            self.logger.info(f"Training window: Days {train_start} to {train_end-1}")
+            self.logger.info(f"Validation window: Days {val_start} to {val_end-1}")
+
+            train_data = full_dataset[train_start:train_end]
+            validation_data = full_dataset[val_start:val_end]
+
+            # 1. Setup Train Env & Agent
+            train_iterator = DataIterator(train_data, column_map, ticker=env_params.get("trading_ticker"))
+            train_env = TradingEnv(data_iterator=train_iterator, order_manager=order_manager, **env_params)
+            agent = PPO("MlpPolicy", train_env, **agent_params)
+
+            # 2. Train Agent
+            self.logger.info(f"Training DRL agent for {train_timesteps} timesteps...")
+            agent.learn(total_timesteps=train_timesteps)
+
+            # 3. Setup Validation Env
+            val_iterator = DataIterator(validation_data, column_map, ticker=env_params.get("trading_ticker"))
+            val_env = TradingEnv(data_iterator=val_iterator, order_manager=order_manager, **env_params)
+
+            # 4. Evaluate Agent
+            fold_metrics = self._evaluate_drl_agent(agent, val_env)
+            all_fold_metrics.append(fold_metrics)
+            mlflow.log_metrics(fold_metrics, step=i)
+
+        final_metrics = self._aggregate_metrics(all_fold_metrics)
+        self.logger.info(f"--- DRL Walk-forward validation complete ---")
+        self.logger.info(f"Aggregated Metrics: {final_metrics}")
+        mlflow.log_metrics({f"agg_{k}": v for k, v in final_metrics.items()})
+        return final_metrics
+
+    def _evaluate_drl_agent(self, agent, env: TradingEnv) -> Dict[str, float]:
+        """Helper to run a trained DRL agent on a validation environment."""
+        obs, _ = env.reset()
+        done = False
+        while not done:
+            action, _ = agent.predict(obs, deterministic=True)
+            obs, reward, done, _, info = env.step(action)
+        
+        # Extract metrics from the env's history
+        metrics = self._calculate_performance_metrics(list(env.return_history))
+        metrics["total_return"] = env.portfolio_value - env.initial_capital
+        return metrics
+
     def _calculate_performance_metrics(self, returns: list) -> Dict[str, float]:
         """从回报列表中计算关键性能指标。"""
-        if not returns:
-            return {"sharpe_ratio": 0, "max_drawdown": 0, "total_return": 0}
+        if not returns or len(returns) == 0:
+            return {"sharpe_ratio_dsr": 0, "max_drawdown": 0, "total_return": 0, "volatility": 0}
             
         returns_array = np.array(returns)
         total_return = np.sum(returns_array)
