@@ -1,7 +1,7 @@
 {
-    "model_name": "text-embedding-3-large",
+    "model_name": "embedding-001",
     "version": "1.0.0",
-    "provider": "OpenAI",
+    "provider": "Gemini",
     "parameters": {
         "dimensions": 3072
     },
