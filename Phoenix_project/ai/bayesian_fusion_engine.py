@@ -1,164 +1,142 @@
-# ai/bayesian_fusion_engine.py
-"""
-Implements a probabilistic Evidence Fusion service with a Bayesian core.
-This engine updates its beliefs based on incoming evidence using Bayes' theorem,
-moving from simple heuristics to a mathematically rigorous framework.
-"""
-import logging
+import os
+import json
+import glob
+import math
 from typing import List, Dict, Any, Tuple
+from pydantic import BaseModel, Field
 from scipy.stats import beta
+import numpy as np
 
-from ai.validation import EvidenceItem
-from .contradiction_detector import ContradictionDetector
-from .embedding_client import EmbeddingClient
+# Internal dependencies (to be added)
+from .contradiction_detector import ContradictionDetector # For Task 2.1
+from .validation import EvidenceItem # For Task 2.1
+from observability import get_logger
+
+logger = get_logger(__name__)
+
+
+# --- Task 2.2: Source Credibility Store ---
 
 class SourceCredibilityStore:
     """
-    Manages the dynamic credibility scores for various evidence sources.
-    Each source's credibility is modeled as a Beta distribution.
+    Manages persistence and updates for L1 Agent credibility scores.
+    Uses Beta distribution (alpha, beta) parameters for each source.
     """
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initializes the store with a default credibility for unknown sources.
-        A default of (2, 8) represents a prior belief that sources are more likely
-        to be unreliable than reliable until proven otherwise.
+    def __init__(self, store_path: str = "credibility_store.json", prompts_dir: str = "Phoenix_project/prompts"):
+        self.store_path = store_path
+        self.prompts_dir = prompts_dir
+        self.store = self._load_store()
+        self._initialize_store()
 
-        Args:
-            config: A dictionary that may contain 'default_alpha' and 'default_beta'.
-        """
-        self.logger = logging.getLogger("PhoenixProject.SourceCredibilityStore")
-        self.default_prior = (config.get('default_alpha', 2.0), config.get('default_beta', 8.0))
-        self.credibility_scores: Dict[str, Tuple[float, float]] = {
-            # Pre-seed with some known high-quality sources
-            "SEC EDGAR": (10.0, 2.0),
-            "Reuters": (8.0, 3.0),
-            "Bloomberg": (8.0, 3.0),
-        }
-        self.logger.info("SourceCredibilityStore initialized.")
+    def _load_store(self) -> Dict[str, Dict[str, int]]:
+        """Loads the credibility store from a JSON file."""
+        if os.path.exists(self.store_path):
+            try:
+                with open(self.store_path, 'r') as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                logger.error("Failed to decode credibility store. Reinitializing.")
+                return {}
+        return {}
 
-    def get_credibility_prior(self, source: str) -> Tuple[float, float]:
-        """Gets the current credibility parameters for a given source."""
-        return self.credibility_scores.get(source, self.default_prior)
+    def _save_store(self):
+        """Saves the credibility store to a JSON file."""
+        with open(self.store_path, 'w') as f:
+            json.dump(self.store, f, indent=2)
 
-    def update_source_credibility(self, source: str, was_correct: bool):
-        """
-        Updates a source's credibility based on feedback.
-        This would be called by a downstream validation process.
-        """
-        alpha, beta = self.get_credibility_prior(source)
+    def _initialize_store(self):
+        """Task 2.2: On system startup, create a default entry for every Agent."""
+        logger.info(f"Initializing Credibility Store. Checking agents in {self.prompts_dir}...")
+        agent_files = glob.glob(os.path.join(self.prompts_dir, "*.json"))
+        updated = False
+        for f_path in agent_files:
+            agent_name = os.path.basename(f_path).replace('.json', '')
+            if agent_name not in self.store:
+                logger.info(f"Adding new agent '{agent_name}' to store with neutral prior Beta(2, 2).")
+                self.store[agent_name] = {"alpha": 2, "beta": 2} # Neutral prior
+                updated = True
+        if updated:
+            self._save_store()
+
+    def get_credibility_params(self, agent_source: str) -> Tuple[int, int]:
+        """Gets the (alpha, beta) parameters for a given agent source."""
+        params = self.store.get(agent_source, {"alpha": 2, "beta": 2}) # Default to neutral if somehow missed
+        return params['alpha'], params['beta']
+
+    def update_source_credibility(self, agent_source: str, was_correct: bool):
+        """Task 2.2: Update credibility based on feedback (called by L3)."""
+        alpha, beta = self.get_credibility_params(agent_source)
         if was_correct:
-            alpha += 1.0
+            self.store[agent_source]['alpha'] = alpha + 1
         else:
-            beta += 1.0
-        self.credibility_scores[source] = (alpha, beta)
-        self.logger.info(f"Updated credibility for source '{source}': New prior is Beta({alpha:.2f}, {beta:.2f}).")
+            self.store[agent_source]['beta'] = beta + 1
+        logger.info(f"Updated credibility for '{agent_source}': {self.store[agent_source]}")
+        self._save_store()
 
+
+# --- Task 2.1: Bayesian Fusion Engine ---
 
 class BayesianFusionEngine:
     """
-    Fuses evidence using a Bayesian framework to produce a posterior probability distribution.
+    Performs Bayesian fusion of evidence scores.
     """
-    def __init__(self, embedding_client: EmbeddingClient, config: Dict[str, Any]):
+    def __init__(self):
+        """Initializes the engine and its dependencies."""
+        self.credibility_store = SourceCredibilityStore()
+        self.contradiction_detector = ContradictionDetector()
+
+    def fuse(self, core_hypothesis: str, evidence_items: List[EvidenceItem]) -> Dict[str, Any]:
         """
-        Initializes the engine with a prior belief.
-
-        Args:
-            embedding_client (EmbeddingClient): Client for generating embeddings needed for contradiction detection.
-            config: A configuration dictionary containing fusion engine settings.
-                    Expected keys: 'prior_alpha', 'prior_beta', 'source_credibility'.
+        Task 2.1: Fuses a list of EvidenceItems into a final judgment.
         """
-        self.logger = logging.getLogger("PhoenixProject.BayesianFusionEngine")
+        logger.info(f"Starting Bayesian fusion for hypothesis: '{core_hypothesis}'")
 
-        prior_alpha = config.get('prior_alpha', 2.0)
-        prior_beta = config.get('prior_beta', 2.0)
-
-        if prior_alpha <= 0 or prior_beta <= 0:
-            raise ValueError("Prior parameters (alpha, beta) must be positive.")
-        self.base_prior_alpha = prior_alpha
-        self.base_prior_beta = prior_beta
-        # The engine now uses a credibility store and a contradiction detector
-        self.credibility_store = SourceCredibilityStore(config.get('source_credibility', {}))
-        self.embedding_client = embedding_client
-        self.contradiction_detector = ContradictionDetector(embedding_client)
-        self.logger.info(f"BayesianFusionEngine initialized with prior Beta({prior_alpha}, {prior_beta}).")
-
-    def _convert_evidence_to_likelihood(self, evidence: EvidenceItem) -> Tuple[float, float]:
-        """
-        Converts a single evidence item into likelihood counts (successes and failures).
-        This is a simplified model where score and confidence directly influence the counts.
-        """
-        # A high score (e.g., 0.9) and high confidence (e.g., 0.8) should result in more "successes".
-        # A low score (e.g., 0.2) should result in more "failures".
-        # We can model successes as `confidence * score` and failures as `confidence * (1 - score)`.
-        successes = evidence.provenance_confidence * evidence.score
-        failures = evidence.provenance_confidence * (1.0 - evidence.score)
-        return successes, failures
-
-    async def fuse(self, hypothesis: str, evidence_list: List[EvidenceItem]) -> Dict[str, Any]:
-        """
-        Updates the prior belief with a list of evidence to produce a posterior distribution.
-
-        Args:
-            hypothesis (str): A description of the hypothesis being tested.
-            evidence_list (List[EvidenceItem]): A list of evidence items from the retriever.
-
-        Returns:
-            A dictionary containing the parameters and key stats of the posterior distribution.
-        """
-        self.logger.info(f"Fusing {len(evidence_list)} pieces of evidence for hypothesis: '{hypothesis}'")
-
-        # --- [NEW] Adversarial Validation Step ---
-        contradictions = await self.contradiction_detector.detect(evidence_list)
+        # 1. Call ContradictionDetector
+        contradictions = self.contradiction_detector.detect(evidence_items)
         if contradictions:
-            return {
-                "hypothesis": hypothesis,
-                "status": "LOW_CONSENSUS",
-                "reason": "Contradictory evidence was detected.",
-                "posterior_distribution": None,
-                "summary_statistics": None,
-                "contradictory_pairs": [[e1.dict(), e2.dict()] for e1, e2 in contradictions]
-            }
+            logger.warning(f"ContradictionDetector flagged {len(contradictions)} pairs.")
+            # TODO: Add logic to down-weight or handle contradictions
+
+        # 2. Iterate list, update Bayesian Beta Distribution
+        # Start with a neutral prior (e.g., Beta(1, 1) or Beta(2, 2))
+        total_alpha = 1.0
+        total_beta = 1.0
         
-        # Start with the base prior for the hypothesis itself
-        posterior_alpha = self.base_prior_alpha
-        posterior_beta = self.base_prior_beta
+        for item in evidence_items:
+            # 3. Integrate Credibility
+            cred_alpha, cred_beta = self.credibility_store.get_credibility_params(item.source)
+            # Credibility weight = mean of the agent's Beta distribution
+            credibility_weight = cred_alpha / (cred_alpha + cred_beta) 
 
-        # Update the belief iteratively for each piece of evidence
-        total_successes = 0
-        total_failures = 0
-        for evidence in evidence_list:
-            # [NEW] Get a dynamic prior based on the source's credibility
-            source_prior_alpha, source_prior_beta = self.credibility_store.get_credibility_prior(evidence.source)
+            # Combine provenance confidence with source credibility
+            evidence_weight = item.provenance_confidence * credibility_weight
 
-            successes, failures = self._convert_evidence_to_likelihood(evidence)
-            # The update is now influenced by both the evidence itself AND the source's credibility
-            posterior_alpha += successes * (source_prior_alpha / (source_prior_alpha + source_prior_beta))
-            posterior_beta += failures
-            total_successes += successes
+            # Map score [-1, 1] to alpha (success) and beta (failure) updates.
+            # A high score (e.g., +1.0) adds to alpha.
+            # A low score (e.g., -1.0) adds to beta.
+            # A score of 0.0 adds to neither.
+            # We use a scaling factor to make updates significant
+            update_strength = 5.0 * evidence_weight 
 
-        self.logger.info(f"Evidence update: Added {total_successes:.2f} successes and {total_failures:.2f} failures.")
+            successes = max(0, item.score) * update_strength
+            failures = max(0, -item.score) * update_strength
 
-        # The posterior distribution is a new Beta distribution
-        posterior_dist = beta(posterior_alpha, posterior_beta)
-        mean_prob = posterior_dist.mean()
-        cred_interval = posterior_dist.interval(0.95) # 95% credible interval
+            total_alpha += successes
+            total_beta += failures
+
+        # 3. Output structured dictionary
+        dist = beta(total_alpha, total_beta)
+        posterior_mean = dist.mean()
+        posterior_variance = dist.var()
+        ci_low, ci_high = dist.interval(0.95)
+        # "Cognitive Uncertainty" = width of the 95% confidence interval
+        cognitive_uncertainty = ci_high - ci_low
 
         return {
-            "hypothesis": hypothesis,
-            "posterior_distribution": {
-                "type": "Beta",
-                "alpha": posterior_alpha,
-                "beta": posterior_beta
-            },
-            "summary_statistics": {
-                "mean_probability": mean_prob,
-                "median_probability": posterior_dist.median(),
-                "std_dev": posterior_dist.std(),
-                "95_credible_interval": [cred_interval[0], cred_interval[1]]
-            },
-            "key_evidence": sorted(
-                [e.dict() for e in evidence_list], 
-                key=lambda x: x.get('provenance_confidence', 0) * x.get('score', 0), 
-                reverse=True
-            )[:5] # Return the top 5 most impactful pieces of evidence
+            "final_posterior_mean": posterior_mean,
+            "final_posterior_variance": posterior_variance,
+            "confidence_interval_95": (ci_low, ci_high),
+            "cognitive_uncertainty_score": cognitive_uncertainty,
+            "contradictions_found": len(contradictions),
+            "final_beta_params": (total_alpha, total_beta)
         }
