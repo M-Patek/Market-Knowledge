@@ -2,28 +2,60 @@ import logging
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, List
-from features.base import IFeature
+
+from schemas.feature_schema import FeatureSchema
 
 class FeatureStore:
     """
-    管理所有特征的定义、计算和检索。
+    (L1 Patched) 管理所有特征的定义、计算和检索。
     """
-    def __init__(self, feature_list: List[IFeature]):
+    def __init__(self, feature_list: List[FeatureSchema]):
         """
         初始化 FeatureStore。
 
         Args:
-            feature_list: 一个实现了 IFeature 接口的特征对象列表。
+            feature_list: 一个 FeatureSchema 对象的列表。
         """
         self.logger = logging.getLogger("PhoenixProject.FeatureStore")
-        self.features = {f.name: f for f in feature_list}
+        self.features: Dict[str, FeatureSchema] = {f.name: f for f in feature_list}
         self.logger.info(f"FeatureStore initialized with {len(self.features)} features: {list(self.features.keys())}")
 
-    def add_feature(self, feature: IFeature):
+    def add_feature(self, feature: FeatureSchema):
         """动态添加一个新特征。"""
         if feature.name in self.features:
             self.logger.warning(f"Feature '{feature.name}' already exists. Overwriting.")
         self.features[feature.name] = feature
+
+    def validate_feature_dependencies(self):
+        """
+        (L1) Validates the dependency graph of all registered features.
+        Checks for undefined dependencies and circular dependencies.
+        Raises:
+            ValueError: If a dependency is not found or a circular dependency is detected.
+        """
+        self.logger.info("Validating feature dependency graph...")
+        visiting = set()  # For detecting cycles (nodes currently in the recursion stack)
+        visited = set()   # For tracking already validated nodes
+
+        for feature_name in self.features:
+            if feature_name not in visited:
+                self._dfs_validate(feature_name, visiting, visited)
+
+        self.logger.info("Feature dependency graph is valid.")
+
+    def _dfs_validate(self, feature_name: str, visiting: set, visited: set):
+        visiting.add(feature_name)
+
+        for dep_name in self.features[feature_name].dependencies:
+            if dep_name not in self.features:
+                raise ValueError(f"Undefined dependency '{dep_name}' for feature '{feature_name}'.")
+            if dep_name in visiting:
+                raise ValueError(f"Circular dependency detected: '{feature_name}' -> '{dep_name}'")
+            if dep_name not in visited:
+                self._dfs_validate(dep_name, visiting, visited)
+
+        visiting.remove(feature_name)
+        visited.add(feature_name)
 
     def get_feature_dependencies(self, feature_name: str) -> List[str]:
         """
@@ -64,12 +96,15 @@ class FeatureStore:
         # 1. 构建一个依赖图（DAG）
         # 2. 按拓扑顺序执行特征计算
         # 3. 从 `data` DataFrame 中提取所需的列
+        # 4. (L11) Resolve self.features[name].calc_fn (string) to a function via a Registry
         
         features = {}
         for name, feature in self.features.items():
             try:
                 # 简化：假设每个特征都可以从原始 DataFrame 计算
-                features[name] = feature.compute(data)
+                # This line is intentionally broken until L11 Registry is implemented
+                # features[name] = feature.compute(data) 
+                features[name] = np.random.rand() # Placeholder
             except Exception as e:
                 self.logger.error(f"Failed to compute feature '{name}' for {ticker}: {e}")
                 features[name] = None
