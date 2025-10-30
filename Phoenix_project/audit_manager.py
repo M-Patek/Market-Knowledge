@@ -1,128 +1,80 @@
 # audit_manager.py
-import os
-import json
+
 import logging
-import boto3
-from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError
-from typing import Dict, Any, List
+from datetime import datetime
+from ai.tabular_db_client import TabularDBClient  # Assuming a tabular client
+from models.evidence import EvidenceItem
+from typing import List, Dict, Any
 
-# Dependency for Task 4.1
-try:
-    from ai.validation import EvidenceItem
-except ImportError:
-    # Handle potential circular dependency or path issue if validation is not available
-    class EvidenceItem: pass # Dummy class
-
+logger = logging.getLogger(__name__)
 
 class AuditManager:
     """
-    处理关键系统决策的日志记录，以实现审计、可追溯性
-    和离线分析，包括影子模型的性能。
+    Handles logging of all L1-L3 decisions, final fusion results,
+    and associated metadata to a persistent, auditable database.
     """
-    def __init__(self):
-        self.logger = logging.getLogger("PhoenixProject.AuditManager")
-        self.logger.info("AuditManager initialized.")
+    def __init__(self, db_client: TabularDBClient):
+        self.db_client = db_client
+        logger.info("AuditManager initialized.")
 
-    def log_shadow_decision(self, champion_decision: Dict[str, Any], shadow_decision: Dict[str, Any]):
+    def log_decision_process(
+        self,
+        decision_id: str,
+        ticker: str,
+        timestamp: datetime,
+        l1_evidence: List[EvidenceItem],
+        l2_fusion_result: Dict[str, Any],
+        l3_rules_applied: List[str] = None
+    ):
         """
-        [Sub-Task 1.1.3] 记录冠军模型和影子模型的输出，以便进行并行比较。
-        在真实系统中，这会写入一个结构化的、可查询的数据库（例如 Elasticsearch）。
+        Logs the entire decision-making trail for a single analysis pipeline run.
         """
-        log_record = {
-            "comparison_type": "SHADOW_VS_CHAMPION",
-            "champion_decision": champion_decision,
-            "shadow_decision": shadow_decision
-        }
-        # 目前，我们记录到一个专门的记录器。
-        self.logger.info(f"SHADOW_LOG: {json.dumps(log_record)}")
-
-    def log_decision(self, 
-                       decision_id: str, 
-                       evidence_items: List[EvidenceItem], 
-                       fusion_result: Dict[str, Any], 
-                       trading_decision: Dict[str, Any]):
-        """
-        Task 4.1: Complete Decision Audit Log.
-        Records the full state of a decision for L3 causal inference.
-        """
-        if not decision_id:
-            self.logger.error("Failed to log decision: 'decision_id' is missing.")
-            return
+        logger.info(f"Logging decision trail for ID: {decision_id}")
         
-        # Serialize Pydantic models to dicts for JSON logging
-        serializable_evidence = [item.model_dump(mode='json') if hasattr(item, 'model_dump') else item for item in evidence_items]
-
-        log_record = {
-            "decision_id": decision_id,
-            "l1_evidence_items": serializable_evidence, # Full list of L1 EvidenceItem objects
-            "l2_fusion_result": fusion_result,         # Full L2 fusion result
-            "final_trading_decision": trading_decision,
-            "pnl_result": None # Initially empty for post-fact backfilling
-        }
-
-        self.logger.info(f"AUDIT_TRAIL: {json.dumps(log_record, default=str)}") # Use default=str for datetimes
-
-    def archive_logs_to_s3(self, source_dir: str, bucket_name: str):
-        """
-        将所有日志文件从本地目录归档到 S3 存储桶，并在本地删除它们。
-        """
-        if not os.path.isdir(source_dir):
-            self.logger.info(f"Audit log source directory '{source_dir}' not found. Skipping archiving.")
-            return
-
         try:
-            s3_client = boto3.client('s3')
-            self.logger.info(f"Starting archival of audit logs from '{source_dir}' to S3 bucket '{bucket_name}'.")
-        except (NoCredentialsError, PartialCredentialsError):
-            self.logger.error("AWS credentials not found or incomplete. Skipping S3 archival.")
-            return
-
-        archived_count = 0
-        log_files = [f for f in os.listdir(source_dir) if os.path.isfile(os.path.join(source_dir, f))]
-
-        if not log_files:
-            self.logger.info("No audit logs found to archive.")
-            return
-
-        for filename in log_files:
-            local_path = os.path.join(source_dir, filename)
-            try:
-                # 强制执行服务器端加密以保护静态数据
-                extra_args = {'ServerSideEncryption': 'AES256'}
-                s3_client.upload_file(
-                    local_path, bucket_name, filename, ExtraArgs=extra_args
+            decision_data = {
+                "decision_id": decision_id,
+                "ticker": ticker,
+                "timestamp": timestamp,
+                "l1_evidence_count": len(l1_evidence),
+                "l1_evidence_sources": [item.source for item in l1_evidence],
+                "l2_final_score": l2_fusion_result.get("final_posterior_mean"),
+                "l2_uncertainty": l2_fusion_result.get("cognitive_uncertainty_score"),
+                "l3_rules_applied": l3_rules_applied or [],
+                "pnl_result": None  # To be backfilled by TradeLifecycleManager
+            }
+            
+            # 1. Log the main decision record
+            self.db_client.insert_record(
+                'decision_log',
+                decision_data
+            )
+            
+            # 2. Log each piece of L1 evidence individually
+            for item in l1_evidence:
+                evidence_data = item.model_dump()
+                evidence_data["decision_id"] = decision_id
+                self.db_client.insert_record(
+                    'evidence_log',
+                    evidence_data
                 )
-                self.logger.debug(f"Successfully uploaded {filename} to S3.")
-                os.remove(local_path)
-                archived_count += 1
-            except ClientError as e:
-                self.logger.error(f"Failed to upload {filename} to S3: {e}")
-            except Exception as e:
-                self.logger.error(f"An unexpected error occurred while processing {filename}: {e}")
+            
+            logger.info(f"Successfully logged decision trail for ID: {decision_id}")
 
-        self.logger.info(f"Completed S3 archival. Archived {archived_count} of {len(log_files)} log files.")
+        except Exception as e:
+            logger.error(f"Failed to log decision trail for ID {decision_id}: {e}", exc_info=True)
 
-    def fetch_logs_with_pnl(self, days: int) -> List[Dict[str, Any]]:
+    def update_pnl_for_decision(self, decision_id: str, pnl_result: float):
         """
-        [L3 Agent Requirement] 获取包含 P&L 基本事实的最近决策日志。
-        这是 MetaCognitiveAgent (Task 2.2) 调用的方法。
+        Finds the corresponding decision log by decision_id and backfills the pnl_result field.
         """
-        # 这是数据库查询逻辑的占位符。
-        # 一个真实的实现会查询一个结构化的数据库 (例如 SQL, NoSQL)。
-        self.logger.info(f"Fetching logs with P&L for the last {days} days.")
-        # 返回虚拟数据以满足 L3 代理的需求
-        return [{"decision_id": "dummy_123", "parameters": {"asset": "BTC", "amount": 1.5}, "outcome_pnl": 150.75}]
-
-    def backfill_pnl_for_decision(self, decision_id: str, final_pnl: float) -> bool:
-        """
-        查找特定的决策日志，并用最终的 P&L 基本事实更新它。
-        (Task 2.3 - P&L Backfill)
-        """
-        self.logger.info(f"Attempting to backfill P&L for decision_id: {decision_id}.")
-        # 这是数据库更新逻辑的占位符。
-        # 一个真实的实现会执行像下面这样的查询:
-        # UPDATE decision_logs SET final_pnl = ? WHERE id = ?
-        # 目前, 我们只记录操作并返回 True 表示成功。
-        self.logger.info(f"DATABASE_UPDATE: SET final_pnl = {final_pnl} WHERE decision_id = {decision_id}")
-        self.logger.info(f"Successfully backfilled P&L for decision_id: {decision_id}.")
-        return True
+        logger.info(f"Backfilling P&L for decision_id {decision_id} with result {pnl_result}.")
+        try:
+            # Assuming the db_client has a method to update records based on a condition.
+            # The condition here is finding the record with the matching decision_id.
+            self.db_client.update_record(
+                'decision_log', {'pnl_result': pnl_result}, {'decision_id': decision_id}
+            )
+            logger.info(f"Successfully updated P&L for decision_id {decision_id}.")
+        except Exception as e:
+            logger.error(f"Failed to update P&L for decision_id {decision_id}: {e}", exc_info=True)
