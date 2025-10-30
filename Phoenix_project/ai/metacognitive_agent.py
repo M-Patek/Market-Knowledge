@@ -1,101 +1,148 @@
-import asyncio
+# ai/metacognitive_agent.py
+
 import logging
-from typing import List, Dict, Any
-import yaml
 import json
+from typing import List, Dict, Any
+from ai.tabular_db_client import TabularDBClient # Placeholder
+from api.gemini_pool_manager import GeminiPoolManager # Placeholder
+from observability import get_logger
 
-# Internal dependencies
-from audit_manager import AuditManager
-from api.gemini_pool_manager import query_model # Task 0.3
+logger = get_logger(__name__)
 
-logger = logging.getLogger("PhoenixProject.MetaCognitiveAgent")
-
-
+LLM_CLIENT = "gemini" # Assuming a default
 class MetaCognitiveAgent:
     """
-    The L3 agent responsible for Causal Inference and Heuristic Rule Generation.
-    (Task 2.2 in original doc, Task 4.2 in new spec)
+    L3 Agent: Performs meta-cognition by analyzing the system's own decision-making process.
+    It runs periodically to analyze P&L results and decision logs.
     """
-    def __init__(self, audit_manager: AuditManager):
-        self.audit_manager = audit_manager
-        logger.info("L3 MetaCognitiveAgent initialized.")
+    def __init__(
+        self,
+        db_client: TabularDBClient,
+        gemini_client: GeminiPoolManager,
+        lookback_period: int = 30,
+        min_logs_for_analysis: int = 50
+    ):
+        self.db_client = db_client
+        self.gemini_client = gemini_client
+        self.lookback_period = lookback_period
+        self.min_logs_for_analysis = min_logs_for_analysis
+        logger.info("MetaCognitiveAgent initialized.")
 
-    async def run_analysis(self, lookback_days: int) -> List[Dict[str, Any]]:
+    async def run_periodic_analysis(self) -> List[Dict]:
         """
-        Core logic of the L3 agent (Task 4.2).
+        Main entry point for the agent's periodic execution.
         """
-        logger.info(f"L3 MetaCognitiveAgent: Starting analysis for last {lookback_days} days.")
+        logger.info("L3 MetaCognitiveAgent running periodic analysis...")
         
-        # 1. Fetch logs with P&L
-        logs = self.audit_manager.fetch_logs_with_pnl(lookback_days)
+        # --- Task 5.1: Implement Sliding Window Strategy ---
+        # Fetch logs from a fixed, recent lookback period to manage cost and context.
+        recent_logs = self.db_client.get_decision_logs(days_back=7)
         
-        if not logs:
-            logger.info("L3 MetaCognitiveAgent: No logs with P&L found. Skipping analysis.")
+        if len(recent_logs) < self.min_logs_for_analysis:
+            logger.info(f"Not enough logs ({len(recent_logs)}) for meta-analysis. Minimum is {self.min_logs_for_analysis}. Skipping.")
             return []
-        
-        # 2. Build Causal Inference Prompt
-        prompt = self._build_causal_inference_prompt(logs)
-        
-        # 3. Call LLM
-        raw_yaml_output = await query_model(prompt, agent_name="metacognitive_agent")
-        logger.debug(f"L3 MetaCognitiveAgent raw output: {raw_yaml_output}")
-        
-        # 4. Parse output and return rules
-        rules = self._parse_yaml_rules(raw_yaml_output)
-        
-        logger.info(f"L3 MetaCognitiveAgent: Analysis complete. Generated {len(rules)} new rules.")
-        return rules
 
-    def _build_causal_inference_prompt(self, logs: List[Dict[str, Any]]) -> str:
-        logger.info(f"Building causal inference prompt for {len(logs)} log entries...")
+        # 2. Build the prompt using the summarized logs
+        prompt = await self._build_causal_inference_prompt(recent_logs)
         
-        # Convert logs to a more compact JSON string for the prompt
-        log_summary = json.dumps(logs, default=str)
+        # 3. Call the high-tier model with the summarized prompt
+        # This is expected to be a high-cost, high-capability model
+        response_text = await self.gemini_client.query_model_async(prompt, model="gemini-1.5-pro-latest", client_name=LLM_CLIENT)
+        
+        # 3. Parse the response to extract actionable rules
+        new_rules = self._parse_response_for_rules(response_text)
+        
+        return new_rules
 
-        # Task 4.2: Specialized Causal Inference Prompt
+    async def _summarize_logs(self, logs: List[Dict]) -> str:
+        """
+        Task 5.2: Pre-processes logs by summarizing them with a low-cost model.
+        """
+        logger.info(f"Summarizing {len(logs)} logs with a low-cost model...")
+        
+        log_texts = [json.dumps(log) for log in logs]
+        
+        # Simple chunking to avoid massive single prompts
+        CHUNK_SIZE = 20
+        summaries = []
+        for i in range(0, len(log_texts), CHUNK_SIZE):
+            chunk = "\n".join(log_texts[i:i+CHUNK_SIZE])
+            prompt = f"""
+            Analyze the following JSON log entries. Summarize the key patterns, decisions, and outcomes into 2-3 bullet points. Focus on relationships between agent evidence, fusion results, and P&L.
+            --- LOGS ---
+            {chunk}
+            --- SUMMARY ---
+            """
+            # Use a low-cost model for this summarization task
+            summary = await self.gemini_client.query_model_async(prompt, model="gemini-1.5-flash-latest", client_name=LLM_CLIENT)
+            summaries.append(summary)
+            
+        return "\n".join(summaries)
+
+    async def _build_causal_inference_prompt(self, logs: List[Dict]) -> str:
+        """
+        Constructs the prompt for the high-tier model, now using summarized logs.
+        """
+        # The prompt asks the LLM to perform causal inference.
+        # The goal is to find causal links between agent behaviors, market conditions, and P&L.
+        # For example: "The 'technical_analyst' agent consistently provides over-optimistic scores
+        # during high-volatility periods, leading to negative P&L. A new rule should be injected..."
+        
+        summarized_logs = await self._summarize_logs(logs)
+        
         prompt = f"""
-You are a Meta-Cognitive Causal Inference Agent. Your task is to analyze a list of historical trading decisions to find recurrent logical patterns that lead to significant profit or loss.
+        You are a Meta-Cognitive AI analyzing the performance of a multi-agent financial analysis system.
+        Your task is to identify flawed reasoning patterns, biases, or incorrect causal links in the system's behavior.
+        Analyze the following summaries of recent decision logs. Each summary represents a cluster of decisions and their outcomes.
+        Based on these summaries, identify 1 to 3 systemic issues. For each issue, propose a specific, actionable rule to correct it.
+        The rule MUST be in the format specified in the output schema.
 
-**Input Data:**
-A JSON list of decision logs. Each log contains:
-- 'decision_id': A unique identifier.
-- 'l1_evidence_items': A list of evidence objects, EACH with a 'reasoning_chain', 'source', and 'score'.
-- 'l2_fusion_result': The final L2 probability.
-- 'pnl_result': The final profit or loss (the ground truth).
+        ### Summarized Decision Logs ###
+        {summarized_logs}
 
-**Your Mission:**
-1.  Focus on the 'l1_evidence_items' and their 'reasoning_chain' fields.
-2.  Correlate the reasoning, sources, and scores with the final 'pnl_result'.
-3.  Identify 1-3 high-conviction, recurrent patterns of error or success.
-
-**Mandatory Output Format (YAML):**
-You MUST summarize your findings as 1-3 Heuristic Rules in the following YAML format. Do not output ANY text, explanation, or preamble outside of the YAML block.
-
-rules:
-  - name: "Identified Pattern Name (e.g., Macro-Technical Divergence)"
-    description: "A human-readable explanation of the pattern you found. e.g., 'When the 'macro_strategist' is bearish but 'technical_analyst' is bullish, the 'pnl_result' is consistently negative.'"
-    action:
-      type: "adjust_credibility"
-      target_agent: "technical_analyst"
-      adjustment_reason: "punitive_adjustment_on_bearish_macro"
-
-**Logs to Analyze:**
-{log_summary}
-
-Please begin your YAML output now:
-"""
+        ### Causal Inference and Rule Generation ###
+        Analyze the patterns and generate rules.
+        Your output MUST be a valid JSON list containing rule objects.
+        
+        Example Output Format:
+        [
+          {{
+            "name": "Add constraint for analyst bias",
+            "action_type": "update_prompt",
+            "target_agent": "fundamental_analyst",
+            "description": "Always double-check revenue projections against 3rd-party data."
+          }},
+          {{
+            "name": "Down-weight technicals in high-vol",
+            "action_type": "adjust_credibility",
+            "target_agent": "technical_analyst",
+            "adjustment_factor": -0.2,
+            "conditions": ["market_volatility > 0.8"]
+          }}
+        ]
+        """
         return prompt
 
-    def _parse_yaml_rules(self, raw_yaml: str) -> List[Dict[str, Any]]:
+    def _parse_response_for_rules(self, response_text: str) -> List[Dict]:
+        """
+        Safely parses the LLM's JSON response into a list of rule dictionaries.
+        """
+        logger.info(f"Parsing L3 response for rules...")
         try:
-            # Ensure we return the list of rules, even if nested under a 'rules' key
-            parsed_data = yaml.safe_load(raw_yaml)
-            if isinstance(parsed_data, dict) and 'rules' in parsed_data:
-                return parsed_data.get('rules', [])
-            elif isinstance(parsed_data, list):
-                return parsed_data
-            logger.warning(f"Could not parse rules from YAML output: {raw_yaml}")
+            # Clean the response text (LLMs sometimes add markdown)
+            if response_text.strip().startswith("```json"):
+                response_text = response_text.strip()[7:-3].strip()
+            
+            rules = json.loads(response_text)
+            if isinstance(rules, list):
+                logger.info(f"Successfully parsed {len(rules)} new rules.")
+                return rules
+            else:
+                logger.warning(f"L3 response was valid JSON but not a list: {type(rules)}")
+                return []
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode L3 response JSON: {e}\nResponse was:\n{response_text}")
             return []
-        except yaml.YAMLError as e:
-            logger.error(f"Failed to parse YAML rules: {e}")
+        except Exception as e:
+            logger.error(f"Error parsing L3 rules: {e}", exc_info=True)
             return []
