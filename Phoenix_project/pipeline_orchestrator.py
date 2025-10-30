@@ -10,7 +10,7 @@ from datetime import datetime
 import logging
 
 # Internal dependencies
-from models.evidence import EvidenceItem          # Base data model
+from ai.validation import EvidenceItem            # Base data model
 from ai.retriever import HybridRetriever     # For Task 1.1
 from ai.prompt_renderer import render_prompt # For Task 0.3
 from api.gemini_pool_manager import query_model # For Task 0.3
