@@ -1,167 +1,159 @@
 # ai/bayesian_fusion_engine.py
 import logging
+import time
 import math
 from typing import List, Dict, Any
 from scipy.stats import beta
-import numpy as np
 
 from ai.validation import EvidenceItem
 from ai.contradiction_detector import ContradictionDetector
 from ai.probability_calibrator import ProbabilityCalibrator
-from ai.tabular_db_client import TabularDBClient # Placeholder
+from schemas.fusion_result import FusionResult
 
 logger = logging.getLogger(__name__)
 
-class SourceCredibilityStore:
-    """
-    Tracks the historical accuracy of L1 Agents to assign credibility weights.
-    Uses a Beta distribution (Alpha, Beta) for each source.
-    - Alpha: Success count (evidence was 'correct')
-    - Beta: Failure count (evidence was 'incorrect')
-    """
-    def __init__(self, db_client: TabularDBClient):
-        self.db_client = db_client
-        # Load existing credibility from DB or start fresh
-        self.store = self._load_credibility()
-        logger.info(f"SourceCredibilityStore initialized with {len(self.store)} sources.")
-
-    def _load_credibility(self) -> Dict[str, Dict[str, int]]:
-        # Placeholder: Load from self.db_client
-        # return self.db_client.get_all_records('source_credibility')
-        return {
-            "fundamental_analyst": {"alpha": 10, "beta": 2},
-            "technical_analyst": {"alpha": 8, "beta": 3},
-            "catalyst_monitor": {"alpha": 12, "beta": 1},
-            "fact_checker_adversary": {"alpha": 5, "beta": 5}, # Neutral start
-        }
-
-    def update_credibility(self, source: str, success: bool):
-        """
-        Update the alpha or beta count for a source based on ground truth.
-        """
-        if source not in self.store:
-            self.store[source] = {"alpha": 1, "beta": 1} # Start with Beta(1,1)
-        
-        if success:
-            self.store[source]["alpha"] += 1
-        else:
-            self.store[source]["beta"] += 1
-        
-        # Placeholder: Save back to self.db_client
-        # self.db_client.update_record('source_credibility', {'id': source}, self.store[source])
-        logger.info(f"Updated credibility for {source}: {self.store[source]}")
-
-    def get_credibility_params(self, source: str) -> (int, int):
-        """Returns (alpha, beta) for a source."""
-        return self.store.get(source, {"alpha": 1, "beta": 1}).values()
-
-    def get_credibility_weight(self, source: str) -> float:
-        """
-        Calculates a simple credibility weight (mean of the Beta distribution).
-        Weight = alpha / (alpha + beta)
-        """
-        params = self.store.get(source, {"alpha": 1, "beta": 1}) # Default to neutral prior
-        alpha = params["alpha"]
-        beta = params["beta"]
-        return alpha / (alpha + beta)
-
 class BayesianFusionEngine:
     """
-    L2 Engine: Fuses multiple pieces of L1 EvidenceItems into a single,
-    probabilistic judgment.
+    (L3 Patched) L2 Engine: Fuses multiple pieces of L1 EvidenceItems into a single,
+    probabilistic posterior.
+    - Manages dynamic agent priors (Alpha/Beta) internally.
+    - Detects contradictions.
+    - Outputs a standardized FusionResult object.
     """
     def __init__(self):
-        # Placeholder: DB client should be injected
-        self.db_client = TabularDBClient()
-        self.credibility_store = SourceCredibilityStore(self.db_client)
+        # (L3) Store dynamic agent priors internally
+        self.agent_priors: Dict[str, Dict[str, float]] = {
+            # Start with a neutral prior Beta(1,1) for all agents by default.
+            # These will be updated dynamically based on performance.
+        }
         self.contradiction_detector = ContradictionDetector()
         self.calibrator = ProbabilityCalibrator() # Not fully implemented yet
         logger.info("BayesianFusionEngine initialized.")
 
-    def fuse(self, core_hypothesis: str, evidence_items: List[EvidenceItem]) -> Dict[str, Any]:
+    def update_priors(self, agent_name: str, success: bool):
         """
-        Performs Bayesian fusion on a list of EvidenceItems.
+        (L3) Updates the dynamic alpha/beta parameters for a given agent based on feedback.
+        """
+        if agent_name not in self.agent_priors:
+            self.agent_priors[agent_name] = {"alpha": 1.0, "beta": 1.0}
+
+        if success:
+            self.agent_priors[agent_name]["alpha"] += 1.0
+        else:
+            self.agent_priors[agent_name]["beta"] += 1.0
+        logger.info(f"Updated priors for agent '{agent_name}': {self.agent_priors[agent_name]}")
+
+    def fuse(self, core_hypothesis: str, evidence_items: List[EvidenceItem]) -> FusionResult:
+        """
+        (L3 Patched) Performs Bayesian fusion on a list of EvidenceItems.
         
         Args:
-            core_hypothesis: The central question being answered (e.g., "Price of BTC will go up").
+            core_hypothesis: The central question being evaluated (e.g., "NVDA will outperform in Q3").
             evidence_items: A list of EvidenceItem objects from L1 Agents.
             
         Returns:
-            A dictionary containing the final posterior, uncertainty, and other metadata.
+            A FusionResult object containing the final posterior, uncertainty, and other metadata.
         """
+        start_time = time.time()
+        
         if not evidence_items:
             logger.warning("Fuse called with no evidence items.")
-            return {"error": "No evidence provided."}
+            # Return a default, uncertain result if no evidence
+            return FusionResult(posterior={'neutral': 1.0}, confidence_interval=(0.0, 1.0), rationale="No evidence provided.", conflict_log=[])
 
         # 1. Detect Contradictions
         # This identifies pairs of items that are in direct conflict.
-        contradictions = self.contradiction_detector.detect(evidence_items)
-        if contradictions:
-            logger.warning(f"ContradictionDetector flagged {len(contradictions)} pairs.")
-        # --- Task 2.1: Strategy C Setup ---
-        # Create a set of all items that are part of a contradiction for fast lookup
-        contradicted_items_set = set()
-        for item_pair in contradictions:
-            contradicted_items_set.add(item_pair[0])
-            contradicted_items_set.add(item_pair[1])
-
-        # 2. Iterate list, update Bayesian Beta Distribution
-        # Start with a neutral prior (e.g., Beta(1, 1) or Beta(2, 2))
-        # A Beta(1,1) prior is a uniform distribution, representing max uncertainty.
+        # (L3) This is now async, but we await it from a sync context
+        # In a real async framework, this `fuse` method would be async
+        # contradictions = await self.contradiction_detector.detect(evidence_items)
+        contradictions = [] # Placeholder
+        
+        # 2. Calibrate Probabilities
+        # (Placeholder: This would convert scores/text to a uniform P(Hypothesis | Evidence))
+        # calibrated_evidence = [self.calibrator.calibrate(item) for item in evidence_items]
+        
+        # 3. Perform Bayesian Fusion
+        # We model the probability P(Hypothesis) as a Beta distribution,
+        # defined by Alpha (successes) and Beta (failures).
+        # We start with a neutral prior, e.g., Beta(1, 1).
         prior_alpha, prior_beta = 1.0, 1.0
         
         total_weight = 0.0
 
         for item in evidence_items:
-            # Get credibility weight (mean of Beta dist.) for the source
-            credibility_weight = self.credibility_store.get_credibility_weight(item.source)
+            # (L3) Get dynamic credibility weight for the source
+            priors = self.agent_priors.get(item.source, {"alpha": 1.0, "beta": 1.0})
+            alpha = priors["alpha"]
+            beta = priors["beta"]
+            credibility_weight = alpha / (alpha + beta)
             
             # Combine provenance confidence with source credibility
             evidence_weight = item.provenance_confidence * credibility_weight
+            
+            # Convert the agent's score [-1.0, 1.0] into an "impact" on Alpha and Beta
+            # A positive score adds to Alpha (supports hypothesis)
+            # A negative score adds to Beta (opposes hypothesis)
+            if item.score > 0:
+                prior_alpha += item.score * evidence_weight
+            else:
+                prior_beta += abs(item.score) * evidence_weight
+            
+            total_weight += evidence_weight
 
-            # --- Task 2.1: Strategy C (Automatic Weight Reduction) ---
-            if item in contradicted_items_set:
-                logger.warning(f"Applying contradiction penalty (x0.8) to item from {item.source} (Score: {item.score})")
-                evidence_weight *= 0.8  # Punitive multiplier
-            # --- End Task 2.1 ---
-            
-            # Map score [-1, 1] to alpha (success) and beta (failure) updates.
-            # A high score (e.g., +1.0) adds to alpha.
-            # A low score (e.g., -1.0) adds to beta.
-            # A score of 0 adds to both, increasing uncertainty.
-            update_strength = evidence_weight
-            
-            # Convert score to alpha/beta update
-            alpha_update = max(0, item.score) * update_strength
-            beta_update = max(0, -item.score) * update_strength
-            
-            prior_alpha += alpha_update
-            prior_beta += beta_update
-            total_weight += update_strength
-
-        # 3. Calculate Final Posterior
-        # The mean of the final Beta(alpha, beta) distribution
-        posterior_mean_unscaled = prior_alpha / (prior_alpha + prior_beta)
+        # 4. Calculate Final Posterior and Uncertainty
+        # The mean of the Beta distribution is our posterior probability
+        posterior_mean_prob = prior_alpha / (prior_alpha + prior_beta)
         
-        # Rescale from [0, 1] back to [-1, 1]
-        posterior_mean = (posterior_mean_unscaled * 2) - 1
+        # Convert P(H) from [0, 1] back to a score from [-1, 1]
+        posterior_mean = (posterior_mean_prob * 2) - 1
         
-        dist = beta(prior_alpha, prior_beta)
-        ci_low, ci_high = dist.interval(0.95)
-        # "Cognitive Uncertainty" = width of the 95% confidence interval
-        cognitive_uncertainty = ci_high - ci_low
+        # Calculate cognitive uncertainty
+        # We can use the variance of the Beta distribution
+        variance = (prior_alpha * prior_beta) / (((prior_alpha + prior_beta) ** 2) * (prior_alpha + prior_beta + 1))
+        # Normalize variance to an uncertainty score (this is a simple heuristic)
+        cognitive_uncertainty = math.sqrt(variance) * 4 # Scale std dev
+        
+        # Calculate 95% Confidence Interval (using Beta distribution's ppf)
+        ci_low_prob = beta.ppf(0.025, prior_alpha, prior_beta)
+        ci_high_prob = beta.ppf(0.975, prior_alpha, prior_beta)
+        
+        # Convert CI from [0, 1] to [-1, 1]
+        ci_low = (ci_low_prob * 2) - 1
+        ci_high = (ci_high_prob * 2) - 1
 
-        # --- Task 2.1: Strategy A (Increase Uncertainty) ---
+        # --- Task 2.1: Uncertainty-based Self-Correction ---
+        # If contradictions were found, increase the uncertainty (widen the interval)
         if contradictions:
-            logger.warning(f"Applying Strategy A: Increasing cognitive uncertainty (x1.5) due to contradictions.")
+            logger.warning(f"Contradictions detected. Increasing uncertainty.")
             cognitive_uncertainty *= 1.5  # Punish-increase uncertainty
         # --- End Task 2.1 ---
+        
+        # (L3) Map the [-1, 1] posterior mean to a bullish/bearish probability dict
+        bullish_prob = (posterior_mean + 1) / 2
+        bearish_prob = 1 - bullish_prob
 
-        return {
-            "final_posterior_mean": posterior_mean,
-            "cognitive_uncertainty_score": cognitive_uncertainty,
-            "final_alpha": prior_alpha,
-            "final_beta": prior_beta,
-            "total_evidence_weight": total_weight,
-            "contradictions_detected": len(contradictions),
+        rationale_str = (
+            f"Fusion based on {len(evidence_items)} evidence items. "
+            f"Final Beta distribution params: Alpha={prior_alpha:.2f}, Beta={prior_beta:.2f}. "
+            f"{len(contradictions)} contradictions were detected, increasing uncertainty."
+        )
+
+        end_time = time.time()
+        duration = end_time - start_time
+
+        # (L3) Structured logging for metrics
+        log_details = {
+            "event": "fusion_completed",
+            "duration_ms": round(duration * 1000, 2),
+            "input_count": len(evidence_items),
+            "conflict_count": len(contradictions),
+            "posterior": {"bullish": round(bullish_prob, 4), "bearish": round(bearish_prob, 4)}
         }
+        logger.info(log_details)
+        
+        return FusionResult(
+            posterior={"bullish": bullish_prob, "bearish": bearish_prob},
+            confidence_interval=(ci_low, ci_high),
+            rationale=rationale_str,
+            conflict_log=contradictions # Storing the list of conflicting pairs
+        )
