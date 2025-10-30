@@ -10,6 +10,8 @@ from sizing.fixed_fraction import FixedFractionSizer
 from sizing.volatility_parity import VolatilityParitySizer
 from .risk_manager import RiskManager
 from .portfolio_constructor import PortfolioConstructor
+# L5: Import schemas needed for signal integration
+from schemas.fusion_result import FusionResult
 
 class CognitiveEngine:
     def __init__(self,
@@ -64,7 +66,8 @@ class CognitiveEngine:
                               total_portfolio_value: float,
                               historical_returns: Optional[pd.DataFrame] = None,
                               adv_data: Optional[Dict[str, float]] = None,
-                              emergency_factor: Optional[float] = None) -> List[Dict[str, Any]]:
+                              emergency_factor: Optional[float] = None,
+                              rl_output: Optional[Any] = None) -> List[Dict[str, Any]]: # (L5) Added rl_output
         self.logger.info("--- [Cognitive Engine Call: Marshal Coordination] ---")
         
         # --- 紧急覆盖 ---
@@ -97,9 +100,15 @@ class CognitiveEngine:
         initial_battle_plan = self.position_sizer.size_positions(worthy_targets, effective_max_allocation)
 
         # 4. [V2.0+] 首先应用流动性约束
-        battle_plan = self.risk_manager.apply_liquidity_constraints(
+        liquidity_constrained_plan = self.risk_manager.apply_liquidity_constraints(
             initial_battle_plan, adv_data or {}, total_portfolio_value
         )
+
+        # 5. (L5 Task 3) Integrate DRL signal if provided
+        if rl_output is not None:
+            battle_plan = self.integrate_rl_signal(liquidity_constrained_plan, rl_output)
+        else:
+            battle_plan = liquidity_constrained_plan
 
         # 5. [V2.0+] 在流动性调整后的计划上强制执行 CVaR 约束
         if self.risk_manager.risk_config.cvar_enabled and historical_returns is not None and battle_plan:
@@ -140,3 +149,33 @@ class CognitiveEngine:
         # 组合分数。给趋势更多权重。
         final_score = (0.6 * trend_score) + (0.4 * rsi_score)
         return max(0, min(100, final_score))
+
+    def integrate_rl_signal(self,
+                              bayesian_target_weights: List[Dict],
+                              rl_output: Any) -> List[Dict[str, Any]]:
+        """
+        (L5 Task 3) Combines the Bayesian-driven target weights from the position sizer
+        with the policy output from the DRL agent.
+
+        Args:
+            bayesian_target_weights: The list of allocations from determine_allocations.
+            rl_output: The raw output from the DRL agent (e.g., a single float or dict).
+
+        Returns:
+            A final, mixed list of allocation decisions.
+        """
+        self.logger.info(f"Integrating DRL signal ({rl_output}) with Bayesian plan...")
+
+        # Placeholder Logic:
+        # A simple merge could be to use the RL output as a "scaling factor"
+        # on the Bayesian-derived weights.
+        # e.g., if rl_output is a float from [0, 1] representing "risk-on".
+        try:
+            rl_scaling_factor = float(rl_output) # Assuming rl_output is a simple scalar
+            mixed_plan = bayesian_target_weights.copy()
+            for position in mixed_plan:
+                position['capital_allocation_pct'] *= rl_scaling_factor
+            return mixed_plan
+        except Exception as e:
+            self.logger.error(f"Failed to integrate DRL signal: {e}. Returning original Bayesian plan.")
+            return bayesian_target_weights
