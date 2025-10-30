@@ -3,13 +3,14 @@ import logging
 import math
 from typing import List, Dict, Any
 import backtrader as bt
+from execution.signal_protocol import StrategySignal # (L6) Import
 
 from .interfaces import IBrokerAdapter, Order
 
 class OrderManager:
     """
-    Handles the creation, submission, and tracking of orders.
-    It translates the desired portfolio state (the "battle plan") into concrete orders.
+    (L6 Patched) Handles the creation, submission, and tracking of orders.
+    It translates the desired portfolio state (StrategySignals) into concrete orders.
     """
     def __init__(self,
                  broker_adapter: IBrokerAdapter,
@@ -68,7 +69,7 @@ class OrderManager:
         return 1 / (1 + math.exp(-self.fill_prob_aggressiveness * (advantage_bps / 100))) # Normalize by 100
 
     def calculate_target_orders(self,
-                                target_portfolio: List[Dict[str, Any]],
+                                strategy_signals: List[StrategySignal], # (L6) Use StrategySignal
                                 total_value: float,
                                 current_positions: Dict[str, Dict[str, float]], # {ticker: {'size': s, 'value': v}}
                                 market_data: Dict[str, Dict[str, float]] # {ticker: {'price': p, 'volume': v}}
@@ -79,11 +80,11 @@ class OrderManager:
         not present in the target_portfolio; that is left to the caller.
         """
         orders_to_place: List[Order] = []
-        # Create a dictionary for easy lookup
-        target_map = {item['ticker']: item['capital_allocation_pct'] for item in target_portfolio}
 
         # Adjust positions for assets in the target portfolio
-        for ticker, target_pct in target_map.items():
+        for signal in strategy_signals:
+            ticker = signal.ticker
+            target_pct = signal.target_weight # (L6) Use target_weight from signal
             if ticker not in market_data:
                 self.logger.warning(f"No market data for target '{ticker}'. Skipping order calculation.")
                 continue
@@ -115,10 +116,10 @@ class OrderManager:
         
         return orders_to_place
 
-    def rebalance(self, strategy: bt.Strategy, target_portfolio: List[Dict[str, Any]]) -> None:
+    def rebalance(self, strategy: bt.Strategy, strategy_signals: List[StrategySignal]) -> None: # (L6) Use StrategySignal
         self.logger.info("--- [Order Manager]: Backtrader Rebalance protocol initiated ---")
 
-        target_map = {item['ticker']: item['capital_allocation_pct'] for item in target_portfolio}
+        target_map = {signal.ticker: signal.target_weight for signal in strategy_signals} # (L6) Build map from signals
         total_value = strategy.broker.getvalue()
 
         # Step 1: (Unchanged) Liquidate or reduce positions no longer in the target portfolio
@@ -145,7 +146,7 @@ class OrderManager:
 
         # Call the framework-agnostic calculation method
         orders_to_place = self.calculate_target_orders(
-            target_portfolio=target_portfolio,
+            strategy_signals=strategy_signals, # (L6) Pass signals
             total_value=total_value,
             current_positions=current_positions,
             market_data=market_data
