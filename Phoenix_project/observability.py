@@ -1,15 +1,37 @@
 import logging
 import sys
+import uuid
+
+# (L7) Task 2: Import Prometheus client
+from prometheus_client import Counter, Histogram, start_http_server
+import time
+
+
+class TraceFormatter(logging.Formatter):
+    """
+    (L7 Task 1) A custom formatter to include trace_id and stage_name.
+    """
+    def format(self, record):
+        # Set default values if not provided in 'extra'
+        if not hasattr(record, 'trace_id'):
+            record.trace_id = 'N/A'
+        if not hasattr(record, 'stage_name'):
+            record.stage_name = 'N/A'
+        
+        # (L7 Task 1) Add trace_id and stage_name to the log format
+        self._style._fmt = '%(asctime)s - [%(trace_id)s] - [%(stage_name)s] - %(name)s - %(levelname)s - %(message)s'
+        return super().format(record)
+
 
 def get_logger(name, level=logging.INFO):
     """
-    Creates a standardized logger.
+    (L7 Task 1) Creates a standardized logger with trace_id/stage_name context.
     """
     logger = logging.getLogger(name)
     if not logger.handlers: # Avoid duplicate handlers
         logger.setLevel(level)
         handler = logging.StreamHandler(sys.stdout)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        formatter = TraceFormatter() # (L7 Task 1) Use our custom formatter
         handler.setFormatter(formatter)
         logger.addHandler(handler)
     return logger
@@ -18,25 +40,46 @@ def get_logger(name, level=logging.INFO):
 # Get the monitoring-specific logger
 metric_logger = get_logger("PhoenixProject.Metrics")
 
-# --- Task 5.3: Comprehensive Monitoring Hooks ---
+# --- (L7 Task 1) Trace ID Generation ---
+def generate_trace_id():
+    """Generates a unique trace ID."""
+    return f"trace-{uuid.uuid4().hex[:12]}"
+    
+# --- (L7 Task 2) Prometheus Metrics Definitions ---
 
-def log_api_call(agent_name: str, token_usage: int):
-    """Captures API call count and token usage (segmented by Agent)."""
-    # In a real system, this would increment a Prometheus counter
-    metric_logger.info(f"MONITORING_METRIC: api_call_count=1, agent={agent_name}")
-    metric_logger.info(f"MONITORING_METRIC: api_token_usage={token_usage}, agent={agent_name}")
+AGENT_LATENCY = Histogram(
+    'agent_latency_seconds',
+    'Latency of L1 agent calls',
+    ['agent_name']
+)
 
-def log_pipeline_latency(pipeline_name: str, latency_sec: float):
+FUSION_CONFLICTS = Counter(
+    'fusion_conflict_count',
+    'Total number of conflicts detected by the L2 fusion engine'
+)
+
+UNCERTAINTY_DISTRIBUTION = Histogram(
+    'uncertainty_distribution',
+    'Distribution of L3 final uncertainty scores',
+    buckets=(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+)
+
+def start_metrics_server(port: int = 8000):
+    """Starts the Prometheus metrics server."""
+    start_http_server(port)
+    logger.info(f"Prometheus metrics server started on port {port}")
+
+
+# --- (L7 Patched) Monitoring Hooks ---
+
+def log_agent_latency(agent_name: str, latency_sec: float):
     """Captures pipeline execution latency."""
-    # In a real system, this would update a Prometheus histogram
-    metric_logger.info(f"MONITORING_METRIC: pipeline_execution_latency_seconds={latency_sec}, pipeline={pipeline_name}")
+    AGENT_LATENCY.labels(agent_name=agent_name).observe(latency_sec)
 
 def log_l2_uncertainty(score: float):
     """Captures the L2 cognitive uncertainty score."""
-    # In a real system, this would set a Prometheus gauge
-    metric_logger.info(f"MONITORING_METRIC: l2_cognitive_uncertainty_score={score}")
+    UNCERTAINTY_DISTRIBUTION.observe(score)
 
-def log_l3_rules_generated(count: int):
-    """Captures the count of new L3 rules."""
-    # In a real system, this would increment a Prometheus counter
-    metric_logger.info(f"MONITORING_METRIC: l3_rules_generated_count={count}")
+def log_fusion_conflict(count: int = 1):
+    """Increments the fusion conflict counter."""
+    FUSION_CONFLICTS.inc(count)
