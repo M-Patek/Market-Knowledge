@@ -3,6 +3,8 @@
 import logging
 import json
 from typing import List, Dict, Any
+from schemas.fusion_result import FusionResult  # (L4) Import new schema
+from ai.validation import EvidenceItem         # (L4) Import new schema
 from ai.tabular_db_client import TabularDBClient # Placeholder
 from api.gemini_pool_manager import GeminiPoolManager, query_model # Placeholder
 from observability import get_logger
@@ -12,8 +14,9 @@ logger = get_logger(__name__)
 LLM_CLIENT = "gemini" # Assuming a default
 class MetaCognitiveAgent:
     """
-    L3 Agent: Performs meta-cognition by analyzing the system's own decision-making process.
-    It runs periodically to analyze P&L results and decision logs.
+    (L4 Patched) L3 Agent: Performs meta-cognition.
+    - (Original) Periodically analyzes P&L and decision logs.
+    - (L4) Performs real-time analysis (consistency, critique) on new decisions.
     """
     def __init__(
         self,
@@ -71,7 +74,7 @@ class MetaCognitiveAgent:
             Analyze the following JSON log entries. Summarize the key patterns, decisions, and outcomes into 2-3 bullet points. Focus on relationships between agent evidence, fusion results, and P&L.
             --- LOGS ---
             {chunk}
-            --- SUMMARY ---
+--- SUMMARY ---
             """
             # Use a low-cost model for this summarization task
             summary = await self.gemini_client.query_model_async(prompt, model="gemini-1.5-flash-latest", client_name=LLM_CLIENT)
@@ -146,3 +149,80 @@ class MetaCognitiveAgent:
         except Exception as e:
             logger.error(f"Error parsing L3 rules: {e}", exc_info=True)
             return []
+
+    async def consistency_check(self, fusion_result: FusionResult, evidence_list: List[EvidenceItem]) -> Dict[str, Any]:
+        """
+        (L4 Task 1) Performs a real-time consistency check.
+        Analyzes if the final fused posterior is logically consistent with the raw evidence.
+        """
+        logger.info("Running L3 real-time consistency check...")
+        
+        evidence_summary = "\n".join([f"- {item.source}: {item.finding} (Score: {item.score})" for item in evidence_list])
+        
+        prompt = f"""
+        You are a meta-cognitive analyst. Analyze the following fusion result against the raw evidence it was based on.
+        Is the final decision logically consistent with the evidence?
+        
+        Evidence Summary:
+        {evidence_summary}
+        
+        Fusion Result:
+        - Posterior: {fusion_result.posterior}
+        - Rationale: {fusion_result.rationale}
+        
+        Respond with a JSON object: {{"consistency_score": float, "reasoning": "Your analysis..."}}
+        (Score: 1.0 = Highly Consistent, 0.0 = Highly Inconsistent)
+        """
+        try:
+            response_text = await self.gemini_client.query_model_async(prompt, model="gemini-1.5-pro-latest", client_name=LLM_CLIENT)
+            # TODO: Add robust JSON parsing
+            result = json.loads(response_text)
+            return {"consistency": result.get("consistency_score", 0.0)}
+        except Exception as e:
+            logger.error(f"L3 consistency_check failed: {e}")
+            return {"consistency": 0.5} # Return neutral on failure
+
+    async def self_critique(self, fusion_result: FusionResult) -> Dict[str, Any]:
+        """
+        (L4 Task 1) Performs a self-critique of the fusion result to identify internal weaknesses.
+        """
+        logger.info("Running L3 real-time self-critique...")
+
+        # Rule-based critique for now, can be LLM-based later
+        uncertainty_width = fusion_result.confidence_interval[1] - fusion_result.confidence_interval[0]
+        evidence_gap = 0.0
+
+        if uncertainty_width > 0.5:
+            reasoning = "High uncertainty detected (wide confidence interval)."
+            # This score is inversely related to the width of the confidence interval
+            evidence_gap = uncertainty_width 
+
+        # Placeholder for more complex critiques (e.g., analyzing rationale text)
+        
+        return {"evidence_gap": evidence_gap}
+
+    async def meta_update(self, consistency_result: Dict[str, Any], critique_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        (L4 Task 1 & 2) Synthesizes critique and consistency checks into a final Meta Log and action.
+        """
+        logger.info("Running L3 meta-update...")
+
+        consistency = consistency_result.get("consistency", 0.5)
+        evidence_gap = critique_result.get("evidence_gap", 0.0)
+        
+        action = "hold" # Default action
+
+        # Simple rule-based action generation
+        if consistency < 0.6:
+            action = "reduce_confidence"
+        elif evidence_gap > 0.5:
+            action = "request_more_evidence"
+
+        meta_log = {
+            "consistency": consistency,
+            "evidence_gap": evidence_gap,
+            "action": action
+        }
+        
+        logger.info(f"L3 Meta-Log generated: {meta_log}")
+        return meta_log
