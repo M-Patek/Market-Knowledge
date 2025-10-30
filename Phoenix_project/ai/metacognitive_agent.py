@@ -4,7 +4,7 @@ import logging
 import json
 from typing import List, Dict, Any
 from ai.tabular_db_client import TabularDBClient # Placeholder
-from api.gemini_pool_manager import GeminiPoolManager # Placeholder
+from api.gemini_pool_manager import GeminiPoolManager, query_model # Placeholder
 from observability import get_logger
 
 logger = get_logger(__name__)
