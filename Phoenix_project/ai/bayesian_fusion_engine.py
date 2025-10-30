@@ -1,142 +1,167 @@
-import os
-import json
-import glob
+# ai/bayesian_fusion_engine.py
+import logging
 import math
-from typing import List, Dict, Any, Tuple
-from pydantic import BaseModel, Field
+from typing import List, Dict, Any
 from scipy.stats import beta
 import numpy as np
 
-# Internal dependencies (to be added)
-from .contradiction_detector import ContradictionDetector # For Task 2.1
-from .validation import EvidenceItem # For Task 2.1
-from observability import get_logger
+from models.evidence import EvidenceItem
+from ai.contradiction_detector import ContradictionDetector
+from ai.probability_calibrator import ProbabilityCalibrator
+from ai.tabular_db_client import TabularDBClient # Placeholder
 
-logger = get_logger(__name__)
-
-
-# --- Task 2.2: Source Credibility Store ---
+logger = logging.getLogger(__name__)
 
 class SourceCredibilityStore:
     """
-    Manages persistence and updates for L1 Agent credibility scores.
-    Uses Beta distribution (alpha, beta) parameters for each source.
+    Tracks the historical accuracy of L1 Agents to assign credibility weights.
+    Uses a Beta distribution (Alpha, Beta) for each source.
+    - Alpha: Success count (evidence was 'correct')
+    - Beta: Failure count (evidence was 'incorrect')
     """
-    def __init__(self, store_path: str = "credibility_store.json", prompts_dir: str = "Phoenix_project/prompts"):
-        self.store_path = store_path
-        self.prompts_dir = prompts_dir
-        self.store = self._load_store()
-        self._initialize_store()
+    def __init__(self, db_client: TabularDBClient):
+        self.db_client = db_client
+        # Load existing credibility from DB or start fresh
+        self.store = self._load_credibility()
+        logger.info(f"SourceCredibilityStore initialized with {len(self.store)} sources.")
 
-    def _load_store(self) -> Dict[str, Dict[str, int]]:
-        """Loads the credibility store from a JSON file."""
-        if os.path.exists(self.store_path):
-            try:
-                with open(self.store_path, 'r') as f:
-                    return json.load(f)
-            except json.JSONDecodeError:
-                logger.error("Failed to decode credibility store. Reinitializing.")
-                return {}
-        return {}
+    def _load_credibility(self) -> Dict[str, Dict[str, int]]:
+        # Placeholder: Load from self.db_client
+        # return self.db_client.get_all_records('source_credibility')
+        return {
+            "fundamental_analyst": {"alpha": 10, "beta": 2},
+            "technical_analyst": {"alpha": 8, "beta": 3},
+            "catalyst_monitor": {"alpha": 12, "beta": 1},
+            "fact_checker_adversary": {"alpha": 5, "beta": 5}, # Neutral start
+        }
 
-    def _save_store(self):
-        """Saves the credibility store to a JSON file."""
-        with open(self.store_path, 'w') as f:
-            json.dump(self.store, f, indent=2)
-
-    def _initialize_store(self):
-        """Task 2.2: On system startup, create a default entry for every Agent."""
-        logger.info(f"Initializing Credibility Store. Checking agents in {self.prompts_dir}...")
-        agent_files = glob.glob(os.path.join(self.prompts_dir, "*.json"))
-        updated = False
-        for f_path in agent_files:
-            agent_name = os.path.basename(f_path).replace('.json', '')
-            if agent_name not in self.store:
-                logger.info(f"Adding new agent '{agent_name}' to store with neutral prior Beta(2, 2).")
-                self.store[agent_name] = {"alpha": 2, "beta": 2} # Neutral prior
-                updated = True
-        if updated:
-            self._save_store()
-
-    def get_credibility_params(self, agent_source: str) -> Tuple[int, int]:
-        """Gets the (alpha, beta) parameters for a given agent source."""
-        params = self.store.get(agent_source, {"alpha": 2, "beta": 2}) # Default to neutral if somehow missed
-        return params['alpha'], params['beta']
-
-    def update_source_credibility(self, agent_source: str, was_correct: bool):
-        """Task 2.2: Update credibility based on feedback (called by L3)."""
-        alpha, beta = self.get_credibility_params(agent_source)
-        if was_correct:
-            self.store[agent_source]['alpha'] = alpha + 1
+    def update_credibility(self, source: str, success: bool):
+        """
+        Update the alpha or beta count for a source based on ground truth.
+        """
+        if source not in self.store:
+            self.store[source] = {"alpha": 1, "beta": 1} # Start with Beta(1,1)
+        
+        if success:
+            self.store[source]["alpha"] += 1
         else:
-            self.store[agent_source]['beta'] = beta + 1
-        logger.info(f"Updated credibility for '{agent_source}': {self.store[agent_source]}")
-        self._save_store()
+            self.store[source]["beta"] += 1
+        
+        # Placeholder: Save back to self.db_client
+        # self.db_client.update_record('source_credibility', {'id': source}, self.store[source])
+        logger.info(f"Updated credibility for {source}: {self.store[source]}")
 
+    def get_credibility_params(self, source: str) -> (int, int):
+        """Returns (alpha, beta) for a source."""
+        return self.store.get(source, {"alpha": 1, "beta": 1}).values()
 
-# --- Task 2.1: Bayesian Fusion Engine ---
+    def get_credibility_weight(self, source: str) -> float:
+        """
+        Calculates a simple credibility weight (mean of the Beta distribution).
+        Weight = alpha / (alpha + beta)
+        """
+        params = self.store.get(source, {"alpha": 1, "beta": 1}) # Default to neutral prior
+        alpha = params["alpha"]
+        beta = params["beta"]
+        return alpha / (alpha + beta)
 
 class BayesianFusionEngine:
     """
-    Performs Bayesian fusion of evidence scores.
+    L2 Engine: Fuses multiple pieces of L1 EvidenceItems into a single,
+    probabilistic judgment.
     """
     def __init__(self):
-        """Initializes the engine and its dependencies."""
-        self.credibility_store = SourceCredibilityStore()
+        # Placeholder: DB client should be injected
+        self.db_client = TabularDBClient()
+        self.credibility_store = SourceCredibilityStore(self.db_client)
         self.contradiction_detector = ContradictionDetector()
+        self.calibrator = ProbabilityCalibrator() # Not fully implemented yet
+        logger.info("BayesianFusionEngine initialized.")
 
     def fuse(self, core_hypothesis: str, evidence_items: List[EvidenceItem]) -> Dict[str, Any]:
         """
-        Task 2.1: Fuses a list of EvidenceItems into a final judgment.
+        Performs Bayesian fusion on a list of EvidenceItems.
+        
+        Args:
+            core_hypothesis: The central question being answered (e.g., "Price of BTC will go up").
+            evidence_items: A list of EvidenceItem objects from L1 Agents.
+            
+        Returns:
+            A dictionary containing the final posterior, uncertainty, and other metadata.
         """
-        logger.info(f"Starting Bayesian fusion for hypothesis: '{core_hypothesis}'")
+        if not evidence_items:
+            logger.warning("Fuse called with no evidence items.")
+            return {"error": "No evidence provided."}
 
-        # 1. Call ContradictionDetector
+        # 1. Detect Contradictions
+        # This identifies pairs of items that are in direct conflict.
         contradictions = self.contradiction_detector.detect(evidence_items)
         if contradictions:
             logger.warning(f"ContradictionDetector flagged {len(contradictions)} pairs.")
-            # TODO: Add logic to down-weight or handle contradictions
+        # --- Task 2.1: Strategy C Setup ---
+        # Create a set of all items that are part of a contradiction for fast lookup
+        contradicted_items_set = set()
+        for item_pair in contradictions:
+            contradicted_items_set.add(item_pair[0])
+            contradicted_items_set.add(item_pair[1])
 
         # 2. Iterate list, update Bayesian Beta Distribution
         # Start with a neutral prior (e.g., Beta(1, 1) or Beta(2, 2))
-        total_alpha = 1.0
-        total_beta = 1.0
+        # A Beta(1,1) prior is a uniform distribution, representing max uncertainty.
+        prior_alpha, prior_beta = 1.0, 1.0
         
-        for item in evidence_items:
-            # 3. Integrate Credibility
-            cred_alpha, cred_beta = self.credibility_store.get_credibility_params(item.source)
-            # Credibility weight = mean of the agent's Beta distribution
-            credibility_weight = cred_alpha / (cred_alpha + cred_beta) 
+        total_weight = 0.0
 
+        for item in evidence_items:
+            # Get credibility weight (mean of Beta dist.) for the source
+            credibility_weight = self.credibility_store.get_credibility_weight(item.source)
+            
             # Combine provenance confidence with source credibility
             evidence_weight = item.provenance_confidence * credibility_weight
 
+            # --- Task 2.1: Strategy C (Automatic Weight Reduction) ---
+            if item in contradicted_items_set:
+                logger.warning(f"Applying contradiction penalty (x0.8) to item from {item.source} (Score: {item.score})")
+                evidence_weight *= 0.8  # Punitive multiplier
+            # --- End Task 2.1 ---
+            
             # Map score [-1, 1] to alpha (success) and beta (failure) updates.
             # A high score (e.g., +1.0) adds to alpha.
             # A low score (e.g., -1.0) adds to beta.
-            # A score of 0.0 adds to neither.
-            # We use a scaling factor to make updates significant
-            update_strength = 5.0 * evidence_weight 
+            # A score of 0 adds to both, increasing uncertainty.
+            update_strength = evidence_weight
+            
+            # Convert score to alpha/beta update
+            alpha_update = max(0, item.score) * update_strength
+            beta_update = max(0, -item.score) * update_strength
+            
+            prior_alpha += alpha_update
+            prior_beta += beta_update
+            total_weight += update_strength
 
-            successes = max(0, item.score) * update_strength
-            failures = max(0, -item.score) * update_strength
-
-            total_alpha += successes
-            total_beta += failures
-
-        # 3. Output structured dictionary
-        dist = beta(total_alpha, total_beta)
-        posterior_mean = dist.mean()
-        posterior_variance = dist.var()
+        # 3. Calculate Final Posterior
+        # The mean of the final Beta(alpha, beta) distribution
+        posterior_mean_unscaled = prior_alpha / (prior_alpha + prior_beta)
+        
+        # Rescale from [0, 1] back to [-1, 1]
+        posterior_mean = (posterior_mean_unscaled * 2) - 1
+        
+        dist = beta(prior_alpha, prior_beta)
         ci_low, ci_high = dist.interval(0.95)
         # "Cognitive Uncertainty" = width of the 95% confidence interval
         cognitive_uncertainty = ci_high - ci_low
 
+        # --- Task 2.1: Strategy A (Increase Uncertainty) ---
+        if contradictions:
+            logger.warning(f"Applying Strategy A: Increasing cognitive uncertainty (x1.5) due to contradictions.")
+            cognitive_uncertainty *= 1.5  # Punish-increase uncertainty
+        # --- End Task 2.1 ---
+
         return {
             "final_posterior_mean": posterior_mean,
-            "final_posterior_variance": posterior_variance,
-            "confidence_interval_95": (ci_low, ci_high),
             "cognitive_uncertainty_score": cognitive_uncertainty,
-            "contradictions_found": len(contradictions),
-            "final_beta_params": (total_alpha, total_beta)
+            "final_alpha": prior_alpha,
+            "final_beta": prior_beta,
+            "total_evidence_weight": total_weight,
+            "contradictions_detected": len(contradictions),
         }
