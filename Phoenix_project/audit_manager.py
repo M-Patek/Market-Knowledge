@@ -3,7 +3,7 @@
 import logging
 from datetime import datetime
 from ai.tabular_db_client import TabularDBClient  # Assuming a tabular client
-from models.evidence import EvidenceItem
+from ai.validation import EvidenceItem
 from typing import List, Dict, Any
 
 logger = logging.getLogger(__name__)
