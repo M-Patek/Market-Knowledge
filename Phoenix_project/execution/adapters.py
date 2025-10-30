@@ -7,16 +7,18 @@ import logging
 import random
 import backtrader as bt
 from .interfaces import Order
+from audit_manager import AuditManager # (L6) Import AuditManager
 
 class BacktraderBrokerAdapter:
     """
-    An adapter that translates universal Order objects into backtrader
+    (L6 Patched) An adapter that translates universal Order objects into backtrader
     buy/sell commands, allowing the OrderManager to be used within a backtest.
     """
-    def __init__(self, broker: bt.Broker):
+    def __init__(self, broker: bt.Broker, audit_manager: AuditManager): # (L6) Inject AuditManager
         self.logger = logging.getLogger("PhoenixProject.BacktraderAdapter")
         self.broker = broker
-        self.logger.info("BacktraderBrokerAdapter initialized.")
+        self.audit_manager = audit_manager # (L6) Store AuditManager
+        self.logger.info("BacktraderBrokerAdapter initialized with AuditManager.")
 
     def place_order(self, strategy: bt.Strategy, order: Order) -> Order:
         """Places an order using the backtrader engine."""
@@ -26,6 +28,8 @@ class BacktraderBrokerAdapter:
             else:
                 strategy.sell(data=strategy.getdatabyname(order.ticker), size=order.size)
             order.status = 'SUBMITTED'
+            # (L6) Write to AuditManager
+            self.audit_manager.log_order_submission(strategy.decision_id, order) # Assuming decision_id is on strategy
         elif order.order_type == 'Limit':
             data = strategy.getdatabyname(order.ticker)
             next_bar_open = data.open[1]
@@ -48,6 +52,8 @@ class BacktraderBrokerAdapter:
                 else: # SELL
                     strategy.sell(data=data, size=order.size, price=order.limit_price, exectype=bt.Order.Limit)
                 order.status = 'SUBMITTED'
+                # (L6) Write to AuditManager
+                self.audit_manager.log_order_submission(strategy.decision_id, order) # Assuming decision_id is on strategy
             else:
                 self.logger.warning(f"LIMIT order for {order.ticker} failed simulation (Final Prob: {final_fill_prob:.2f}). Base Prob: {order.fill_probability:.2f}, Adverse Selection Penalty: {adverse_selection_penalty:.2f}")
                 order.status = 'REJECTED'
