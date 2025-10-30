@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 from scipy.stats import beta
 import numpy as np
 
-from models.evidence import EvidenceItem
+from ai.validation import EvidenceItem
 from ai.contradiction_detector import ContradictionDetector
 from ai.probability_calibrator import ProbabilityCalibrator
 from ai.tabular_db_client import TabularDBClient # Placeholder
