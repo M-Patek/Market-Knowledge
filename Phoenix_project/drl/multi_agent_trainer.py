@@ -17,7 +17,7 @@ from utils.replay_buffer import ReplayBuffer
 
 class MultiAgentTrainer:
     """
-    Implements the Centralized Training, Decentralized Execution (CTDE) framework
+    (L5 Patched) Implements the Centralized Training, Decentralized Execution (CTDE) framework
     in a hierarchical manner.
     - Strategic Layer (Alpha, Risk) decides *what* to do.
     - Execution Layer (Exec) decides *how* to do it.
@@ -41,6 +41,11 @@ class MultiAgentTrainer:
         self.exploration_noise = self.config.get('exploration_noise', 0.1)
         self.variance_scaling_factor = self.config.get('variance_scaling_factor', 10.0) # Factor to scale variance into a [0, 1] penalty
         self.signal_variance_index = self.config.get('signal_variance_index', 3) # Index of signal_variance in global_state
+
+        # (L5) Task 1&2: Define indices for new L3/L4 features in global_state
+        self.posterior_index = self.config.get('posterior_index', 4) # L5: Index for L3 bullish posterior
+        self.uncertainty_score_index = self.config.get('uncertainty_score_index', 5) # L5: Index for L3/L4 uncertainty score
+        self.uncertainty_penalty_factor = self.config.get('uncertainty_penalty_factor', 0.1) # L5: Penalty multiplier
 
         # --- Initialize Strategic Layer (Alpha, Risk) ---
         self.strategic_agents = {id: agent for id, agent in agents.items() if id in ['alpha', 'risk']}
@@ -140,8 +145,15 @@ class MultiAgentTrainer:
         # The 'action' it takes is the fused percentage.
         next_global_state, _, done, _, _ = self.strategic_env.step(fused_pct)
 
+        # (L5) Task 2: Add "uncertainty penalty" to the reward function.
+        # We use the uncertainty score from the *current* state (global_state),
+        # which is provided by the L3 fusion engine.
+        uncertainty_score = global_state[self.uncertainty_score_index]
+        reward_penalty = self.uncertainty_penalty_factor * uncertainty_score
+        penalized_reward = cumulative_reward - reward_penalty
+
         # Store the strategic experience
-        self.strategic_replay_buffer.add(global_state, strategic_actions, cumulative_reward, next_global_state, done)
+        self.strategic_replay_buffer.add(global_state, strategic_actions, penalized_reward, next_global_state, done)
 
         # Trigger a strategic training update
         if len(self.strategic_replay_buffer) > self.batch_size:
@@ -210,12 +222,21 @@ class MultiAgentTrainer:
         }
 
     def _get_strategic_observations(self, global_state: np.ndarray) -> Dict[str, np.ndarray]:
-        """Extracts agent-specific observations from the global state. Placeholder."""
-        # This needs a concrete implementation based on the feature order in TradingEnv
-        # For now, we assume a simple slicing for demonstration.
+        """
+        (L5 Task 1) Extracts agent-specific observations from the global state.
+        This now includes the L3 posterior and uncertainty_score.
+        """
+        # Basic features (assuming original placeholder indices are for e.g., price, volume)
+        price = global_state[0]
+        volume = global_state[1]
+        signal_mean = global_state[2]
+        signal_variance = global_state[self.signal_variance_index]
+        posterior = global_state[self.posterior_index]
+        uncertainty_score = global_state[self.uncertainty_score_index]
+        
         return {
-            'alpha': global_state[[2, 0, 1]], # e.g., Signal Mean, Price, Volume
-            'risk': global_state[[3, -2, -1]]   # e.g., Signal Variance, CVaR (needs to be added), Risk Budget
+            'alpha': np.array([signal_mean, price, volume, posterior]),
+            'risk': np.array([signal_variance, uncertainty_score])
         }
 
     def _fuse_actions(self, actions: Dict[str, np.ndarray], global_state: np.ndarray) -> np.ndarray:
