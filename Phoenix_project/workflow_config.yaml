@@ -1,0 +1,10 @@
+"""
+Defines the sequence of stages for the cognitive pipeline (Layer 9).
+"""
+stages:
+  - L1_agents
+  - L2_fusion
+  - L3_meta
+  - RL_fusion
+  - Signal_generation
+  - Execution
