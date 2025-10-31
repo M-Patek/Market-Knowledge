@@ -1,13 +1,26 @@
 version: '3.8'
 
 services:
-phoenix-project:
-build: .
-container_name: phoenix_project_runner
-env_file:
-- .env # For injecting secrets like GEMINI_API_KEY
-volumes:
-- ./data_cache:/usr/src/app/data_cache
-- ./logs:/usr/src/app/logs
-- ./ai_audit_logs:/usr/src/app/ai_audit_logs
-- ./phoenix_walk_forward_study.db:/usr/src/app/phoenix_walk_forward_study.db # Persist the Optuna study DB
+  
+  api:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: phoenix_api
+    ports:
+      - "5000:5000"
+    command: ["flask", "run", "--host=0.0.0.0", "--port=5000"]
+    environment:
+      - FLASK_APP=Phoenix_project.api.gateway:create_app
+    volumes:
+      - .:/app
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: phoenix_worker
+    # This assumes a celery app is defined in 'phoenix_project.worker'
+    command: ["celery", "-A", "phoenix_project.worker.app", "worker", "--loglevel=info"]
+    volumes:
+      - .:/app
