@@ -1,26 +1,50 @@
-from pydantic import BaseModel, Field
-from typing import List, Tuple, Dict, Any
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from pydantic import BaseModel, model_validator, ConfigDict
+from schemas.data_schema import MarketEvent, AnalystOpinion
+
+class L1AgentResult(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    agent_name: str
+    ticker: str
+    output: Dict[str, Any]
 
 class FusionResult(BaseModel):
     """
-    (L3) Standardized data structure for the output of the BayesianFusionEngine.
+    Represents the output of the L2 Fusion Engine.
+    This is the final, consolidated output after L2 Bayesian Fusion,
+    Contradiction Detection, and Metacognitive analysis.
     """
-    posterior: Dict[str, float] = Field(
-        ...,
-        description="The resulting posterior probabilities for different outcomes (e.g., {'bullish': 0.7, 'bearish': 0.3})."
-    )
+    model_config = ConfigDict(extra='ignore')
+    ticker: str
+    final_sentiment: str  # "Bullish", "Bearish", "Neutral"
+    confidence_score: float  # 0.0 to 1.0
+    uncertainty_score: float # 0.0 to 1.0
+    sentiment_reasoning: str
     
-    confidence_interval: Tuple[float, float] = Field(
-        ...,
-        description="The confidence interval for the primary posterior estimate."
-    )
+    # Raw inputs that led to this fusion
+    l1_agent_results: List[L1AgentResult]
     
-    rationale: str = Field(
-        ...,
-        description="A natural language explanation of how the fusion result was reached."
-    )
+    # Structured data extracted and verified
+    contributing_events: List[MarketEvent]
+    contributing_opinions: List[AnalystOpinion]
     
-    conflict_log: List[Dict[str, Any]] = Field(
-        default_factory=list,
-        description="A log of any detected contradictions between evidence items."
-    )
+    # List of detected contradictions
+    contradictions_found: List[str]
+    
+    # Optional field for the reasoning trace from the metacognitive agent
+    meta_reasoning_trace: Optional[str] = None
+
+    @model_validator(mode='after')
+    def check_sentiment_and_scores(self):
+        sentiment = self.final_sentiment
+        conf_score = self.confidence_score
+        uncert_score = self.uncertainty_score
+
+        if sentiment not in ["Bullish", "Bearish", "Neutral"]:
+            raise ValueError("Final sentiment must be Bullish, Bearish, or Neutral")
+        if not (0.0 <= conf_score <= 1.0):
+            raise ValueError("Confidence score must be between 0.0 and 1.0")
+        if not (0.0 <= uncert_score <= 1.0):
+            raise ValueError("Uncertainty score must be between 0.0 and 1.0")
+        return self
