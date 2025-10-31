@@ -1,11 +1,10 @@
-from pydantic import BaseModel
-from typing import List, Any
+# Phoenix_project/schemas/feature_schema.py
+from typing import List, Dict, Any
+from pydantic import BaseModel, ConfigDict
 
-class FeatureSchema(BaseModel):
-    """
-    (L1) Standardized schema for defining features.
-    """
+class Feature(BaseModel):
+    model_config = ConfigDict(extra='ignore')
     name: str
-    dependencies: List[str]
-    data_type: Any
-    calc_fn: str  # (L1) The registered name of the calculation function
+    value: Any
+    timestamp: str
+    metadata: Dict[str, Any] = {}
