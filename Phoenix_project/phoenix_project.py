@@ -1,78 +1,80 @@
-import asyncio
-import logging
-import os
 import yaml
-from typing import Dict, Any, MutableMapping
+from cognitive.engine import CognitiveEngine
+from data_manager import DataManager
+from audit_manager import AuditManager
+from ai.prompt_manager import PromptManager
+from ai.source_credibility import SourceCredibilityStore
+from api.gemini_pool_manager import GeminiPoolManager
+from l3_rules_engine import L3RulesEngine
+from registry import registry
+from observability import get_logger
+from knowledge_graph_service import KnowledgeGraphService
+from ai.embedding_client import EmbeddingClient
+from backtesting.engine import BacktestingEngine
+from ai.bayesian_fusion_engine import BayesianFusionEngine
 
-from .cognitive.engine import CognitiveEngine
-from .events.risk_filter import RiskFilter
-from .events.event_distributor import EventDistributor
-# from .data_manager import DataManager (被流处理器取代)
+# Configure logger for this module (Layer 12)
+logger = get_logger(__name__)
 
-def _load_and_override_config(config_path: str) -> Dict[str, Any]:
-    """Loads a YAML config and overrides values from environment variables."""
-    with open(config_path, 'r', encoding='utf-8') as f:
+
+def setup_dependencies():
+    """
+    Centralized service instantiation and registration (Layer 11).
+    Loads configurations and registers all core services with the singleton registry.
+    """
+    # Load main config
+    with open("config.yaml", 'r') as f:
         config = yaml.safe_load(f)
+    logger.info("Configuration loaded.")
+    
+    # Instantiate and register services
+    audit_manager = AuditManager(config.get('audit_log_path', 'logs/audit_log.jsonl'))
+    registry.register("audit_manager", audit_manager)
 
-    def _recursive_override(sub_config: MutableMapping[str, Any]):
-        """Recursively traverses the config dict to find and replace env var placeholders."""
-        for key, value in list(sub_config.items()):
-            if isinstance(value, dict):
-                _recursive_override(value)
-            elif isinstance(key, str) and key.endswith('_env_var'):
-                env_var_name = value
-                env_var_value = os.getenv(env_var_name)
-                if env_var_value:
-                    # Replace the placeholder key with the actual config key
-                    # e.g., 'api_key_env_var' becomes 'api_key'
-                    new_key = key.replace('_env_var', '')
-                    sub_config[new_key] = env_var_value
-                    del sub_config[key] # Remove the original placeholder
-                    logging.info(f"Configuration override: Found and set '{new_key}' from environment variable '{env_var_name}'.")
+    data_manager = DataManager(config.get('data_catalog_path', 'data_catalog.json'))
+    registry.register("data_manager", data_manager)
 
-    _recursive_override(config)
-    return config
+    prompt_manager = PromptManager()
+    registry.register("prompt_manager", prompt_manager)
 
-class PhoenixProject:
-    """
-    项目的主应用类，初始化并连接所有核心组件。
-    现在以事件驱动模式运行。
-    """
-    def __init__(self, config_path: str = "config.yaml"):
-        """
-        Initializes the PhoenixProject application.
+    credibility_store = SourceCredibilityStore()
+    registry.register("credibility_store", credibility_store)
 
-        Args:
-            config_path (str): Path to the base configuration YAML file.
-        """
-        # Setup logging first
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        self.logger = logging.getLogger("PhoenixProject")
+    cognitive_engine = CognitiveEngine(data_manager)
+    registry.register("cognitive_engine", cognitive_engine)
 
-        # [V2.0] Load base config and override with environment variables
-        self.config = _load_and_override_config(config_path)
+    gemini_pool = GeminiPoolManager()
+    registry.register("gemini_pool", gemini_pool)
 
-        # --- 主应用逻辑 ---
-        self.cognitive_engine = CognitiveEngine(self.config)
-        self.risk_filter = RiskFilter(self.config)
-        self.event_distributor = EventDistributor(self.cognitive_engine, self.risk_filter)
-        self.logger.info("PhoenixProject组件已初始化。")
+    l3_rules_engine = L3RulesEngine()
+    registry.register("l3_rules_engine", l3_rules_engine)
 
-    async def run(self):
-        """
-        主运行循环，现在是事件驱动的。
-        """
-        self.logger.info("--- PhoenixProject切换到事件驱动模式 ---")
-        try:
-            # EventDistributor的循环现在无限期运行，消费实时流
-            await self.event_distributor.run_event_loop()
-        except KeyboardInterrupt:
-            self.logger.info("收到关闭信号。正在退出。")
-        except Exception as e:
-            self.logger.critical(f"事件驱动运行循环出现严重错误: {e}", exc_info=True)
+    # Register Layer 10 service
+    knowledge_graph_service = KnowledgeGraphService()
+    registry.register("knowledge_graph_service", knowledge_graph_service)
+
+    # Register Layer 13 service
+    embedding_client = EmbeddingClient()
+    registry.register("embedding_client", embedding_client)
+
+    # Register Layer 14 service
+    backtesting_engine = BacktestingEngine()
+    registry.register("backtesting_engine", backtesting_engine)
+
+    # Register Layer 13 (L2) service
+    bayesian_fusion_engine = BayesianFusionEngine()
+    registry.register("bayesian_fusion_engine", bayesian_fusion_engine)
+
+    logger.info("All core services instantiated and registered.")
+
 
 if __name__ == "__main__":
-    # 这是一个简化的启动器
-    project = PhoenixProject(config_path="config.yaml")
-    asyncio.run(project.run())
+    # Set up all application dependencies first
+    setup_dependencies()
 
+    # Resolve the main engine from the registry
+    cognitive_engine: CognitiveEngine = registry.resolve("cognitive_engine")
+
+    logger.info("Starting Phoenix Project simulation...")
+    cognitive_engine.run_simulation()
+    logger.info("Phoenix Project simulation finished.")
