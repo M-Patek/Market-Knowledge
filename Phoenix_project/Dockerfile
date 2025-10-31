@@ -1,37 +1,21 @@
-# Stage 1: Builder stage to compile dependencies on an Alpine base
-FROM python:3.11-alpine as builder
+# Base image
+FROM python:3.10-slim
 
-WORKDIR /usr/src/app
+# Set working directory
+WORKDIR /app
 
-# [V2.0] Install build-base which contains compilers (gcc, etc.) needed for some Python packages
-# that lack pre-compiled wheels for Alpine's musl libc.
-RUN apk add --no-cache build-base
-
-# Create a virtual environment
-RUN python -m venv /opt/venv
-
-# Activate the virtual environment
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Install dependencies
+# Copy requirements and install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Stage 2: Final, deeply optimized production image
-FROM python:3.11-alpine
+# Install Layer 15 dependencies (Prometheus, pytest, celery, pydantic)
+RUN pip install --no-cache-dir prometheus-client pytest celery pydantic
 
-WORKDIR /usr/src/app
+# Expose any necessary ports (e.g., for the API)
+EXPOSE 5000
 
-# Copy the virtual environment from the builder stage
-COPY --from=builder /opt/venv /opt/venv
-
-# Activate the virtual environment
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Copy the application source code
+# Copy the rest of the application code
 COPY . .
 
-# Command to run the application
-CMD ["python", "phoenix_project.py"]
-
+# Default command (can be overridden in docker-compose)
+CMD ["python", "Phoenix_project/phoenix_project.py"]
