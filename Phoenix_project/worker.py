@@ -6,7 +6,7 @@ This file is the entry point for the 'worker' service in docker-compose.yml.
 """
 
 from celery import Celery
-from observability import get_logger
+from monitor.logging import get_logger
 
 # Configure logger for this module (Layer 12)
 logger = get_logger(__name__)
