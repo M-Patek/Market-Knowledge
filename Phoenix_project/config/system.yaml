@@ -1,0 +1,77 @@
+# Phoenix_project/config/system.yaml
+# Global configuration for the Phoenix Project AI system
+
+# System-wide settings
+system:
+  environment: "development" # "production" or "development"
+  log_level: "INFO"
+
+# Pipeline settings from Task 20
+pipeline:
+  K_paths: 5
+  conflict_threshold: 0.6
+  uncertainty_threshold: 0.4
+  auto_retry: 3
+  audit_log_retention_days: 30
+  
+ai:
+  # 1. AI Client Providers (from config/ai_clients.yaml)
+  ai_providers:
+    google:
+      api_key_env_var: "GEMINI_PRO_KEY"
+      models:
+        - name: "gemini-1.5-flash-latest"
+          type: "generative"
+        - name: "text-embedding-004"
+          type: "embedding"
+  
+  # 2. Embedding Client Configuration (from config/ai_clients.yaml)
+  embedding_client:
+    provider: "google"
+    model: "text-embedding-004"
+    batch_size: 100
+    
+  # 3. Vector Database Configuration (from config/ai_clients.yaml)
+  vector_database:
+    index_name: "phoenix-project-rag"
+    embedding_dimension: 768
+  
+  # 4. Hybrid Retriever & Re-ranking Settings (from config/ai_clients.yaml)
+  retriever:
+    rrf_k: 60
+    freshness_decay_rate: 0.05
+    source_type_weights:
+      "10-K": 1.0
+      "10-Q": 0.9
+      "Press Release": 0.8
+      "News": 0.7
+      "Analyst Report": 0.6
+      "Market Data": 0.9
+      "Other": 0.5
+      
+  # 5. Reasoning Ensemble (from ai/model_config.yaml)
+  reasoning_ensemble:
+    meta_learner:
+      n_timesteps: 5
+      n_features: 16
+    loss_function:
+      beta_nll_weight: 0.5
+      focal_loss_gamma: 2.0
+    adversarial_training:
+      enabled: true
+      epsilon: 0.02
+    reasoners:
+      - name: "SymbolicLogicReasoner"
+        class: "ai.reasoning_ensemble.SymbolicLogicReasoner"
+        enabled: true
+        config:
+          rules_path: "config/symbolic_rules.yaml"
+      - name: "BayesianBeliefNetworkReasoner"
+        class: "ai.reasoning_ensemble.BayesianBeliefNetworkReasoner"
+        enabled: true
+      - name: "LLMExplainerReasoner"
+        class: "ai.reasoning_ensemble.LLMExplainerReasoner"
+        enabled: true
+      - name: "DeepForestReasoner"
+        class: "ai.reasoning_ensemble.DeepForestReasoner"
+        enabled: true
