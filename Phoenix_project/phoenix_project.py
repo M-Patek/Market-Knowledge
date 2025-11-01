@@ -5,20 +5,12 @@ from audit_manager import AuditManager
 from ai.prompt_manager import PromptManager
 from ai.source_credibility import SourceCredibilityStore
 from api.gemini_pool_manager import GeminiPoolManager
-# NOTE: 'l3_rules_engine.py' 在项目文件列表中不存在。
-# 必须保持注释，否则会导致 ModuleNotFoundError。
-# from l3_rules_engine import L3RulesEngine
 from registry import registry
-# FIXED: 'observability.py' 不存在。'get_logger' 位于 'monitor/logging.py'。
 from monitor.logging import get_logger
 from knowledge_graph_service import KnowledgeGraphService
 from ai.embedding_client import EmbeddingClient
 from backtesting.engine import BacktestingEngine
-# NOTE: 'ai/bayesian_fusion_engine.py' 在项目文件列表中不存在。
-# FIXED: Refactored to ai.reasoning_ensemble.py per analysis
 from ai.reasoning_ensemble import ReasoningEnsemble # Was BayesianFusionEngine
-
-# NEW IMPORTS FOR RAG (Task 7)
 from ai.retriever import HybridRetriever, VectorDBClient # Imports dummy VectorDBClient
 from ai.temporal_db_client import TemporalDBClient
 from ai.tabular_db_client import TabularDBClient
@@ -33,7 +25,6 @@ def setup_dependencies():
     Loads configurations and registers all core services with the singleton registry.
     """
     # Load main config
-    # FIXED: 修正了配置文件的路径
     with open("config/system.yaml", 'r') as f:
         config = yaml.safe_load(f)
     logger.info("Configuration loaded.")
@@ -57,8 +48,6 @@ def setup_dependencies():
     gemini_pool = GeminiPoolManager()
     registry.register("gemini_pool", gemini_pool)
 
-    # NOTE: 已注释掉，因为 'l3_rules_engine.py' 文件缺失
-
     # Register Layer 10 service
     knowledge_graph_service = KnowledgeGraphService()
     registry.register("knowledge_graph_service", knowledge_graph_service)
@@ -72,13 +61,13 @@ def setup_dependencies():
     registry.register("backtesting_engine", backtesting_engine)
 
     # Register Layer 13 (L2) service
-    # NOTE: 'ai/bayesian_fusion_engine.py' and 'l3_rules_engine.py' are obsolete.
-    # REFACTORED: Registering under the single, correct name.
+    # 'ai/bayesian_fusion_engine.py' and 'l3_rules_engine.py' are obsolete.
+    # Registering under the single, correct name.
     reasoning_ensemble_service = ReasoningEnsemble(config) # Instantiated with config
     registry.register("reasoning_ensemble", reasoning_ensemble_service)
     logger.info("ReasoningEnsemble registered as 'reasoning_ensemble'.")
 
-    # --- NEW RAG SERVICE REGISTRATION (Task 7) ---
+    # --- RAG SERVICE REGISTRATION ---
     logger.info("Registering RAG services...")
     # Instantiate clients for the retriever
     vector_db_client = VectorDBClient() # Uses dummy client from retriever.py
