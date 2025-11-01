@@ -3,8 +3,8 @@ import os
 import hashlib
 
 # Configure logger for this module (Layer 12)
-from observability import get_logger
-logger = get_logger(__name__)
+from monitor.logging import get_logger
+logger = get_logger("PhoenixProject.CoTDatabase")
 
 
 def _generate_hash(data: any) -> str:
