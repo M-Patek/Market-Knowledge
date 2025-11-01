@@ -1,103 +1,143 @@
-# ai/temporal_db_client.py
-"""
-Manages the connection and lifecycle of the temporal index (Elasticsearch)
-for storing and retrieving time-stamped event data.
-"""
-import os
-import logging
-from elasticsearch import Elasticsearch
+import pandas as pd
+from elasticsearch import AsyncElasticsearch
 from typing import List, Dict, Any, Optional
-from datetime import date
+from datetime import datetime
+
+from ..monitor.logging import get_logger
+
+logger = get_logger(__name__)
 
 class TemporalDBClient:
     """
-    A client to manage interactions with the Elasticsearch temporal index.
+    Client for interacting with a temporal database (e.g., Elasticsearch).
+    Used for storing and retrieving time-series events (news, filings, etc.).
     """
-    def __init__(self, index_name: str = "phoenix-temporal-index"):
-        """
-        Initializes the connection to Elasticsearch and ensures the index exists.
-        """
-        self.logger = logging.getLogger("PhoenixProject.TemporalDBClient")
-        self.index_name = index_name
-        self.es: Optional[Elasticsearch] = None
-        es_url = os.getenv("ELASTICSEARCH_URL")
 
-        if not es_url:
-            self.logger.error("ELASTICSEARCH_URL environment variable not set. TemporalDBClient will be non-operational.")
-            return
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initializes the Elasticsearch client.
         
-        try:
-            self.es = Elasticsearch(es_url)
-            if not self.es.ping():
-                raise ConnectionError("Elasticsearch ping failed.")
-            self.logger.info("Successfully connected to Elasticsearch.")
-            self._setup_index()
-        except Exception as e:
-            self.logger.error(f"Failed to connect or setup Elasticsearch: {e}")
-            self.es = None
-
-    def _setup_index(self):
-        """Creates the index with the correct mapping if it doesn't exist."""
-        if not self.es or self.es.indices.exists(index=self.index_name):
-            return
-
-        mapping = {
-            "properties": {
-                "timestamp": {"type": "date"},
-                "entities": {"type": "keyword"},
-                "keywords": {"type": "text"},
-                "source_id": {"type": "keyword"}
-            }
-        }
-        try:
-            self.es.indices.create(index=self.index_name, mappings=mapping)
-            self.logger.info(f"Successfully created Elasticsearch index '{self.index_name}' with correct mapping.")
-        except Exception as e:
-            self.logger.error(f"Failed to create Elasticsearch index: {e}")
-
-    def insert_events(self, events: List[Dict[str, Any]]):
-        """
-        Bulk inserts a list of event documents into the index.
-
         Args:
-            events: A list of event dictionaries.
+            config (Dict[str, Any]): Configuration dict, expects 'temporal_db'
+                                      with 'hosts' and 'index_name'.
         """
-        if not self.es:
-            self.logger.error("No Elasticsearch connection. Cannot insert events.")
-            return
-        
-        actions = [
-            {"_index": self.index_name, "_id": event["source_id"], "_source": event}
-            for event in events
-        ]
-        try:
-            from elasticsearch.helpers import bulk
-            bulk(self.es, actions)
-            self.logger.info(f"Successfully indexed {len(events)} events.")
-        except Exception as e:
-            self.logger.error(f"Failed to bulk insert events: {e}")
+        db_config = config.get('temporal_db', {})
+        self.es = AsyncElasticsearch(
+            hosts=db_config.get('hosts', ["http://localhost:9200"])
+        )
+        self.index_name = db_config.get('index_name', 'market_events')
+        logger.info(f"TemporalDBClient initialized for index: {self.index_name}")
 
-    def query_by_time_and_entities(self, start_date: date, end_date: date, entities: List[str], size: int = 25) -> List[Dict]:
-        """
-        Queries for documents containing specific entities within a date range.
-        """
-        if not self.es: return []
-        
-        query = {
-            "bool": {
-                "filter": [
-                    {"range": {"timestamp": {"gte": start_date, "lte": end_date}}},
-                    {"terms": {"entities": entities}}
-                ]
-            }
-        }
+    async def connect(self):
+        """Checks the connection to Elasticsearch."""
         try:
-            response = self.es.search(index=self.index_name, query=query, size=size)
-            return [hit["_source"] for hit in response["hits"]["hits"]]
+            if not await self.es.ping():
+                logger.error("Elasticsearch connection failed.")
+                raise ConnectionError("Failed to connect to Elasticsearch")
+            
+            # Ensure index exists
+            if not await self.es.indices.exists(index=self.index_name):
+                logger.warning(f"Elasticsearch index '{self.index_name}' not found. Attempting to create.")
+                # TODO: Add index mapping definition
+                await self.es.indices.create(index=self.index_name)
+                
+            logger.info("Elasticsearch connection successful.")
         except Exception as e:
-            self.logger.error(f"Failed to query Elasticsearch: {e}")
+            logger.error(f"Error connecting to Elasticsearch: {e}", exc_info=True)
+            raise
+
+    async def close(self):
+        """Closes the Elasticsearch connection."""
+        await self.es.close()
+        logger.info("Elasticsearch connection closed.")
+
+    async def index_event(self, event_id: str, event_data: Dict[str, Any]) -> bool:
+        """
+        Indexes a single event document in Elasticsearch.
+        
+        Args:
+            event_id (str): The unique ID for the document.
+            event_data (Dict[str, Any]): The event data (must be JSON-serializable).
+            
+        Returns:
+            bool: True on success, False on failure.
+        """
+        try:
+            # Ensure timestamp is in correct format
+            if 'timestamp' in event_data and isinstance(event_data['timestamp'], pd.Timestamp):
+                event_data['timestamp'] = event_data['timestamp'].isoformat()
+                
+            response = await self.es.index(
+                index=self.index_name,
+                id=event_id,
+                document=event_data
+            )
+            
+            if response.get('result') not in ['created', 'updated']:
+                logger.warning(f"Failed to index event {event_id}: {response}")
+                return False
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error indexing event {event_id} in Elasticsearch: {e}", exc_info=True)
+            return False
+
+    async def search_events(
+        self, 
+        symbols: Optional[List[str]] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        query_string: Optional[str] = None,
+        size: int = 25
+    ) -> List[Dict[str, Any]]:
+        """
+        Searches the temporal database for events matching the criteria.
+        
+        Args:
+            symbols: List of ticker symbols to match.
+            start_time: The start of the time window.
+            end_time: The end of the time window.
+            query_string: A free-text query string.
+            size: The maximum number of hits to return.
+            
+        Returns:
+            List[Dict[str, Any]]: A list of event data dictionaries.
+        """
+        try:
+            query = {"bool": {"filter": []}}
+            
+            # Time range filter
+            time_range = {}
+            if start_time:
+                time_range["gte"] = start_time.isoformat()
+            if end_time:
+                time_range["lte"] = end_time.isoformat()
+            if time_range:
+                query["bool"]["filter"].append({"range": {"timestamp": time_range}})
+                
+            # Symbols filter (assuming 'symbols' is a keyword field)
+            if symbols:
+                query["bool"]["filter"].append({"terms": {"symbols": symbols}})
+                
+            # Full-text query (if provided)
+            if query_string:
+                query["bool"]["must"] = {
+                    "query_string": {
+                        "query": query_string,
+                        "fields": ["headline", "summary", "tags"]
+                    }
+                }
+            
+            response = await self.es.search(
+                index=self.index_name,
+                query=query,
+                size=size,
+                sort=[{"timestamp": "desc"}] # Most recent first
+            )
+            
+            hits = response.get('hits', {}).get('hits', [])
+            return [hit.get('_source', {}) for hit in hits]
+            
+        except Exception as e:
+            logger.error(f"Error searching Elasticsearch: {e}", exc_info=True)
             return []
-
-    def is_healthy(self) -> bool:
-        """Checks if the Elasticsearch connection is active."""
-        return self.es is not None and self.es.ping()
