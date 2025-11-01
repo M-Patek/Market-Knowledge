@@ -1,134 +1,190 @@
-# drl/execution_env.py
-
-import gymnasium as gym
-from gymnasium import spaces
+import gym
+from gym import spaces
 import numpy as np
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional
 
-# from data.hf_data_iterator import HighFrequencyDataIterator # TODO: Will need a new iterator
+from ..monitor.logging import get_logger
+
+logger = get_logger(__name__)
 
 class ExecutionEnv(gym.Env):
     """
-    A high-frequency environment to train the ExecutionAgent.
-    Its goal is to execute a given 'parent order' over a fixed
-    duration, minimizing slippage and price impact.
+    A custom OpenAI Gym Environment for training an ExecutionAgent.
+    
+    The goal is to execute a large parent order (e.g., "BUY 10,000 AAPL")
+    over a fixed time horizon (e.g., 60 minutes) to minimize slippage.
     """
 
-    def __init__(self, 
-                 hf_data_iterator, # TODO: Needs a high-frequency (e.g., L1 order book) iterator
-                 parent_order_goal: Dict[str, Any],
-                 config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], market_data_simulator: Any):
         """
-        Initializes the execution environment with a specific goal.
-
+        Initializes the execution environment.
+        
         Args:
-            hf_data_iterator: An iterator that yields high-frequency market data.
-            parent_order_goal: {'side': 'BUY'/'SELL', 'size': float, 'duration_steps': int}
-            config: Env configuration (e.g., impact coefficients).
+            config: Configuration dictionary.
+            market_data_simulator: A simulator that provides
+                                   market micro-structure data (LOB, trades).
         """
-        super().__init__()
-        self.hf_data_iterator = hf_data_iterator
-        self.start_size = parent_order_goal['size']
-        self.side = parent_order_goal['side']
-        self.total_steps = parent_order_goal['duration_steps']
+        super(ExecutionEnv, self).__init__()
         
         self.config = config
-        self.impact_coefficient = config.get('impact_coefficient', 0.01) # Example
+        self.simulator = market_data_simulator
+        
+        self.time_horizon_steps = config.get('time_horizon_steps', 60) # e.g., 60 (1-minute steps)
+        self.parent_order_size = config.get('parent_order_size', 10000)
+        
+        # --- Define Action Space ---
+        # Action: Percentage of *remaining* order to execute now.
+        # Box(low=0.0, high=1.0, shape=(1,))
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
 
-        # State: [rem_size, rem_time, bid_prc, ask_prc, bid_vol, ask_vol, vwap]
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
-        # Actions: 0:WAIT, 1:EXECUTE_SMALL, 2:EXECUTE_LARGE, 3:PLACE_LIMIT
-        self.action_space = spaces.Discrete(4)
+        # --- Define Observation Space ---
+        # This is crucial. Needs to include all relevant info.
+        # Example:
+        # 0: Shares Remaining (normalized: 0 to 1)
+        # 1: Time Remaining (normalized: 0 to 1)
+        # 2: VWAP (normalized)
+        # 3: Bid-Ask Spread (normalized)
+        # 4: Imbalance (LOB)
+        obs_shape = 5 
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_shape,), dtype=np.float32)
 
-        # Internal State
-        self.remaining_size = self.start_size
         self.current_step = 0
-        self.cumulative_reward = 0.0
+        self.shares_remaining = 0
+        self.benchmark_price = 0 # (e.g., Arrival Price)
+        self.trade_direction = 1 # 1 for Buy, -1 for Sell
+        
+        self.trade_log = []
 
-    def reset(self, seed=None, options=None) -> Tuple[np.ndarray, Dict]:
-        """Resets the environment for a new execution run."""
-        super().reset(seed=seed)
-        self.remaining_size = self.start_size
+    def reset(self) -> np.ndarray:
+        """
+        Resets the environment for a new episode.
+        
+        Returns:
+            np.ndarray: The initial observation.
+        """
         self.current_step = 0
-        self.cumulative_reward = 0.0
-        self.hf_data_iterator.reset()
+        self.shares_remaining = self.parent_order_size
+        self.trade_log = []
         
-        obs = self._get_observation()
-        info = {}
-        return obs, info
+        # Reset the market data simulator
+        initial_market_state = self.simulator.reset()
+        
+        # Set the benchmark price (Arrival Price)
+        self.benchmark_price = initial_market_state['price']
+        
+        # Randomize trade direction?
+        # self.trade_direction = np.random.choice([1, -1])
+        
+        logger.debug(f"ExecutionEnv reset. Target: {self.trade_direction * self.shares_remaining} shares.")
+        
+        return self._get_observation(initial_market_state)
 
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+    def step(self, action: np.ndarray) -> (np.ndarray, float, bool, Dict):
         """
-        Executes one high-frequency step (e.g., 1 second).
+        Takes a step in the environment.
+        
+        Args:
+            action (np.ndarray): The action from the agent (pct_to_execute).
+            
+        Returns:
+            (np.ndarray, float, bool, Dict): observation, reward, done, info
         """
-        # 1. Determine execution size based on agent's action
-        child_order_size = self._get_child_order_size(action)
+        if self.current_step >= self.time_horizon_steps:
+            # Should have been 'done' last step
+            return self._get_observation(self.simulator.get_current_state()), 0, True, {}
+
+        # 1. Determine shares to execute based on action
+        pct_to_execute = action[0]
+        shares_to_execute = round(self.shares_remaining * pct_to_execute)
         
-        # 2. Get current high-frequency market data
-        hf_data = self.hf_data_iterator.next()
+        # Ensure we don't execute more than remaining
+        shares_to_execute = min(shares_to_execute, self.shares_remaining)
         
-        # 3. Simulate the child order's execution and cost
-        # TODO: This logic will be complex, simulating impact against L1 data
-        price_impact_cost = self._simulate_child_order(child_order_size, hf_data)
+        # 2. Simulate the trade
+        # The simulator applies market impact
+        execution_price, next_market_state = self.simulator.execute_trade(
+            shares=shares_to_execute,
+            direction=self.trade_direction
+        )
         
-        # 4. Calculate the immediate reward (penalty for cost)
-        immediate_reward = -price_impact_cost
-        self.cumulative_reward += immediate_reward
-        
-        # 5. Update internal state
-        self.remaining_size = max(0, self.remaining_size - child_order_size)
+        # 3. Update internal state
+        self.shares_remaining -= shares_to_execute
         self.current_step += 1
         
-        # 6. Check if done
-        done = (self.current_step >= self.total_steps) or (self.remaining_size <= 0)
-        
-        # 7. If done, add a final penalty for any unexecuted size
-        if done and self.remaining_size > 0:
-            final_penalty = self._calculate_final_penalty(hf_data)
-            immediate_reward -= final_penalty
-            self.cumulative_reward -= final_penalty
-        
-        obs = self._get_observation()
-        info = {'cumulative_reward': self.cumulative_reward}
-        
-        return obs, immediate_reward, done, False, info
+        # Log the fill
+        self.trade_log.append({
+            "step": self.current_step,
+            "shares_executed": shares_to_execute,
+            "execution_price": execution_price
+        })
 
-    def _get_observation(self) -> np.ndarray:
-        # TODO: Get hf_data from iterator
-        # TODO: Get current_vwap from iterator or calculate it
-        # For now, placeholder:
-        rem_size_norm = self.remaining_size / self.start_size if self.start_size > 0 else 0.0
-        rem_time_norm = (self.total_steps - self.current_step) / self.total_steps if self.total_steps > 0 else 0.0
+        # 4. Calculate Reward (Implementation Shortfall)
+        # We reward minimizing slippage against the benchmark
+        # Reward = (Benchmark_Price - Execution_Price) * Shares_Executed * Direction
+        slippage_per_share = (self.benchmark_price - execution_price) * self.trade_direction
+        reward = slippage_per_share * shares_to_execute
         
-        # hf_data = self.hf_data_iterator.current() # Assuming iterator has current()
-        # bid_prc = hf_data.get('bid_prc', 0)
-        # ask_prc = hf_data.get('ask_prc', 0)
-        # bid_vol = hf_data.get('bid_vol', 0)
-        # ask_vol = hf_data.get('ask_vol', 0)
-        # vwap = hf_data.get('vwap', 0)
-        # return np.array([rem_size_norm, rem_time_norm, bid_prc, ask_prc, bid_vol, ask_vol, vwap], dtype=np.float32)
+        # 5. Check if 'done'
+        done = False
+        if self.shares_remaining == 0:
+            logger.debug(f"Execution complete at step {self.current_step}.")
+            done = True
+        elif self.current_step >= self.time_horizon_steps:
+            logger.warning(f"Time horizon reached. {self.shares_remaining} shares leftover.")
+            done = True
+            # Penalize for leftover shares
+            reward -= self.shares_remaining * self.config.get('leftover_penalty_factor', 1.0)
+            
+        # 6. Get next observation
+        observation = self._get_observation(next_market_state)
         
-        return np.array([rem_size_norm, rem_time_norm, 0, 0, 0, 0, 0], dtype=np.float32)
+        info = {
+            "execution_price": execution_price,
+            "shares_executed": shares_to_execute,
+            "is_terminal": done,
+            "shares_remaining": self.shares_remaining
+        }
+        
+        return observation, reward, done, info
 
-
-    def _get_child_order_size(self, action: int) -> float:
-        # TODO: Implement logic based on self.remaining_size
-        size = 0.0
-        if action == 0: # WAIT
-            size = 0.0
-        elif action == 1: # SMALL
-            size = self.remaining_size * 0.10
-        elif action == 2: # LARGE
-            size = self.remaining_size * 0.50
-        elif action == 3: # LIMIT
-            size = 0.0 # TODO: Limit order logic is different
+    def _get_observation(self, market_state: Dict[str, Any]) -> np.ndarray:
+        """
+        Constructs the observation array from the current state.
+        """
         
-        return min(self.remaining_size, size) # Can't execute more than remaining
-    
-    def _simulate_child_order(self, size: float, hf_data: Dict) -> float:
-        # TODO: Implement high-frequency price impact simulation
-        return size * 0.0001 # Placeholder for cost
-    
-    def _calculate_final_penalty(self, hf_data: Dict) -> float:
-        # TODO: Implement a large penalty for failing to execute
-        return self.remaining_size * 0.01 # Placeholder for penalty
+        # Normalize shares remaining
+        norm_shares_remaining = self.shares_remaining / self.parent_order_size
+        
+        # Normalize time remaining
+        norm_time_remaining = (self.time_horizon_steps - self.current_step) / self.time_horizon_steps
+        
+        # Normalize market data (example: relative to benchmark)
+        norm_vwap = (market_state.get('vwap', self.benchmark_price) - self.benchmark_price) / self.benchmark_price
+        norm_spread = market_state.get('spread', 0) / self.benchmark_price
+        imbalance = market_state.get('imbalance', 0.5) # (0 to 1)
+        
+        obs = np.array([
+            norm_shares_remaining,
+            norm_time_remaining,
+            norm_vwap,
+            norm_spread,
+            imbalance
+        ], dtype=np.float32)
+        
+        return obs
+
+    def render(self, mode='human'):
+        """(Optional) Render the environment state."""
+        if mode == 'human':
+            print(f"Step: {self.current_step}/{self.time_horizon_steps}")
+            print(f"Shares Remaining: {self.shares_remaining}/{self.parent_order_size}")
+            
+            avg_exec_price = 0
+            total_shares = 0
+            if self.trade_log:
+                total_shares = sum(t['shares_executed'] for t in self.trade_log)
+                if total_shares > 0:
+                    avg_exec_price = sum(t['shares_executed'] * t['execution_price'] for t in self.trade_log) / total_shares
+            
+            print(f"Avg Exec Price: {avg_exec_price:.4f} (Benchmark: {self.benchmark_price:.4f})")
+            
