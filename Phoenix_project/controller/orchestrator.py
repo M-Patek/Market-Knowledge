@@ -1,60 +1,136 @@
 import asyncio
-from opentelemetry import trace
-from agents.executor import run_agents
-from evaluation.voter import vote
-from reasoning.planner import build_graph
-from evaluation.critic import review # 导入新的 critic 函数
-from evaluation.arbitrator import resolve # 导入 Arbitrator (Task 12)
-from fusion.synthesizer import fuse
-from core.pipeline_state import PipelineState
-from registry import registry
-from ai.retriever import HybridRetriever
+from typing import Dict, Any, List
 
-tracer = trace.get_tracer(__name__)
+# 修复：全部改为相对导入
+from ..agents.executor import AgentExecutor
+from ..ai.retriever import Retriever
+from ..evaluation.voter import Voter
+from ..evaluation.critic import Critic
+from ..evaluation.arbitrator import Arbitrator
+from ..fusion.synthesizer import Synthesizer
+from ..core.pipeline_state import PipelineState
+from ..context_bus import ContextBus
+from ..registry import Registry
+from ..monitor.logging import get_logger
+
+logger = get_logger(__name__)
 
 class Orchestrator:
-    async def run_pipeline(self, task: dict) -> dict:
+    """
+    The main orchestrator component that manages the high-level
+    workflow of the cognitive pipeline.
+    """
+    
+    def __init__(self, 
+                 agent_executor: AgentExecutor, 
+                 retriever: Retriever, 
+                 voter: Voter,
+                 critic: Critic,
+                 arbitrator: Arbitrator,
+                 synthesizer: Synthesizer,
+                 context_bus: ContextBus,
+                 registry: Registry):
         """
-        Automatically reads task -> plans -> executes in parallel -> evaluates -> fuses -> outputs.
-        (轻微优化：确保 ticker 始终在最终输出中)
+        Initializes the Orchestrator with all necessary components.
         """
-        # TODO: 添加适当的任务解析逻辑。目前假设 task["ticker"] 来自 API 规范 (Task 21)
-        ticker = task.get("ticker", "UNKNOWN")
-        query = task.get("query", f"Comprehensive analysis for ticker {ticker}")
-        state = PipelineState(ticker=ticker)
+        self.agent_executor = agent_executor
+        self.retriever = retriever
+        self.voter = voter
+        self.critic = critic
+        self.arbitrator = arbitrator
+        self.synthesizer = synthesizer
+        self.context_bus = context_bus
+        self.registry = registry # Component registry
+        logger.info("Orchestrator initialized.")
 
-        with tracer.start_as_current_span("full_analysis_pipeline") as span:
-            span.set_attribute("ticker", state.ticker)
+    async def build_graph(self, query: str) -> Dict[str, Any]:
+        """
+        (Placeholder) Dynamically builds an execution graph or plan 
+        based on the query.
+        
+        In a real implementation, this might involve an LLM call
+        to decompose the query into sub-tasks.
+        """
+        logger.debug(f"Building execution graph for query: {query}")
+        # Simplified plan: just run the standard agent set
+        plan = {
+            "steps": [
+                {"name": "L1_Retrieve", "type": "retrieval"},
+                {"name": "L1_Execute_Agents", "type": "agent_execution", "agents": "all"},
+                {"name": "L2_Reason", "type": "reasoning"},
+                {"name": "L2_Evaluate", "type": "evaluation"},
+                {"name": "L3_Fuse", "type": "synthesis"}
+            ]
+        }
+        return plan
 
-            # L1 Agents (Plan + Execute)
-            plan = build_graph(task)
+    async def run_pipeline(self, query: str, config: Dict[str, Any]) -> PipelineState:
+        """
+        Runs the full end-to-end cognitive pipeline for a given query.
+        
+        Args:
+            query (str): The user or system query (e.g., "Analyze TSLA outlook").
+            config (Dict[str, Any]): Runtime configuration, including start/end times.
+
+        Returns:
+            PipelineState: The final state containing the synthesized insight.
+        """
+        logger.info(f"Orchestrator starting pipeline for query: {query}")
+        
+        try:
+            # 1. Plan
+            plan = await self.build_graph(query)
             
-            retriever: HybridRetriever = registry.resolve("hybrid_retriever")
-            rag_context = await retriever.retrieve(query=query, ticker=ticker)
-            l1_results = await run_agents(plan, rag_context)
-            state.set_l1_results(l1_results)
-
-            # L2 Fusion (Voter)
-            fused_result_dict = vote(l1_results)
-            state.set_fusion_result("fused_analysis", fused_result_dict)
-
-            # L2 Evaluation & Arbitration
-            critic_issues = review(l1_results)
-            resolved_issues = resolve(critic_issues)
-
-            # L3 Fusion / Synthesis
-            final_result = fuse(fused_result_dict)
+            # 2. Initialize State
+            # PipelineState holds all data for this run
+            state = PipelineState(query=query, graph=plan, **config)
             
-            # If the Arbitrator found and resolved issues, its conclusion updates/overrides the final result.
-            if critic_issues:
-                final_result.update(resolved_issues)
+            # 3. Retrieve (L1)
+            # Use hybrid RAG to gather context
+            context = await self.retriever.retrieve(
+                query=state.query,
+                start_date=state.start_time,
+                end_date=state.end_time
+            )
+            state.retrieved_context = context
+            
+            # 4. Execute Agents (L1)
+            # Agents process context in parallel
+            agent_outputs = await self.agent_executor.run_agents(
+                context=context,
+                state=state
+            )
+            state.agent_outputs = agent_outputs
+            
+            # 5. Evaluate (L2)
+            # Voter aggregates agent outputs
+            votes = self.voter.vote(agent_outputs)
+            state.votes = votes
+            
+            # Critic reviews for conflicts
+            critiques = self.critic.review(state, votes)
+            state.critiques = critiques
+            
+            # 6. Resolve (L3)
+            # Arbitrator makes a final call based on critiques
+            consensus = self.arbitrator.resolve(critiques, votes)
+            state.arbitrator_decision = consensus
+            
+            # 7. Synthesize (L3)
+            # Synthesizer generates the final human-readable insight
+            final_state = self.synthesizer.fuse(state, consensus)
+            
+            # 8. Publish
+            # Send the final result to the context bus for other systems
+            await self.context_bus.publish("system_insights", final_state.fusion_result.model_dump())
+            
+            logger.info(f"Orchestrator finished pipeline. Final insight: {final_state.fusion_result.insight}")
+            return final_state
 
-            # 修复：确保 ticker 始终存在于返回的 dict 中，以便 engine.py 安全使用
-            if "ticker" not in final_result:
-                final_result["ticker"] = ticker
-
-            return final_result # 这现在是一个 dict
-
-
-}
+        except Exception as e:
+            logger.error(f"Critical error in orchestrator pipeline: {e}", exc_info=True)
+            # Create a failed state
+            failed_state = PipelineState(query=query, graph={}, **config)
+            failed_state.error_message = str(e)
+            return failed_state
 
