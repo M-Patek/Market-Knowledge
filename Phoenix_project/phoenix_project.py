@@ -11,7 +11,6 @@ if project_root not in sys.path:
 # 从 .env 文件加载环境变量
 load_dotenv()
 
-# 修正: 从新的 config.loader 模块导入 load_config 函数
 from config.loader import load_config
 from monitor.logging import get_logger
 from controller.orchestrator import Orchestrator
@@ -22,6 +21,9 @@ from api.gemini_pool_manager import GeminiPoolManager
 from events.stream_processor import StreamProcessor
 from events.event_distributor import EventDistributor
 from execution.order_manager import OrderManager
+
+# 修正：导入 celery app 实例，以传递给 Orchestrator
+from worker import app as celery_app
 
 # --- 全局组件 ---
 logger = get_logger('PhoenixMain')
@@ -35,7 +37,7 @@ async def initialize_system():
     """
     初始化 Phoenix 系统的所有核心组件。
     """
-    global config, orchestrator, gemini_pool, stream_processor, event_distributor, logger
+    global config, orchestrator, gemini_pool, stream_processor, event_distributor, logger, celery_app
     
     logger.info("--- PHOENIX PROJECT V2.0 INITIALIZATION START ---")
     
@@ -49,7 +51,6 @@ async def initialize_system():
         logger.info(f"配置已从 {config_path} 加载")
 
         # 2. 初始化 Gemini API 池
-        # 该池将在所有组件之间共享
         gemini_api_key = os.environ.get("GEMINI_API_KEY")
         if not gemini_api_key:
             logger.warning("未设置 GEMINI_API_KEY。LLM 功能将被禁用。")
@@ -62,7 +63,6 @@ async def initialize_system():
 
         # 3. 初始化核心状态和数据管理
         pipeline_state = PipelineState()
-        # 修正: DataManager 构造函数需要 cache_dir
         cache_dir = config.get('data_manager', {}).get('cache_dir', 'data_cache')
         data_manager = DataManager(config, pipeline_state, cache_dir=cache_dir)
         logger.info("PipelineState 和 DataManager 已初始化。")
@@ -81,14 +81,14 @@ async def initialize_system():
         logger.info("RomanLegionStrategy 已初始化。")
 
         # 6. 初始化协调器 (大脑)
-        # 将所有共享组件传递给协调器
         orchestrator = Orchestrator(
             config=config,
             data_manager=data_manager,
             pipeline_state=pipeline_state,
             gemini_pool=gemini_pool,
             strategy_handler=strategy,
-            order_manager=order_manager
+            order_manager=order_manager,
+            celery_app=celery_app  # 修正：传入 Celery app 实例
         )
         logger.info("主协调器已初始化。")
         
@@ -96,7 +96,7 @@ async def initialize_system():
         stream_processor = StreamProcessor(config.get('event_stream', {}))
         event_distributor = EventDistributor(
             stream_processor=stream_processor,
-            orchestrator=orchestrator,
+            orchestrator=orchestrator, # 传入已包含 celery_app 的 orchestrator
             config=config.get('event_distributor', {})
         )
         logger.info("EventStreamProcessor 和 EventDistributor 已初始化。")
@@ -171,7 +171,6 @@ async def main():
     if await initialize_system():
         loop = asyncio.get_running_loop()
         try:
-            # TODO: 添加信号处理器以实现优雅关闭
             await run_system()
         except KeyboardInterrupt:
             logger.info("收到 KeyboardInterrupt。正在关闭。")
@@ -180,15 +179,19 @@ async def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
+    # 检查 CLI 参数 (例如，运行回测、运行数据验证)
+    # 注意：'celery' 命令将通过它自己的入口点运行 'worker.py'
+    if len(sys.argv) > 1 and "celery" not in sys.argv[0]:
         command = sys.argv[1]
         logger.info(f"检测到 CLI 命令: {command}")
         # TODO: 实现 CLI 参数处理
         print(f"CLI 命令 '{command}' 尚未实现。启动主系统。")
-    
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.critical(f"应用程序运行失败: {e}", exc_info=True)
-        sys.exit(1)
+    elif "celery" not in sys.argv[0]:
+        try:
+            asyncio.run(main())
+        except Exception as e:
+            logger.critical(f"应用程序运行失败: {e}", exc_info=True)
+            sys.exit(1)
+    # 如果 'celery' 在 'sys.argv[0]' 中，则不执行 asyncio.run(main())
+    # Celery 会自己处理启动
 
