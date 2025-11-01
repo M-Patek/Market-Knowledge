@@ -84,9 +84,13 @@ def setup_dependencies():
     logger.info("Registering RAG services...")
     vector_db_client = VectorDBClient() # Uses dummy client from retriever.py
     
+    # (无需更改) - .get() 提供了默认的 {}，
+    # 并且 config/system.yaml 现在有了基于文档的真实配置
     temporal_db_client = TemporalDBClient(config.get('temporal_db', {}))
     tabular_db_client = TabularDBClient(config.get('tabular_db', {}))
     
+    # (无需更改) - .get() 提供了默认的 {}，
+    # 并且 config/system.yaml 现在有了基于文档的真实配置
     rerank_config = config.get('ai', {}).get('retriever', {}).get('rerank', {})
     
     hybrid_retriever = HybridRetriever(
@@ -112,3 +116,6 @@ if __name__ == "__main__":
     logger.info("Starting Phoenix Project simulation...")
     cognitive_engine.run_simulation()
     logger.info("Phoenix Project simulation finished.")
+
+}
+
