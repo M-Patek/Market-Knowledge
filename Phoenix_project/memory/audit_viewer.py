@@ -1,143 +1,151 @@
 import pandas as pd
+from typing import Dict, Any, List, Optional
 import json
-from typing import Dict, Any, List
+import logging
 
-from ..monitor.logging import get_logger
+# 修正: 'CoTDatabase' 在 'cot_database.py' 中不存在。
+# 正确的类名是 'CoTDatabaseConnection'。
+from memory.cot_database import CoTDatabaseConnection
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class AuditViewer:
     """
-    A utility to read, parse, and analyze the audit log file
-    (e.g., 'logs/phoenix_audit.jsonl') created by AuditLogger.
-    
-    This is used for debugging, analysis, and generating reports.
+    一个用于查询和格式化来自 CoT (思维链) 数据库的
+    人类可读审计追踪的工具。
+    (Task 16 - 审计追踪查看器)
     """
-
-    def __init__(self, config: Dict[str, Any]):
+    
+    def __init__(self, db_path: str):
         """
-        Initializes the AuditViewer.
+        初始化审计查看器。
         
         Args:
-            config: Main system configuration.
+            db_path (str): CoT (SQLite) 数据库文件的路径。
         """
-        audit_config = config.get('audit_logger', {})
-        self.log_path = audit_config.get('log_path', 'logs/phoenix_audit.jsonl')
-        self.full_log: List[Dict] = []
-        logger.info(f"AuditViewer initialized for log file: {self.log_path}")
+        # 修正: 实例化 CoTDatabaseConnection
+        self.db = CoTDatabaseConnection(db_path)
+        logger.info(f"AuditViewer initialized with database: {db_path}")
 
-    def load_log(self) -> bool:
+    def get_full_trace_by_id(self, decision_id: str) -> Optional[Dict[str, Any]]:
         """
-        Loads the entire .jsonl audit log into memory.
-        
-        Returns:
-            bool: True on success, False on failure.
+        检索与单个决策 ID 相关联的完整思维链。
         """
+        logger.debug(f"Retrieving full trace for decision_id: {decision_id}")
         try:
-            self.full_log = []
-            with open(self.log_path, 'r') as f:
-                for line in f:
-                    try:
-                        self.full_log.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        logger.warning(f"Skipping malformed audit log line: {line[:100]}...")
+            # 修正: 调用 CoTDatabaseConnection 上的方法
+            records = self.db.get_trace_by_decision_id(decision_id)
+            if not records:
+                logger.warning(f"No audit trace found for decision_id: {decision_id}")
+                return None
             
-            # Sort by timestamp just in case
-            self.full_log.sort(key=lambda x: x.get('timestamp', ''))
-            
-            logger.info(f"Successfully loaded {len(self.full_log)} audit log entries.")
-            return True
-            
-        except FileNotFoundError:
-            logger.error(f"Audit log file not found: {self.log_path}")
-            return False
+            # 格式化输出
+            return self._format_trace(records)
+        
         except Exception as e:
-            logger.error(f"Failed to load audit log: {e}", exc_info=True)
-            return False
+            logger.error(f"Error retrieving trace for {decision_id}: {e}", exc_info=True)
+            return None
 
-    def get_logs_by_type(self, log_type: str) -> List[Dict]:
+    def get_recent_decisions(self, limit: int = 20) -> List[Dict[str, Any]]:
         """
-        Filters the loaded log by 'log_type'.
-        
-        Args:
-            log_type (str): e.g., "TRADE", "FUSION_RESULT", "PIPELINE_IO"
+        检索最近的 N 个决策及其摘要。
+        """
+        logger.debug(f"Retrieving last {limit} decisions")
+        try:
+            # 修正: 调用 CoTDatabaseConnection 上的方法
+            records = self.db.get_recent_decisions(limit)
             
-        Returns:
-            List[Dict]: A list of matching log entries.
-        """
-        if not self.full_log:
-            logger.warning("Log not loaded. Call load_log() first.")
+            # 聚合每个 decision_id 的记录
+            decisions = {}
+            for rec in records:
+                did = rec['decision_id']
+                if did not in decisions:
+                    decisions[did] = {
+                        "decision_id": did,
+                        "timestamp": rec['timestamp'],
+                        "steps": []
+                    }
+                decisions[did]['steps'].append(rec)
+            
+            # 格式化每个决策
+            formatted_decisions = []
+            for did, data in decisions.items():
+                formatted = self._format_summary(data['steps'])
+                formatted['decision_id'] = did
+                formatted['timestamp'] = data['timestamp']
+                formatted_decisions.append(formatted)
+                
+            return formatted_decisions
+            
+        except Exception as e:
+            logger.error(f"Error retrieving recent decisions: {e}", exc_info=True)
             return []
-            
-        return [entry for entry in self.full_log if entry.get('log_type') == log_type]
 
-    def get_pipeline_run(self, event_id: str) -> Dict[str, Any]:
+    def _format_trace(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Reconstructs the full pipeline run for a single event_id.
-        
-        Args:
-            event_id (str): The event_id to search for.
-            
-        Returns:
-            Dict[str, Any]: A consolidated dictionary for that event.
+        将原始数据库记录格式化为结构化的 JSON 追踪。
         """
-        if not self.full_log:
-            logger.warning("Log not loaded. Call load_log() first.")
+        if not records:
             return {}
             
-        run_data = {"event_id": event_id}
+        # 按时间戳排序
+        records.sort(key=lambda r: r['timestamp'])
         
-        for entry in self.full_log:
-            log_type = entry.get('log_type')
-            data = entry.get('data', {})
-            
-            if log_type == "EVENT_IN" and data.get('event', {}).get('event_id') == event_id:
-                run_data['event_in'] = data['event']
-            
-            elif log_type == "PIPELINE_IO" and data.get('event_id') == event_id:
-                run_data['pipeline_io'] = data['io_bundle']
-                
-            elif log_type == "FUSION_RESULT" and data.get('result', {}).get('event_id') == event_id:
-                run_data['fusion_result'] = data['result']
-                
-            elif log_type == "STRATEGY_SIGNAL" and data.get('signal', {}).get('metadata', {}).get('event_id') == event_id:
-                run_data['signal'] = data['signal']
-                
-            elif log_type == "TRADE":
-                # Trades aren't directly linked to event_id, but to the signal's timestamp
-                # This requires more complex time-based correlation
-                pass
-                
-        return run_data
+        trace = {
+            "decision_id": records[0]['decision_id'],
+            "start_time": records[0]['timestamp'],
+            "end_time": records[-1]['timestamp'],
+            "steps": []
+        }
         
-    def get_trades_as_df(self) -> pd.DataFrame:
-        """Returns all 'TRADE' logs as a pandas DataFrame."""
-        trade_logs = self.get_logs_by_type("TRADE")
-        if not trade_logs:
-            return pd.DataFrame()
+        for rec in records:
+            step = {
+                "step_name": rec['step_name'],
+                "timestamp": rec['timestamp'],
+                "status": rec['status'],
+                "context": self._safe_json_load(rec['context']),
+                "output": self._safe_json_load(rec['output']),
+                "error": rec['error']
+            }
+            trace['steps'].append(step)
             
-        # Extract the 'fill' data from each log
-        fill_data = [entry['data']['fill'] for entry in trade_logs]
+        return trace
+
+    def _format_summary(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        从完整的追踪记录中提取一个高级摘要。
+        """
+        summary = {
+            "overall_status": "FAILURE" if any(r['status'] == 'FAILURE' for r in records) else "SUCCESS",
+            "total_steps": len(records),
+            "final_decision": None,
+            "error_step": None
+        }
         
-        df = pd.DataFrame(fill_data)
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.set_index('timestamp')
+        # 按时间戳排序
+        records.sort(key=lambda r: r['timestamp'])
+
+        for rec in records:
+            if rec['status'] == 'FAILURE':
+                summary['error_step'] = rec['step_name']
             
-        return df
-        
-    def get_pnl_as_df(self) -> pd.DataFrame:
-        """Returns all 'PORTFOLIO_SNAPSHOT' logs as a pandas DataFrame."""
-        pnl_logs = self.get_logs_by_type("PORTFOLIO_SNAPSHOT")
-        if not pnl_logs:
-            return pd.DataFrame()
-            
-        # Extract the 'pnl' data
-        pnl_data = [entry['data']['pnl'] for entry in pnl_logs]
-        
-        df = pd.DataFrame(pnl_data)
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.set_index('timestamp')
-            
-        return df
+            # 假设最后一步或 'PortfolioConstruction' 包含最终决策
+            if rec['step_name'] == 'PortfolioConstruction' and rec['status'] == 'SUCCESS':
+                output = self._safe_json_load(rec['output'])
+                summary['final_decision'] = output.get('target_weights', 'N/A')
+
+        # 如果未找到特定步骤，则使用最后一步
+        if summary['final_decision'] is None and records:
+             output = self._safe_json_load(records[-1]['output'])
+             summary['final_decision'] = output if isinstance(output, dict) else str(output)
+
+        return summary
+
+    def _safe_json_load(self, text_data: Optional[str]) -> Any:
+        """安全地将 JSON 字符串解析为 Python 对象。"""
+        if text_data is None:
+            return None
+        try:
+            return json.loads(text_data)
+        except json.JSONDecodeError:
+            return text_data # 如果不是 JSON，则按原样返回文本
