@@ -3,31 +3,29 @@
 import pytest
 from datetime import date
 from cognitive.portfolio_constructor import PortfolioConstructor
-from phoenix_project import StrategyConfig
+from core.schemas.config_schema import StrategyConfig
 
 @pytest.mark.parametrize(
-    "current_price, current_sma, expected_score"，
+    "current_price, current_sma, expected_score",
     [
         (110.0, 100.0, 55.0),
-        (90.0， 100.0, 45.0)，
-        (100.0， 100.0, 50.0)，
-        (300.0， 100.0, 100.0)，
-        (0.0， 100.0, 0.0)，
-        (100.0， 0.0, 0.0)，
-        (0.0， 0.0, 0.0)，
+        (90.0, 100.0, 45.0),
+        (100.0, 100.0, 50.0),
+        (300.0, 100.0, 100.0),
+        (0.0, 100.0, 0.0),
+        (100.0, 0.0, 0.0),
     ]
 )
-def test_calculate_opportunity_score_momentum_only(base_config, current_price, current_sma, expected_score):
+def test_calculate_opportunity_score(current_price, current_sma, expected_score, base_config):
     """
-    Tests the calculate_opportunity_score for momentum, assuming RSI is not overbought.
+    Basic scoring sanity checks against SMA baseline.
     """
     constructor = PortfolioConstructor(config=base_config)
-    neutral_rsi = 60.0
-    score = constructor.calculate_opportunity_score(current_price, current_sma, neutral_rsi)
+    score = constructor.calculate_opportunity_score(current_price, current_sma)
     assert score == pytest.approx(expected_score)
 
 @pytest.mark.parametrize(
-    "current_price, current_sma, current_rsi, expected_score"，
+    "current_price, current_sma, current_rsi, expected_score",
     [
         (110.0, 100.0, 70.0, 55.0),
         (110.0, 100.0, 85.0, 41.25),
