@@ -5,13 +5,18 @@ from audit_manager import AuditManager
 from ai.prompt_manager import PromptManager
 from ai.source_credibility import SourceCredibilityStore
 from api.gemini_pool_manager import GeminiPoolManager
-from l3_rules_engine import L3RulesEngine
+# NOTE: 'l3_rules_engine.py' 在项目文件列表中不存在。
+# 必须保持注释，否则会导致 ModuleNotFoundError。
+# from l3_rules_engine import L3RulesEngine
 from registry import registry
-from observability import get_logger
+# FIXED: 'observability.py' 不存在。'get_logger' 位于 'monitor/logging.py'。
+from monitor.logging import get_logger
 from knowledge_graph_service import KnowledgeGraphService
 from ai.embedding_client import EmbeddingClient
 from backtesting.engine import BacktestingEngine
-from ai.bayesian_fusion_engine import BayesianFusionEngine
+# NOTE: 'ai/bayesian_fusion_engine.py' 在项目文件列表中不存在。
+# 必须保持注释，否则会导致 ModuleNotFoundError。
+# from ai.bayesian_fusion_engine import BayesianFusionEngine
 
 # Configure logger for this module (Layer 12)
 logger = get_logger(__name__)
@@ -23,7 +28,8 @@ def setup_dependencies():
     Loads configurations and registers all core services with the singleton registry.
     """
     # Load main config
-    with open("config.yaml", 'r') as f:
+    # FIXED: 修正了配置文件的路径
+    with open("config/system.yaml", 'r') as f:
         config = yaml.safe_load(f)
     logger.info("Configuration loaded.")
     
@@ -46,8 +52,9 @@ def setup_dependencies():
     gemini_pool = GeminiPoolManager()
     registry.register("gemini_pool", gemini_pool)
 
-    l3_rules_engine = L3RulesEngine()
-    registry.register("l3_rules_engine", l3_rules_engine)
+    # NOTE: 已注释掉，因为 'l3_rules_engine.py' 文件缺失
+    # l3_rules_engine = L3RulesEngine()
+    # registry.register("l3_rules_engine", l3_rules_engine)
 
     # Register Layer 10 service
     knowledge_graph_service = KnowledgeGraphService()
@@ -62,8 +69,9 @@ def setup_dependencies():
     registry.register("backtesting_engine", backtesting_engine)
 
     # Register Layer 13 (L2) service
-    bayesian_fusion_engine = BayesianFusionEngine()
-    registry.register("bayesian_fusion_engine", bayesian_fusion_engine)
+    # NOTE: 已注释掉，因为 'ai/bayesian_fusion_engine.py' 文件缺失
+    # bayesian_fusion_engine = BayesianFusionEngine()
+    # registry.register("bayesian_fusion_engine", bayesian_fusion_engine)
 
     logger.info("All core services instantiated and registered.")
 
@@ -78,3 +86,4 @@ if __name__ == "__main__":
     logger.info("Starting Phoenix Project simulation...")
     cognitive_engine.run_simulation()
     logger.info("Phoenix Project simulation finished.")
+
