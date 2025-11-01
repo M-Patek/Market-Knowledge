@@ -1,7 +1,8 @@
 import asyncio
 import logging
-from typing import Dict, Any, Optional
-from celery import Celery # 修正：导入 Celery
+import pandas as pd  # 修正：导入 pandas
+from typing import Dict, Any, Optional, List  # 修正：导入 List
+from celery import Celery
 
 from data_manager import DataManager
 from core.pipeline_state import PipelineState
@@ -103,7 +104,7 @@ class Orchestrator:
         self.logger.info("--- Starting new decision cycle ---")
         
         # 1. 更新当前时间戳和状态
-        current_time = pd.Timestamp.utcnow()
+        current_time = pd.Timestamp.utcnow() # 修正：pd 现在已定义
         self.pipeline_state.update_time(current_time)
         
         # 2. (可选) 检查系统健康状况
@@ -186,7 +187,7 @@ class Orchestrator:
         """
         self.logger.info(f"--- Running cognitive workflow: {task_description} ---")
         
-        current_time = pd.Timestamp.utcnow()
+        current_time = pd.Timestamp.utcnow() # 修正：pd 现在已定义
         self.pipeline_state.update_time(current_time)
         
         try:
@@ -209,7 +210,7 @@ class Orchestrator:
             self.logger.error(f"Cognitive workflow failed: {e}", exc_info=True)
             return {"status": "error", "message": str(e)}
 
-    def schedule_data_ingestion(self, sources: List[str]):
+    def schedule_data_ingestion(self, sources: List[str]): # 修正：List 现在已定义
         """
         (由 Scheduler 调用)
         触发一个数据摄取任务。
