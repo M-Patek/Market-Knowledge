@@ -58,11 +58,6 @@ def setup_dependencies():
     registry.register("gemini_pool", gemini_pool)
 
     # NOTE: 已注释掉，因为 'l3_rules_engine.py' 文件缺失
-    # l3_rules_engine = L3RulesEngine()
-    # registry.register("l3_rules_engine", l3_rules_engine)
-    # FIXED: Registering the ReasoningEnsemble (aliased as bayesian_fusion_engine)
-    # under the old "l3_rules_engine" key as a compatibility shim.
-    # This relies on bayesian_fusion_engine being registered first (below).
 
     # Register Layer 10 service
     knowledge_graph_service = KnowledgeGraphService()
@@ -77,13 +72,11 @@ def setup_dependencies():
     registry.register("backtesting_engine", backtesting_engine)
 
     # Register Layer 13 (L2) service
-    # NOTE: 已注释掉，因为 'ai/bayesian_fusion_engine.py' 文件缺失
-    bayesian_fusion_engine = ReasoningEnsemble(config) # Instantiated with config
-    registry.register("bayesian_fusion_engine", bayesian_fusion_engine)
-    
-    # Register L3RulesEngine compatibility shim *after* bayesian_fusion_engine
-    registry.register("l3_rules_engine", bayesian_fusion_engine)
-    logger.info("ReasoningEnsemble registered under compatibility keys 'bayesian_fusion_engine' and 'l3_rules_engine'.")
+    # NOTE: 'ai/bayesian_fusion_engine.py' and 'l3_rules_engine.py' are obsolete.
+    # REFACTORED: Registering under the single, correct name.
+    reasoning_ensemble_service = ReasoningEnsemble(config) # Instantiated with config
+    registry.register("reasoning_ensemble", reasoning_ensemble_service)
+    logger.info("ReasoningEnsemble registered as 'reasoning_ensemble'.")
 
     # --- NEW RAG SERVICE REGISTRATION (Task 7) ---
     logger.info("Registering RAG services...")
@@ -121,3 +114,4 @@ if __name__ == "__main__":
     logger.info("Starting Phoenix Project simulation...")
     cognitive_engine.run_simulation()
     logger.info("Phoenix Project simulation finished.")
+
