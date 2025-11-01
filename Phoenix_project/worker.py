@@ -5,7 +5,10 @@ Defines the Celery application and any asynchronous tasks.
 This file is the entry point for the 'worker' service in docker-compose.yml.
 """
 
+import os
 from celery import Celery
+from kombu import Queue, Exchange
+
 from monitor.logging import get_logger
 
 # Configure logger for this module (Layer 12)
