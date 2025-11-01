@@ -1,213 +1,188 @@
-import gym
-from gym import spaces
 import numpy as np
-from typing import Dict, Any, Tuple
+import pandas as pd
+# 修正: 'gym' 已被 'gymnasium' 替代。我们已在 requirements.txt 中添加 gymnasium
+import gymnasium as gym
+from gymnasium import spaces
+from typing import List, Dict, Any, Optional
 
-from ..monitor.logging import get_logger
-from ..data_manager import DataManager
-
-logger = get_logger(__name__)
+from data.data_iterator import DataIterator
+from execution.order_manager import OrderManager
+from core.pipeline_state import PipelineState
 
 class TradingEnv(gym.Env):
     """
-    A custom OpenAI Gym Environment for training a multi-agent DRL system
-    (e.g., AlphaAgent and RiskAgent).
+    一个符合 OpenAI Gym 规范的交易环境，用于强化学习。
+    (Task 1.2 - DRL 基础设施)
     
-    This environment simulates the market and portfolio.
+    这个环境模拟了在一个时间序列上进行买入/卖出/持有的决策过程。
     """
+    metadata = {'render.modes': ['human']}
 
-    def __init__(self, config: Dict[str, Any], data_manager: DataManager):
+    def __init__(self, 
+                 data_iterator: DataIterator, 
+                 order_manager: OrderManager,
+                 initial_capital: float = 100000.0,
+                 lookback_window: int = 30,
+                 **kwargs):
         """
-        Initializes the trading environment.
-        
+        初始化交易环境。
+
         Args:
-            config: Configuration dictionary.
-            data_manager: Client to fetch historical data for the simulation.
+            data_iterator: 提供市场数据的迭代器。
+            order_manager: 处理订单执行和投资组合管理的对象。
+            initial_capital: 模拟开始时的初始资金。
+            lookback_window: 代理在每一步可以看到的历史数据天数。
+            **kwargs: 传递给父类的其他参数 (例如 'ticker')。
         """
         super(TradingEnv, self).__init__()
         
-        self.config = config
-        self.data_manager = data_manager
+        self.data_iterator = data_iterator
+        self.order_manager = order_manager
+        self.initial_capital = initial_capital
+        self.lookback_window = lookback_window
         
-        # Load historical data for the simulation
-        self._load_data()
+        # 从迭代器获取特征数量
+        # (lookback_window, num_features)
+        self.num_features = self.data_iterator.get_feature_count()
+        
+        # 动作空间: 0: 卖出, 1: 持有, 2: 买入
+        self.action_space = spaces.Discrete(3) 
+        
+        # 观测空间: (窗口大小, 特征数量)
+        # 例如: 过去30天的 (Open, High, Low, Close, Volume, RSI, SMA)
+        self.observation_space = spaces.Box(
+            low=-np.inf, 
+            high=np.inf, 
+            shape=(self.lookback_window, self.num_features), 
+            dtype=np.float32
+        )
+        
+        # 内部状态
         self.current_step = 0
-        self.max_steps = len(self.market_data) - 1
-
-        # --- Define Action Space (Multi-Agent) ---
-        # We use a Dict space.
-        # 'alpha_agent': Box(low=-1.0, high=1.0, shape=(1,)) # Signal
-        # 'risk_agent': Box(low=0.1, high=1.0, shape=(1,))  # Capital Modifier
-        self.action_space = spaces.Dict({
-            "alpha_agent": spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
-            "risk_agent": spaces.Box(low=0.1, high=1.0, shape=(1,), dtype=np.float32)
-        })
-
-        # --- Define Observation Space (Multi-Agent) ---
-        # We provide a "global" observation (dictionary), and the
-        # trainer is responsible for splitting it.
-        # 'market_features': e.g., 60-day price history, volatility
-        # 'risk_features': e.g., current portfolio value, drawdown, VIX
-        self.observation_space = spaces.Dict({
-            "market_features": spaces.Box(low=-np.inf, high=np.inf, shape=(60,), dtype=np.float32),
-            "risk_features": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
-        })
-        
-        # Portfolio state
-        self.initial_capital = config.get('initial_capital', 100000)
-        self.cash = self.initial_capital
-        self.shares = 0
+        self.done = False
         self.portfolio_value = self.initial_capital
-        self.max_portfolio_value = self.initial_capital
-        
-        logger.info("TradingEnv initialized.")
+        self.return_history = [] # 存储每日回报
 
-    def _load_data(self):
-        """Loads and prepares the market data for the simulation."""
-        logger.info("Loading simulation data...")
-        # This is a simplified example, loading one asset
-        symbol = self.config.get('simulation_symbol', 'AAPL')
-        start = self.config.get('simulation_start_date', '2020-01-01')
-        end = self.config.get('simulation_end_date', '2023-01-01')
-        
-        self.market_data = self.data_manager.get_historical_data(
-            symbol, pd.to_datetime(start), pd.to_datetime(end)
-        )
-        if self.market_data.empty:
-            raise ValueError("Failed to load simulation data for TradingEnv.")
-            
-        # Pre-calculate features (e.g., returns, volatility)
-        self.market_data['returns'] = self.market_data['close'].pct_change()
-        self.market_data['volatility_20d'] = self.market_data['returns'].rolling(20).std()
-        
-        # Lookback window for market features
-        self.lookback_window = 60
-        
-        self.market_data = self.market_data.dropna()
-        self.max_steps = len(self.market_data) - self.lookback_window - 1
-        logger.info(f"Data loaded. {self.max_steps} trainable steps available.")
-
-    def reset(self) -> Dict[str, np.ndarray]:
-        """Resets the environment for a new episode."""
-        self.cash = self.initial_capital
-        self.shares = 0
-        self.portfolio_value = self.initial_capital
-        self.max_portfolio_value = self.initial_capital
-        
-        # Start at a random point in the data (to avoid overfitting to one start)
-        self.current_step = np.random.randint(
-            0, self.max_steps - 1
-        )
-        
-        return self._get_observation()
-
-    def step(self, actions: Dict[str, np.ndarray]) -> (Dict, Dict, bool, Dict):
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None) -> tuple[np.ndarray, dict]:
         """
-        Takes a step using the combined actions from all agents.
+        重置环境到初始状态。
+        """
+        if seed is not None:
+            super().reset(seed=seed)
+            
+        self.current_step = 0
+        self.done = False
+        self.data_iterator.reset()
+        self.order_manager.reset_portfolio(self.initial_capital)
+        self.portfolio_value = self.initial_capital
+        self.return_history = []
+
+        # 获取初始观测
+        obs = self._get_observation()
         
+        # 填充回看窗口 (在模拟开始前)
+        # 我们跳过前 `lookback_window` 步来预热状态
+        for _ in range(self.lookback_window):
+             _, done = self.data_iterator.next()
+             if done:
+                 raise ValueError("数据集太短，无法填充初始回看窗口")
+        
+        obs = self._get_observation()
+        self.current_step = self.lookback_window
+        
+        info = self._get_info()
+        return obs, info
+
+    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
+        """
+        在环境中执行一个步骤 (一个交易日)。
+
         Args:
-            actions (Dict): e.g., {"alpha_agent": [0.8], "risk_agent": [0.5]}
-            
-        Returns:
-            (obs, rewards, done, info)
-        """
-        if self.current_step >= (self.max_steps + self.lookback_window - 2):
-            # End of data
-            return self._get_observation(), {"alpha_agent": 0, "risk_agent": 0}, True, {}
-            
-        # 1. Get current state and actions
-        current_price = self.market_data['close'].iloc[self.current_step + self.lookback_window]
-        
-        alpha_signal = actions['alpha_agent'][0] # e.g., 0.8 (target 80% long)
-        risk_modifier = actions['risk_agent'][0] # e.g., 0.5 (use 50% capital)
-        
-        # 2. Calculate final target position
-        # Final exposure = 80% * 50% = 40% of portfolio
-        target_exposure_pct = alpha_signal * risk_modifier
-        target_value = self.portfolio_value * target_exposure_pct
-        
-        # 3. Simulate trade (simple, no slippage)
-        current_value = self.shares * current_price
-        value_to_trade = target_value - current_value
-        shares_to_trade = value_to_trade / current_price
-        
-        self.shares += shares_to_trade
-        self.cash -= value_to_trade
-        
-        # 4. Update portfolio value for next step
-        self.current_step += 1
-        next_price = self.market_data['close'].iloc[self.current_step + self.lookback_window]
-        
-        last_portfolio_value = self.portfolio_value
-        self.portfolio_value = self.cash + (self.shares * next_price)
-        
-        # 5. Calculate Rewards
-        portfolio_return = (self.portfolio_value - last_portfolio_value) / last_portfolio_value
-        
-        # Update drawdown
-        self.max_portfolio_value = max(self.max_portfolio_value, self.portfolio_value)
-        drawdown = (self.max_portfolio_value - self.portfolio_value) / self.max_portfolio_value
-        
-        # Get market volatility
-        current_vol = self.market_data['volatility_20d'].iloc[self.current_step + self.lookback_window]
-        
-        # We use the *same* portfolio-level reward for both agents (CTDE)
-        # We let the agent's reward function (in the agent class) parse this
-        # This is a *global* reward signal
-        
-        # TODO: A better approach is to return agent-specific rewards
-        # AlphaReward: (alpha_signal * market_return)
-        # RiskReward: (portfolio_sharpe - target_sharpe) - (drawdown * penalty)
-        
-        alpha_reward = alpha_signal * self.market_data['returns'].iloc[self.current_step + self.lookback_window]
-        
-        # Risk reward (e.g., based on volatility)
-        risk_reward = -abs(portfolio_return) if current_vol > 0.02 else portfolio_return
-        
-        rewards = {
-            "alpha_agent": alpha_reward,
-            "risk_agent": risk_reward # Simple example
-        }
-        
-        # 6. Check if done
-        done = False
-        if self.portfolio_value <= (self.initial_capital * 0.5): # 50% drawdown
-            logger.info(f"Episode failed: 50% drawdown reached.")
-            done = True
-        
-        info = {
-            "portfolio_return": portfolio_return,
-            "portfolio_volatility": current_vol,
-            "drawdown": drawdown,
-        }
-        
-        return self._get_observation(), rewards, done, info
+            action (int): 代理选择的动作 (0=卖, 1=持有, 2=买)。
 
-    def _get_observation(self) -> Dict[str, np.ndarray]:
-        """Constructs the observation dictionary."""
+        Returns:
+            tuple: (observation, reward, done, truncated, info)
+        """
+        if self.done:
+            # 如果环境已结束，返回最后的状态
+            obs = self._get_observation()
+            return obs, 0.0, self.done, False, self._get_info()
+
+        # 1. 获取当前市场数据 (用于执行)
+        current_data_slice, self.done = self.data_iterator.next()
+        if self.done:
+            # 数据结束
+            obs = self._get_observation()
+            return obs, 0.0, self.done, False, self._get_info()
+            
+        self.current_step += 1
         
-        idx = self.current_step + self.lookback_window
+        # 2. 获取当前投资组合价值 (T-1)
+        value_t_minus_1 = self.order_manager.get_portfolio_value(current_data_slice)
+
+        # 3. 将 DRL 动作转换为 OrderManager 信号
+        # 这是一个简化的映射：
+        # 0 (卖): 平仓所有多头头寸
+        # 1 (持有): 不做操作
+        # 2 (买): 分配 100% 资金做多
         
-        # Market features (e.g., 60-day price history, normalized)
-        price_history = self.market_data['close'].iloc[idx - self.lookback_window : idx]
-        normalized_prices = (price_history / price_history.iloc[-1]) - 1.0
+        signal_pct = 0.0 # 默认为持有 (或平仓)
+        if action == 2: # 买入
+            signal_pct = 1.0
+        elif action == 0: # 卖出
+            signal_pct = 0.0 # 目标仓位为 0%
+            
+        # 假设我们只交易 data_iterator.ticker
+        ticker = self.data_iterator.get_current_ticker()
+        if ticker:
+            # 生成目标信号
+            target_signal = {ticker: signal_pct}
+            
+            # 4. OrderManager 执行交易
+            # OrderManager 会处理滑点、佣金和投资组合更新
+            self.order_manager.process_signals(
+                signals=target_signal, 
+                data_slice=current_data_slice
+            )
+
+        # 5. 获取新的投资组合价值 (T)
+        self.portfolio_value = self.order_manager.get_portfolio_value(current_data_slice)
         
-        market_features = normalized_prices.values.astype(np.float32)
+        # 6. 计算奖励 (Reward)
+        # 奖励 = (T 时价值) - (T-1 时价值)
+        reward = self.portfolio_value - value_t_minus_1
+        self.return_history.append(reward) # 存储绝对回报
+
+        # 7. 获取下一个观测
+        obs = self._get_observation()
         
-        # Risk features
-        current_vol = self.market_data['volatility_20d'].iloc[idx]
-        drawdown = (self.max_portfolio_value - self.portfolio_value) / self.max_portfolio_value
-        current_exposure = (self.shares * self.market_data['close'].iloc[idx]) / self.portfolio_value
-        
-        risk_features = np.array([
-            self.portfolio_value / self.initial_capital, # Portfolio growth
-            current_exposure, # Current position (-1 to 1)
-            drawdown, # 0 to 1
-            current_vol,
-            0.0 # Placeholder for VIX
-        ], dtype=np.float32)
-        
+        # 8. 获取信息
+        info = self._get_info()
+
+        return obs, reward, self.done, False, info
+
+    def _get_observation(self) -> np.ndarray:
+        """
+        从数据迭代器获取当前的回看窗口。
+        """
+        return self.data_iterator.get_lookback_window(self.lookback_window)
+
+    def _get_info(self) -> dict:
+        """
+        返回关于当前步骤的附加信息。
+        """
         return {
-            "market_features": market_features,
-            "risk_features": risk_features
+            "step": self.current_step,
+            "portfolio_value": self.portfolio_value,
+            "cash": self.order_manager.portfolio.get('CASH', 0),
+            "positions": self.order_manager.portfolio
         }
+
+    def render(self, mode='human'):
+        """
+        (可选) 渲染环境状态。
+        """
+        if mode == 'human':
+            print(f"Step: {self.current_step}")
+            print(f"Portfolio Value: {self.portfolio_value:.2f}")
+            print(f"Positions: {self.order_manager.portfolio}")
