@@ -1,9 +1,9 @@
 from data_manager import DataManager
-from observability import get_logger
-from pipeline_orchestrator import PipelineOrchestrator
+from monitor.logging import get_logger # FIXED: Refactored import path
+from controller.orchestrator import Orchestrator as PipelineOrchestrator # FIXED: Corrected import path
 from registry import registry
 from backtesting.engine import BacktestingEngine
-from ai.bayesian_fusion_engine import BayesianFusionEngine
+from ai.reasoning_ensemble import ReasoningEnsemble # FIXED: Refactored from BayesianFusionEngine
 
 # Configure logger for this module (Layer 12)
 logger = get_logger(__name__)
@@ -18,6 +18,10 @@ class CognitiveEngine:
         self.data_manager = data_manager
         # self.l1_orchestrator = L1Orchestrator() # Replaced by Layer 9 orchestrator
         self.pipeline_orchestrator = PipelineOrchestrator()
+        self.backtesting_engine: BacktestingEngine = registry.resolve("backtesting_engine")
+        self.bayesian_fusion_engine: ReasoningEnsemble = registry.resolve("bayesian_fusion_engine") # FIXED: Type hint updated
+
+        logger.info("CognitiveEngine initialized.")
 
     def run_simulation(self):
         logger.info("CognitiveEngine: Starting simulation...")
@@ -43,14 +47,14 @@ class CognitiveEngine:
 
         # --- Layer 14: Backtesting Feedback Loop ---
         logger.info("CognitiveEngine: Starting backtesting run...")
-        backtesting_engine: BacktestingEngine = registry.resolve("backtesting_engine")
-        metrics = backtesting_engine.run_backtest(all_signals)
+        # backtesting_engine: BacktestingEngine = registry.resolve("backtesting_engine") # Already initialized in __init__
+        metrics = self.backtesting_engine.run_backtest(all_signals)
         
         logger.info(f"CognitiveEngine: Backtest complete. Metrics: {metrics}")
         logger.info("CognitiveEngine: Feeding metrics back to L2 (BayesianFusionEngine)...")
         
-        l2_fusion_engine: BayesianFusionEngine = registry.resolve("bayesian_fusion_engine")
-        l2_fusion_engine.meta_update(metrics)
+        # l2_fusion_engine: ReasoningEnsemble = registry.resolve("bayesian_fusion_engine") # Already initialized in __init__
+        self.bayesian_fusion_engine.meta_update(metrics)
         
         logger.info("CognitiveEngine: Layer 14 feedback loop complete.")
 
