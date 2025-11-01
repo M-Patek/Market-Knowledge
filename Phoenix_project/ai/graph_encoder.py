@@ -2,7 +2,7 @@
 import tensorflow as tf
 import tensorflow_gnn as tfgnn
 from typing import List
-from .relation_extractor import KnowledgeGraph
+from ..core.schemas.data_schema import KnowledgeGraph # 修复：从 data_schema 导入
 
 class GNNEncoder(tf.keras.Model):
     """
