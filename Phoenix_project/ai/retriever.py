@@ -1,266 +1,250 @@
-import logging
 import asyncio
-import hashlib
 from typing import List, Dict, Any, Optional
-from datetime import datetime, date, timezone
-import google.generativeai as genai
-from pydantic import BaseModel, Field
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 
-# FIXED: 明确导入存在的模块
-from .temporal_db_client import TemporalDBClient
-from .tabular_db_client import TabularDBClient
-from .relation_extractor import RelationExtractor, KnowledgeGraph
-from .embedding_client import EmbeddingClient
+from monitor.logging import get_logger
+from ai.tabular_db_client import TabularDBClient
+from ai.temporal_db_client import TemporalDBClient
+# FIX: Removed the try...except block for the missing 'ai.vector_db_client'
+# FIX: Imported the correct VectorStore from the 'memory' module
+from memory.vector_store import VectorStore
+from api.gemini_pool_manager import GeminiPoolManager
+from core.schemas.data_schema import QueryResult
 
-try:
-    # 'ai/vector_db_client.py' 在项目文件列表中不存在。
-    # 我们只为这个缺失的模块设置 try/except 回退。
-    from .vector_db_client import VectorDBClient
-except ImportError:
-    # Dummy classes for standalone import
-    class VectorDBClient: 
-        def query(self, query: str, top_k: int, query_vector=None):
-            logging.getLogger("PhoenixProject.HybridRetriever").warning("VectorDBClient not found. Using dummy class.")
-            return []
-    
-    class KnowledgeGraph(BaseModel): pass # 确保 KnowledgeGraph 在两种情况下都有定义
-    
-from sentence_transformers import CrossEncoder
-
-# --- 用于结构化LLM输出的Pydantic模型 ---
-class DeconstructedQuery(BaseModel):
-    """解构后用户查询的结构化表示。"""
-    keywords: List[str] = Field(..., description="用于向量搜索的语义关键词列表。")
-    ticker: Optional[str] = Field(None, description="提及的股票代码，如果有的话。")
-    start_date: Optional[date] = Field(None, description="提及的日期范围的开始，如果有的话。")
-    end_date: Optional[date] = Field(None, description="提及的日期范围的结束，如果有的话。")
-    metric_name: Optional[str] = Field(None, description="提及的具体财务指标 (例如, '收入', '每股收益')。")
-
-    class Config:
-        # 为模型参考添加一个示例
-        schema_extra = {"example": {"keywords": ["市场对Q3财报的反应", "苹果"], "ticker": "AAPL", "start_date": "2023-09-01", "end_date": "2023-09-30", "metric_name": "财报"}}
-
+logger = get_logger('HybridRetriever')
 
 class HybridRetriever:
     """
-    协调跨不同数据源（向量、时序、表格）的多路检索策略，
-    并融合结果。
+    Implements the RAG (Retrieval-Augmented Generation) retrieval pipeline.
+    It combines results from three different data sources:
+    1. Vector Store (Semantic search for unstructured data)
+    2. Temporal DB (Time-series search for events)
+    3. Tabular DB (Structured search for financial metrics)
     """
-    def __init__(self, vector_db_client: VectorDBClient, temporal_db_client: TemporalDBClient, tabular_db_client: TabularDBClient, rerank_config: Dict[str, Any]):
-        self.logger = logging.getLogger("PhoenixProject.HybridRetriever")
-        self.vector_client = vector_db_client
-        self.temporal_client = temporal_db_client
-        self.tabular_client = tabular_db_client
-        # --- Task 5.2: Caching Layer ---
-        self.cache: Dict[str, Any] = {}
-        self.cache_lock = asyncio.Lock()
-        self.embedding_client = EmbeddingClient()
-        self.retriever_config = rerank_config
-        self.rrf_k = self.retriever_config.get('rrf_k', 60)
-        try:
-            self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-        except Exception as e:
-            self.logger.warning(f"Could not load CrossEncoder model. Reranking will be skipped. Error: {e}")
-            self.cross_encoder = None
-        
-        # [NEW] Initialize a separate, simple generative model for HyDE
-        try:
-            self.hyde_model = genai.GenerativeModel("gemini-1.5-flash-latest")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize HyDE model: {e}")
-            self.hyde_model = None
-        
-        # 初始化关系提取器
-        self.relation_extractor = RelationExtractor()
 
-        # 初始化用于查询解构的生成式模型
+    def __init__(self, 
+                 config: Dict[str, Any],
+                 tabular_client: TabularDBClient,
+                 temporal_client: TemporalDBClient,
+                 # FIX: Updated type hint to use the correct VectorStore class
+                 vector_client: VectorStore,
+                 gemini_pool: Optional[GeminiPoolManager]):
+        """
+        Initializes the HybridRetriever.
+        
+        Args:
+            config: Configuration settings for the retriever.
+            tabular_client: An initialized TabularDBClient.
+            temporal_client: An initialized TemporalDBClient.
+            vector_client: An initialized VectorStore client.
+            gemini_pool: The shared GeminiPoolManager for LLM calls (e.g., HyDE).
+        """
+        self.config = config
+        self.tabular_client = tabular_client
+        self.temporal_client = temporal_client
+        self.vector_client = vector_client
+        self.gemini_pool = gemini_pool
+
+        self.use_hyde = self.config.get('use_hyde', True)
+        self.vector_namespace = self.config.get('vector_namespace', 'default')
+        
+        # RRF (Reciprocal Rank Fusion) constant
+        self.k_rrf = self.config.get('rrf_k', 60)
+        
+        logger.info("HybridRetriever initialized.")
+        logger.info(f"HyDE (Hypothetical Document Embeddings) enabled: {self.use_hyde}")
+
+    async def _generate_hyde_query(self, query: str) -> str:
+        """
+        Generates a hypothetical document for the query (HyDE) to improve
+        semantic retrieval quality.
+        """
+        if not self.gemini_pool:
+            logger.warning("HyDE enabled but no Gemini pool available. Skipping.")
+            return query
+            
+        prompt = f"""
+        Please generate a short, hypothetical document that provides a relevant answer 
+        to the following query. The document should be neutral, factual, and dense 
+        with information related to the query.
+        
+        Query: "{query}"
+        
+        Hypothetical Document:
+        """
+        
         try:
-            # 将Pydantic模型作为工具，升级模型为"函数调用"模型
-            self.deconstructor_model = genai.GenerativeModel(
-                "gemini-1.5-flash-latest", tools=[DeconstructedQuery]
+            model = self.config.get('hyde_model', 'gemini-1.5-flash-latest')
+            response_text = await self.gemini_pool.generate_content(prompt, model_name=model)
+            logger.debug(f"Generated HyDE document for query '{query}': {response_text[:100]}...")
+            # Combine original query with HyDE doc for embedding
+            return f"{query}\n\n{response_text}"
+        except Exception as e:
+            logger.error(f"Failed to generate HyDE query: {e}", exc_info=True)
+            # Fallback to the original query
+            return query
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def _query_vector_store(self, query: str, top_k: int) -> List[QueryResult]:
+        """Wrapper for vector store query with retry logic."""
+        try:
+            hyde_query = query
+            if self.use_hyde:
+                hyde_query = await self._generate_hyde_query(query)
+                
+            results = await self.vector_client.query(
+                query=hyde_query,
+                top_k=top_k,
+                namespace=self.vector_namespace
+                # TODO: Add metadata filtering if needed
+                # filter={"source": "sec_filings"}
             )
+            # Convert to standard QueryResult objects
+            return [
+                QueryResult(
+                    id=res.get('id'),
+                    text=res.get('text', ''),
+                    score=res.get('score', 0.0),
+                    source=res.get('metadata', {}).get('source', 'vector_store'),
+                    type='vector'
+                ) for res in results
+            ]
         except Exception as e:
-            self.logger.error(f"初始化解构器模型失败: {e}")
-            self.deconstructor_model = None
-        self.logger.info(f"HybridRetriever已初始化，RRF k={self.rrf_k}。")
+            logger.error(f"Vector store query failed: {e}", exc_info=True)
+            raise  # Re-raise to trigger tenacity retry
 
-    async def _recall_from_vector(self, query: str, top_k: int) -> List[Dict[str, Any]]:
-        """从向量数据库召回。"""
-        hyde_vector = None
-        if self.hyde_model:
-            try:
-                # 1. Generate a hypothetical document
-                prompt = f"Please write a short, hypothetical paragraph that would be the perfect answer to the financial query: '{query}'"
-                response = await self.hyde_model.generate_content_async(prompt)
-                hypothetical_doc = response.text
-                self.logger.info(f"Generated Hypothetical Document for HyDE: '{hypothetical_doc[:100]}...'")
-                # 2. Embed the hypothetical document
-                hyde_vector = self.embedding_client.create_query_embedding(hypothetical_doc)
-            except Exception as e:
-                self.logger.error(f"HyDE generation failed: {e}. Falling back to standard query embedding.")
-
-        # 3. Query using the HyDE vector, or fall back to the original query's vector
-        if self.vector_client:
-            return self.vector_client.query(query, top_k=top_k, query_vector=hyde_vector)
-        return []
-
-    async def _recall_from_temporal(self, ticker: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
-        """从时序数据库召回。"""
-        if self.temporal_client:
-            return self.temporal_client.query_by_date(ticker, start_date, end_date)
-        return []
-
-    async def _recall_from_tabular(self, ticker: str) -> List[Dict[str, Any]]:
-        """从表格数据库召回。"""
-        if self.tabular_client:
-            return self.tabular_client.query_by_ticker(ticker)
-        return []
-
-    async def _deconstruct_query(self, query: str) -> DeconstructedQuery:
-        """
-        使用专用于工具调用的生成式模型将自然语言查询分解
-        为用于定向检索的结构化组件。
-        """
-        if not self.deconstructor_model:
-            self.logger.warning("解构器模型不可用。使用简单关键词提取。")
-            return DeconstructedQuery(keywords=query.split())
-        
-        prompt = f"请解构以下金融查询: '{query}'"
-        
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def _query_temporal_store(self, query: str, top_k: int, time_window_days: int) -> List[QueryResult]:
+        """Wrapper for temporal store query with retry logic."""
         try:
-            response = await self.deconstructor_model.generate_content_async(
-                prompt,
-                tool_config={'function_calling_config': 'ANY'}
+            results = await self.temporal_client.search_events(
+                keywords=query.split(), # Simple keyword search
+                top_k=top_k,
+                days=time_window_days
             )
-            fc = response.candidates[0].content.parts[0].function_call
-            deconstructed_args = {key: value for key, value in fc.args.items()}
-            return DeconstructedQuery(**deconstructed_args)
+            return [
+                QueryResult(
+                    id=res.get('event_id'),
+                    text=res.get('content', ''),
+                    score=res.get('score', 0.0), # Assuming temporal client provides a score
+                    source=res.get('source', 'temporal_store'),
+                    type='temporal'
+                ) for res in results
+            ]
         except Exception as e:
-            self.logger.error(f"使用LLM解构查询失败: {e}。回退到简单提取。")
-            # FIXED: 修复了拼写错误，DeDCoT_query -> DeconstructedQuery
-            return DeconstructedQuery(keywords=query.split())
+            logger.error(f"Temporal store query failed: {e}", exc_info=True)
+            raise
 
-    async def recall(self, query: str, ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def _query_tabular_store(self, query: str, top_k: int) -> List[QueryResult]:
+        """Wrapper for tabular store query with retry logic."""
+        # This is a simplified example. A real implementation would parse 'query'
+        # to identify symbols, metrics, and quarters.
+        # For now, we'll assume the query is just a symbol.
+        symbol = query.upper() # e.g., "AAPL"
+        try:
+            results = await self.tabular_client.get_financials(symbol, limit=top_k)
+            return [
+                QueryResult(
+                    id=f"{res.get('symbol')}_{res.get('quarter')}",
+                    text=f"Financials for {res.get('symbol')} (Q{res.get('quarter')} {res.get('year')}): "
+                         f"Revenue: {res.get('revenue')}, EPS: {res.get('eps')}",
+                    score=1.0, # Tabular data is exact match, give high score
+                    source='tabular_store',
+                    type='tabular'
+                ) for res in results
+            ]
+        except Exception as e:
+            logger.error(f"Tabular store query failed for symbol '{symbol}': {e}", exc_info=True)
+            raise
+
+    def _fuse_results_rrf(self, results_lists: List[List[QueryResult]]) -> List[QueryResult]:
         """
-        并行地从所有可用数据源执行第一阶段检索，
-        并使用倒数排序融合（RRF）进行融合。
+        Fuses multiple ranked lists of results using Reciprocal Rank Fusion (RRF).
         """
-        self.logger.info(f"为查询启动召回阶段: '{query}'")
-        keywords = query
-        query_ticker = ticker
+        fused_scores = {}
+        doc_content = {}
         
-        tasks = []
-        if self.vector_client:
-            tasks.append(self._recall_from_vector(keywords, top_k=50)) # Increased for better reranking
-        if self.temporal_client and query_ticker:
-            end_date = date.today()
-            start_date = date(end_date.year - 1, end_date.month, end_date.day)
-            tasks.append(self._recall_from_temporal(query_ticker, start_date, end_date))
-        if self.tabular_client and query_ticker:
-            tasks.append(self._recall_from_tabular(query_ticker))
+        for results in results_lists:
+            if not results:
+                continue
+            for rank, res in enumerate(results):
+                doc_id = res.id
+                if not doc_id:
+                    continue
+                    
+                score = 1.0 / (self.k_rrf + rank + 1)
+                
+                if doc_id not in fused_scores:
+                    fused_scores[doc_id] = 0.0
+                    doc_content[doc_id] = res # Store the full QueryResult object
+                
+                fused_scores[doc_id] += score
         
-        if not tasks:
-            self.logger.warning("No DB clients configured for recall. Returning empty list.")
+        if not fused_scores:
             return []
 
-        results_from_all_indexes = await asyncio.gather(*tasks, return_exceptions=True)
+        # Sort by fused score
+        sorted_docs = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
         
-        rrf_scores = {}
-        master_doc_lookup = {}
-        for result_set in results_from_all_indexes:
-            if isinstance(result_set, list):
-                for rank, doc in enumerate(result_set):
-                    if not isinstance(doc, dict): continue # Safety check
-                    source_id = doc.get('source_id')
-                    if not source_id: continue
-                    if source_id not in master_doc_lookup or 'vector_similarity_score' in doc:
-                        master_doc_lookup[source_id] = doc
-                    rrf_scores[source_id] = rrf_scores.get(source_id, 0.0) + (1.0 / (self.rrf_k + rank + 1))
-
-        fused_candidates = {}
-        for source_id, score in rrf_scores.items():
-            if source_id in master_doc_lookup:
-                doc = master_doc_lookup[source_id]
-                doc['rrf_score'] = score
-                
-                # [NEW] Generate and inject the data fingerprint
-                content = doc.get('content', '')
-                if content:
-                    doc['data_fingerprint'] = hashlib.sha256(content.encode('utf-8')).hexdigest()
-                    
-                fused_candidates[source_id] = doc
-
-        final_candidates = sorted(fused_candidates.values(), key=lambda x: x['rrf_score'], reverse=True)
-        self.logger.info(f"召回阶段完成。使用RRF融合并排序了 {len(final_candidates)} 个唯一候选。")
-        return final_candidates
-
-    def rerank(self, query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """使用Cross-Encoder模型对候选列表进行深度语义重排。"""
-        if not candidates or not query or not self.cross_encoder:
-            if not self.cross_encoder:
-                self.logger.warning("CrossEncoder not loaded. Skipping reranking.")
-            return candidates
-
-        # 准备模型输入：[query, document_content]
-        model_inputs = [[query, doc.get('content', '')] for doc in candidates]
-        
-        # 使用Cross-Encoder计算语义相关性分数
-        self.logger.info(f"Reranking {len(model_inputs)} candidates with CrossEncoder...")
-        semantic_scores = self.cross_encoder.predict(model_inputs, show_progress_bar=False)
-
-        # 将分数添加到候选文档中
-        for doc, score in zip(candidates, semantic_scores):
-            doc['semantic_rerank_score'] = float(score)
-
-        # 根据新的语义分数降序排序
-        reranked_results = sorted(candidates, key=lambda x: x['semantic_rerank_score'], reverse=True)
-        self.logger.info(f"使用Cross-Encoder重排了 {len(reranked_results)} 个候选。")
-        return reranked_results
-
-    async def retrieve(self, query: str, ticker: Optional[str] = None, top_k: int = 10) -> Dict[str, Any]:
-        """
-        执行完整的检索和重排流程的主公共方法。
-        """
-        self.logger.info(f"--- [混合检索器]: 为查询 '{query}' 启动完整检索流程 ---")
-        
-        # --- Task 5.2: Caching Logic ---
-        cache_key = f"{query}|{ticker}|{top_k}"
-        
-        # 1. Check cache (read is cheap, no lock needed)
-        if cache_key in self.cache:
-            self.logger.info(f"CACHE HIT for key: {cache_key}")
-            return self.cache[cache_key]
-
-        # 2. If miss, acquire lock to prevent cache stampede
-        async with self.cache_lock:
-            # 3. Double-check cache (in case another coroutine just finished)
-            if cache_key in self.cache:
-                self.logger.info(f"CACHE HIT (after lock) for key: {cache_key}")
-                return self.cache[cache_key]
-
-            # 4. If still miss, do the work
-            self.logger.info(f"CACHE MISS for key: {cache_key}. Running retrieval.")
-            recalled_candidates = await self.recall(query, ticker)
-            reranked_results = self.rerank(query, recalled_candidates)
-            final_top_k = reranked_results[:top_k]
+        # Reconstruct final list of QueryResult objects
+        final_results = []
+        for doc_id, score in sorted_docs:
+            final_doc = doc_content[doc_id]
+            final_doc.score = score # Overwrite with fused score
+            final_results.append(final_doc)
             
-            # 从最终证据中提取关系图
-            evidence_texts = [doc.get('content', '') for doc in final_top_k if doc.get('content')]
-            knowledge_graph_data = await self.relation_extractor.extract_graph(evidence_texts)
-            # Ensure it's a dict, not a Pydantic model
-            if hasattr(knowledge_graph_data, 'dict'):
-                 knowledge_graph = knowledge_graph_data.dict()
-            else:
-                 knowledge_graph = knowledge_graph_data
+        return final_results
 
-            self.logger.info(f"检索流程完成。返回前 {len(final_top_k)} 个结果和知识图谱。")
+    async def retrieve(self, 
+                       query: str, 
+                       top_k: int = 10, 
+                       time_window_days: int = 30) -> List[QueryResult]:
+        """
+        Executes the full hybrid retrieval pipeline.
+        
+        1. Asynchronously query all three data sources.
+        2. Fuse the results using Reciprocal Rank Fusion (RRF).
+        3. Return the final, reranked list of documents.
+        """
+        logger.info(f"Starting hybrid retrieval for query: '{query}'")
+        
+        try:
+            # 1. Dispatch all queries concurrently
+            tasks = [
+                self._query_vector_store(query, top_k),
+                self._query_temporal_store(query, top_k, time_window_days),
+                self._query_tabular_store(query, top_k)
+            ]
             
-            result = {
-                "evidence_documents": final_top_k,
-                "knowledge_graph": knowledge_graph
-            }
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Handle potential failures
+            vector_results = results[0] if not isinstance(results[0], Exception) else []
+            temporal_results = results[1] if not isinstance(results[1], Exception) else []
+            tabular_results = results[2] if not isinstance(results[2], Exception) else []
+            
+            if isinstance(results[0], Exception):
+                 logger.error(f"Vector query failed after retries: {results[0]}")
+            if isinstance(results[1], Exception):
+                 logger.error(f"Temporal query failed after retries: {results[1]}")
+            if isinstance(results[2], Exception):
+                 logger.error(f"Tabular query failed after retries: {results[2]}")
 
-            # 5. Store in cache and return
-            self.cache[cache_key] = result
-            return result
-
+            # 2. Fuse the results
+            all_results = [vector_results, temporal_results, tabular_results]
+            fused_list = self._fuse_results_rrf(all_results)
+            
+            # 3. Get the final top_k results
+            final_top_k = fused_list[:top_k]
+            
+            logger.info(f"Hybrid retrieval complete. Found {len(final_top_k)} fused results (from "
+                        f"{len(vector_results)} vector, {len(temporal_results)} temporal, "
+                        f"{len(tabular_results)} tabular).")
+            
+            return final_top_k
+            
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during hybrid retrieval: {e}", exc_info=True)
+            return []
