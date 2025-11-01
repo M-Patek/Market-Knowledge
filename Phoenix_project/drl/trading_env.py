@@ -1,274 +1,213 @@
+import gym
+from gym import spaces
 import numpy as np
-import pandas as pd
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Dict, Any, Tuple
 
-# 修复：
-# 1. 'Fill' 和 'Order' 来自 'execution.interfaces'
-# 2. 'MarketData' 来自 'core.schemas.data_schema' (不再从 interfaces 导入)
-from ..execution.interfaces import Fill, Order
-from ..core.schemas.data_schema import MarketData
-from ..data.data_iterator import DataIterator
 from ..monitor.logging import get_logger
+from ..data_manager import DataManager
 
 logger = get_logger(__name__)
 
-class TradingEnv:
+class TradingEnv(gym.Env):
     """
-    Gym-like environment for training DRL agents.
-    Handles market data simulation, state creation, action execution,
-    and reward calculation.
-    """
+    A custom OpenAI Gym Environment for training a multi-agent DRL system
+    (e.g., AlphaAgent and RiskAgent).
     
-    def __init__(self, 
-                 data_iterator: DataIterator, 
-                 config: Dict[str, Any]):
+    This environment simulates the market and portfolio.
+    """
+
+    def __init__(self, config: Dict[str, Any], data_manager: DataManager):
         """
-        Initialize the environment.
+        Initializes the trading environment.
         
         Args:
-            data_iterator (DataIterator): Feeds market data to the env.
-            config (Dict[str, Any]): Environment configuration.
+            config: Configuration dictionary.
+            data_manager: Client to fetch historical data for the simulation.
         """
-        self.data_iterator = data_iterator
+        super(TradingEnv, self).__init__()
+        
         self.config = config
+        self.data_manager = data_manager
         
-        self.symbols = config.get('symbols', [])
-        self.initial_balance = config.get('initial_balance', 1_000_000)
-        self.transaction_cost = config.get('transaction_cost', 0.001) # 0.1%
-        
-        self.lookback_window = config.get('lookback_window', 50)
-        self.state_features = config.get('state_features', ['close', 'volume']) # 修正：self_state_features -> self.state_features
+        # Load historical data for the simulation
+        self._load_data()
+        self.current_step = 0
+        self.max_steps = len(self.market_data) - 1
 
-        self.reset()
-        logger.info(f"TradingEnv initialized for symbols: {self.symbols}")
+        # --- Define Action Space (Multi-Agent) ---
+        # We use a Dict space.
+        # 'alpha_agent': Box(low=-1.0, high=1.0, shape=(1,)) # Signal
+        # 'risk_agent': Box(low=0.1, high=1.0, shape=(1,))  # Capital Modifier
+        self.action_space = spaces.Dict({
+            "alpha_agent": spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+            "risk_agent": spaces.Box(low=0.1, high=1.0, shape=(1,), dtype=np.float32)
+        })
 
-    def reset(self) -> np.ndarray:
-        """
-        Resets the environment to the initial state.
-        """
-        logger.debug("Resetting trading environment.")
-        self.balance = self.initial_balance
-        self.positions = {symbol: 0.0 for symbol in self.symbols}
-        self.portfolio_value = self.initial_balance
-        self.current_step = self.lookback_window
+        # --- Define Observation Space (Multi-Agent) ---
+        # We provide a "global" observation (dictionary), and the
+        # trainer is responsible for splitting it.
+        # 'market_features': e.g., 60-day price history, volatility
+        # 'risk_features': e.g., current portfolio value, drawdown, VIX
+        self.observation_space = spaces.Dict({
+            "market_features": spaces.Box(low=-np.inf, high=np.inf, shape=(60,), dtype=np.float32),
+            "risk_features": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
+        })
         
-        self.data_iterator.reset()
+        # Portfolio state
+        self.initial_capital = config.get('initial_capital', 100000)
+        self.cash = self.initial_capital
+        self.shares = 0
+        self.portfolio_value = self.initial_capital
+        self.max_portfolio_value = self.initial_capital
         
-        # Load initial data to fill the lookback window
-        self._load_initial_history()
-        
-        return self._get_state()
+        logger.info("TradingEnv initialized.")
 
-    def _load_initial_history(self):
-        """
-        Loads the initial lookback data from the iterator.
-        """
-        self.market_history: Dict[str, pd.DataFrame] = {}
-        # This part is complex; depends on DataIterator implementation
-        # For simplicity, assume data_iterator can provide a bulk history
-        try:
-            self.market_history = self.data_iterator.get_initial_history(self.lookback_window)
-        except Exception as e:
-            logger.error(f"Failed to load initial history: {e}")
-            # Fallback: create empty dataframes
-            for symbol in self.symbols:
-                 self.market_history[symbol] = pd.DataFrame(
-                     columns=['timestamp'] + self.state_features, # 修正：使用 self.state_features
-                     index=pd.RangeIndex(self.lookback_window)
-                 ).fillna(0)
-
-
-    def _get_state(self) -> np.ndarray:
-        """
-        Constructs the state array for the agent.
+    def _load_data(self):
+        """Loads and prepares the market data for the simulation."""
+        logger.info("Loading simulation data...")
+        # This is a simplified example, loading one asset
+        symbol = self.config.get('simulation_symbol', 'AAPL')
+        start = self.config.get('simulation_start_date', '2020-01-01')
+        end = self.config.get('simulation_end_date', '2023-01-01')
         
-        State could be:
-        [balance, pos_AAPL, pos_MSFT, ..., 
-         price_hist_AAPL, ..., price_hist_MSFT, ...]
-        """
-        state_parts = []
-        
-        # 1. Portfolio state
-        state_parts.append(self.balance / self.initial_balance) # Normalized balance
-        for symbol in self.symbols:
-            # Normalized position value
-            # 修正：检查 self.market_history[symbol]['close'] 是否为空
-            current_price = self.market_history[symbol]['close'].iloc[-1] if not self.market_history[symbol]['close'].empty else 0
-            pos_value = self.positions[symbol] * current_price
-            state_parts.append(pos_value / self.portfolio_value if self.portfolio_value != 0 else 0)
+        self.market_data = self.data_manager.get_historical_data(
+            symbol, pd.to_datetime(start), pd.to_datetime(end)
+        )
+        if self.market_data.empty:
+            raise ValueError("Failed to load simulation data for TradingEnv.")
             
-        # 2. Market state (lookback window)
-        for symbol in self.symbols:
-            for feature in self.state_features: # 修正：使用 self.state_features
-                # Normalized price/volume history
-                history = self.market_history[symbol][feature].iloc[-self.lookback_window:]
-                # 修正：处理 history.iloc[0] 可能为 0 的情况
-                first_val = history.iloc[0] if not history.empty else 0
-                if first_val != 0:
-                    normalized_history = (history / first_val).fillna(1.0).values
-                else:
-                    normalized_history = history.fillna(0.0).values # 或者别的标准化方式
-                
-                # 修正：确保 normalized_history 长度正确，即使数据不足
-                if len(normalized_history) < self.lookback_window:
-                    padding = np.zeros(self.lookback_window - len(normalized_history))
-                    normalized_history = np.concatenate((padding, normalized_history))
-
-                state_parts.append(normalized_history)
+        # Pre-calculate features (e.g., returns, volatility)
+        self.market_data['returns'] = self.market_data['close'].pct_change()
+        self.market_data['volatility_20d'] = self.market_data['returns'].rolling(20).std()
         
-        try:
-            return np.concatenate(state_parts)
-        except ValueError as e:
-            logger.error(f"Error concatenating state parts: {e}. State parts shapes: {[p.shape for p in state_parts]}")
-            # Return a zero-state of expected shape if possible
-            # This requires knowing the state shape beforehand
-            return np.zeros(self._get_state_shape())
+        # Lookback window for market features
+        self.lookback_window = 60
+        
+        self.market_data = self.market_data.dropna()
+        self.max_steps = len(self.market_data) - self.lookback_window - 1
+        logger.info(f"Data loaded. {self.max_steps} trainable steps available.")
 
+    def reset(self) -> Dict[str, np.ndarray]:
+        """Resets the environment for a new episode."""
+        self.cash = self.initial_capital
+        self.shares = 0
+        self.portfolio_value = self.initial_capital
+        self.max_portfolio_value = self.initial_capital
+        
+        # Start at a random point in the data (to avoid overfitting to one start)
+        self.current_step = np.random.randint(
+            0, self.max_steps - 1
+        )
+        
+        return self._get_observation()
 
-    def _get_state_shape(self) -> Tuple[int, ...]:
-        """Helper to define the shape of the state vector."""
-        # 1 (balance) + N (positions) + N * K * F
-        # N=symbols, K=lookback, F=features
-        N = len(self.symbols)
-        K = self.lookback_window
-        F = len(self.state_features) # 修正：使用 self.state_features
-        shape = (1 + N + N * K * F, )
-        return shape
-
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+    def step(self, actions: Dict[str, np.ndarray]) -> (Dict, Dict, bool, Dict):
         """
-        Executes one time step in the environment.
+        Takes a step using the combined actions from all agents.
         
         Args:
-            action (np.ndarray): Action from the agent. Shape (N_symbols,).
-                                 Values could be -1 (sell), 0 (hold), 1 (buy)
-                                 or continuous values representing target allocation.
-        
+            actions (Dict): e.g., {"alpha_agent": [0.8], "risk_agent": [0.5]}
+            
         Returns:
-            Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-                (next_state, reward, done, info)
+            (obs, rewards, done, info)
         """
-        
-        # 1. Get next market data
-        try:
-            # 修正：DataIterator 现在返回一个 MarketData 列表
-            next_data_batch: List[MarketData] = next(self.data_iterator)
-            if not next_data_batch:
-                logger.warning("DataIterator returned None, ending episode.")
-                return self._get_state(), 0.0, True, {"status": "End of data"}
-        except StopIteration:
-            logger.info("DataIterator finished, ending episode.")
-            return self._get_state(), 0.0, True, {"status": "End of data"}
-        
-        # Update history
-        for data in next_data_batch:
-            if data.symbol in self.symbols:
-                # 修正：从 Pydantic 模型创建 DataFrame 行
-                new_row_data = {
-                    'open': data.open, 'high': data.high, 'low': data.low,
-                    'close': data.close, 'volume': data.volume
-                }
-                new_row = pd.DataFrame([new_row_data], index=[data.timestamp])
-                new_row.index.name = 'timestamp'
-
-                self.market_history[data.symbol] = pd.concat([
-                    self.market_history[data.symbol], new_row
-                ]).iloc[1:] # Maintain lookback window size
-
-        
-        # 2. Calculate portfolio value BEFORE action
-        prev_portfolio_value = self.portfolio_value
-        
-        # 3. Execute action (simulate trades)
-        # This assumes 'action' is an array of target allocations
-        # e.g., action = [0.5, 0.2, 0.3] for 3 symbols
-        
-        target_allocations = self._normalize_action(action)
-        
-        fills: List[Fill] = []
-        for i, symbol in enumerate(self.symbols):
-            target_alloc = target_allocations[i]
-            target_value = self.portfolio_value * target_alloc
+        if self.current_step >= (self.max_steps + self.lookback_window - 2):
+            # End of data
+            return self._get_observation(), {"alpha_agent": 0, "risk_agent": 0}, True, {}
             
-            current_price = self.market_history[symbol]['close'].iloc[-1]
-            if current_price == 0: continue # Skip if no price data
-
-            current_value = self.positions[symbol] * current_price
-            
-            trade_value = target_value - current_value
-            trade_amount = trade_value / current_price
-            
-            # Simulate transaction costs
-            cost = abs(trade_value) * self.transaction_cost
-            self.balance -= cost
-            
-            # Simulate fill
-            fill = self._simulate_execution(symbol, trade_amount, current_price)
-            fills.append(fill)
-            
-            # Update portfolio state
-            self.balance -= fill.fill_price * fill.fill_amount
-            self.positions[symbol] += fill.fill_amount
-
-        # 4. Calculate portfolio value AFTER action
-        self._update_portfolio_value()
+        # 1. Get current state and actions
+        current_price = self.market_data['close'].iloc[self.current_step + self.lookback_window]
         
-        # 5. Calculate reward
-        # Simple reward: change in portfolio value
-        reward = self.portfolio_value - prev_portfolio_value
+        alpha_signal = actions['alpha_agent'][0] # e.g., 0.8 (target 80% long)
+        risk_modifier = actions['risk_agent'][0] # e.g., 0.5 (use 50% capital)
         
-        # 6. Check if done
+        # 2. Calculate final target position
+        # Final exposure = 80% * 50% = 40% of portfolio
+        target_exposure_pct = alpha_signal * risk_modifier
+        target_value = self.portfolio_value * target_exposure_pct
+        
+        # 3. Simulate trade (simple, no slippage)
+        current_value = self.shares * current_price
+        value_to_trade = target_value - current_value
+        shares_to_trade = value_to_trade / current_price
+        
+        self.shares += shares_to_trade
+        self.cash -= value_to_trade
+        
+        # 4. Update portfolio value for next step
         self.current_step += 1
-        done = (self.portfolio_value <= 0) or (self.current_step >= self.config.get('max_steps', 1000))
+        next_price = self.market_data['close'].iloc[self.current_step + self.lookback_window]
         
-        # 7. Get next state
-        next_state = self._get_state()
+        last_portfolio_value = self.portfolio_value
+        self.portfolio_value = self.cash + (self.shares * next_price)
         
-        info = {
-            "portfolio_value": self.portfolio_value,
-            "balance": self.balance,
-            "positions": self.positions,
-            "fills": [f.__dict__ for f in fills] # 修正：序列化 dataclass
+        # 5. Calculate Rewards
+        portfolio_return = (self.portfolio_value - last_portfolio_value) / last_portfolio_value
+        
+        # Update drawdown
+        self.max_portfolio_value = max(self.max_portfolio_value, self.portfolio_value)
+        drawdown = (self.max_portfolio_value - self.portfolio_value) / self.max_portfolio_value
+        
+        # Get market volatility
+        current_vol = self.market_data['volatility_20d'].iloc[self.current_step + self.lookback_window]
+        
+        # We use the *same* portfolio-level reward for both agents (CTDE)
+        # We let the agent's reward function (in the agent class) parse this
+        # This is a *global* reward signal
+        
+        # TODO: A better approach is to return agent-specific rewards
+        # AlphaReward: (alpha_signal * market_return)
+        # RiskReward: (portfolio_sharpe - target_sharpe) - (drawdown * penalty)
+        
+        alpha_reward = alpha_signal * self.market_data['returns'].iloc[self.current_step + self.lookback_window]
+        
+        # Risk reward (e.g., based on volatility)
+        risk_reward = -abs(portfolio_return) if current_vol > 0.02 else portfolio_return
+        
+        rewards = {
+            "alpha_agent": alpha_reward,
+            "risk_agent": risk_reward # Simple example
         }
         
-        return next_state, reward, done, info
-
-    def _normalize_action(self, action: np.ndarray) -> np.ndarray:
-        """Normalizes action array to sum to 1 (e.g., softmax)."""
-        # Example: Simple clipping and re-normalization
-        action = np.clip(action, 0, 1) # Assume long-only
-        total = np.sum(action)
-        if total == 0:
-            return np.zeros_like(action)
-        return action / total
-
-    def _update_portfolio_value(self):
-        """Recalculates total portfolio value."""
-        value = self.balance
-        for symbol in self.symbols:
-            price = self.market_history[symbol]['close'].iloc[-1]
-            value += self.positions[symbol] * price
-        self.portfolio_value = value
-
-    def _simulate_execution(self, symbol: str, amount: float, price: float) -> Fill:
-        """
-        Simulates an order execution, returning a Fill object.
-        (Simplified: assumes full fill at given price)
-        """
-        order = Order(
-            symbol=symbol,
-            side='BUY' if amount > 0 else 'SELL', # 修正：正确设置 side
-            size=abs(amount), # 修正：size 应为正数
-            order_type="MARKET",
-            timestamp=self.market_history[symbol].index[-1].to_pydatetime()
-        )
+        # 6. Check if done
+        done = False
+        if self.portfolio_value <= (self.initial_capital * 0.5): # 50% drawdown
+            logger.info(f"Episode failed: 50% drawdown reached.")
+            done = True
         
-        fill = Fill(
-            order_id=order.order_id,
-            symbol=symbol,
-            fill_amount=amount, # fill_amount 可以为负
-            fill_price=price, # No slippage in this simulation
-            timestamp=order.timestamp
-        )
-        return fill
+        info = {
+            "portfolio_return": portfolio_return,
+            "portfolio_volatility": current_vol,
+            "drawdown": drawdown,
+        }
+        
+        return self._get_observation(), rewards, done, info
 
+    def _get_observation(self) -> Dict[str, np.ndarray]:
+        """Constructs the observation dictionary."""
+        
+        idx = self.current_step + self.lookback_window
+        
+        # Market features (e.g., 60-day price history, normalized)
+        price_history = self.market_data['close'].iloc[idx - self.lookback_window : idx]
+        normalized_prices = (price_history / price_history.iloc[-1]) - 1.0
+        
+        market_features = normalized_prices.values.astype(np.float32)
+        
+        # Risk features
+        current_vol = self.market_data['volatility_20d'].iloc[idx]
+        drawdown = (self.max_portfolio_value - self.portfolio_value) / self.max_portfolio_value
+        current_exposure = (self.shares * self.market_data['close'].iloc[idx]) / self.portfolio_value
+        
+        risk_features = np.array([
+            self.portfolio_value / self.initial_capital, # Portfolio growth
+            current_exposure, # Current position (-1 to 1)
+            drawdown, # 0 to 1
+            current_vol,
+            0.0 # Placeholder for VIX
+        ], dtype=np.float32)
+        
+        return {
+            "market_features": market_features,
+            "risk_features": risk_features
+        }
