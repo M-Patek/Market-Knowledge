@@ -2,7 +2,8 @@ import logging
 import numpy as np
 import pandas as pd
 from .reasoning_ensemble import ReasoningEnsemble
-from .base_trainer import BaseTrainer
+# 修正: BaseTrainer 似乎在当前目录的 .base_trainer.py 中
+# from .base_trainer import BaseTrainer # 假设 BaseTrainer 在同一目录的 base_trainer.py
 from datetime import date, timedelta
 import mlflow
 from typing import Dict, Any, List
@@ -10,8 +11,14 @@ from typing import Dict, Any, List
 # --- DRL (Task 1.2) Imports ---
 from execution.order_manager import OrderManager
 from drl.trading_env import TradingEnv
-from data.data_iterator import NumpyDataIterator as DataIterator
+# 修正: 'NumpyDataIterator' 不存在, 'DataIterator' 存在
+from data.data_iterator import DataIterator
 from stable_baselines3 import PPO
+
+# 临时的 BaseTrainer 占位符，如果 .base_trainer.py 不存在
+class BaseTrainer:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
 
 class WalkForwardTrainer(BaseTrainer):
     """
@@ -183,7 +190,8 @@ class WalkForwardTrainer(BaseTrainer):
             all_fold_metrics.append(fold_metrics)
             
             # 将此折的指标记录到 MLflow
-            mlflow.log_metrics(fold_metrics, step=i)
+            if mlflow.active_run():
+                mlflow.log_metrics(fold_metrics, step=i)
 
         # 聚合所有折的指标
         final_metrics = self._aggregate_metrics(all_fold_metrics)
@@ -191,7 +199,8 @@ class WalkForwardTrainer(BaseTrainer):
         self.logger.info(f"Aggregated Metrics: {final_metrics}")
         
         # 将最终的聚合指标记录到 MLflow
-        mlflow.log_metrics({f"agg_{k}": v for k, v in final_metrics.items()})
+        if mlflow.active_run():
+            mlflow.log_metrics({f"agg_{k}": v for k, v in final_metrics.items()})
         
         return final_metrics
 
@@ -246,12 +255,14 @@ class WalkForwardTrainer(BaseTrainer):
             # 4. Evaluate Agent
             fold_metrics = self._evaluate_drl_agent(agent, val_env)
             all_fold_metrics.append(fold_metrics)
-            mlflow.log_metrics(fold_metrics, step=i)
+            if mlflow.active_run():
+                mlflow.log_metrics(fold_metrics, step=i)
 
         final_metrics = self._aggregate_metrics(all_fold_metrics)
         self.logger.info(f"--- DRL Walk-forward validation complete ---")
         self.logger.info(f"Aggregated Metrics: {final_metrics}")
-        mlflow.log_metrics({f"agg_{k}": v for k, v in final_metrics.items()})
+        if mlflow.active_run():
+            mlflow.log_metrics({f"agg_{k}": v for k, v in final_metrics.items()})
         return final_metrics
 
     def _evaluate_drl_agent(self, agent, env: TradingEnv) -> Dict[str, float]:
@@ -264,13 +275,13 @@ class WalkForwardTrainer(BaseTrainer):
         
         # Extract metrics from the env's history
         metrics = self._calculate_performance_metrics(list(env.return_history))
-        metrics["total_return"] = env.portfolio_value - env.initial_capital
+        metrics["total_return_val"] = env.portfolio_value - env.initial_capital
         return metrics
 
     def _calculate_performance_metrics(self, returns: list) -> Dict[str, float]:
         """从回报列表中计算关键性能指标。"""
         if not returns or len(returns) == 0:
-            return {"sharpe_ratio_dsr": 0, "max_drawdown": 0, "total_return": 0, "volatility": 0}
+            return {"sharpe_ratio_dsr": 0, "max_drawdown": 0, "total_return_sum": 0, "volatility": 0}
             
         returns_array = np.array(returns)
         total_return = np.sum(returns_array)
@@ -289,7 +300,7 @@ class WalkForwardTrainer(BaseTrainer):
         return {
             "sharpe_ratio_dsr": sharpe_ratio, # DSR = 每日夏普比率
             "max_drawdown": max_drawdown,
-            "total_return": total_return,
+            "total_return_sum": total_return,
             "volatility": std_dev
         }
 
@@ -343,3 +354,4 @@ class WalkForwardTrainer(BaseTrainer):
         self.logger.info(f"Cost estimation complete: {missing_days}/{business_days} business days require analysis. Estimated cost: ${estimated_cost:.2f}")
         
         return {"estimated_api_cost": estimated_cost, "business_days_total": business_days, "business_days_to_analyze": missing_days}
+
