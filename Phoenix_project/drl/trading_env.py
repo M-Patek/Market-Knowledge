@@ -2,8 +2,11 @@ import numpy as np
 import pandas as pd
 from typing import List, Dict, Any, Optional, Tuple
 
-# 修复：导入缺失的 'Order'
-from ..execution.interfaces import Fill, MarketData, Order
+# 修复：
+# 1. 'Fill' 和 'Order' 来自 'execution.interfaces'
+# 2. 'MarketData' 来自 'core.schemas.data_schema' (不再从 interfaces 导入)
+from ..execution.interfaces import Fill, Order
+from ..core.schemas.data_schema import MarketData
 from ..data.data_iterator import DataIterator
 from ..monitor.logging import get_logger
 
@@ -34,7 +37,7 @@ class TradingEnv:
         self.transaction_cost = config.get('transaction_cost', 0.001) # 0.1%
         
         self.lookback_window = config.get('lookback_window', 50)
-        self_state_features = config.get('state_features', ['close', 'volume'])
+        self.state_features = config.get('state_features', ['close', 'volume']) # 修正：self_state_features -> self.state_features
 
         self.reset()
         logger.info(f"TradingEnv initialized for symbols: {self.symbols}")
@@ -70,7 +73,7 @@ class TradingEnv:
             # Fallback: create empty dataframes
             for symbol in self.symbols:
                  self.market_history[symbol] = pd.DataFrame(
-                     columns=['timestamp'] + self_state_features,
+                     columns=['timestamp'] + self.state_features, # 修正：使用 self.state_features
                      index=pd.RangeIndex(self.lookback_window)
                  ).fillna(0)
 
@@ -89,21 +92,34 @@ class TradingEnv:
         state_parts.append(self.balance / self.initial_balance) # Normalized balance
         for symbol in self.symbols:
             # Normalized position value
-            pos_value = self.positions[symbol] * self.market_history[symbol]['close'].iloc[-1]
-            state_parts.append(pos_value / self.portfolio_value)
+            # 修正：检查 self.market_history[symbol]['close'] 是否为空
+            current_price = self.market_history[symbol]['close'].iloc[-1] if not self.market_history[symbol]['close'].empty else 0
+            pos_value = self.positions[symbol] * current_price
+            state_parts.append(pos_value / self.portfolio_value if self.portfolio_value != 0 else 0)
             
         # 2. Market state (lookback window)
         for symbol in self.symbols:
-            for feature in self_state_features:
+            for feature in self.state_features: # 修正：使用 self.state_features
                 # Normalized price/volume history
                 history = self.market_history[symbol][feature].iloc[-self.lookback_window:]
-                normalized_history = (history / history.iloc[0]).fillna(1.0).values
+                # 修正：处理 history.iloc[0] 可能为 0 的情况
+                first_val = history.iloc[0] if not history.empty else 0
+                if first_val != 0:
+                    normalized_history = (history / first_val).fillna(1.0).values
+                else:
+                    normalized_history = history.fillna(0.0).values # 或者别的标准化方式
+                
+                # 修正：确保 normalized_history 长度正确，即使数据不足
+                if len(normalized_history) < self.lookback_window:
+                    padding = np.zeros(self.lookback_window - len(normalized_history))
+                    normalized_history = np.concatenate((padding, normalized_history))
+
                 state_parts.append(normalized_history)
         
         try:
             return np.concatenate(state_parts)
         except ValueError as e:
-            logger.error(f"Error concatenating state parts: {e}. State parts: {state_parts}")
+            logger.error(f"Error concatenating state parts: {e}. State parts shapes: {[p.shape for p in state_parts]}")
             # Return a zero-state of expected shape if possible
             # This requires knowing the state shape beforehand
             return np.zeros(self._get_state_shape())
@@ -115,7 +131,7 @@ class TradingEnv:
         # N=symbols, K=lookback, F=features
         N = len(self.symbols)
         K = self.lookback_window
-        F = len(self_state_features)
+        F = len(self.state_features) # 修正：使用 self.state_features
         shape = (1 + N + N * K * F, )
         return shape
 
@@ -135,7 +151,8 @@ class TradingEnv:
         
         # 1. Get next market data
         try:
-            next_data_batch = next(self.data_iterator)
+            # 修正：DataIterator 现在返回一个 MarketData 列表
+            next_data_batch: List[MarketData] = next(self.data_iterator)
             if not next_data_batch:
                 logger.warning("DataIterator returned None, ending episode.")
                 return self._get_state(), 0.0, True, {"status": "End of data"}
@@ -145,10 +162,17 @@ class TradingEnv:
         
         # Update history
         for data in next_data_batch:
-            if data['symbol'] in self.symbols:
-                new_row = pd.DataFrame([data]).set_index('timestamp')
-                self.market_history[data['symbol']] = pd.concat([
-                    self.market_history[data['symbol']], new_row
+            if data.symbol in self.symbols:
+                # 修正：从 Pydantic 模型创建 DataFrame 行
+                new_row_data = {
+                    'open': data.open, 'high': data.high, 'low': data.low,
+                    'close': data.close, 'volume': data.volume
+                }
+                new_row = pd.DataFrame([new_row_data], index=[data.timestamp])
+                new_row.index.name = 'timestamp'
+
+                self.market_history[data.symbol] = pd.concat([
+                    self.market_history[data.symbol], new_row
                 ]).iloc[1:] # Maintain lookback window size
 
         
@@ -204,7 +228,7 @@ class TradingEnv:
             "portfolio_value": self.portfolio_value,
             "balance": self.balance,
             "positions": self.positions,
-            "fills": [f.model_dump() for f in fills]
+            "fills": [f.__dict__ for f in fills] # 修正：序列化 dataclass
         }
         
         return next_state, reward, done, info
@@ -233,7 +257,8 @@ class TradingEnv:
         """
         order = Order(
             symbol=symbol,
-            amount=amount,
+            side='BUY' if amount > 0 else 'SELL', # 修正：正确设置 side
+            size=abs(amount), # 修正：size 应为正数
             order_type="MARKET",
             timestamp=self.market_history[symbol].index[-1].to_pydatetime()
         )
@@ -241,7 +266,7 @@ class TradingEnv:
         fill = Fill(
             order_id=order.order_id,
             symbol=symbol,
-            fill_amount=amount,
+            fill_amount=amount, # fill_amount 可以为负
             fill_price=price, # No slippage in this simulation
             timestamp=order.timestamp
         )
