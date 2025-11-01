@@ -47,3 +47,4 @@ async def run_agents(plan: dict, rag_context: str) -> list[dict]:
     results = await asyncio.gather(*tasks)
     
     return results
+
