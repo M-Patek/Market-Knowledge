@@ -11,7 +11,8 @@ services:
       - "5000:5000"
     command: ["flask", "run", "--host=0.0.0.0", "--port=5000"]
     environment:
-      - FLASK_APP=Phoenix_project.api.gateway:create_app
+      # FIXED: 修正了 Python 导入路径，以匹配 /app 工作目录
+      - FLASK_APP=api.gateway:create_app
     volumes:
       - .:/app
 
@@ -20,7 +21,9 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: phoenix_worker
-    # This assumes a celery app is defined in 'phoenix_project.worker'
-    command: ["celery", "-A", "phoenix_project.worker.app", "worker", "--loglevel=info"]
+    # FIXED: 修正了 Celery 的 Python 导入路径，以匹配 /app 工作目录
+    # 假设 'app' 对象定义在 /app/worker.py 文件中
+    command: ["celery", "-A", "worker.app", "worker", "--loglevel=info"]
     volumes:
       - .:/app
+
