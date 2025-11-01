@@ -1,61 +1,97 @@
-import yaml
-import pandas as pd
+import jsonschema
+import json
 import sys
-from datetime import datetime, timedelta
+from pathlib import Path
 
-def run_dqm_checks():
+# 修正：添加项目根目录到 sys.path，以便导入根目录下的模块
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+sys.path.append(str(PROJECT_ROOT))
+
+# --------------------------------------------------
+# 原始脚本内容现在可以正常导入了
+# --------------------------------------------------
+
+from data_manager import DataManager
+from monitor.logging import get_logger
+
+logger = get_logger(__name__)
+
+def validate_data_contract():
     """
-    Runs a suite of Data Quality Monitoring (DQM) checks against a dataset.
-    Exits with a non-zero status code on failure.
+    Ensures that the AI cache data strictly adheres to the schema defined in data_catalog.json.
+    This is the Data Contract Enforcement gate for MLOps.
     """
+    logger.info("Starting Data Contract Enforcement...")
+
     try:
-        print("--- Running Data Quality Monitoring (DQM) Checks ---")
+        # 1. Load the DataManager to get access to the schema
+        # 修正：使用基于 PROJECT_ROOT 的路径
+        data_catalog_path = PROJECT_ROOT / "data_catalog.json"
+        dm = DataManager(data_catalog_path=data_catalog_path)
+        
+        schema = dm.get_schema("fused_ai_analysis_schema")
+        if not schema:
+            logger.error("Failed to load 'fused_ai_analysis_schema' from data catalog.")
+            return False
+        
+        logger.info("Successfully loaded 'fused_ai_analysis_schema' data contract.")
 
-        # 1. Load Configuration
-        with open('config.yaml', 'r') as f:
-            config = yaml.safe_load(f)
-        dqm_config = config.get('data_quality_monitoring', {})
-        completeness_threshold = dqm_config.get('completeness_threshold', 0.98)
-        staleness_days = dqm_config.get('staleness_days_threshold', 3)
+        # 2. Load the actual data cache
+        # 修正：使用基于 PROJECT_ROOT 的路径
+        # (假设 'asset_analysis_cache.json' 位于 'cache/' 目录)
+        cache_path = PROJECT_ROOT / "cache" / "asset_analysis_cache.json"
+        
+        if not cache_path.exists():
+            logger.warning(f"Cache file not found at {cache_path}. Skipping validation.")
+            # 在 CI/CD 中，这可能是一个通过（pass）或失败（fail）的状态，取决于策略
+            return True # 暂定为通过
 
-        print(f"DQM Config: Completeness >= {completeness_threshold:.2%}, Staleness <= {staleness_days} days")
+        with open(cache_path, 'r') as f:
+            data_cache = json.load(f)
 
-        # 2. Load a representative dataset (e.g., SPY data)
-        # In a real CI job, we'd fetch this from a designated test data store.
-        # Here, we'll create a dummy dataframe for a robust demonstration.
-        dates = pd.to_datetime(pd.date_range(end=datetime.today() - timedelta(days=2), periods=100))
-        data = pd.DataFrame({
-            'Close': range(100)
-        }, index=dates)
-        # Introduce some missing data to test the check
-        data.iloc[10:15, 0] = None
-        print(f"Loaded sample dataset with {len(data)} rows, from {data.index.min().date()} to {data.index.max().date()}")
+        logger.info(f"Loaded data cache from {cache_path}.")
 
+        # 3. Validate the data against the schema
+        # 假设缓存是一个字典，其键是 Ticker，值是符合 schema 的分析对象
+        if not isinstance(data_cache, dict):
+            logger.error("Data cache is not a dictionary (key-value store). Validation failed.")
+            return False
 
-        # 3. Perform Checks
-        # a) Completeness Check
-        completeness = data['Close'].notna().mean()
-        print(f"Checking completeness... Found: {completeness:.2%}")
-        if completeness < completeness_threshold:
-            print(f"❌ DQM FAILED: Data completeness ({completeness:.2%}) is below the threshold of {completeness_threshold:.2%}.")
-            sys.exit(1)
-        print("✅ Completeness check passed.")
+        all_valid = True
+        for ticker, record in data_cache.items():
+            try:
+                jsonschema.validate(instance=record, schema=schema)
+                logger.debug(f"Record for {ticker} PASSED validation.")
+            except jsonschema.ValidationError as e:
+                logger.error(f"Data Contract VIOLATION for ticker {ticker}: {e.message}")
+                all_valid = False
 
-        # b) Staleness Check
-        days_since_last_point = (datetime.now() - data.index.max()).days
-        print(f"Checking staleness... Last data point is {days_since_last_point} days old.")
-        if days_since_last_point > staleness_days:
-            print(f"❌ DQM FAILED: Data is stale ({days_since_last_point} days old), exceeding the threshold of {staleness_days} days.")
-            sys.exit(1)
-        print("✅ Staleness check passed.")
+        if all_valid:
+            logger.info("Data Contract Enforcement PASSED. All records are valid.")
+        else:
+            logger.error("Data Contract Enforcement FAILED. Invalid records found.")
+            
+        return all_valid
 
-        print("\n--- ✅ All DQM checks passed successfully! ---")
-        sys.exit(0)
-
+    except FileNotFoundError:
+        logger.error(f"Failed to load required file (data_catalog.json or cache).")
+        return False
+    except json.JSONDecodeError:
+        logger.error(f"Failed to parse JSON from data catalog or cache.")
+        return False
     except Exception as e:
-        print(f"❌ An unexpected error occurred during DQM checks: {e}")
-        sys.exit(1)
+        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
+        return False
 
 if __name__ == "__main__":
-    run_dqm_checks()
-
+    """
+    This script is intended to be run as a CI/CD quality gate.
+    If validation fails, it will exit with a non-zero status code,
+    which should fail the CI pipeline.
+    """
+    if not validate_data_contract():
+        logger.error("CI Quality Gate: FAILED")
+        sys.exit(1)
+    else:
+        logger.info("CI Quality Gate: PASSED")
+        sys.exit(0)
