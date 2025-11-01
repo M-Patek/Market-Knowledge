@@ -1,3 +1,4 @@
+import asyncio  # 修复：导入 asyncio
 from data_manager import DataManager
 from monitor.logging import get_logger
 from controller.orchestrator import Orchestrator as PipelineOrchestrator
@@ -29,19 +30,30 @@ class CognitiveEngine:
         all_signals = [] # Collect signals for backtesting
 
         for data_event in self.data_manager.stream_data():
-            logger.info(f"CognitiveEngine: Processing event for {data_event.get('ticker')}")
+            ticker = data_event.get('ticker', 'UNKNOWN') # 修复：从 data_event 中获取 ticker
+            logger.info(f"CognitiveEngine: Processing event for {ticker}")
             
-            # Run the full pipeline via the orchestrator (Layer 9)
-            pipeline_result_state = self.pipeline_orchestrator.run_pipeline(data_event)
+            # 修复：使用 asyncio.run() 来正确调用异步的 pipeline
+            # 修复：将返回值视为 'pipeline_result' (一个 dict)，而不是 'pipeline_result_state'
+            try:
+                # 运行异步的 pipeline 并等待其 dict 结果
+                pipeline_result = asyncio.run(
+                    self.pipeline_orchestrator.run_pipeline(data_event)
+                )
+            except Exception as e:
+                logger.error(f"CognitiveEngine: Pipeline run failed for {ticker}: {e}")
+                continue # 继续处理下一个事件
             
-            # Mock: Assume the pipeline state now contains a signal
-            # In a real app, this would come from the 'Signal_generation' stage
-            mock_signal = pipeline_result_state.get_data("Signal_generation")
+            # 修复：从 'pipeline_result' (dict) 中 .get() 数据
+            # orchestrator.py 确保了 'ticker' 字段存在于返回的 dict 中
+            mock_signal = pipeline_result.get("Signal_generation")
             if not mock_signal:
-                mock_signal = {"ticker": data_event.get('ticker'), "action": "HOLD", "confidence": 0.5}
+                # 修复：使用我们之前从 data_event 中获取的 ticker
+                mock_signal = {"ticker": ticker, "action": "HOLD", "confidence": 0.5}
             
             all_signals.append(mock_signal)
-            logger.info(f"CognitiveEngine: Pipeline run completed for {pipeline_result_state.ticker}")
+            # 修复：使用 ticker 变量进行日志记录
+            logger.info(f"CognitiveEngine: Pipeline run completed for {ticker}")
 
         logger.info("CognitiveEngine: Simulation finished.")
 
@@ -60,8 +72,18 @@ class CognitiveEngine:
         """
         Runs the pipeline for a single event, intended for API calls (Layer 9).
         """
-        logger.info(f"CognitiveEngine: Processing single event for {data_event.get('ticker')}")
-        pipeline_result_state = self.pipeline_orchestrator.run_pipeline(data_event)
-        logger.info(f"CognitiveEngine: Single event run completed for {pipeline_result_state.ticker}")
-        return pipeline_result_state
+        ticker = data_event.get('ticker', 'UNKNOWN') # 修复：从 data_event 中获取 ticker
+        logger.info(f"CognitiveEngine: Processing single event for {ticker}")
+        
+        # 修复：使用 asyncio.run() 来正确调用异步的 pipeline
+        # 修复：将返回值视为 'pipeline_result' (一个 dict)
+        try:
+            pipeline_result = asyncio.run(
+                self.pipeline_orchestrator.run_pipeline(data_event)
+            )
+            logger.info(f"CognitiveEngine: Single event run completed for {ticker}")
+            return pipeline_result # 修复：返回 'pipeline_result' (dict)
+        except Exception as e:
+            logger.error(f"CognitiveEngine: Single event pipeline run failed for {ticker}: {e}")
+            return {"error": str(e), "ticker": ticker}
 
