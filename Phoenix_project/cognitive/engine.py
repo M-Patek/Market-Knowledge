@@ -1,119 +1,116 @@
-import asyncio
 from typing import Dict, Any, Optional
 
-# 修复：全部改为相对导入
-from ..ai.retriever import Retriever
-from ..ai.reasoning_ensemble import ReasoningEnsemble
-from ..evaluation.voter import Voter
-from ..evaluation.critic import Critic
-from ..evaluation.arbitrator import Arbitrator
-from ..fusion.synthesizer import Synthesizer
 from ..core.pipeline_state import PipelineState
-from ..agents.executor import AgentExecutor
+from ..core.schemas.fusion_result import FusionResult
+from ..ai.metacognitive_agent import MetacognitiveAgent
+from .portfolio_constructor import PortfolioConstructor, Portfolio
+from ..execution.signal_protocol import StrategySignal
 from ..monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 class CognitiveEngine:
     """
-    The core cognitive pipeline (L1-L3).
-    This engine integrates retrieval, agentic execution, reasoning,
-    evaluation, and synthesis.
-    """
+    The Cognitive Engine is the "brain" of the strategy.
+    It encapsulates the MetacognitiveAgent (which runs the AI pipeline)
+    and the PortfolioConstructor (which translates AI decisions into targets).
     
-    def __init__(self, 
-                 retriever: Retriever, 
-                 agent_executor: AgentExecutor,
-                 reasoning_ensemble: ReasoningEnsemble,
-                 voter: Voter,
-                 critic: Critic,
-                 arbitrator: Arbitrator,
-                 synthesizer: Synthesizer,
-                 config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the cognitive engine with all its components.
-        """
-        self.retriever = retriever
-        self.agent_executor = agent_executor
-        self.reasoning_ensemble = reasoning_ensemble
-        self.voter = voter
-        self.critic = critic
-        self.arbitrator = arbitrator
-        self.synthesizer = synthesizer
-        self.config = config or {}
-        logger.info("CognitiveEngine initialized.")
+    Its main job is to take the current system state and an AI's fusion result,
+    and output a concrete StrategySignal (target portfolio weights).
+    """
 
-    async def run_pipeline(self, initial_state: PipelineState) -> PipelineState:
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        metacognitive_agent: MetacognitiveAgent,
+        portfolio_constructor: PortfolioConstructor
+    ):
         """
-        Executes the full L1-L3 cognitive pipeline.
+        Initializes the CognitiveEngine.
         
         Args:
-            initial_state (PipelineState): The starting state, usually containing
-                                           the query and time range.
-
-        Returns:
-            PipelineState: The final, synthesized state after the pipeline run.
+            config: The main strategy configuration.
+            metacognitive_agent: The agent responsible for AI reasoning (RAG, ensemble, etc.).
+            portfolio_constructor: The module that builds the target portfolio.
         """
-        logger.info(f"Cognitive pipeline starting for query: {initial_state.query}")
+        self.config = config
+        self.metacognitive_agent = metacognitive_agent
+        self.portfolio_constructor = portfolio_constructor
+        logger.info("CognitiveEngine initialized.")
+
+    async def run_cognitive_pipeline(
+        self, 
+        state: PipelineState
+    ) -> Optional[FusionResult]:
+        """
+        Runs the full AI reasoning pipeline on the *triggering event*
+        found in the current state.
         
-        current_state = initial_state.model_copy(deep=True)
-
-        try:
-            # --- L1: RETRIEVAL & AGENTS ---
-            logger.debug("Running L1: Retrieval and Agents")
+        Args:
+            state: The current PipelineState (must contain a 'triggering_event').
             
-            # L1a: Retrieval (Hybrid RAG)
-            retrieved_context = await self.retriever.retrieve(
-                current_state.query, 
-                current_state.start_time, 
-                current_state.end_time
-            )
-            current_state.retrieved_context = retrieved_context
+        Returns:
+            Optional[FusionResult]: The output from the MetacognitiveAgent,
+                                    or None if no event was processed.
+        """
+        
+        if not state.triggering_event:
+            logger.warning("Cognitive pipeline run skipped: No triggering event in state.")
+            return None
             
-            # L1b: Agentic Execution
-            # Agents run in parallel, using the retrieved context
-            agent_results = await self.agent_executor.run_agents(
-                retrieved_context, 
-                current_state
-            )
-            current_state.agent_outputs = agent_results
+        logger.debug(f"Running cognitive pipeline for event: {state.triggering_event.event_id}")
+        
+        # The MetacognitiveAgent handles RAG, the agent ensemble,
+        # fact-checking, arbitration, and uncertainty calculation.
+        fusion_result = await self.metacognitive_agent.process_event(
+            event=state.triggering_event,
+            market_context=state.get_all_market_data_as_list() # Provide all market data
+        )
+        
+        return fusion_result
 
-            # --- L2: REASONING & EVALUATION ---
-            logger.debug("Running L2: Reasoning and Evaluation")
-
-            # L2a: Reasoning Ensemble
-            # Heterogeneous reasoners (Symbolic, LLM) run in parallel
-            reasoning_outputs = await self.reasoning_ensemble.run(
-                current_state, 
-                {"retrieved_context": retrieved_context, "agent_results": agent_results}
-            )
-            current_state.reasoning_outputs = reasoning_outputs
+    def generate_target_signal(
+        self,
+        state: PipelineState,
+        fusion_result: FusionResult
+    ) -> StrategySignal:
+        """
+        Generates the target portfolio weights based on the AI's decision.
+        
+        Args:
+            state: The current PipelineState.
+            fusion_result: The output from the cognitive pipeline run.
             
-            # L2b: Evaluation (Vote & Critique)
-            # Voter aggregates outputs
-            votes = self.voter.vote(reasoning_outputs, agent_results)
-            current_state.votes = votes
-
-            # Critic reviews the votes and outputs for conflicts/biases
-            critiques = self.critic.review(current_state, votes)
-            current_state.critiques = critiques
-
-            # --- L3: FUSION & SYNTHESIS ---
-            logger.debug("Running L3: Fusion and Synthesis")
-
-            # L3a: Arbitrator resolves conflicts based on critiques
-            final_decision = self.arbitrator.resolve(critiques, votes)
-            current_state.arbitrator_decision = final_decision
-            
-            # L3b: Synthesizer fuses the final decision into a coherent insight
-            final_state = self.synthesizer.fuse(current_state, final_decision)
-            
-            logger.info(f"Cognitive pipeline finished. Final insight: {final_state.fusion_result.insight}")
-            return final_state
-
-        except Exception as e:
-            logger.error(f"Error during cognitive pipeline execution: {e}", exc_info=True)
-            # Return the state as it was when the error occurred
-            current_state.error_message = str(e)
-            return current_state
-
+        Returns:
+            StrategySignal: A standardized signal object with target weights.
+        """
+        
+        logger.debug(f"Generating target signal for event: {fusion_result.event_id}")
+        
+        # The PortfolioConstructor translates the (qualitative) AI decision
+        # and (quantitative) uncertainty score into a (quantitative)
+        # target portfolio (e.g., {"AAPL": 0.1, "CASH": 0.9}).
+        portfolio: Portfolio = self.portfolio_constructor.generate_optimized_portfolio(
+            state=state,
+            fusion_result=fusion_result
+        )
+        
+        # Package the portfolio into a standard StrategySignal
+        signal = StrategySignal(
+            strategy_id=state.strategy_name,
+            timestamp=state.timestamp,
+            target_weights=portfolio.weights,
+            metadata={
+                "event_id": fusion_result.event_id,
+                "ai_decision": fusion_result.final_decision.decision,
+                "ai_confidence": fusion_result.final_decision.confidence,
+                "cognitive_uncertainty": fusion_result.cognitive_uncertainty,
+                **portfolio.metadata # Include metadata from portfolio construction
+            }
+        )
+        
+        logger.info(f"Generated signal for {fusion_result.event_id}: "
+                    f"Decision: {signal.metadata['ai_decision']}, "
+                    f"Uncertainty: {signal.metadata['cognitive_uncertainty']:.2f}")
+        
+        return signal
