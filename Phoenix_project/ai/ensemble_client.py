@@ -2,8 +2,7 @@ import asyncio
 from typing import List, Dict, Any, Union
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ai.llm_client import LLMClient
-from observability import get_logger
-from ai.prompt_renderer import PromptRenderer
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
