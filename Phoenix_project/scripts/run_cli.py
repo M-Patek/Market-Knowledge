@@ -1,27 +1,50 @@
-# Phoenix_project/scripts/run_cli.py
-"""
-Command-line interface wrapper to run the Phoenix project pipeline.
-This script is used by the self_check.sh
-"""
-import asyncio
-import argparse
-import logging
-
-# 我们需要将项目根目录添加到路径中才能导入 controller 模块
 import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent))
 
-from controller.loop_manager import control_loop
+# 修正：添加项目根目录到 sys.path，以便导入根目录下的模块
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+sys.path.append(str(PROJECT_ROOT))
 
-logging.basicConfig(level=logging.INFO)
+# --------------------------------------------------
+# 原始脚本内容现在可以正常导入了
+# --------------------------------------------------
+
+from controller.orchestrator import Orchestrator
+from monitor.logging import get_logger
+import asyncio
+
+logger = get_logger(__name__)
+
+async def main_async():
+    """Asynchronous entry point for the CLI."""
+    logger.info("Starting CLI... (Async)")
+    
+    # 示例任务
+    task = {
+        "type": "analysis_request",
+        "ticker": "AAPL",
+        "query": "What is the market sentiment and technical outlook for Apple?"
+    }
+    
+    orchestrator = Orchestrator()
+    
+    try:
+        result = await orchestrator.run_pipeline(task)
+        logger.info(f"CLI Run Result:\n{result}")
+    except Exception as e:
+        logger.error(f"An error occurred during CLI pipeline execution: {e}", exc_info=True)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Phoenix Analysis Pipeline")
-    parser.add_argument("--ticker", type=str, required=True, help="Stock ticker to analyze (e.g., 'NVDA')")
-    args = parser.parse_args()
+    """
+    Command-Line Interface (CLI) entry point for the Phoenix Project.
     
-    task = {"task": f"analyze {args.ticker} stock", "ticker": args.ticker}
-    logging.info(f"Starting CLI run for task: {task}")
-    asyncio.run(control_loop(task))
-    logging.info(f"CLI run finished for task: {task}")
+    This script allows for direct, synchronous execution of the analysis pipeline
+    from the command line for testing and debugging purposes.
+    """
+    
+    # Since main_async is async, we must run it within an event loop.
+    logger.info("Phoenix Project CLI Runner (Synchronous Wrapper)")
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("CLI execution interrupted by user.")
