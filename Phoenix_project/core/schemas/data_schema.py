@@ -106,3 +106,19 @@ class QueryResult(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
+
+class MarketEvent(BaseModel):
+    """
+    一个通用的市场事件 schema，用于事件流。
+    (从 strategy_handler.py 推断)
+    """
+    event_id: str = Field(..., description="事件的唯一 ID")
+    event_type: str = Field(..., description="事件类型 (e.g., 'PRICE', 'NEWS', 'URGENT_NEWS')")
+    timestamp: datetime = Field(..., description="事件发生时间")
+    symbols: List[str] = Field(default_factory=list, description="与此事件相关的 Tickers")
+    content: Optional[str] = Field(None, description="事件的文本内容 (例如新闻正文)")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="其他事件数据")
+
+    class Config:
+        arbitrary_types_allowed = True
+
