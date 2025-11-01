@@ -14,7 +14,10 @@ tracer = trace.get_tracer(__name__)
 
 class Orchestrator:
     async def run_pipeline(self, task: dict) -> dict:
-        """Automatically reads task -> plans -> executes in parallel -> evaluates -> fuses -> outputs."""
+        """
+        Automatically reads task -> plans -> executes in parallel -> evaluates -> fuses -> outputs.
+        (轻微优化：确保 ticker 始终在最终输出中)
+        """
         # TODO: 添加适当的任务解析逻辑。目前假设 task["ticker"] 来自 API 规范 (Task 21)
         ticker = task.get("ticker", "UNKNOWN")
         query = task.get("query", f"Comprehensive analysis for ticker {ticker}")
@@ -46,5 +49,12 @@ class Orchestrator:
             if critic_issues:
                 final_result.update(resolved_issues)
 
-            return final_result # 这现在是一个 dict，匹配 Task 1 的输出
+            # 修复：确保 ticker 始终存在于返回的 dict 中，以便 engine.py 安全使用
+            if "ticker" not in final_result:
+                final_result["ticker"] = ticker
+
+            return final_result # 这现在是一个 dict
+
+
+}
 
