@@ -2,7 +2,7 @@ import json
 import hashlib
 
 # Configure logger for this module (Layer 12)
-from observability import get_logger
+from monitor.logging import get_logger
 logger = get_logger(__name__)
 
 
