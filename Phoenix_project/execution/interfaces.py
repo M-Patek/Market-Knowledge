@@ -6,10 +6,10 @@ mechanics of order submission and management.
 """
 import logging
 from typing import Protocol, List, Dict, Any, Literal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import backtrader as bt
-
+import uuid
 
 @dataclass
 class Order:
@@ -20,9 +20,21 @@ class Order:
     order_type: Literal['Market', 'Limit'] = 'Limit'
     limit_price: float = 0.0
     fill_probability: float = 1.0 # The base probability of fill, calculated by the OrderManager
-    created_at: datetime = datetime.utcnow()
+    created_at: datetime = field(default_factory=datetime.utcnow)
     status: str = 'NEW'
-    order_id: str = ''
+    order_id: str = field(default_factory=lambda: f"ord_{uuid.uuid4()}") # 确保 Order 有 ID
+
+# --- 新增：补全缺失的 Fill Pydantic 模型 ---
+# 供 drl/trading_env.py 和 execution/adapters.py 使用
+@dataclass
+class Fill:
+    """Represents an executed trade (a fill)."""
+    order_id: str
+    symbol: str
+    fill_amount: float
+    fill_price: float
+    timestamp: datetime
+    fill_id: str = field(default_factory=lambda: f"fill_{uuid.uuid4()}")
 
 
 class IBrokerAdapter(Protocol):
