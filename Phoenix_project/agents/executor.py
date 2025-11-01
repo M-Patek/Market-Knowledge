@@ -2,8 +2,10 @@
 import asyncio
 from typing import List
 from monitor.metrics import L1_LAT # 来自 Task 25 的更正后导入
-from schemas.fusion_result import L1AgentResult # 旧导入，可以清理
-from pipeline_state import PipelineState # 旧导入，可以清理
+# FIXED: 修正了导入路径
+from core.schemas.fusion_result import L1AgentResult # 旧导入，可以清理
+# FIXED: 修正了导入路径
+from core.pipeline_state import PipelineState # 旧导入，可以清理
 import time
 
 
@@ -45,3 +47,4 @@ async def run_agents(plan: dict, rag_context: str) -> list[dict]:
     results = await asyncio.gather(*tasks)
     
     return results
+
