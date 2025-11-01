@@ -2,8 +2,10 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-# 修复：路径从 'schemas.data_schema' 改为 '..core.schemas.data_schema'
-from ..core.schemas.data_schema import MarketData, NewsData
+# 修复：
+# 从：from ..core.schemas.data_schema import MarketData, NewsData (路径错误)
+# 改为：from .data_schema import MarketData, NewsData (同目录相对导入)
+from .data_schema import MarketData, NewsData
 
 class FusionResult(BaseModel):
     """
