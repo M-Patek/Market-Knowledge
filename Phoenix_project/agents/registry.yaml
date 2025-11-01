@@ -1,0 +1,27 @@
+# Phoenix_project/agents/registry.yaml
+# Defines the fixed agent identities for the system as specified in Task 3.
+
+agents:
+  - id: planner
+    role: Task Decomposition
+    description: Analyzes the main task and generates a multi-step execution graph (subgoals and dependencies).
+
+  - id: technical
+    role: Technical Analysis
+    description: Performs technical analysis on market data (e.g., price trends, indicators).
+
+  - id: fundamental
+    role: Fundamental Analysis
+    description: Performs fundamental analysis (e.g., financial statements, news, economic factors).
+
+  - id: adversary
+    role: Counter-Argument
+    description: Actively seeks to find flaws, risks, and counter-arguments to the primary analyses.
+
+  - id: critic
+    role: Criticism & Fact Check
+    description: Reviews all paths for logical consistency, factual accuracy, and adherence to constraints.
+
+  - id: fusion
+    role: Fusion & Arbitration
+    description: Synthesizes diverse analyses, arbitrates conflicts, and forms a final, unified conclusion.
