@@ -3,11 +3,10 @@
 import logging
 import json
 from typing import List, Dict, Any
-from core.schemas.fusion_result import FusionResult, EvidenceItem  # (L4) Import new schema / FIXED: Path refactored to core
-# from ai.validation import EvidenceItem         # (L4) Import new schema / DEPRECATED: Module moved to core.schemas
+from core.schemas.fusion_result import FusionResult, EvidenceItem  # (L4) Import new schema
 from ai.tabular_db_client import TabularDBClient # Placeholder
 from api.gemini_pool_manager import GeminiPoolManager, query_model # Placeholder
-from monitor.logging import get_logger # FIXED: Refactored import path
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -176,7 +175,6 @@ class MetaCognitiveAgent:
         try:
             response_text = await self.gemini_client.query_model_async(prompt, model="gemini-1.5-pro-latest", client_name=LLM_CLIENT)
             
-            # TODO: Add robust JSON parsing - FULFILLED
             # Re-using logic from _parse_response_for_rules to strip markdown
             if response_text.strip().startswith("```json"):
                 response_text = response_text.strip()[7:-3].strip()
