@@ -2,11 +2,19 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 import asyncio
 
+# 检查：
+# 1. QueryResult 来自 data_schema - 正确
+# 2. VectorStore 来自 memory.vector_store - 正确
+# 3. TemporalDBClient 来自 ai.temporal_db_client - 正确
+# 4. TabularDBClient 来自 ai.tabular_db_client - 正确
+# 5. get_logger 来自 monitor.logging - 正确
+#
+# 状态：此文件中的所有导入均正确。
+
 from ..core.schemas.data_schema import QueryResult
 from ..memory.vector_store import VectorStore
 from ..ai.temporal_db_client import TemporalDBClient
-# 修复：从 'import ai.tabular_db_client' 改为导入
-from ..ai.tabular_db_client import TabularDBClient # 假设类名为 TabularDBClient
+from ..ai.tabular_db_client import TabularDBClient
 from ..monitor.logging import get_logger
 
 logger = get_logger(__name__)
