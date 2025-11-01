@@ -1,6 +1,7 @@
-from typing import List
-from schemas.data_schema import DataSchema
-import logging
+from typing import List, Dict, Any
+import pandas as pd
+import json
+from ..core.schemas.data_schema import MarketData, NewsData, AlternativeData
 
 logger = logging.getLogger(__name__)
 
