@@ -1,84 +1,125 @@
-# drl/drl_explainer.py
 import shap
 import torch
-import numpy as np
-import pandas as pd
 from typing import Dict, Any, List
-from .drl_model_registry import DRLModelRegistry
+
+from ..monitor.logging import get_logger
+from .agents.base_agent import BaseAgent
+
+logger = get_logger(__name__)
 
 class DRLExplainer:
     """
-    (Task 3.2) Implements explainability for DRL agents using SHAP.
-    This class can be used to analyze the feature importance for an
-    agent's decisions at critical points.
+    Uses SHAP (SHapley Additive exPlanations) to explain the
+    decisions of a trained DRL agent's network.
+    
+    It helps answer: "Why did the agent take this action?"
     """
 
-    def __init__(self, model_registry: DRLModelRegistry, feature_names: List[str]):
+    def __init__(self, agent: BaseAgent, background_data: torch.Tensor, feature_names: List[str]):
         """
         Initializes the explainer.
-
+        
         Args:
-            model_registry (DRLModelRegistry): The registry to load models from.
-            feature_names (List[str]): The ordered list of feature names corresponding
-                                       to the observation space columns.
+            agent (BaseAgent): The trained DRL agent (with its network).
+            background_data (torch.Tensor): A sample of 'typical' observations
+                                            used as the baseline for SHAP.
+            feature_names (List[str]): Names of the features in the observation space.
         """
-        self.model_registry = model_registry
+        self.agent = agent
+        self.network = agent.network
+        self.network.eval() # Set network to evaluation mode
+        
+        self.background_data = background_data
         self.feature_names = feature_names
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        logger.info(f"DRLExplainer initialized for agent: {agent.agent_id}")
 
-    def explain_actor_decision(self,
-                               run_id: str,
-                               actor_name: str,
-                               background_states: np.ndarray,
-                               decision_states: np.ndarray) -> Dict[str, Any]:
-        """
-        Calculates SHAP values for a specific actor's decisions.
-
-        Args:
-            run_id (str): The MLflow run_id where the model is stored.
-            actor_name (str): The name of the actor model artifact.
-            background_states (np.ndarray): A sample of typical states to serve
-                                            as the background distribution for SHAP.
-            decision_states (np.ndarray): The specific state(s) where we want
-                                          to explain the agent's decision.
-
-        Returns:
-            Dict[str, Any]: A dictionary containing the SHAP values and base values.
-        """
-        print(f"--- Starting DRL Explanation for {actor_name} from run {run_id} ---")
-        try:
-            # 1. Load the actor network
-            actor_network = self.model_registry.load_models(run_id, [actor_name])[actor_name]
-            actor_network.to(self.device)
-            actor_network.eval()
-
-            # 2. Convert numpy arrays to torch tensors
-            if background_states.ndim == 1:
-                background_states = background_states.reshape(1, -1)
-            if decision_states.ndim == 1:
-                decision_states = decision_states.reshape(1, -1)
+        # SHAP requires a function that takes a (N, D) numpy array
+        # and returns a (N, K) numpy array of outputs (where K=1 for us).
+        def shap_predict_function(observations_np):
+            """Wrapper for SHAP DeepExplainer."""
+            try:
+                # 1. Convert numpy array to torch tensor
+                observations_tensor = torch.tensor(observations_np, dtype=torch.float32)
                 
-            background_tensor = torch.tensor(background_states, dtype=torch.float32).to(self.device)
-            decision_tensor = torch.tensor(decision_states, dtype=torch.float32).to(self.device)
+                # 2. Run tensor through the network
+                # We want to explain the *mean* of the action distribution,
+                # not a random sample.
+                with torch.no_grad():
+                    action_distribution = self.network(observations_tensor)
+                    # Get the mean of the distribution (the most likely action)
+                    mean_action = action_distribution.mean
+                
+                # 3. Return as numpy array
+                return mean_action.cpu().numpy()
+                
+            except Exception as e:
+                logger.error(f"SHAP prediction function failed: {e}", exc_info=True)
+                # Return an array of zeros with the expected shape
+                return np.zeros((observations_np.shape[0], self.agent.action_space.shape[0]))
 
-            # 3. Instantiate the SHAP DeepExplainer
-            # It takes the model and a background data distribution
-            explainer = shap.DeepExplainer(actor_network, background_tensor)
+        # Initialize the SHAP DeepExplainer
+        try:
+            self.explainer = shap.DeepExplainer(
+                self.network, # The model (PyTorch network)
+                self.background_data # The background data (PyTorch tensor)
+            )
+            logger.info("SHAP DeepExplainer successfully initialized.")
+        except Exception as e:
+            logger.warning(f"Failed to initialize DeepExplainer. Falling back to KernelExplainer. Error: {e}")
+            # Fallback to KernelExplainer (slower, but model-agnostic)
+            self.explainer = shap.KernelExplainer(
+                shap_predict_function, # The function (numpy in, numpy out)
+                self.background_data.cpu().numpy() # Background data (numpy)
+            )
+            logger.info("SHAP KernelExplainer successfully initialized as fallback.")
 
-            # 4. Calculate SHAP values for the critical decision states
-            print("Calculating SHAP values...")
-            shap_values = explainer.shap_values(decision_tensor)
+    def explain_decision(self, observation: torch.Tensor) -> Dict[str, float]:
+        """
+        Generates SHAP values for a single observation.
+        
+        Args:
+            observation (torch.Tensor): The specific state observation
+                                        to explain (1, D) tensor.
+                                        
+        Returns:
+            Dict[str, float]: A dictionary mapping feature_name -> shap_value.
+        """
+        if observation.dim() == 1:
+            observation = observation.unsqueeze(0) # Add batch dimension
             
-            print("Explanation complete.")
+        logger.debug(f"Generating SHAP explanation for observation: {observation.shape}")
+
+        try:
+            # Calculate SHAP values
+            # shap_values is a list (one per output), but our output is 1D (action)
+            # So shap_values[0] will be (1, D) numpy array
+            shap_values = self.explainer.shap_values(observation)
             
-            # For visualization and interpretation
-            return {
-                "shap_values": shap_values,
-                "base_values": explainer.expected_value,
-                "decision_states": decision_states,
-                "feature_names": self.feature_names
-            }
+            if isinstance(self.explainer, shap.KernelExplainer):
+                # KernelExplainer output is just the array
+                shap_values_flat = shap_values[0]
+            else:
+                # DeepExplainer output is a list
+                shap_values_flat = shap_values[0][0]
+                
+            if len(self.feature_names) != len(shap_values_flat):
+                logger.error(f"Mismatch in feature names ({len(self.feature_names)}) and "
+                               f"SHAP values ({len(shap_values_flat)}).")
+                return {"error": "Feature name/SHAP value count mismatch."}
+
+            # Map feature names to their SHAP values
+            explanation = dict(zip(self.feature_names, shap_values_flat))
+            
+            # Sort by absolute SHAP value for importance
+            sorted_explanation = {k: v for k, v in sorted(
+                explanation.items(), 
+                key=lambda item: abs(item[1]), 
+                reverse=True
+            )}
+            
+            return sorted_explanation
 
         except Exception as e:
-            print(f"Failed to generate DRL explanation: {e}")
-            raise
+            logger.error(f"Failed to generate SHAP explanation: {e}", exc_info=True)
+            return {"error": str(e)}
