@@ -7,6 +7,7 @@ from L1 agent outputs into a vector database or graph store.
 
 from neo4j import GraphDatabase
 from typing import List, Dict, Any
+
 from monitor.logging import get_logger
 
 # Configure logger for this module (Layer 12)
