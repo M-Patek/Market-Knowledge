@@ -1,131 +1,207 @@
-import logging
 import pandas as pd
-import numpy as np
-from typing import Dict, Any, List
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+import json
+import os
 
-from schemas.feature_schema import FeatureSchema
+# 修复：路径从 'schemas.feature_schema' 改为 '..core.schemas.feature_schema'
+from ..core.schemas.feature_schema import FeatureDefinition
+from ..monitor.logging import get_logger
+
+logger = get_logger(__name__)
 
 class FeatureStore:
     """
-    (L1 Patched) 管理所有特征的定义、计算和检索。
+    Manages the lifecycle of features: definition, computation, and storage.
+    
+    (Note: This is a simplified in-memory/simple file store for demonstration.
+     A real implementation would use a dedicated DB like Feast, Redis, or a Parquet store.)
     """
-    def __init__(self, feature_list: List[FeatureSchema]):
+    
+    def __init__(self, 
+                 config: Dict[str, Any], 
+                 data_manager: "DataManager"): # Fwd reference
         """
-        初始化 FeatureStore。
-
+        Initialize the feature store.
+        
         Args:
-            feature_list: 一个 FeatureSchema 对象的列表。
+            config (Dict[str, Any]): Configuration, e.g., {'store_path': '...'}.
+            data_manager (DataManager): Used to fetch raw data for computation.
         """
-        self.logger = logging.getLogger("PhoenixProject.FeatureStore")
-        self.features: Dict[str, FeatureSchema] = {f.name: f for f in feature_list}
-        self.logger.info(f"FeatureStore initialized with {len(self.features)} features: {list(self.features.keys())}")
-
-    def add_feature(self, feature: FeatureSchema):
-        """动态添加一个新特征。"""
-        if feature.name in self.features:
-            self.logger.warning(f"Feature '{feature.name}' already exists. Overwriting.")
-        self.features[feature.name] = feature
-
-    def validate_feature_dependencies(self):
-        """
-        (L1) Validates the dependency graph of all registered features.
-        Checks for undefined dependencies and circular dependencies.
-        Raises:
-            ValueError: If a dependency is not found or a circular dependency is detected.
-        """
-        self.logger.info("Validating feature dependency graph...")
-        visiting = set()  # For detecting cycles (nodes currently in the recursion stack)
-        visited = set()   # For tracking already validated nodes
-
-        for feature_name in self.features:
-            if feature_name not in visited:
-                self._dfs_validate(feature_name, visiting, visited)
-
-        self.logger.info("Feature dependency graph is valid.")
-
-    def _dfs_validate(self, feature_name: str, visiting: set, visited: set):
-        visiting.add(feature_name)
-
-        for dep_name in self.features[feature_name].dependencies:
-            if dep_name not in self.features:
-                raise ValueError(f"Undefined dependency '{dep_name}' for feature '{feature_name}'.")
-            if dep_name in visiting:
-                raise ValueError(f"Circular dependency detected: '{feature_name}' -> '{dep_name}'")
-            if dep_name not in visited:
-                self._dfs_validate(dep_name, visiting, visited)
-
-        visiting.remove(feature_name)
-        visited.add(feature_name)
-
-    def get_feature_dependencies(self, feature_name: str) -> List[str]:
-        """
-        递归地获取一个特征所需的所有依赖项。
-        """
-        if feature_name not in self.features:
-            raise ValueError(f"Feature '{feature_name}' not found in store.")
+        self.config = config
+        self.store_path = config.get('store_path', './feature_store_data')
+        self.data_manager = data_manager
+        self.feature_definitions: Dict[str, FeatureDefinition] = {}
         
-        deps_set = set()
-        
-        def _find_deps(f_name):
-            if f_name in deps_set:
-                return
-            
-            feat = self.features.get(f_name)
-            if not feat:
-                # 这是一个原始数据源，不是一个计算特征
-                deps_set.add(f_name)
-                return
+        os.makedirs(self.store_path, exist_ok=True)
+        self._load_definitions()
+        logger.info(f"FeatureStore initialized at path: {self.store_path}")
 
-            # 添加特征本身及其依赖项
-            deps_set.add(f_name)
-            for dep in feat.dependencies:
-                _find_deps(dep)
-
-        _find_deps(feature_name)
-        return list(deps_set)
-
-    def generate_features_for_ticker(self, ticker: str, data: pd.DataFrame) -> Dict[str, Any]:
-        """
-        为单个代码计算所有已注册的特征。
-        """
-        if data.empty:
-            self.logger.warning(f"No data provided for {ticker}. Cannot generate features.")
-            return {}
-
-        # 这是一个占位符。一个真实的实现会：
-        # 1. 构建一个依赖图（DAG）
-        # 2. 按拓扑顺序执行特征计算
-        # 3. 从 `data` DataFrame 中提取所需的列
-        # 4. (L11) Resolve self.features[name].calc_fn (string) to a function via a Registry
-        
-        features = {}
-        for name, feature in self.features.items():
-            try:
-                # 简化：假设每个特征都可以从原始 DataFrame 计算
-                # This line is intentionally broken until L11 Registry is implemented
-                # features[name] = feature.compute(data) 
-                features[name] = np.random.rand() # Placeholder
-            except Exception as e:
-                self.logger.error(f"Failed to compute feature '{name}' for {ticker}: {e}")
-                features[name] = None
-        
-        # 返回最近的特征值
-        # 这是一个简化的假设；真实的实现会返回一个时间序列或特定日期的值
-        final_features = {name: val[-1] if isinstance(val, (pd.Series, list, np.ndarray)) else val for name, val in features.items() if val is not None}
-        
-        self.logger.debug(f"Generated {len(final_features)} features for {ticker}.")
-        return final_features
-
-    def generate_features_from_alt_data(self, alt_data_df: pd.DataFrame):
-        """
-        [Task 2.1] 将原始替代数据转换为预测性特征
-        并存储它们。
-        """
-        if alt_data_df.empty:
-            self.logger.info("Received empty alternative data DataFrame. No features generated.")
+    def _load_definitions(self):
+        """Loads feature definitions from a central JSON file."""
+        def_path = os.path.join(self.store_path, '_definitions.json')
+        if not os.path.exists(def_path):
             return
+
+        try:
+            with open(def_path, 'r') as f:
+                defs_json = json.load(f)
+                for name, data in defs_json.items():
+                    self.feature_definitions[name] = FeatureDefinition(**data)
+            logger.info(f"Loaded {len(self.feature_definitions)} feature definitions.")
+        except Exception as e:
+            logger.error(f"Error loading feature definitions: {e}")
+
+    def _save_definitions(self):
+        """Saves all current feature definitions to the central JSON file."""
+        def_path = os.path.join(self.store_path, '_definitions.json')
+        try:
+            with open(def_path, 'w') as f:
+                json.dump(
+                    {name: fdef.model_dump() for name, fdef in self.feature_definitions.items()},
+                    f,
+                    indent=2,
+                    default=str # Handle datetimes
+                )
+        except Exception as e:
+            logger.error(f"Error saving feature definitions: {e}")
+
+    def register_feature(self, feature_def: FeatureDefinition):
+        """
+        Registers a new feature definition.
+        """
+        if feature_def.name in self.feature_definitions:
+            logger.warning(f"Feature '{feature_def.name}' is already registered. Overwriting.")
         
-        self.logger.info(f"Received {len(alt_data_df)} rows of alternative data. (Placeholder for transformation logic).")
-        # 占位符: 一个真实的实现会运行转换
-        # (例如, self._transform_supply_chain_data(alt_data_df))
-        # 并保存特征。
+        self.feature_definitions[feature_def.name] = feature_def
+        self._save_definitions()
+        logger.info(f"Registered feature: {feature_def.name}")
+
+    async def compute_feature(self, feature_name: str, symbol: str, end_date: datetime):
+        """
+        Computes a feature value for a given symbol and date.
+        (This is a placeholder for a complex computation engine)
+        """
+        if feature_name not in self.feature_definitions:
+            raise ValueError(f"Feature '{feature_name}' not defined.")
+            
+        fdef = self.feature_definitions[feature_name]
+        
+        # 1. Get required raw data
+        # (This is simplified; real version needs date ranges, joins, etc.)
+        try:
+            raw_data = await self.data_manager.get_historical_data(
+                symbol, 
+                start_date=end_date - pd.Timedelta(days=fdef.lookback_days + 5), # Add buffer
+                end_date=end_date
+            )
+            if raw_data.empty:
+                logger.warning(f"No raw data found for {symbol} to compute {feature_name}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to get raw data for feature computation: {e}")
+            return None
+
+        # 2. Apply computation logic (Example: SMA)
+        value = None
+        try:
+            if fdef.computation_logic == 'SMA':
+                window = fdef.parameters.get('window', 20)
+                if len(raw_data) >= window:
+                    value = raw_data['close'].rolling(window=window).mean().iloc[-1]
+            
+            elif fdef.computation_logic == 'RSI':
+                # Requires pandas_ta
+                pass # Placeholder
+            
+            else:
+                logger.warning(f"Computation logic '{fdef.computation_logic}' not implemented.")
+
+        except Exception as e:
+            logger.error(f"Error during feature computation for {feature_name}: {e}")
+            return None
+        
+        if value is not None and not pd.isna(value):
+            # 3. Store the computed value
+            await self.save_feature_value(symbol, feature_name, end_date, value)
+            return value
+        
+        return None
+
+
+    async def save_feature_value(self, 
+                                 symbol: str, 
+                                 feature_name: str, 
+                                 timestamp: datetime, 
+                                 value: Any):
+        """
+        Saves a single computed feature value to its store.
+        (Stores as daily CSVs for simplicity)
+        """
+        date_str = timestamp.strftime('%Y-%m-%d')
+        feature_file = os.path.join(self.store_path, f"{feature_name}.csv")
+        
+        try:
+            # This is highly inefficient for production, but simple
+            if os.path.exists(feature_file):
+                df = pd.read_csv(feature_file, index_col='timestamp', parse_dates=True)
+            else:
+                df = pd.DataFrame(columns=['symbol', 'value'])
+                df.index.name = 'timestamp'
+            
+            # Add or update value
+            df.loc[timestamp, 'symbol'] = symbol
+            df.loc[timestamp, 'value'] = value
+            df = df[~df.index.duplicated(keep='last')] # Keep last value for timestamp
+            
+            df.to_csv(feature_file)
+            
+        except Exception as e:
+            logger.error(f"Failed to save feature value for {feature_name}: {e}")
+
+
+    async def get_feature_values(self, 
+                                 feature_names: List[str], 
+                                 symbol: str, 
+                                 start_date: datetime, 
+                                 end_date: datetime) -> pd.DataFrame:
+        """
+        Retrieves one or more features for a symbol over a date range.
+        """
+        all_features_df = pd.DataFrame()
+        
+        for feature_name in feature_names:
+            feature_file = os.path.join(self.store_path, f"{feature_name}.csv")
+            
+            if not os.path.exists(feature_file):
+                logger.warning(f"No data file found for feature: {feature_name}")
+                continue
+                
+            try:
+                df = pd.read_csv(feature_file, index_col='timestamp', parse_dates=True)
+                df = df.sort_index()
+                
+                # Filter for symbol and date range
+                symbol_df = df[
+                    (df['symbol'] == symbol) & 
+                    (df.index >= start_date) & 
+                    (df.index <= end_date)
+                ]
+                
+                if not symbol_df.empty:
+                    # Rename 'value' column to feature name for joining
+                    symbol_df = symbol_df.rename(columns={'value': feature_name})
+                    
+                    if all_features_df.empty:
+                        all_features_df = symbol_df[[feature_name]]
+                    else:
+                        all_features_df = all_features_df.join(symbol_df[[feature_name]], how='outer')
+                        
+            except Exception as e:
+                logger.error(f"Failed to load feature {feature_name}: {e}")
+                
+        # Forward-fill missing values
+        all_features_df = all_features_df.fillna(method='ffill')
+        
+        return all_features_df
+
