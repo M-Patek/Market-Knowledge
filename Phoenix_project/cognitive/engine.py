@@ -1,89 +1,119 @@
-import asyncio  # 修复：导入 asyncio
-from data_manager import DataManager
-from monitor.logging import get_logger
-from controller.orchestrator import Orchestrator as PipelineOrchestrator
-from registry import registry
-from backtesting.engine import BacktestingEngine
-from ai.reasoning_ensemble import ReasoningEnsemble
+import asyncio
+from typing import Dict, Any, Optional
 
-# Configure logger for this module (Layer 12)
+# 修复：全部改为相对导入
+from ..ai.retriever import Retriever
+from ..ai.reasoning_ensemble import ReasoningEnsemble
+from ..evaluation.voter import Voter
+from ..evaluation.critic import Critic
+from ..evaluation.arbitrator import Arbitrator
+from ..fusion.synthesizer import Synthesizer
+from ..core.pipeline_state import PipelineState
+from ..agents.executor import AgentExecutor
+from ..monitor.logging import get_logger
+
 logger = get_logger(__name__)
 
 class CognitiveEngine:
     """
-    The main engine driving the cognitive simulation.
-    It orchestrates data flow and the cognitive pipeline.
+    The core cognitive pipeline (L1-L3).
+    This engine integrates retrieval, agentic execution, reasoning,
+    evaluation, and synthesis.
     """
-
-    def __init__(self, data_manager: DataManager):
-        self.data_manager = data_manager
-        # self.l1_orchestrator = L1Orchestrator() # Replaced by Layer 9 orchestrator
-        self.pipeline_orchestrator = PipelineOrchestrator()
-        self.backtesting_engine: BacktestingEngine = registry.resolve("backtesting_engine") 
-        self.reasoning_ensemble: ReasoningEnsemble = registry.resolve("reasoning_ensemble")
-
+    
+    def __init__(self, 
+                 retriever: Retriever, 
+                 agent_executor: AgentExecutor,
+                 reasoning_ensemble: ReasoningEnsemble,
+                 voter: Voter,
+                 critic: Critic,
+                 arbitrator: Arbitrator,
+                 synthesizer: Synthesizer,
+                 config: Optional[Dict[str, Any]] = None):
+        """
+        Initialize the cognitive engine with all its components.
+        """
+        self.retriever = retriever
+        self.agent_executor = agent_executor
+        self.reasoning_ensemble = reasoning_ensemble
+        self.voter = voter
+        self.critic = critic
+        self.arbitrator = arbitrator
+        self.synthesizer = synthesizer
+        self.config = config or {}
         logger.info("CognitiveEngine initialized.")
 
-    def run_simulation(self):
-        logger.info("CognitiveEngine: Starting simulation...")
-        
-        all_signals = [] # Collect signals for backtesting
-
-        for data_event in self.data_manager.stream_data():
-            ticker = data_event.get('ticker', 'UNKNOWN') # 修复：从 data_event 中获取 ticker
-            logger.info(f"CognitiveEngine: Processing event for {ticker}")
-            
-            # 修复：使用 asyncio.run() 来正确调用异步的 pipeline
-            # 修复：将返回值视为 'pipeline_result' (一个 dict)，而不是 'pipeline_result_state'
-            try:
-                # 运行异步的 pipeline 并等待其 dict 结果
-                pipeline_result = asyncio.run(
-                    self.pipeline_orchestrator.run_pipeline(data_event)
-                )
-            except Exception as e:
-                logger.error(f"CognitiveEngine: Pipeline run failed for {ticker}: {e}")
-                continue # 继续处理下一个事件
-            
-            # 修复：从 'pipeline_result' (dict) 中 .get() 数据
-            # orchestrator.py 确保了 'ticker' 字段存在于返回的 dict 中
-            mock_signal = pipeline_result.get("Signal_generation")
-            if not mock_signal:
-                # 修复：使用我们之前从 data_event 中获取的 ticker
-                mock_signal = {"ticker": ticker, "action": "HOLD", "confidence": 0.5}
-            
-            all_signals.append(mock_signal)
-            # 修复：使用 ticker 变量进行日志记录
-            logger.info(f"CognitiveEngine: Pipeline run completed for {ticker}")
-
-        logger.info("CognitiveEngine: Simulation finished.")
-
-        # --- Layer 14: Backtesting Feedback Loop ---
-        logger.info("CognitiveEngine: Starting backtesting run...")
-        metrics = self.backtesting_engine.run_backtest(all_signals)
-        
-        logger.info(f"CognitiveEngine: Backtest complete. Metrics: {metrics}")
-        logger.info("CognitiveEngine: Feeding metrics back to L2 (ReasoningEnsemble)...")
-        
-        self.reasoning_ensemble.meta_update(metrics)
-        
-        logger.info("CognitiveEngine: Layer 14 feedback loop complete.")
-
-    def run_single_event(self, data_event: dict):
+    async def run_pipeline(self, initial_state: PipelineState) -> PipelineState:
         """
-        Runs the pipeline for a single event, intended for API calls (Layer 9).
-        """
-        ticker = data_event.get('ticker', 'UNKNOWN') # 修复：从 data_event 中获取 ticker
-        logger.info(f"CognitiveEngine: Processing single event for {ticker}")
+        Executes the full L1-L3 cognitive pipeline.
         
-        # 修复：使用 asyncio.run() 来正确调用异步的 pipeline
-        # 修复：将返回值视为 'pipeline_result' (一个 dict)
+        Args:
+            initial_state (PipelineState): The starting state, usually containing
+                                           the query and time range.
+
+        Returns:
+            PipelineState: The final, synthesized state after the pipeline run.
+        """
+        logger.info(f"Cognitive pipeline starting for query: {initial_state.query}")
+        
+        current_state = initial_state.model_copy(deep=True)
+
         try:
-            pipeline_result = asyncio.run(
-                self.pipeline_orchestrator.run_pipeline(data_event)
+            # --- L1: RETRIEVAL & AGENTS ---
+            logger.debug("Running L1: Retrieval and Agents")
+            
+            # L1a: Retrieval (Hybrid RAG)
+            retrieved_context = await self.retriever.retrieve(
+                current_state.query, 
+                current_state.start_time, 
+                current_state.end_time
             )
-            logger.info(f"CognitiveEngine: Single event run completed for {ticker}")
-            return pipeline_result # 修复：返回 'pipeline_result' (dict)
+            current_state.retrieved_context = retrieved_context
+            
+            # L1b: Agentic Execution
+            # Agents run in parallel, using the retrieved context
+            agent_results = await self.agent_executor.run_agents(
+                retrieved_context, 
+                current_state
+            )
+            current_state.agent_outputs = agent_results
+
+            # --- L2: REASONING & EVALUATION ---
+            logger.debug("Running L2: Reasoning and Evaluation")
+
+            # L2a: Reasoning Ensemble
+            # Heterogeneous reasoners (Symbolic, LLM) run in parallel
+            reasoning_outputs = await self.reasoning_ensemble.run(
+                current_state, 
+                {"retrieved_context": retrieved_context, "agent_results": agent_results}
+            )
+            current_state.reasoning_outputs = reasoning_outputs
+            
+            # L2b: Evaluation (Vote & Critique)
+            # Voter aggregates outputs
+            votes = self.voter.vote(reasoning_outputs, agent_results)
+            current_state.votes = votes
+
+            # Critic reviews the votes and outputs for conflicts/biases
+            critiques = self.critic.review(current_state, votes)
+            current_state.critiques = critiques
+
+            # --- L3: FUSION & SYNTHESIS ---
+            logger.debug("Running L3: Fusion and Synthesis")
+
+            # L3a: Arbitrator resolves conflicts based on critiques
+            final_decision = self.arbitrator.resolve(critiques, votes)
+            current_state.arbitrator_decision = final_decision
+            
+            # L3b: Synthesizer fuses the final decision into a coherent insight
+            final_state = self.synthesizer.fuse(current_state, final_decision)
+            
+            logger.info(f"Cognitive pipeline finished. Final insight: {final_state.fusion_result.insight}")
+            return final_state
+
         except Exception as e:
-            logger.error(f"CognitiveEngine: Single event pipeline run failed for {ticker}: {e}")
-            return {"error": str(e), "ticker": ticker}
+            logger.error(f"Error during cognitive pipeline execution: {e}", exc_info=True)
+            # Return the state as it was when the error occurred
+            current_state.error_message = str(e)
+            return current_state
 
