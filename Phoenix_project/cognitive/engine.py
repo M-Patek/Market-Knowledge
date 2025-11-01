@@ -18,8 +18,8 @@ class CognitiveEngine:
         self.data_manager = data_manager
         # self.l1_orchestrator = L1Orchestrator() # Replaced by Layer 9 orchestrator
         self.pipeline_orchestrator = PipelineOrchestrator()
-        self.backtesting_engine: BacktestingEngine = registry.resolve("backtesting_engine")
-        self.bayesian_fusion_engine: ReasoningEnsemble = registry.resolve("bayesian_fusion_engine") # FIXED: Type hint updated
+        self.backtesting_engine: BacktestingEngine = registry.resolve("backtesting_engine") 
+        self.reasoning_ensemble: ReasoningEnsemble = registry.resolve("reasoning_ensemble") # REFACTORED: Using new key
 
         logger.info("CognitiveEngine initialized.")
 
@@ -51,10 +51,10 @@ class CognitiveEngine:
         metrics = self.backtesting_engine.run_backtest(all_signals)
         
         logger.info(f"CognitiveEngine: Backtest complete. Metrics: {metrics}")
-        logger.info("CognitiveEngine: Feeding metrics back to L2 (BayesianFusionEngine)...")
+        logger.info("CognitiveEngine: Feeding metrics back to L2 (ReasoningEnsemble)...")
         
-        # l2_fusion_engine: ReasoningEnsemble = registry.resolve("bayesian_fusion_engine") # Already initialized in __init__
-        self.bayesian_fusion_engine.meta_update(metrics)
+        # REFACTORED: Using new property name
+        self.reasoning_ensemble.meta_update(metrics)
         
         logger.info("CognitiveEngine: Layer 14 feedback loop complete.")
 
@@ -66,3 +66,4 @@ class CognitiveEngine:
         pipeline_result_state = self.pipeline_orchestrator.run_pipeline(data_event)
         logger.info(f"CognitiveEngine: Single event run completed for {pipeline_result_state.ticker}")
         return pipeline_result_state
+
