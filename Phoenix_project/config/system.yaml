@@ -49,6 +49,12 @@ ai:
       "Market Data": 0.9
       "Other": 0.5
       
+    # 修复：基于 Phoenix_project.md (V2.0) 文档中的明确引用
+    # "第二阶段使用 Cross-Encoder (cross-encoder/ms-marco-MiniLM-L-6-v2) 进行深度语义重排。"
+    rerank:
+      model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+      top_n: 10 # 这是一个合理的默认值
+      
   # 5. Reasoning Ensemble (from ai/model_config.yaml)
   reasoning_ensemble:
     meta_learner:
@@ -75,3 +81,20 @@ ai:
       - name: "DeepForestReasoner"
         class: "ai.reasoning_ensemble.DeepForestReasoner"
         enabled: true
+
+# 修复：基于 RAG_ARCHITECTURE.md 文档的推断
+# "Technology: Elasticsearch"
+temporal_db:
+  host: "localhost"
+  port: 9200
+  index: "phoenix-temporal"
+
+# 修复：基于 RAG_ARCHITECTURE.md 文档的推断
+# "Technology: PostgreSQL"
+tabular_db:
+  host: "localhost"
+  port: 5432
+  user: "phoenix_user"
+  password_env_var: "PG_PASSWORD"
+  database: "phoenix_tabular"
+
