@@ -1,295 +1,249 @@
-# drl/trading_env.py
-from collections import deque
-import gymnasium as gym
-from gymnasium import spaces
 import numpy as np
-from typing import Dict, Any, List, Tuple
-import math
+import pandas as pd
+from typing import List, Dict, Any, Optional, Tuple
 
-# Assuming these imports will be created/are available
-from execution.order_manager import OrderManager
-# from data.data_iterator import DataIterator # Placeholder for our data source
+# 修复：导入缺失的 'Order'
+from ..execution.interfaces import Fill, MarketData, Order
+from ..data.data_iterator import DataIterator
+from ..monitor.logging import get_logger
 
-class TradingEnv(gym.Env):
+logger = get_logger(__name__)
+
+class TradingEnv:
     """
-    A high-fidelity Deep Reinforcement Learning trading environment.
-
-    This environment simulates market interactions, including price impact and slippage,
-    and provides a composite reward signal for training DRL agents.
+    Gym-like environment for training DRL agents.
+    Handles market data simulation, state creation, action execution,
+    and reward calculation.
     """
-    metadata = {'render.modes': ['human']}
-
-    def __init__(self,
-                 data_iterator, # TODO: Define DataIterator class
-                 order_manager: OrderManager,
-                 trading_ticker: str, # The primary asset being traded
-                 initial_capital: float = 100000.0,
-                 impact_coefficient_range: Tuple[float, float] = (0.005, 0.015),
-                 slippage_std_dev_range: Tuple[float, float] = (0.0005, 0.0015),
-                 commission_bps_range: Tuple[float, float] = (2.0, 3.0),
-                 reward_lambda_1: float = 1.0,      # Penalty weight for transaction costs
-                 reward_lambda_2: float = 1.0,      # Penalty weight for price impact
-                 reward_lambda_3: float = 1.0,      # Penalty weight for cvar risk
-                 cvar_lookback_window: int = 100, # Lookback window for cvar calculation
-                 cvar_threshold: float = 0.05     # CVaR threshold (e.g., 5% tail risk)
-                 ):
-        super(TradingEnv, self).__init__()
-
+    
+    def __init__(self, 
+                 data_iterator: DataIterator, 
+                 config: Dict[str, Any]):
+        """
+        Initialize the environment.
+        
+        Args:
+            data_iterator (DataIterator): Feeds market data to the env.
+            config (Dict[str, Any]): Environment configuration.
+        """
         self.data_iterator = data_iterator
-        self.order_manager = order_manager
-        self.initial_capital = initial_capital
-        self.trading_ticker = trading_ticker
-
-        # --- Domain Randomization (Task 3.3) ---
-        self.impact_range = impact_coefficient_range
-        self.slippage_range = slippage_std_dev_range
-        self.commission_range = commission_bps_range
-        # Initialize current values (will be randomized in reset())
-        self.impact_coefficient = np.mean(self.impact_range)
-        self.slippage_std_dev = np.mean(self.slippage_range)
-        self.commission_bps = np.mean(self.commission_range)
-
-        self.reward_lambda_1 = reward_lambda_1
-        self.reward_lambda_2 = reward_lambda_2
-        self.reward_lambda_3 = reward_lambda_3
-        self.cvar_threshold = cvar_threshold
+        self.config = config
         
-        # --- State and Action Spaces (as per Task 1.1) ---
-        # State: [Price, Volume, Signal Mean, Signal Variance, Position, Cash, Risk Budget]
-        # This will need to be defined more concretely. Let's assume a Box space for now.
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
-
-        # Action: Target position change ratio [-1, 1]
-        self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
-
-        # --- Portfolio State ---
-        self.portfolio_value = self.initial_capital
-        self.prev_portfolio_value = self.initial_capital
-        self.positions: Dict[str, Dict[str, float]] = {} # {ticker: {'size': s, 'avg_price': p, 'value': v}}
-        self.cash = self.initial_capital
-        self.dynamic_risk_budget = 1.0
-        self.return_history = deque(maxlen=cvar_lookback_window)
-
-    def reset(self, seed=None, options=None):
-        """Resets the environment to an initial state."""
-        super().reset(seed=seed)
+        self.symbols = config.get('symbols', [])
+        self.initial_balance = config.get('initial_balance', 1_000_000)
+        self.transaction_cost = config.get('transaction_cost', 0.001) # 0.1%
         
-        # --- Domain Randomization (Task 3.3) ---
-        self.impact_coefficient = self.np_random.uniform(*self.impact_range)
-        self.slippage_std_dev = self.np_random.uniform(*self.slippage_range)
-        self.commission_bps = self.np_random.uniform(*self.commission_range)
+        self.lookback_window = config.get('lookback_window', 50)
+        self_state_features = config.get('state_features', ['close', 'volume'])
 
-        # Reset portfolio and data
-        self.portfolio_value = self.initial_capital
-        self.prev_portfolio_value = self.initial_capital
-        self.positions = {}
-        self.cash = self.initial_capital
-        self.dynamic_risk_budget = 1.0
-        self.return_history.clear()
+        self.reset()
+        logger.info(f"TradingEnv initialized for symbols: {self.symbols}")
+
+    def reset(self) -> np.ndarray:
+        """
+        Resets the environment to the initial state.
+        """
+        logger.debug("Resetting trading environment.")
+        self.balance = self.initial_balance
+        self.positions = {symbol: 0.0 for symbol in self.symbols}
+        self.portfolio_value = self.initial_balance
+        self.current_step = self.lookback_window
+        
         self.data_iterator.reset()
         
-        # Get initial observation from the first data point
-        first_market_data = self.data_iterator.next()
-        initial_observation = self._get_observation(first_market_data)
-        info = {}  # Placeholder for auxiliary diagnostic info
+        # Load initial data to fill the lookback window
+        self._load_initial_history()
         
-        return initial_observation, info
+        return self._get_state()
 
-    def step(self, action: np.ndarray):
+    def _load_initial_history(self):
         """
-        Executes one time step within the environment.
+        Loads the initial lookback data from the iterator.
         """
-        # 1. Get current market data from the iterator
-        current_market_data = self.data_iterator.next()
+        self.market_history: Dict[str, pd.DataFrame] = {}
+        # This part is complex; depends on DataIterator implementation
+        # For simplicity, assume data_iterator can provide a bulk history
+        try:
+            self.market_history = self.data_iterator.get_initial_history(self.lookback_window)
+        except Exception as e:
+            logger.error(f"Failed to load initial history: {e}")
+            # Fallback: create empty dataframes
+            for symbol in self.symbols:
+                 self.market_history[symbol] = pd.DataFrame(
+                     columns=['timestamp'] + self_state_features,
+                     index=pd.RangeIndex(self.lookback_window)
+                 ).fillna(0)
 
-        # 2. Convert agent action to a target portfolio
-        # TODO: This logic needs to be defined. For now, a placeholder.
-        target_portfolio = self._action_to_target_portfolio(action)
+
+    def _get_state(self) -> np.ndarray:
+        """
+        Constructs the state array for the agent.
         
-        # 3. Use OrderManager to calculate orders
-        # Note: This is where we leverage our refactoring!
-        orders_to_place = self.order_manager.calculate_target_orders(
-            target_portfolio=target_portfolio,
-            total_value=self.portfolio_value,
-            current_positions=self.positions,
-            market_data=current_market_data
+        State could be:
+        [balance, pos_AAPL, pos_MSFT, ..., 
+         price_hist_AAPL, ..., price_hist_MSFT, ...]
+        """
+        state_parts = []
+        
+        # 1. Portfolio state
+        state_parts.append(self.balance / self.initial_balance) # Normalized balance
+        for symbol in self.symbols:
+            # Normalized position value
+            pos_value = self.positions[symbol] * self.market_history[symbol]['close'].iloc[-1]
+            state_parts.append(pos_value / self.portfolio_value)
+            
+        # 2. Market state (lookback window)
+        for symbol in self.symbols:
+            for feature in self_state_features:
+                # Normalized price/volume history
+                history = self.market_history[symbol][feature].iloc[-self.lookback_window:]
+                normalized_history = (history / history.iloc[0]).fillna(1.0).values
+                state_parts.append(normalized_history)
+        
+        try:
+            return np.concatenate(state_parts)
+        except ValueError as e:
+            logger.error(f"Error concatenating state parts: {e}. State parts: {state_parts}")
+            # Return a zero-state of expected shape if possible
+            # This requires knowing the state shape beforehand
+            return np.zeros(self._get_state_shape())
+
+
+    def _get_state_shape(self) -> Tuple[int, ...]:
+        """Helper to define the shape of the state vector."""
+        # 1 (balance) + N (positions) + N * K * F
+        # N=symbols, K=lookback, F=features
+        N = len(self.symbols)
+        K = self.lookback_window
+        F = len(self_state_features)
+        shape = (1 + N + N * K * F, )
+        return shape
+
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        """
+        Executes one time step in the environment.
+        
+        Args:
+            action (np.ndarray): Action from the agent. Shape (N_symbols,).
+                                 Values could be -1 (sell), 0 (hold), 1 (buy)
+                                 or continuous values representing target allocation.
+        
+        Returns:
+            Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+                (next_state, reward, done, info)
+        """
+        
+        # 1. Get next market data
+        try:
+            next_data_batch = next(self.data_iterator)
+            if not next_data_batch:
+                logger.warning("DataIterator returned None, ending episode.")
+                return self._get_state(), 0.0, True, {"status": "End of data"}
+        except StopIteration:
+            logger.info("DataIterator finished, ending episode.")
+            return self._get_state(), 0.0, True, {"status": "End of data"}
+        
+        # Update history
+        for data in next_data_batch:
+            if data['symbol'] in self.symbols:
+                new_row = pd.DataFrame([data]).set_index('timestamp')
+                self.market_history[data['symbol']] = pd.concat([
+                    self.market_history[data['symbol']], new_row
+                ]).iloc[1:] # Maintain lookback window size
+
+        
+        # 2. Calculate portfolio value BEFORE action
+        prev_portfolio_value = self.portfolio_value
+        
+        # 3. Execute action (simulate trades)
+        # This assumes 'action' is an array of target allocations
+        # e.g., action = [0.5, 0.2, 0.3] for 3 symbols
+        
+        target_allocations = self._normalize_action(action)
+        
+        fills: List[Fill] = []
+        for i, symbol in enumerate(self.symbols):
+            target_alloc = target_allocations[i]
+            target_value = self.portfolio_value * target_alloc
+            
+            current_price = self.market_history[symbol]['close'].iloc[-1]
+            if current_price == 0: continue # Skip if no price data
+
+            current_value = self.positions[symbol] * current_price
+            
+            trade_value = target_value - current_value
+            trade_amount = trade_value / current_price
+            
+            # Simulate transaction costs
+            cost = abs(trade_value) * self.transaction_cost
+            self.balance -= cost
+            
+            # Simulate fill
+            fill = self._simulate_execution(symbol, trade_amount, current_price)
+            fills.append(fill)
+            
+            # Update portfolio state
+            self.balance -= fill.fill_price * fill.fill_amount
+            self.positions[symbol] += fill.fill_amount
+
+        # 4. Calculate portfolio value AFTER action
+        self._update_portfolio_value()
+        
+        # 5. Calculate reward
+        # Simple reward: change in portfolio value
+        reward = self.portfolio_value - prev_portfolio_value
+        
+        # 6. Check if done
+        self.current_step += 1
+        done = (self.portfolio_value <= 0) or (self.current_step >= self.config.get('max_steps', 1000))
+        
+        # 7. Get next state
+        next_state = self._get_state()
+        
+        info = {
+            "portfolio_value": self.portfolio_value,
+            "balance": self.balance,
+            "positions": self.positions,
+            "fills": [f.model_dump() for f in fills]
+        }
+        
+        return next_state, reward, done, info
+
+    def _normalize_action(self, action: np.ndarray) -> np.ndarray:
+        """Normalizes action array to sum to 1 (e.g., softmax)."""
+        # Example: Simple clipping and re-normalization
+        action = np.clip(action, 0, 1) # Assume long-only
+        total = np.sum(action)
+        if total == 0:
+            return np.zeros_like(action)
+        return action / total
+
+    def _update_portfolio_value(self):
+        """Recalculates total portfolio value."""
+        value = self.balance
+        for symbol in self.symbols:
+            price = self.market_history[symbol]['close'].iloc[-1]
+            value += self.positions[symbol] * price
+        self.portfolio_value = value
+
+    def _simulate_execution(self, symbol: str, amount: float, price: float) -> Fill:
+        """
+        Simulates an order execution, returning a Fill object.
+        (Simplified: assumes full fill at given price)
+        """
+        order = Order(
+            symbol=symbol,
+            amount=amount,
+            order_type="MARKET",
+            timestamp=self.market_history[symbol].index[-1].to_pydatetime()
         )
-
-        # 4. Simulate order execution (Price Impact, Slippage, Costs)
-        execution_results = self._simulate_execution(orders_to_place, current_market_data)
-
-        # 5. Update internal portfolio state
-        self._update_portfolio_state(execution_results, current_market_data)
-
-        # 6. Calculate reward
-        reward = self._calculate_reward(execution_results)
-
-        # 7. Check if the episode is done
-        done = self.portfolio_value <= 0 or not self.data_iterator.has_next()
-
-        # 8. Get next observation
-        observation = self._get_observation(current_market_data)
-        info = {} # Placeholder
-
-        return observation, reward, done, False, info # Gymnasium expects 5 values now (truncated)
-
-    def _get_observation(self, current_market_data: Dict) -> np.ndarray:
-        """
-        Constructs the state vector from the current environment data.
-        State: [Price, Volume, Signal Mean, Signal Variance, Position Size, Cash, Risk Budget]
-        """
-        market_data = current_market_data.get(self.trading_ticker, {})
         
-        # 1. & 2. Raw Data and Cognitive Signals (assuming they are in market_data)
-        price = market_data.get('price', 0.0)
-        volume = market_data.get('volume', 0.0)
-        signal_mean = market_data.get('signal_mean', 0.0) # Assumed field
-        signal_variance = market_data.get('signal_variance', 0.0) # Assumed field
+        fill = Fill(
+            order_id=order.order_id,
+            symbol=symbol,
+            fill_amount=amount,
+            fill_price=price, # No slippage in this simulation
+            timestamp=order.timestamp
+        )
+        return fill
 
-        # 3. Environmental State
-        position_size = self.positions.get(self.trading_ticker, {}).get('size', 0.0)
-        cash = self.cash
-        risk_budget = self.dynamic_risk_budget
-
-        return np.array([price, volume, signal_mean, signal_variance, position_size, cash, risk_budget], dtype=np.float32)
-
-    def _action_to_target_portfolio(self, action: np.ndarray) -> List[Dict[str, Any]]:
-        """
-        Converts the agent's action into a target portfolio for the OrderManager.
-        Action is a scalar in [-1, 1] representing target capital allocation.
-        """
-        target_pct = float(action[0])
-        
-        return [{
-            "ticker": self.trading_ticker,
-            "capital_allocation_pct": target_pct
-        }]
-
-    def _simulate_execution(self, orders: List[Order], market_data: Dict) -> List[Dict[str, Any]]:
-        """
-        Simulates the execution of a list of orders with price impact and slippage.
-        """
-        execution_results = []
-        for order in orders:
-            # 1. Stochastic Fill Simulation
-            if self.np_random.random() > order.fill_probability:
-                continue # Order did not fill
-
-            ticker = order.ticker
-            base_price = market_data[ticker]['price']
-            daily_volume = market_data[ticker]['volume']
-
-            # 2. Price Impact Calculation (Square Root Model)
-            # Impact is always adverse to the trader
-            trade_ratio = order.size / daily_volume if daily_volume > 0 else 0
-            price_impact = self.impact_coefficient * math.sqrt(trade_ratio)
-            price_impact_cost = (base_price * price_impact) * order.size
-            
-            # 3. Slippage Calculation (Stochastic)
-            slippage = self.np_random.normal(0, self.slippage_std_dev)
-            
-            # 4. Calculate final execution price
-            if order.side == 'BUY':
-                execution_price = base_price * (1 + price_impact + slippage)
-            else: # SELL
-                execution_price = base_price * (1 - price_impact + slippage)
-            
-            # 5. Calculate Transaction Cost
-            executed_value = order.size * execution_price
-            transaction_cost = executed_value * (self.commission_bps / 10000.0)
-
-            execution_results.append({
-                "ticker": ticker, "executed_size": order.size, "side": order.side,
-                "executed_price": execution_price, "transaction_cost": transaction_cost,
-                "price_impact_cost": price_impact_cost
-            })
-        return execution_results
-
-    def _update_portfolio_state(self, execution_results: List[Dict[str, Any]], current_market_data: Dict):
-        """
-        Updates the portfolio's cash, positions, and total value after trades.
-        """
-        # Store value before updates for reward calculation
-        self.prev_portfolio_value = self.portfolio_value
-
-        # 1. Update cash and position sizes based on execution results
-        for res in execution_results:
-            ticker = res["ticker"]
-            executed_value = res["executed_price"] * res["executed_size"]
-
-            if res["side"] == 'BUY':
-                self.cash -= (executed_value + res["transaction_cost"])
-                
-                # Update position average price
-                old_size = self.positions.get(ticker, {}).get('size', 0.0)
-                old_avg_price = self.positions.get(ticker, {}).get('avg_price', 0.0)
-                old_value = old_size * old_avg_price
-                
-                new_size = old_size + res["executed_size"]
-                new_avg_price = (old_value + executed_value) / new_size
-                self.positions[ticker] = {'size': new_size, 'avg_price': new_avg_price}
-
-            else: # SELL
-                self.cash += (executed_value - res["transaction_cost"])
-                old_size = self.positions.get(ticker, {}).get('size', 0.0)
-                new_size = old_size - res["executed_size"]
-                if new_size > 0:
-                    self.positions[ticker]['size'] = new_size
-                else: # Position closed
-                    if ticker in self.positions:
-                        del self.positions[ticker]
-
-        # 2. Recalculate total portfolio value (Mark-to-Market)
-        total_position_value = 0.0
-        for ticker, pos_data in self.positions.items():
-            if ticker not in current_market_data: continue
-            current_price = current_market_data[ticker]['price']
-            self.positions[ticker]['value'] = pos_data['size'] * current_price
-            total_position_value += self.positions[ticker]['value']
-        self.portfolio_value = self.cash + total_position_value
-
-    def _calculate_reward(self, execution_results: List[Dict[str, Any]]) -> float:
-        """
-        Calculates the composite reward for the current step.
-        Reward = Return - λ1 * TransactionCost - λ2 * PriceImpact - λ3 * CVaR_Penalty
-        """
-        # 1. Calculate Return (change in portfolio value)
-        pnl = self.portfolio_value - self.prev_portfolio_value
-        self.return_history.append(pnl)
-
-        # 2. Calculate total transaction costs for the step
-        total_transaction_cost = sum(res["transaction_cost"] for res in execution_results)
-
-        # 3. Calculate total price impact costs for the step
-        total_price_impact = sum(res.get('price_impact_cost', 0.0) for res in execution_results)
-        
-        # 4. Calculate CVaR Penalty
-        cvar_penalty = self._calculate_cvar_penalty()
-        
-        # Optional: Update dynamic risk budget based on penalty
-        if cvar_penalty > 0:
-            self.dynamic_risk_budget *= 0.99 # Reduce risk budget slightly
-
-        return pnl - (self.reward_lambda_1 * total_transaction_cost) \
-                   - (self.reward_lambda_2 * total_price_impact) \
-                   - (self.reward_lambda_3 * cvar_penalty)
-
-    def _calculate_cvar_penalty(self) -> float:
-        """Calculates the penalty for exceeding the CVaR threshold."""
-        if len(self.return_history) < self.return_history.maxlen:
-            return 0.0 # Not enough data yet
-        
-        returns = np.array(self.return_history)
-        var_level = np.percentile(returns, 5) # 5% Value at Risk
-        if var_level >= 0:
-            return 0.0 # No losses in the 5% tail
-            
-        cvar = returns[returns <= var_level].mean()
-
-        # Quadratic penalty for exceeding the negative threshold
-        cvar_penalty = max(0, -cvar - self.cvar_threshold)**2
-        return cvar_penalty
-
-    def render(self, mode='human', close=False):
-        # Optional: For visualization
-        print(f'Step: {self.data_iterator.current_step}, Portfolio Value: {self.portfolio_value}')
