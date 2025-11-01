@@ -6,23 +6,25 @@ from datetime import datetime, date, timezone
 import google.generativeai as genai
 from pydantic import BaseModel, Field
 
+# FIXED: 明确导入存在的模块
+from .temporal_db_client import TemporalDBClient
+from .tabular_db_client import TabularDBClient
+from .relation_extractor import RelationExtractor, KnowledgeGraph
+from .embedding_client import EmbeddingClient
+
 try:
+    # 'ai/vector_db_client.py' 在项目文件列表中不存在。
+    # 我们只为这个缺失的模块设置 try/except 回退。
     from .vector_db_client import VectorDBClient
-    from .temporal_db_client import TemporalDBClient
-    from .tabular_db_client import TabularDBClient
-    from .relation_extractor import RelationExtractor, KnowledgeGraph
-    from .embedding_client import EmbeddingClient
 except ImportError:
     # Dummy classes for standalone import
-    class VectorDBClient: pass
-    class TemporalDBClient: pass
-    class TabularDBClient: pass
-    class RelationExtractor:
-        async def extract_graph(self, texts): return {"nodes": [], "edges": []}
-    class KnowledgeGraph(BaseModel): pass
-    class EmbeddingClient:
-        def create_query_embedding(self, doc): return [0.1] * 768
-
+    class VectorDBClient: 
+        def query(self, query: str, top_k: int, query_vector=None):
+            logging.getLogger("PhoenixProject.HybridRetriever").warning("VectorDBClient not found. Using dummy class.")
+            return []
+    
+    class KnowledgeGraph(BaseModel): pass # 确保 KnowledgeGraph 在两种情况下都有定义
+    
 from sentence_transformers import CrossEncoder
 
 # --- 用于结构化LLM输出的Pydantic模型 ---
@@ -135,6 +137,7 @@ class HybridRetriever:
             return DeconstructedQuery(**deconstructed_args)
         except Exception as e:
             self.logger.error(f"使用LLM解构查询失败: {e}。回退到简单提取。")
+            # FIXED: 修复了拼写错误，DeDCoT_query -> DeconstructedQuery
             return DeconstructedQuery(keywords=query.split())
 
     async def recall(self, query: str, ticker: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -260,3 +263,4 @@ class HybridRetriever:
             # 5. Store in cache and return
             self.cache[cache_key] = result
             return result
+
