@@ -5,8 +5,7 @@ from evaluation.voter import vote
 from reasoning.planner import build_graph
 from evaluation.critic import review # 导入新的 critic 函数
 from fusion.synthesizer import fuse
-from pipeline_state import PipelineState
-from schemas.fusion_result import FusionResult
+from core.pipeline_state import PipelineState
 
 tracer = trace.get_tracer(__name__)
 
