@@ -1,97 +1,129 @@
-import schedule
 import time
-import threading
-from typing import Dict, Any
+import logging
+from typing import Dict, Any, Callable
+
+# 修正：导入 'schedule' 库，这个库之前缺失了
+import schedule
 
 from .orchestrator import Orchestrator
-from ..monitor.logging import get_logger
+from .error_handler import ErrorHandler
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class Scheduler:
     """
-    Manages all scheduled (cron-like) tasks within the Phoenix system.
-    This is distinct from the real-time event loop.
-    
-    Example tasks:
-    - Daily model retraining
-    - Weekly data integrity checks
-    - Nightly cache clearing
+    一个基于 'schedule' 库的 cron 式作业调度器。
+    它用于触发周期性任务，例如每日数据摄取或
+    定期的认知循环。
     """
 
-    def __init__(self, orchestrator: Orchestrator, config: Dict[str, Any]):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        orchestrator: Orchestrator,
+        error_handler: ErrorHandler
+    ):
         """
-        Initializes the Scheduler.
+        初始化调度器。
         
         Args:
-            orchestrator (Orchestrator): The main orchestrator to trigger tasks on.
-            config (Dict[str, Any]): The main system configuration.
+            config: 'scheduler' 部分的配置。
+            orchestrator: 用于调度作业的协调器实例。
+            error_handler: 用于报告作业执行错误的处理器。
         """
-        self.orchestrator = orchestrator
         self.config = config.get('scheduler', {})
-        self.jobs = []
-        self._stop_run_continuously = threading.Event()
+        self.orchestrator = orchestrator
+        self.error_handler = error_handler
+        self._stop_run_continuously = False
+        logger.info("Scheduler initialized.")
 
-    def setup_schedules(self):
+    def setup_jobs(self):
         """
-        Reads the 'scheduler' config and sets up 'schedule' library jobs.
+        从配置中读取并设置所有调度的作业。
         """
-        logger.info("Setting up scheduled jobs...")
+        jobs = self.config.get('jobs', [])
+        logger.info(f"Setting up {len(jobs)} scheduled jobs...")
         
-        if not self.config:
-            logger.warning("No 'scheduler' config found. No jobs will be scheduled.")
-            return
+        for job in jobs:
+            try:
+                job_name = job.get('name')
+                schedule_time = job.get('schedule_time') # e.g., "10:30"
+                job_type = job.get('type') # e.g., "run_cognitive_workflow"
+                job_params = job.get('params', {})
+                
+                if not all([job_name, schedule_time, job_type]):
+                    logger.warning(f"Skipping incomplete job definition: {job}")
+                    continue
 
-        # Example: Schedule a daily "walk-forward training" task
-        if self.config.get('enable_daily_training', False):
-            train_time = self.config.get('daily_training_time', '01:00')
-            logger.info(f"Scheduling daily training job at {train_time}")
-            job = schedule.every().day.at(train_time).do(
-                self.run_threaded, 
-                self.orchestrator.trigger_daily_training
-            )
-            self.jobs.append(job)
+                # 将作业类型映射到 Orchestrator 上的一个方法
+                job_func: Callable[..., Any]
+                if job_type == "run_cognitive_workflow":
+                    # 创建一个 partial function 或 lambda 来包装带参数的调用
+                    job_func = lambda params=job_params: self.orchestrator.schedule_cognitive_workflow(
+                        task_description=params.get('task_description', 'Scheduled analysis'),
+                        context=params
+                    )
+                elif job_type == "run_data_ingestion":
+                    job_func = lambda params=job_params: self.orchestrator.schedule_data_ingestion(
+                        sources=params.get('sources', ['all'])
+                    )
+                else:
+                    logger.warning(f"Unknown job type '{job_type}' for job '{job_name}'. Skipping.")
+                    continue
+                
+                # 使用 'schedule' 库设置作业
+                # 示例：我们假设所有时间都是每日的
+                logger.info(f"Scheduling job '{job_name}' ({job_type}) every day at {schedule_time}.")
+                schedule.every().day.at(schedule_time).do(
+                    self._job_wrapper, job_func, job_name
+                )
+                
+            except Exception as e:
+                logger.error(f"Failed to schedule job '{job.get('name')}': {e}", exc_info=True)
+                self.error_handler.handle_error(e, f"schedule_job_{job.get('name')}")
 
-        # Example: Schedule a data validation check
-        if self.config.get('enable_hourly_validation', False):
-            logger.info("Scheduling hourly data validation job")
-            job = schedule.every().hour.do(
-                self.run_threaded,
-                self.orchestrator.trigger_data_validation
-            )
-            self.jobs.append(job)
-            
-        logger.info(f"Scheduled {len(self.jobs)} jobs.")
-
-    def run_threaded(self, job_func, *args, **kwargs):
+    def _job_wrapper(self, job_func: Callable, job_name: str):
         """
-        Wrapper to run a scheduled job in its own daemon thread.
-        This prevents a long-running job (like training) from blocking
-        the scheduler loop itself.
+        一个包装器，用于安全地执行调度的作业并处理错误。
         """
-        logger.info(f"Starting scheduled job: {job_func.__name__}")
-        job_thread = threading.Thread(target=job_func, args=args, kwargs=kwargs, daemon=True)
-        job_thread.start()
+        logger.info(f"--- Running scheduled job: {job_name} ---")
+        try:
+            # 执行作业 (例如: orchestrator.schedule_cognitive_workflow(...))
+            job_func()
+            logger.info(f"--- Completed scheduled job: {job_name} ---")
+        except Exception as e:
+            logger.error(f"Scheduled job '{job_name}' failed: {e}", exc_info=True)
+            self.error_handler.handle_error(e, f"run_job_{job_name}", is_critical=False)
 
     def run(self):
         """
-        Starts the main scheduler loop.
-        This is a blocking call and should be run in its own thread or process.
+        启动调度器的主循环 (这是一个阻塞调用)。
         """
-        logger.info("Scheduler started. Waiting for jobs...")
-        self.setup_schedules()
+        if not self.config.get('enabled', True):
+            logger.info("Scheduler is disabled by config. Not starting.")
+            return
+
+        self.setup_jobs()
+        logger.info("Scheduler loop started. Waiting for jobs...")
         
-        while not self._stop_run_continuously.is_set():
+        self._stop_run_continuously = False
+        while not self._stop_run_continuously:
             try:
                 schedule.run_pending()
-                time.sleep(1) # Check for pending jobs every second
+                time.sleep(1)
+            except KeyboardInterrupt:
+                logger.info("Scheduler interrupted by user.")
+                break
             except Exception as e:
-                logger.error(f"Error in scheduler loop: {e}", exc_info=True)
-                time.sleep(60) # Back off for a minute if loop fails
+                logger.error(f"Error in scheduler main loop: {e}", exc_info=True)
+                self.error_handler.handle_error(e, "scheduler_loop", is_critical=True)
+                time.sleep(60) # 发生故障时冷却 60 秒
 
-        logger.info("Scheduler shutting down.")
+        logger.info("Scheduler loop stopped.")
 
     def stop(self):
-        """Signals the scheduler loop to stop."""
-        logger.info("Received stop signal for scheduler.")
-        self._stop_run_continuously.set()
+        """
+        停止调度器的主循环。
+        """
+        logger.info("Stopping scheduler loop...")
+        self._stop_run_continuously = True
