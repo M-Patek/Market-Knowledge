@@ -1,40 +1,95 @@
-# drl/agents/execution_agent.py
-import numpy as np
-from gymnasium import spaces
+import torch
+import torch.nn as nn
 from typing import Dict, Any
+
 from .base_agent import BaseAgent
 
 class ExecutionAgent(BaseAgent):
     """
-    Specialized agent for optimal execution of large orders.
-    It learns to split a "parent" order into smaller "child" orders
-    over time to minimize price impact and achieve targets like VWAP.
+    A DRL agent responsible for optimizing trade execution.
+    Its goal is to minimize slippage and market impact given a
+    target order (e.g., from the AlphaAgent or PortfolioConstructor).
+    
+    Observation: Market micro-structure (LOB, VWAP), remaining order size, time left.
+    Action: How much to trade *now* (e.g., % of remaining order).
     """
 
-    def __init__(self, agent_id: str, config: Dict[str, Any]):
-        super().__init__(agent_id, config)
-        # State: [rem_size, rem_time, bid_prc, ask_prc, bid_vol, ask_vol, vwap]
-        self.obs_dim = config.get('obs_dim', 7) 
-        # Actions: 0:WAIT, 1:EXECUTE_SMALL, 2:EXECUTE_LARGE, 3:PLACE_LIMIT
-        self.action_n = config.get('action_n', 4)
+    def __init__(self, observation_space, action_space, network: nn.Module, config: Dict[str, Any]):
+        """
+        Initializes the ExecutionAgent.
+        """
+        super().__init__(
+            agent_id="execution_agent",
+            observation_space=observation_space,
+            action_space=action_space,
+            network=network,
+            config=config
+        )
+        self.agent_type = "execution"
 
-    def get_observation_space(self) -> spaces.Space:
+    def compute_action(self, observation: torch.Tensor) -> torch.Tensor:
         """
-        Returns the observation space for the Execution Agent.
-        Focuses on market microstructure and the state of the parent order.
+        Computes the action (e.g., % of order to execute) based on the observation.
+        
+        Args:
+            observation (torch.Tensor): The current state observation.
+            
+        Returns:
+            torch.Tensor: The action to take.
         """
-        return spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
+        dist = self.network(observation)
+        action = dist.sample()
+        self.last_log_prob = dist.log_prob(action)
+        
+        # Action is likely a percentage (0 to 1)
+        action = torch.clamp(action, 0.0, 1.0)
+        
+        return action
 
-    def get_action_space(self) -> spaces.Space:
+    def compute_reward(self, state: Any, action: Any, next_state: Any) -> float:
         """
-        Returns the discrete action space for the Execution Agent.
-        Represents different order execution choices.
+        Defines the reward function for the ExecutionAgent.
+        The goal is to minimize slippage (Implementation Shortfall).
+        
+        Reward = (Benchmark_Price - Execution_Price) * Shares_Executed
+        
+        Args:
+            state: The state when the action was taken.
+            action: The action (e.g., 0.2 -> execute 20% of remaining).
+            next_state: The resulting state.
+            
+        Returns:
+            float: The reward.
         """
-        return spaces.Discrete(self.action_n)
+        
+        try:
+            # Benchmark price (e.g., price when the order was received)
+            benchmark_price = state['benchmark_price']
+            
+            # Actual execution price from this step
+            execution_price = next_state['execution_price']
+            
+            # Number of shares executed in this step
+            shares_executed = next_state['shares_executed']
+            
+            # Direction of the trade (1 for buy, -1 for sell)
+            trade_direction = state['trade_direction'] # 1 or -1
+            
+            # Calculate slippage (implementation shortfall)
+            # For BUY: (Benchmark - Exec_Price) -> we want Exec_Price to be low
+            # For SELL: (Exec_Price - Benchmark) -> we want Exec_Price to be high
+            # This can be unified:
+            slippage_per_share = (benchmark_price - execution_price) * trade_direction
+            
+            # Reward is total slippage cost/gain
+            reward = slippage_per_share * shares_executed
+            
+            # Penalize for not executing the full order by the end
+            if next_state['is_terminal'] and next_state['shares_remaining'] > 0:
+                # Heavy penalty for leftover shares
+                reward -= next_state['shares_remaining'] * self.config.get('leftover_penalty_factor', 1.0)
+                
+            return reward
 
-    def act(self, observation: np.ndarray) -> np.ndarray:
-        """
-        Placeholder for decentralized execution.
-        """
-        # Returns a "WAIT" action as a placeholder.
-        return np.array([0])
+        except Exception as e:
+            return 0.0
