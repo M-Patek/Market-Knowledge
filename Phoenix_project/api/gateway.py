@@ -1,272 +1,137 @@
-import os
-import json
-from flask import Flask, request, jsonify, render_template
-from werkzeug.utils import secure_filename
+from fastapi import FastAPI, HTTPException, Depends
+from pydantic import BaseModel
+from typing import Dict, Any, List
+import uvicorn
 import asyncio
 
-# FIX: Changed import from 'observability' to 'monitor.logging'
-from monitor.logging import get_logger
-from controller.orchestrator import Orchestrator
-from data_manager import DataManager
-from config.system import load_config
-from core.pipeline_state import PipelineState
-from api.gemini_pool_manager import GeminiPoolManager
+from ..monitor.logging import get_logger
+from ..controller.orchestrator import Orchestrator
+from ..context_bus import ContextBus
+from ..core.schemas.data_schema import MarketEvent
 
-# --- Configuration & Initialization ---
+logger = get_logger(__name__)
 
-# Load system configuration
-config = load_config('config/system.yaml')
-logger = get_logger('APIGateway')
-
-app = Flask(__name__, template_folder='../templates')
-app.config['UPLOAD_FOLDER'] = config.get('api_server', {}).get('upload_folder', 'uploads/')
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB limit
-
-# Ensure upload folder exists
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-# --- Global Components ---
-# Initialize core components
-pipeline_state = PipelineState()
-data_manager = DataManager(config, pipeline_state)
-
-# Initialize the Gemini API pool
-try:
-    gemini_pool = GeminiPoolManager(
-        api_key=os.environ.get("GEMINI_API_KEY"),
-        pool_size=config.get('llm', {}).get('gemini_pool_size', 5)
-    )
-    logger.info(f"GeminiPoolManager initialized with size {config.get('llm', {}).get('gemini_pool_size', 5)}")
-except Exception as e:
-    logger.error(f"Failed to initialize GeminiPoolManager: {e}", exc_info=True)
-    gemini_pool = None
-
-# Initialize the main orchestrator
-# Pass the shared Gemini pool to the orchestrator
-orchestrator = Orchestrator(config, data_manager, pipeline_state, gemini_pool)
-
-# --- Utility Functions ---
-
-def allowed_file(filename):
-    """Checks if the file extension is allowed."""
-    ALLOWED_EXTENSIONS = {'txt', 'pdf', 'csv', 'json', 'md'}
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-# --- API Endpoints ---
-
-@app.route('/')
-def index():
-    """Serves the main dashboard/control interface."""
-    logger.debug("Serving index page.")
-    # TODO: Pass dynamic data to the template (e.g., system status)
-    return render_template('index.html', system_status="Operational")
-
-@app.route('/api/v1/health', methods=['GET'])
-def health_check():
-    """Provides a simple health check endpoint."""
-    logger.debug("Health check requested.")
-    # TODO: Add deeper checks (e.g., DB connectivity, LLM API status)
-    return jsonify({"status": "healthy", "version": "2.0.0"}), 200
-
-@app.route('/api/v1/analyze', methods=['POST'])
-async def analyze_task():
+class APIGateway:
     """
-    Asynchronously triggers a full analysis pipeline for a given task (e.g., asset).
+    Provides an external REST API interface for the Phoenix project.
+    Allows injecting events and querying system state.
     """
-    data = request.json
-    task_description = data.get('task')
     
-    if not task_description:
-        logger.warning("Analysis request failed: 'task' field missing.")
-        return jsonify({"error": "Missing 'task' field in request body"}), 400
+    def __init__(self, orchestrator: Orchestrator, context_bus: ContextBus, config: Dict[str, Any]):
+        self.app = FastAPI(
+            title="Phoenix Project API Gateway",
+            description="API for event injection and system control.",
+            version="2.0.0"
+        )
+        self.orchestrator = orchestrator
+        self.context_bus = context_bus
+        self.config = config.get('api_gateway', {})
+        self.host = self.config.get('host', '0.0.0.0')
+        self.port = self.config.get('port', 8000)
         
-    if not orchestrator:
-        logger.error("Orchestrator not initialized. Cannot process task.")
-        return jsonify({"error": "System not ready"}), 503
+        self._setup_routes()
+        logger.info(f"API Gateway initialized. Routes registered.")
 
-    logger.info(f"Received analysis task: {task_description}")
+    def _setup_routes(self):
+        """Binds API endpoints to their handler functions."""
+        
+        @self.app.post("/v1/events/inject", status_code=202)
+        async def inject_event(event: MarketEvent):
+            """
+            Asynchronously injects a new MarketEvent into the system.
+            This simulates an event coming from a data stream.
+            """
+            try:
+                # Don't block the API response; schedule the processing
+                # The orchestrator is expected to handle this asynchronously
+                asyncio.create_task(self.orchestrator.process_event(event))
+                
+                logger.info(f"Accepted event for injection: {event.event_id}")
+                return {"status": "accepted", "event_id": event.event_id}
+            
+            except Exception as e:
+                logger.error(f"Failed to accept event {event.event_id}: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
-    try:
-        # Asynchronously run the main processing loop
-        analysis_result = await orchestrator.run_main_loop(task_description)
-        
-        # TODO: Standardize the output format
-        return jsonify({
-            "status": "success",
-            "task": task_description,
-            "result": analysis_result 
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Error during analysis task '{task_description}': {e}", exc_info=True)
-        return jsonify({"error": "An internal error occurred during analysis"}), 500
+        @self.app.get("/v1/system/status")
+        async def get_system_status(self) -> Dict[str, Any]:
+            """
+Example:
+            {"status": "running", "active_tasks": 5, "mode": "paper_trading"}
+            """
+            try:
+                status = self.orchestrator.get_status()
+                return status
+            except Exception as e:
+                logger.error(f"Failed to retrieve system status: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
-@app.route('/api/v1/inject/data', methods=['POST'])
-async def inject_data():
-    """
-    Handles data injection from external sources (e.g., webhook).
-    """
-    data = request.json
-    source = data.get('source')
-    content = data.get('content')
-    
-    if not source or not content:
-        logger.warning("Data injection failed: 'source' or 'content' missing.")
-        return jsonify({"error": "Missing 'source' or 'content' field"}), 400
+        @self.app.get("/v1/context/state")
+        async def get_context_state(self) -> Dict[str, Any]:
+            """
+            Retrieves the current state snapshot from the ContextBus.
+            """
+            try:
+                state = self.context_bus.get_current_state()
+                # We need to serialize this, as it might contain complex objects
+                # For now, just return the dict representation
+                # A proper implementation would use Pydantic models
+                return {
+                    "last_update": state.get('timestamp'),
+                    "active_symbols": list(state.get('market_data', {}).keys()),
+                    "recent_events_count": len(state.get('recent_events', []))
+                }
+            except Exception as e:
+                logger.error(f"Failed to retrieve context state: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+                
+        @self.app.get("/health")
+        async def health_check():
+            """Basic health check endpoint."""
+            return {"status": "ok"}
 
-    logger.info(f"Injecting data from source: {source}")
-
-    try:
-        # Use the knowledge_injector component via the orchestrator
-        # (Assuming orchestrator exposes a method for this)
-        # This is an asynchronous operation
-        ingestion_id = await orchestrator.inject_external_data(source, content)
-        
-        return jsonify({
-            "status": "pending", 
-            "message": "Data queued for ingestion",
-            "ingestion_id": ingestion_id
-        }), 202
-        
-    except Exception as e:
-        logger.error(f"Error during data injection from '{source}': {e}", exc_info=True)
-        return jsonify({"error": "Failed to queue data for ingestion"}), 500
-
-@app.route('/api/v1/inject/file', methods=['POST'])
-async def upload_file():
-    """
-    Allows uploading files (PDF, CSV, TXT) for knowledge ingestion.
-    """
-    if 'file' not in request.files:
-        logger.warning("File upload failed: No 'file' part in request.")
-        return jsonify({"error": "No file part"}), 400
-        
-    file = request.files['file']
-    
-    if file.filename == '':
-        logger.warning("File upload failed: No file selected.")
-        return jsonify({"error": "No selected file"}), 400
-        
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-        
-        logger.info(f"File '{filename}' uploaded successfully. Queuing for ingestion.")
-
+    def run(self):
+        """
+        Starts the FastAPI server using uvicorn.
+        This is a blocking call.
+        """
+        logger.info(f"Starting API Gateway server on {self.host}:{self.port}")
         try:
-            # Trigger ingestion process for the uploaded file
-            # This is an asynchronous operation
-            ingestion_id = await orchestrator.inject_file(filepath, filename)
-            
-            return jsonify({
-                "status": "pending",
-                "message": "File uploaded and queued for ingestion",
-                "filename": filename,
-                "ingestion_id": ingestion_id
-            }), 202
-            
+            uvicorn.run(
+                self.app,
+                host=self.host,
+                port=self.port,
+                log_level="info"
+            )
         except Exception as e:
-            logger.error(f"Error processing uploaded file '{filename}': {e}", exc_info=True)
-            return jsonify({"error": "Failed to process uploaded file"}), 500
-    else:
-        logger.warning(f"File upload failed: File type not allowed ('{file.filename}')")
-        return jsonify({"error": "File type not allowed"}), 400
+            logger.error(f"API Gateway server failed to start: {e}", exc_info=True)
+            raise
 
-@app.route('/api/v1/status', methods=['GET'])
-def get_system_status():
-    """
-    Returns the current state of the processing pipeline.
-    """
-    logger.debug("System status requested.")
-    try:
-        state_data = pipeline_state.get_full_state()
-        return jsonify({
-            "status": "success",
-            "pipeline_state": state_data
-        }), 200
-    except Exception as e:
-        logger.error(f"Error retrieving pipeline state: {e}", exc_info=True)
-        return jsonify({"error": "Failed to retrieve system state"}), 500
-
-@app.route('/api/v1/config/reload', methods=['POST'])
-def reload_config():
-    """
-    Triggers a reload of the system configuration.
-    (Requires careful implementation to avoid race conditions)
-    """
-    logger.warning("Configuration reload triggered via API.")
-    try:
-        # This is a complex operation. The orchestrator needs to handle
-        # this gracefully, potentially pausing and re-initializing components.
-        success = orchestrator.reload_configuration('config/system.yaml')
-        if success:
-            return jsonify({"status": "success", "message": "Configuration reload initiated."}), 200
-        else:
-            return jsonify({"error": "Configuration reload failed."}), 500
-    except Exception as e:
-        logger.error(f"Error during configuration reload: {e}", exc_info=True)
-        return jsonify({"error": "An internal error occurred during reload."}), 500
-
-# --- Circuit Breaker UI ---
-
-@app.route('/circuit-breaker', methods=['GET'])
-def circuit_breaker_ui():
-    """
-    Serves a simple UI to monitor and control circuit breakers.
-    """
-    logger.debug("Serving Circuit Breaker UI.")
-    # The orchestrator's error handler would manage the state
-    breakers = orchestrator.error_handler.get_all_breaker_states()
-    return render_template('circuit_breaker.html', breakers=breakers)
-
-@app.route('/api/v1/circuit-breaker/trip', methods=['POST'])
-def trip_breaker():
-    """Manually trips a circuit breaker."""
-    data = request.json
-    breaker_name = data.get('name')
-    if not breaker_name:
-        return jsonify({"error": "Missing 'name' field"}), 400
+# Example usage (if run as main)
+if __name__ == "__main__":
+    # This is for testing purposes only.
+    # In production, this would be launched by the main phoenix_project.py
     
-    logger.warning(f"Manual trip requested for circuit breaker: {breaker_name}")
-    try:
-        orchestrator.error_handler.manually_trip_breaker(breaker_name)
-        return jsonify({"status": "success", "name": breaker_name, "state": "open"}), 200
-    except KeyError:
-        return jsonify({"error": f"Breaker '{breaker_name}' not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/v1/circuit-breaker/reset', methods=['POST'])
-def reset_breaker():
-    """Manually resets a circuit breaker."""
-    data = request.json
-    breaker_name = data.get('name')
-    if not breaker_name:
-        return jsonify({"error": "Missing 'name' field"}), 400
+    logger.info("Running API Gateway in standalone test mode.")
     
-    logger.info(f"Manual reset requested for circuit breaker: {breaker_name}")
-    try:
-        orchestrator.error_handler.manually_reset_breaker(breaker_name)
-        return jsonify({"status": "success", "name": breaker_name, "state": "closed"}), 200
-    except KeyError:
-        return jsonify({"error": f"Breaker '{breaker_name}' not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    # Mock dependencies
+    class MockOrchestrator:
+        async def process_event(self, event):
+            logger.info(f"[Mock] Processing event: {event.event_id}")
+            await asyncio.sleep(0.1) # Simulate async work
+        
+        def get_status(self):
+            return {"status": "running_mock", "active_tasks": 0, "mode": "mock"}
+            
+    class MockContextBus:
+        def get_current_state(self):
+            return {"timestamp": pd.Timestamp.now(), "market_data": {"AAPL": {}}, "recent_events": []}
 
-
-# --- Main Application Runner ---
-
-def run_server():
-    """Starts the Flask server."""
-    server_config = config.get('api_server', {})
-    host = server_config.get('host', '127.0.0.1')
-    port = server_config.get('port', 5000)
-    debug = server_config.get('debug', False)
+    mock_config = {"api_gateway": {"host": "127.0.0.1", "port": 8000}}
     
-    logger.info(f"Starting API Gateway on http://{host}:{port} (Debug: {debug})")
-    app.run(host=host, port=port, debug=debug)
-
-if __name__ == '__main__':
-    run_server()
+    gateway = APIGateway(
+        orchestrator=MockOrchestrator(),
+        context_bus=MockContextBus(),
+        config=mock_config
+    )
+    gateway.run()
