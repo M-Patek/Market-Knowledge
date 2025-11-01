@@ -1,83 +1,106 @@
-# events/risk_filter.py
-"""
-Implements the first-stage, high-performance synchronous event filter.
-Its sole purpose is to quickly discard irrelevant news items based on a
-pre-defined keyword logic before they are sent for expensive AI analysis.
-"""
 import yaml
-import re
-import logging
-from typing import List, Set
+from typing import Dict, Any, Optional
+
+from ..monitor.logging import get_logger
+from ..core.schemas.data_schema import MarketEvent
+
+logger = get_logger(__name__)
 
 class RiskFilter:
     """
-    A synchronous, keyword-based filter to identify potentially systemic events.
+    A high-speed, synchronous filter that performs a "first pass"
+    on incoming events to check for systemic risk keywords.
+    
+    Its purpose is to *immediately* flag high-importance events
+    (e.g., "FED", "WAR", "CRISIS") before they even enter the
+    main processing queue.
     """
-    def __init__(self, config_path: str = "config/event_filter_config.yaml"):
-        """
-        Initializes the filter by loading and compiling keyword sets from the config.
 
-        Args:
-            config_path: Path to the event_filter_config.yaml file.
+    def __init__(self, config: Dict[str, Any]):
         """
-        self.logger = logging.getLogger("PhoenixProject.RiskFilter")
+        Initializes the RiskFilter and loads the keyword configuration.
+        
+        Args:
+            config: The main system configuration.
+        """
+        self.config = config.get('risk_filter', {})
+        self.filter_config_path = self.config.get('config_path', 'config/event_filter_config.yaml')
+        self.keywords = self._load_keywords()
+        
+        logger.info(f"RiskFilter initialized. Loaded {len(self.keywords)} high-risk keywords.")
+
+    def _load_keywords(self) -> Dict[str, Dict]:
+        """
+        Loads keyword rules from the event_filter_config.yaml file.
+        
+        Expected format in YAML:
+        keywords:
+          systemic:
+            - "fed rate"
+            - "ecb"
+          geopolitical:
+            - "war"
+        """
         try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-
-            # Store keyword sets in lowercase for case-insensitive matching
-            self._risk_actions: Set[str] = {kw.lower() for kw in config.get('RiskActionKeywords', [])}
-            self._systemic_entities: Set[str] = {kw.lower() for kw in config.get('SystemicEntityKeywords', [])}
-            self._exclusions: Set[str] = {kw.lower() for kw in config.get('ExclusionKeywords', [])}
-
-            # Pre-compile regex patterns for precise, whole-word matching
-            self._risk_actions_regex = self._compile_regex(self._risk_actions)
-            self._systemic_entities_regex = self._compile_regex(self._systemic_entities)
-            self._exclusions_regex = self._compile_regex(self._exclusions)
-
-            self.logger.info(f"RiskFilter initialized with {len(self._risk_actions)} risk keywords, "
-                             f"{len(self._systemic_entities)} entity keywords, and {len(self._exclusions)} exclusion keywords.")
-
+            # Construct path relative to this file
+            import os
+            config_path = os.path.join(
+                os.path.dirname(__file__), 
+                '..', 
+                self.filter_config_path
+            )
+            
+            with open(config_path, 'r') as f:
+                config_data = yaml.safe_load(f)
+            
+            # We flatten the keywords into a single set for fast lookup
+            all_keywords = {}
+            for category, keyword_list in config_data.get('keywords', {}).items():
+                for keyword in keyword_list:
+                    # Store as lowercase for case-insensitive matching
+                    all_keywords[keyword.lower()] = {"category": category}
+                    
+            return all_keywords
+            
         except FileNotFoundError:
-            self.logger.error(f"Event filter config not found at '{config_path}'. The filter will be disabled.")
-            # Disable the filter if config is missing to prevent false negatives
-            self._risk_actions_regex = self._systemic_entities_regex = self._exclusions_regex = re.compile('a^') # A regex that never matches
+            logger.error(f"RiskFilter config file not found at: {config_path}")
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to load RiskFilter keywords from {config_path}: {e}", exc_info=True)
+            return {}
 
-    def _compile_regex(self, keywords: Set[str]) -> re.Pattern:
-        """Creates a compiled regex pattern from a set of keywords for efficient matching."""
-        if not keywords:
-            return re.compile('a^') # Return a regex that will never match if the set is empty
-        # Create a pattern that matches any of the keywords as whole words (\b)
-        # The pattern is case-insensitive (re.IGNORECASE)
-        pattern = r'\b(' + '|'.join(re.escape(kw) for kw in keywords) + r')\b'
-        return re.compile(pattern, re.IGNORECASE)
-
-    def is_systemic_event(self, news_text: str) -> bool:
+    def check_event(self, event: MarketEvent) -> Optional[Dict[str, Any]]:
         """
-        Applies the filtering logic to a given text.
-
+        Synchronously checks if an event's text contains any high-risk keywords.
+        This must be *very* fast.
+        
         Args:
-            news_text: The news headline or article snippet to analyze.
-
+            event (MarketEvent): The event to check.
+            
         Returns:
-            True if the event is deemed potentially systemic, False otherwise.
+            Optional[Dict]: A dict with match info if found (e.g., 
+                            {"keyword": "fed rate", "category": "systemic"}),
+                            otherwise None.
         """
-        # 1. Exclusion Logic: Check for negative keywords first for a fast exit.
-        if self._exclusions_regex.search(news_text):
-            self.logger.debug("Event discarded due to exclusion keyword.")
-            return False
+        
+        # Combine headline and summary for searching
+        text_to_search = (event.headline + " " + event.summary).lower()
+        
+        if not text_to_search:
+            return None
 
-        # 2. AND Combination Logic (Core): Must hit both sets.
-        has_risk_action = self._risk_actions_regex.search(news_text)
-        if not has_risk_action:
-            self.logger.debug("Event discarded: No risk action keyword found.")
-            return False
-
-        has_systemic_entity = self._systemic_entities_regex.search(news_text)
-        if not has_systemic_entity:
-            self.logger.debug("Event discarded: No systemic entity keyword found.")
-            return False
-
-        # If both conditions are met, it's a candidate for AI analysis.
-        self.logger.info("Potentially systemic event identified. Passing for AI analysis.")
-        return True
+        # This is a simple O(N*M) search.
+        # For performance, a real system would use Aho-Corasick or
+        # another multi-pattern matching algorithm.
+        for keyword, info in self.keywords.items():
+            if keyword in text_to_search:
+                logger.warning(f"HIGH-RISK EVENT DETECTED (Event: {event.event_id}). "
+                               f"Keyword: '{keyword}', Category: {info['category']}")
+                
+                return {
+                    "keyword_match": keyword,
+                    "category": info['category']
+                }
+                
+        # No match
+        return None
