@@ -1,120 +1,151 @@
-# strategy_handler.py
-import logging
-from ai.market_state_predictor import MarketStatePredictor
-from typing import Dict, Any, Optional
-from dataclasses import dataclass
 import pandas as pd
-import backtrader as bt
-from datetime import date
+from typing import Dict, Any, Optional
 
-from phoenix_project import StrategyConfig
+from monitor.logging import get_logger
+from data_manager import DataManager
+from core.pipeline_state import PipelineState
+from core.schemas.data_schema import MarketEvent
+
+# FIX: Renamed SimpleFeatureStore to FeatureStore
+from features.store import FeatureStore
 from cognitive.engine import CognitiveEngine
-from features.store import SimpleFeatureStore # [V2.0] Import the feature store
-from execution.order_manager import OrderManager
 
-@dataclass
-class DailyDataPacket:
-    current_date: date
-    current_vix: Optional[float]
-    current_yield: Optional[float]
-    current_breadth: Optional[float]
-    market_state: Optional[int]
-    market_state_confidence: Optional[float]
-    # Each dict will now include 'volatility'
-    candidate_analysis: list
-
-class StrategyDataHandler:
+class BaseStrategy:
     """
-    Acts as a data provider and pre-processor for the main strategy logic.
-    Its purpose is to decouple data management from the core strategy decision-making logic.
+    Abstract base class for all trading strategies.
+    Defines the interface for event handling and signal generation.
     """
-    def __init__(self, strategy: bt.Strategy, config: StrategyConfig, vix_data: pd.Series, treasury_yield_data: pd.Series, market_breadth_data: pd.Series, feature_store: SimpleFeatureStore, market_state_predictor: Optional[MarketStatePredictor] = None):
-        self.strategy = strategy
+    def __init__(self, config: Dict[str, Any], data_manager: DataManager):
         self.config = config
-        self.logger = logging.getLogger("PhoenixProject.StrategyDataHandler")
-        self.market_state_predictor = market_state_predictor
-        self.feature_store = feature_store # [V2.0] Use the feature store
+        self.data_manager = data_manager
+        self.logger = get_logger(self.__class__.__name__)
+        self.logger.info(f"Strategy '{self.__class__.__name__}' initialized.")
 
-        self.data_map = {d._name: d for d in self.strategy.datas}
-        self.vix_data = vix_data
-        self.treasury_yield_data = treasury_yield_data
-        self.market_breadth_data = market_breadth_data
-
-    def get_daily_data_packet(self, cognitive_engine: CognitiveEngine) -> Optional[DailyDataPacket]:
-        """Assembles all necessary data for the current day into a single packet."""
-        try:
-            current_date = self.strategy.datetime.date()
-            current_timestamp = pd.Timestamp(current_date)
-        except IndexError:
-            self.logger.warning("Could not get current date from strategy datetime.")
-            return None
-
-        # Fetch macro data
-        current_vix = self.vix_data.loc[current_timestamp]
-        current_yield = self.treasury_yield_data.loc[current_timestamp]
-        current_breadth = self.market_breadth_data.loc[current_timestamp]
-        self.logger.info(f"VIX Index: {current_vix:.2f}, 10Y Yield: {current_yield:.2f if current_yield else 'N/A'}%, Market Breadth: {current_breadth:.2% if current_breadth else 'N/A'}")
-
-        market_state, market_state_confidence = 1, 0.0 # Default to neutral
-        if self.market_state_predictor:
-            macro_features = pd.DataFrame([{
-                'vix': current_vix,
-                'yield': current_yield,
-                'breadth': current_breadth
-            }])
-            market_state, market_state_confidence = self.market_state_predictor.predict(macro_features)
-
-        candidate_analysis = []
-        for ticker, d in self.data_map.items():
-            # [V2.0] Get features from the centralized feature store
-            # We convert the backtrader data lines to a pandas DataFrame
-            df = pd.DataFrame({'close': d.close.get(size=self.config.sma_period + 1)})
-            features = self.feature_store.get_features(ticker, df)
-            
-            candidate_analysis.append({
-                "ticker": ticker,
-                "opportunity_score": cognitive_engine.calculate_opportunity_score(
-                    d.close[0], features.get('sma'), features.get('rsi')
-                ),
-                "volatility": features.get('volatility')
-            })
-
-        return DailyDataPacket(
-            current_date=current_date,
-            current_vix=current_vix,
-            current_yield=current_yield,
-            current_breadth=current_breadth,
-            market_state=market_state,
-            market_state_confidence=market_state_confidence,
-            candidate_analysis=candidate_analysis
-        )
-
-
-class RomanLegionStrategy(bt.Strategy):
-    def __init__(self, config: StrategyConfig, vix_data, treasury_yield_data, market_breadth_data, sentiment_data, asset_analysis_data, market_state_predictor: Optional[MarketStatePredictor] = None):
-        self.config = config
-        self.logger = logging.getLogger("PhoenixProject.RomanLegionStrategy")
-        # [V2.0] Initialize the feature store first
-        self.feature_store = SimpleFeatureStore(config.dict())
-        self.cognitive_engine = CognitiveEngine(config, asset_analysis_data, sentiment_data)
-        self.order_manager = OrderManager(self.broker, **config.execution_model.dict())
-        # [V2.0] Pass the feature_store to the data handler
-        self.data_handler = StrategyDataHandler(self, config, vix_data, treasury_yield_data, market_breadth_data, self.feature_store, market_state_predictor)
+    async def on_event(self, event: MarketEvent, state: PipelineState) -> Optional[Dict[str, Any]]:
+        """
+        Asynchronously process an incoming market event.
         
-    def next(self):
-        daily_data = self.data_handler.get_daily_data_packet(self.cognitive_engine)
-        if not daily_data:
-            return
+        Args:
+            event: The MarketEvent object (e.g., news, price update).
+            state: The current PipelineState object.
+            
+        Returns:
+            A dictionary representing a trading signal, or None if no action.
+            Example signal: {"action": "BUY", "symbol": "AAPL", "weight": 0.1}
+        """
+        raise NotImplementedError("Strategy must implement on_event")
 
-        self.logger.info(f"--- {daily_data.current_date.isoformat()}: Daily Rebalancing Briefing ---")
-        battle_plan = self.cognitive_engine.determine_allocations(daily_data.candidate_analysis, daily_data.current_date)
-        self.order_manager.rebalance(self, battle_plan)
+    async def on_decision_cycle(self, current_time: pd.Timestamp, state: PipelineState) -> Optional[Dict[str, Any]]:
+        """
+        Asynchronously triggered on a regular cycle (e.g., daily, hourly) 
+        for portfolio rebalancing decisions.
+        
+        Args:
+            current_time: The timestamp of the current decision cycle.
+            state: The current PipelineState object.
+            
+        Returns:
+            A dictionary representing a desired portfolio state or list of signals.
+        """
+        self.logger.debug(f"Decision cycle triggered at {current_time}")
+        # Default implementation does nothing
+        return None
 
-    def notify_order(self, order):
-        self.order_manager.handle_order_notification(order)
 
-    def stop(self):
-        self.logger.info("--- [Strategy Stop]: Finalizing operations ---")
-        # Any final logic can go here
-        pass
+class RomanLegionStrategy(BaseStrategy):
+    """
+    A sophisticated strategy handler that uses a "Cognitive Engine" to make
+    decisions. It represents one "Legion" of the trading system.
+    """
+    
+    # FIX: Removed redundant data arguments (asset_analysis_data, sentiment_data)
+    # The CognitiveEngine will now get this data via the DataManager.
+    def __init__(self, config: Dict[str, Any], data_manager: DataManager):
+        """
+        Initializes the strategy, its feature store, and the core cognitive engine.
+        
+        Args:
+            config: The main system configuration dictionary.
+            data_manager: The shared DataManager instance.
+        """
+        super().__init__(config, data_manager)
+        
+        # FIX: Renamed SimpleFeatureStore to FeatureStore
+        self.feature_store = FeatureStore()
+        self.logger.info("FeatureStore initialized.")
 
+        # FIX: Passed config and data_manager to CognitiveEngine.
+        # The CognitiveEngine is now self-sufficient and will load its own data
+        # via the DataManager as needed.
+        self.cognitive_engine = CognitiveEngine(
+            config=self.config, 
+            data_manager=self.data_manager
+        )
+        
+        # Get references to the engine's components for convenience
+        self.portfolio_constructor = self.cognitive_engine.portfolio_constructor
+        self.risk_manager = self.cognitive_engine.risk_manager
+        
+        self.logger.info("RomanLegionStrategy initialized with CognitiveEngine.")
+
+    async def on_event(self, event: MarketEvent, state: PipelineState) -> Optional[Dict[str, Any]]:
+        """
+        Processes high-priority, real-time events (e.g., breaking news).
+        This path is for rapid, tactical decisions.
+        """
+        self.logger.debug(f"Processing event: {event.event_id} ({event.event_type})")
+        
+        # 1. Update features based on the event
+        new_features = self.feature_store.update_features(event)
+        
+        # 2. (Optional) Quick check for immediate action
+        # This bypasses the full cognitive loop for speed
+        if event.event_type == 'URGENT_NEWS' and 'AAPL' in event.symbols:
+             # Example: A simple heuristic rule
+             if "positive guidance" in event.content.lower():
+                 self.logger.info("Tactical BUY signal triggered by urgent news.")
+                 return {"action": "TACTICAL_BUY", "symbol": "AAPL", "weight": 0.02}
+
+        # 3. For most events, we just log and wait for the main decision cycle
+        self.logger.debug(f"Event {event.event_id} logged. Awaiting decision cycle.")
+        return None
+
+    async def on_decision_cycle(self, current_time: pd.Timestamp, state: PipelineState) -> Optional[Dict[str, Any]]:
+        """
+        This is the main entry point for the full cognitive workflow.
+        It runs the entire RAG, reasoning, and portfolio construction process.
+        """
+        self.logger.info(f"--- RomanLegionDecisionCycle START: {current_time} ---")
+        
+        try:
+            # 1. Define the primary analysis task for this cycle
+            # In a real system, this would be more dynamic (e.g., top 50 assets)
+            task_description = "Analyze the market outlook for AAPL and GOOGL for the next 5 trading days."
+            
+            # 2. Run the full cognitive engine workflow
+            # This is an async call that performs RAG, multi-agent reasoning,
+            # synthesis, risk assessment, and portfolio construction.
+            portfolio_decision = await self.cognitive_engine.run_cycle(
+                task_description=task_description,
+                current_time=current_time,
+                current_state=state
+            )
+            
+            if portfolio_decision is None:
+                self.logger.warning("Cognitive engine returned no decision.")
+                return None
+
+            # 3. Log and return the final decision
+            # The decision object (e.g., PortfolioDecision) contains the
+            # target weights, the reasoning, and any generated orders.
+            self.logger.info(f"Cognitive engine produced decision: {portfolio_decision.decision_id}")
+            
+            # The orchestrator will receive this and pass it to the OrderManager
+            return portfolio_decision.to_dict() 
+            
+        except Exception as e:
+            self.logger.error(f"Error during decision cycle: {e}", exc_info=True)
+            # Propagate error to orchestrator's error handler
+            raise
+        finally:
+            self.logger.info(f"--- RomanLegionDecisionCycle END: {current_time} ---")
