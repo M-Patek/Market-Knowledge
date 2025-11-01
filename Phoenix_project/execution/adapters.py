@@ -2,9 +2,13 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional
 import asyncio
 
-# 修复：将根目录导入 'context_bus' 改为相对导入
+# 修复：
+# 1. 'ContextBus' 使用相对导入
+# 2. 'Fill' 和 'Order' 来自 '.interfaces'
+# 3. 'MarketData' 来自 'core.schemas.data_schema'
 from ..context_bus import ContextBus
-from .interfaces import Order, Fill, MarketData
+from .interfaces import Order, Fill
+from ..core.schemas.data_schema import MarketData
 from ..monitor.logging import get_logger
 
 logger = get_logger(__name__)
@@ -76,13 +80,15 @@ class BaseExecutionAdapter(ABC):
         Internal handler to publish a fill event to the ContextBus.
         """
         logger.info(f"Publishing fill: {fill.symbol} {fill.fill_amount} @ {fill.fill_price}")
-        await self.context_bus.publish('fills', fill.model_dump())
+        # 修正：序列化 dataclass
+        await self.context_bus.publish('fills', fill.__dict__) 
         
     async def _on_market_data(self, market_data: MarketData):
         """
         Internal handler to publish market data to the ContextBus.
         """
-        await self.context_bus.publish('market_data', market_data.model_dump())
+        # 修正：序列化 Pydantic 模型
+        await self.context_bus.publish('market_data', market_data.model_dump()) 
 
     async def _order_listener(self):
         """
@@ -226,7 +232,7 @@ class PaperTradingAdapter(BaseExecutionAdapter):
                         fill = Fill(
                             order_id=order.order_id,
                             symbol=order.symbol,
-                            fill_amount=order.amount,
+                            fill_amount=order.size if order.side == 'BUY' else -order.size, # 修正：fill_amount 带方向
                             fill_price=market_data.close, # No slippage
                             timestamp=market_data.timestamp
                         )
