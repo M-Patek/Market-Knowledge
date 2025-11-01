@@ -6,12 +6,16 @@ from datetime import date, timedelta, datetime
 import os
 import shutil
 from unittest.mock import AsyncMock, patch
+from typing import Dict, Any
 
-from phoenix_project import DataManager, StrategyConfig
+# 修正: 导入 DataManager, 新的 StrategyConfig schema, 以及 PipelineState
+from data_manager import DataManager
+from core.schemas.config_schema import StrategyConfig
+from core.pipeline_state import PipelineState
 
 @pytest.fixture
-def mock_config():
-    """Provides a mock StrategyConfig for DataManager testing."""
+def mock_config_dict() -> Dict[str, Any]:
+    """Provides a mock config dict for DataManager testing."""
     config_dict = {
         "start_date": "2023-01-01", "end_date": "2023-01-10",
         "asset_universe": ["TICKER_A", "TICKER_B"],
@@ -43,18 +47,26 @@ def mock_config():
         "position_sizer": {"method": "fixed_fraction", "parameters": {"fraction_per_position": 0.1}},
         "optimizer": {"study_name": "test", "n_trials": 1, "parameters": {}},
         "observability": {"metrics_port": 8002},
-        "audit": {"s3_bucket_name": "none"}
+        "audit": {"s3_bucket_name": "none"},
+        "data_manager": {"cache_dir": "test_cache"} # 为 DataManager 添加 cache_dir 配置
     }
-    return StrategyConfig(**config_dict)
+    # 验证 mock config 是否符合 schema
+    _ = StrategyConfig(**config_dict)
+    return config_dict
 
 @pytest.fixture
-def data_manager(mock_config, tmp_path) -> DataManager:
+def data_manager(mock_config_dict, tmp_path) -> DataManager:
     """Provides a DataManager instance with a temporary cache directory."""
     cache_dir = tmp_path / "data_cache"
     cache_dir.mkdir()
     os.environ["FAKE_KEY_AV"] = "key_av_xyz"
     os.environ["FAKE_KEY_TD"] = "key_td_xyz"
-    yield DataManager(config=mock_config, cache_dir=str(cache_dir))
+    
+    # 修正: DataManager 需要一个 config dict 和一个 PipelineState
+    state = PipelineState()
+    # 修正: DataManager 构造函数需要 config, pipeline_state, 和 cache_dir
+    dm = DataManager(config=mock_config_dict, pipeline_state=state, cache_dir=str(cache_dir))
+    yield dm
     shutil.rmtree(cache_dir)
 
 def create_mock_dataframe(ticker: str, start="2023-01-01", end="2023-01-10"):
@@ -71,7 +83,7 @@ def create_mock_dataframe(ticker: str, start="2023-01-01", end="2023-01-10"):
     return df
 
 @pytest.mark.asyncio
-async def test_concurrent_fetch_cache_miss(data_manager, mock_config):
+async def test_concurrent_fetch_cache_miss(data_manager, mock_config_dict):
     """Tests concurrent cache misses, followed by successful fetches from the primary provider."""
     with patch.object(data_manager, '_fetch_from_alpha_vantage', new_callable=AsyncMock) as mock_fetch:
         # Configure the mock to return a different DataFrame for each ticker
@@ -83,7 +95,7 @@ async def test_concurrent_fetch_cache_miss(data_manager, mock_config):
         assert not result_df.empty
         assert "TICKER_A" in result_df.columns.get_level_values(1)
         assert "TICKER_B" in result_df.columns.get_level_values(1)
-        assert mock_fetch.call_count == len(mock_config.asset_universe)
+        assert mock_fetch.call_count == len(mock_config_dict["asset_universe"])
 
 @pytest.mark.asyncio
 async def test_concurrent_cache_hit(data_manager):
@@ -143,14 +155,14 @@ async def test_incremental_update(data_manager: DataManager):
     """Tests that only new data is fetched if the cache is partial for a single ticker."""
     with patch.object(data_manager, '_fetch_from_alpha_vantage', new_callable=AsyncMock) as mock_fetch:
         # 1. Populate cache with initial data for TICKER_A
-        initial_end_date = date(2023， 1, 5)
-        data_manager.config。end_date = initial_end_date
-        mock_fetch.side_effect = lambda tickers, start, end: create_mock_dataframe(tickers[0], start, end)
+        initial_end_date = date(2023, 1, 5)
+        data_manager.config['end_date'] = initial_end_date.isoformat()
+        mock_fetch.side_effect = lambda tickers, start, end: create_mock_dataframe(tickers[0], str(start), str(end))
         await data_manager.get_asset_universe_data()
         
         # 2. Change end_date and mock the fetch for the new, incremental data
-        new_end_date = date(2023， 1, 10)
-        data_manager.config。end_date = new_end_date
+        new_end_date = date(2023, 1, 10)
+        data_manager.config['end_date'] = new_end_date.isoformat()
         
         final_df = await data_manager.get_asset_universe_data()
         
@@ -171,9 +183,10 @@ async def test_incremental_update(data_manager: DataManager):
             call_for_A = incremental_call_args_B
 
         assert call_for_A is not None
-        assert call_for_A[1] == initial_end_date + timedelta(days=1)
-        assert call_for_A[2] == new_end_date
+        assert call_for_A[1] == (initial_end_date + timedelta(days=1)).isoformat()
+        assert call_for_A[2] == new_end_date.isoformat()
 
         assert final_df is not None
         assert final_df.index.min().date() == date(2023, 1, 1)
         assert final_df.index.max().date() == new_end_date
+
