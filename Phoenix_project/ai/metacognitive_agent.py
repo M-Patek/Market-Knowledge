@@ -1,232 +1,219 @@
-# ai/metacognitive_agent.py
+import asyncio
+from typing import Dict, Any, List, Optional
+import numpy as np
 
-import logging
-import json
-from typing import List, Dict, Any
-from core.schemas.fusion_result import FusionResult, EvidenceItem  # (L4) Import new schema
-from ai.tabular_db_client import TabularDBClient # Placeholder
-from api.gemini_pool_manager import GeminiPoolManager, query_model # Placeholder
-from monitor.logging import get_logger
+from ..core.schemas.data_schema import MarketEvent, TickerData
+from ..core.schemas.fusion_result import FusionResult, AgentDecision, AgentIO
+from .prompt_manager import PromptManager
+from .retriever import Retriever
+from .source_credibility import SourceCredibilityModel
+from ..evaluation.fact_checker import FactChecker
+from ..reasoning.compressor import ContextCompressor
+from ..api.gemini_pool_manager import GeminiPoolManager
+from ..monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
-LLM_CLIENT = "gemini" # Assuming a default
-class MetaCognitiveAgent:
+class MetacognitiveAgent:
     """
-    (L4 Patched) L3 Agent: Performs meta-cognition.
-    - (Original) Periodically analyzes P&L and decision logs.
-    - (L4) Performs real-time analysis (consistency, critique) on new decisions.
+    The core AI agent that orchestrates the entire reasoning pipeline.
+    It combines RAG, multi-agent ensemble reasoning, fact-checking, and
+    metacognitive self-correction to produce a final, uncertainty-aware result.
     """
+
     def __init__(
         self,
-        db_client: TabularDBClient,
-        gemini_client: GeminiPoolManager,
-        lookback_period: int = 30,
-        min_logs_for_analysis: int = 50
+        config: Dict[str, Any],
+        prompt_manager: PromptManager,
+        retriever: Retriever,
+        gemini_pool: GeminiPoolManager,
+        source_credibility_model: SourceCredibilityModel,
+        fact_checker: FactChecker,
+        context_compressor: ContextCompressor
     ):
-        self.db_client = db_client
-        self.gemini_client = gemini_client
-        self.lookback_period = lookback_period
-        self.min_logs_for_analysis = min_logs_for_analysis
-        logger.info("MetaCognitiveAgent initialized.")
+        self.config = config
+        self.prompt_manager = prompt_manager
+        self.retriever = retriever
+        self.gemini_pool = gemini_pool
+        self.source_credibility_model = source_credibility_model
+        self.fact_checker = fact_checker
+        self.context_compressor = context_compressor
+        self.use_metacognition = config.get('ai_ensemble', {}).get('use_metacognition', True)
+        self.metacognition_config = config.get('ai_ensemble', {}).get('metacognition', {})
+        
+        logger.info(f"MetacognitiveAgent initialized. Metacognition enabled: {self.use_metacognition}")
 
-    async def run_periodic_analysis(self) -> List[Dict]:
+    async def process_event(
+        self, 
+        event: MarketEvent, 
+        market_context: Optional[List[TickerData]] = None
+    ) -> FusionResult:
         """
-        Main entry point for the agent's periodic execution.
+        Main entry point for processing a single market event.
         """
-        logger.info("L3 MetaCognitiveAgent running periodic analysis...")
+        event_id = event.event_id
+        logger.info(f"Processing event: {event_id} - {event.headline}")
         
-        # --- Task 5.1: Implement Sliding Window Strategy ---
-        # Fetch logs from a fixed, recent lookback period to manage cost and context.
-        recent_logs = self.db_client.get_decision_logs(days_back=7)
+        pipeline_io = {}
         
-        if len(recent_logs) < self.min_logs_for_analysis:
-            logger.info(f"Not enough logs ({len(recent_logs)}) for meta-analysis. Minimum is {self.min_logs_for_analysis}. Skipping.")
-            return []
-
-        # 2. Build the prompt using the summarized logs
-        prompt = await self._build_causal_inference_prompt(recent_logs)
-        
-        # 3. Call the high-tier model with the summarized prompt
-        # This is expected to be a high-cost, high-capability model
-        response_text = await self.gemini_client.query_model_async(prompt, model="gemini-1.5-pro-latest", client_name=LLM_CLIENT)
-        
-        # 3. Parse the response to extract actionable rules
-        new_rules = self._parse_response_for_rules(response_text)
-        
-        return new_rules
-
-    async def _summarize_logs(self, logs: List[Dict]) -> str:
-        """
-        Task 5.2: Pre-processes logs by summarizing them with a low-cost model.
-        """
-        logger.info(f"Summarizing {len(logs)} logs with a low-cost model...")
-        
-        log_texts = [json.dumps(log) for log in logs]
-        
-        # Simple chunking to avoid massive single prompts
-        CHUNK_SIZE = 20
-        summaries = []
-        for i in range(0, len(log_texts), CHUNK_SIZE):
-            chunk = "\n".join(log_texts[i:i+CHUNK_SIZE])
-            prompt = f"""
-            Analyze the following JSON log entries. Summarize the key patterns, decisions, and outcomes into 2-3 bullet points. Focus on relationships between agent evidence, fusion results, and P&L.
-            --- LOGS ---
-            {chunk}
---- SUMMARY ---
-            """
-            # Use a low-cost model for this summarization task
-            summary = await self.gemini_client.query_model_async(prompt, model="gemini-1.5-flash-latest", client_name=LLM_CLIENT)
-            summaries.append(summary)
-            
-        return "\n".join(summaries)
-
-    async def _build_causal_inference_prompt(self, logs: List[Dict]) -> str:
-        """
-        Constructs the prompt for the high-tier model, now using summarized logs.
-        """
-        # The prompt asks the LLM to perform causal inference.
-        # The goal is to find causal links between agent behaviors, market conditions, and P&L.
-        # For example: "The 'technical_analyst' agent consistently provides over-optimistic scores
-        # during high-volatility periods, leading to negative P&L. A new rule should be injected..."
-        
-        summarized_logs = await self._summarize_logs(logs)
-        
-        prompt = f"""
-        You are a Meta-Cognitive AI analyzing the performance of a multi-agent financial analysis system.
-        Your task is to identify flawed reasoning patterns, biases, or incorrect causal links in the system's behavior.
-        Analyze the following summaries of recent decision logs. Each summary represents a cluster of decisions and their outcomes.
-        Based on these summaries, identify 1 to 3 systemic issues. For each issue, propose a specific, actionable rule to correct it.
-        The rule MUST be in the format specified in the output schema.
-
-        ### Summarized Decision Logs ###
-        {summarized_logs}
-
-        ### Causal Inference and Rule Generation ###
-        Analyze the patterns and generate rules.
-        Your output MUST be a valid JSON list containing rule objects.
-        
-        Example Output Format:
-        [
-          {{
-            "name": "Add constraint for analyst bias",
-            "action_type": "update_prompt",
-            "target_agent": "fundamental_analyst",
-            "description": "Always double-check revenue projections against 3rd-party data."
-          }},
-          {{
-            "name": "Down-weight technicals in high-vol",
-            "action_type": "adjust_credibility",
-            "target_agent": "technical_analyst",
-            "adjustment_factor": -0.2,
-            "conditions": ["market_volatility > 0.8"]
-          }}
-        ]
-        """
-        return prompt
-
-    def _parse_response_for_rules(self, response_text: str) -> List[Dict]:
-        """
-        Safely parses the LLM's JSON response into a list of rule dictionaries.
-        """
-        logger.info(f"Parsing L3 response for rules...")
         try:
-            # Clean the response text (LLMs sometimes add markdown)
-            if response_text.strip().startswith("```json"):
-                response_text = response_text.strip()[7:-3].strip()
+            # 1. Hybrid RAG (Retrieval-Augmented Generation)
+            context_bundle, retrieval_metadata = await self.retriever.retrieve_hybrid_context(event, market_context)
+            pipeline_io['retrieval'] = retrieval_metadata
+
+            # 2. Context Compression
+            compressed_context = await self.context_compressor.compress_context(context_bundle, event.headline)
+            pipeline_io['compressed_context'] = compressed_context
+
+            # 3. Source Credibility Assessment
+            source_scores = self.source_credibility_model.score_sources(context_bundle)
+            pipeline_io['source_scores'] = source_scores
+
+            # 4. Prepare Prompts
+            system_prompts = self.prompt_manager.get_all_system_prompts()
             
-            rules = json.loads(response_text)
-            if isinstance(rules, list):
-                logger.info(f"Successfully parsed {len(rules)} new rules.")
-                return rules
+            # 5. Run initial Agent Ensemble
+            # TODO: This logic needs to be encapsulated in EnsembleClient
+            # decisions, agent_io = await self.ensemble_client.run_ensemble(compressed_context, system_prompts, event_id)
+            # ... temp placeholder ...
+            decisions = [] # Placeholder
+            agent_io = {}  # Placeholder
+            
+            pipeline_io['agent_ensemble_io'] = agent_io
+
+            # 6. Fact Checking (if enabled)
+            # ... logic for fact-checking ...
+            
+            # 7. Metacognition / Self-Correction (if enabled)
+            if self.use_metacognition and self._should_trigger_metacognition(decisions):
+                logger.info(f"Metacognition triggered for event: {event_id}")
+                # ... logic for arbitration and re-ranking ...
+                pass
+
+            # 8. Synthesize Final Result
+            # final_decision, uncertainty = self.synthesize_results(decisions, source_scores)
+            final_decision = AgentDecision(agent_id="synthesizer", decision="PLACEHOLDER", confidence=0.0, justification="Not implemented")
+            uncertainty = {"cognitive_uncertainty": 1.0}
+
+
+            logger.info(f"Successfully processed event: {event_id}. Final decision: {final_decision.decision}")
+            
+            return FusionResult(
+                event_id=event_id,
+                final_decision=final_decision,
+                cognitive_uncertainty=uncertainty.get('cognitive_uncertainty', 1.0),
+                agent_decisions=decisions,
+                pipeline_io=pipeline_io,
+                status="SUCCESS"
+            )
+
+        except Exception as e:
+            logger.error(f"Error processing event {event_id}: {e}", exc_info=True)
+            return FusionResult(
+                event_id=event_id,
+                final_decision=AgentDecision(
+                    agent_id="system_error",
+                    decision="ERROR",
+                    confidence=0.0,
+                    justification=str(e)
+                ),
+                cognitive_uncertainty=1.0,
+                agent_decisions=[],
+                pipeline_io=pipeline_io,
+                status="ERROR",
+                error_message=str(e)
+            )
+
+    def _should_trigger_metacognition(self, decisions: List[AgentDecision]) -> bool:
+        """
+        Determines if the metacognitive (arbitration) step should be triggered
+        based on agent disagreement or low confidence.
+        """
+        if not decisions:
+            return False
+            
+        # Example trigger logic:
+        # 1. High disagreement (e.g., mix of BUY, SELL, HOLD)
+        unique_decisions = set(d.decision for d in decisions if d.decision not in ["ERROR", "INVALID_RESPONSE"])
+        if len(unique_decisions) > self.metacognition_config.get('disagreement_threshold', 1):
+            logger.debug("Metacognition trigger: High disagreement.")
+            return True
+            
+        # 2. Low average confidence
+        confidences = [d.confidence for d in decisions if d.decision not in ["ERROR", "INVALID_RESPONSE"]]
+        if not confidences:
+            return False
+            
+        avg_confidence = np.mean(confidences)
+        if avg_confidence < self.metacognition_config.get('confidence_threshold', 0.5):
+            logger.debug(f"Metacognition trigger: Low average confidence ({avg_confidence:.2f}).")
+            return True
+            
+        return False
+
+    def synthesize_results(
+        self, 
+        decisions: List[AgentDecision], 
+        source_scores: Dict[str, float]
+    ) -> (AgentDecision, Dict[str, float]):
+        """
+        Fuses all agent decisions and source credibility into a final
+        decision and uncertainty score.
+        
+        This is a placeholder. A real implementation would use a more
+        sophisticated Bayesian model.
+        """
+        
+        # Placeholder logic: weighted average
+        total_weight = 0
+        weighted_score = 0
+        valid_justifications = []
+        
+        decision_map = {"BUY": 1, "HOLD": 0, "SELL": -1}
+        
+        for d in decisions:
+            if d.decision in decision_map:
+                weight = d.confidence
+                total_weight += weight
+                weighted_score += weight * decision_map[d.decision]
+                valid_justifications.append(f"[{d.agent_id} @ {d.confidence:.0%}): {d.justification}")
+        
+        if total_weight == 0:
+            final_decision_str = "HOLD"
+            final_confidence = 0.0
+            cognitive_uncertainty = 1.0
+        else:
+            final_score = weighted_score / total_weight
+            final_confidence = np.mean([d.confidence for d in decisions if d.decision in decision_map])
+            
+            # Simple discretization
+            if final_score > 0.33:
+                final_decision_str = "BUY"
+            elif final_score < -0.33:
+                final_decision_str = "SELL"
             else:
-                logger.warning(f"L3 response was valid JSON but not a list: {type(rules)}")
-                return []
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode L3 response JSON: {e}\nResponse was:\n{response_text}")
-            return []
-        except Exception as e:
-            logger.error(f"Error parsing L3 rules: {e}", exc_info=True)
-            return []
-
-    async def consistency_check(self, fusion_result: FusionResult, evidence_list: List[EvidenceItem]) -> Dict[str, Any]:
-        """
-        (L4 Task 1) Performs a real-time consistency check.
-        Analyzes if the final fused posterior is logically consistent with the raw evidence.
-        """
-        logger.info("Running L3 real-time consistency check...")
-        
-        evidence_summary = "\n".join([f"- {item.source}: {item.finding} (Score: {item.score})" for item in evidence_list])
-        
-        prompt = f"""
-        You are a meta-cognitive analyst. Analyze the following fusion result against the raw evidence it was based on.
-        Is the final decision logically consistent with the evidence?
-        
-        Evidence Summary:
-        {evidence_summary}
-        
-        Fusion Result:
-        - Posterior: {fusion_result.posterior}
-        - Rationale: {fusion_result.rationale}
-        
-        Respond with a JSON object: {{"consistency_score": float, "reasoning": "Your analysis..."}}
-        (Score: 1.0 = Highly Consistent, 0.0 = Highly Inconsistent)
-        """
-        try:
-            response_text = await self.gemini_client.query_model_async(prompt, model="gemini-1.5-pro-latest", client_name=LLM_CLIENT)
+                final_decision_str = "HOLD"
             
-            # Re-using logic from _parse_response_for_rules to strip markdown
-            if response_text.strip().startswith("```json"):
-                response_text = response_text.strip()[7:-3].strip()
+            # Calculate cognitive uncertainty
+            # Example: 1.0 - (agreement * avg_confidence)
+            std_dev = np.std([decision_map[d.decision] for d in decisions if d.decision in decision_map])
+            agreement = 1.0 - (std_dev / np.max([1.0, 1.0])) # Normalized std dev
+            cognitive_uncertainty = 1.0 - (agreement * final_confidence)
 
-            result = json.loads(response_text)
-            return {"consistency": result.get("consistency_score", 0.0)}
-        except Exception as e:
-            logger.error(f"L3 consistency_check failed: {e}")
-            return {"consistency": 0.5} # Return neutral on failure
 
-    async def self_critique(self, fusion_result: FusionResult) -> Dict[str, Any]:
-        """
-        (L4 Task 1) Performs a self-critique of the fusion result to identify internal weaknesses.
-        """
-        logger.info("Running L3 real-time self-critique...")
-
-        # Rule-based critique for now, can be LLM-based later
-        uncertainty_width = fusion_result.confidence_interval[1] - fusion_result.confidence_interval[0]
-        evidence_gap = 0.0
-
-        if uncertainty_width > 0.5:
-            reasoning = "High uncertainty detected (wide confidence interval)."
-            # This score is inversely related to the width of the confidence interval
-            evidence_gap = uncertainty_width 
-
-        # Placeholder for more complex critiques (e.g., analyzing rationale text)
+        final_justification = " | ".join(valid_justifications)
         
-        return {"evidence_gap": evidence_gap}
-
-    async def meta_update(self, consistency_result: Dict[str, Any], critique_result: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        (L4 Task 1 & 2) Synthesizes critique and consistency checks into a final Meta Log and action.
-        """
-        logger.info("Running L3 meta-update...")
-
-        consistency = consistency_result.get("consistency", 0.5)
-        evidence_gap = critique_result.get("evidence_gap", 0.0)
+        final_decision = AgentDecision(
+            agent_id="synthesizer",
+            decision=final_decision_str,
+            confidence=final_confidence,
+            justification=final_justification
+        )
         
-        action = "hold" # Default action
-
-        # Simple rule-based action generation
-        if consistency < 0.6:
-            action = "reduce_confidence"
-        elif evidence_gap > 0.5:
-            action = "request_more_evidence"
-
-        meta_log = {
-            "consistency": consistency,
-            "evidence_gap": evidence_gap,
-            "action": action
+        uncertainty_scores = {
+            "cognitive_uncertainty": cognitive_uncertainty,
+            "average_confidence": final_confidence,
+            "decision_agreement": agreement
         }
-        
-        logger.info(f"L3 Meta-Log generated: {meta_log}")
-        return meta_log
 
+        return final_decision, uncertainty_scores
