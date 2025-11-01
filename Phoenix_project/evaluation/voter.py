@@ -1,9 +1,6 @@
 # Phoenix_project/evaluation/voter.py
 from typing import List
 from monitor.metrics import UNCERTAINTY # 来自 Task 25 的更正后导入
-from schemas.fusion_result import FusionResult, L1AgentResult # 旧导入
-from pipeline_state import PipelineState # 旧导入
-
 
 def vote(paths: list[dict]) -> dict:
     """
