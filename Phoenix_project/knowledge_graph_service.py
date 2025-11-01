@@ -1,6 +1,6 @@
 from neo4j import AsyncGraphDatabase
 from typing import Dict, Any, List, Optional
-from ..monitor.logging import get_logger
+from .monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -14,104 +14,112 @@ class KnowledgeGraphService:
     def __init__(self, config: Dict[str, Any]):
         """
         Initializes the KnowledgeGraphService.
-        
-        Args:
-            config (Dict, Any): Expects 'knowledge_graph' config block
-                                with 'uri', 'user', 'password'.
-        """
-        kg_config = config.get('knowledge_graph', {})
-        self.uri = kg_config.get('uri') # e.g., "neo4j://localhost:7687"
-        self.user = kg_config.get('user', 'neo4j')
-        self.password = kg_config.get('password')
-        
-        if not self.uri or not self.password:
-            logger.error("KnowledgeGraphService config (uri, password) incomplete.")
-            raise ValueError("KG URI and password are required.")
-            
-        self.driver = None
-        logger.info(f"KnowledgeGraphService initialized for URI: {self.uri}")
 
-    async def connect(self):
-        """Establishes the connection to the Neo4j driver."""
-        try:
-            self.driver = AsyncGraphDatabase.driver(self.uri, auth=(self.user, self.password))
-            await self.driver.verify_connectivity()
-            logger.info("KnowledgeGraphService connected to Neo4j.")
-        except Exception as e:
-            logger.error(f"Failed to connect to Neo4j: {e}", exc_info=True)
-            raise
+        Expected config keys:
+          - uri: Neo4j bolt/bolt+s URI
+          - user: Username for Neo4j
+          - password: Password for Neo4j
+          - database: Database name (optional; defaults to 'neo4j')
+        """
+        self.uri = config.get("uri")
+        self.user = config.get("user")
+        self.password = config.get("password")
+        self.database = config.get("database", "neo4j")
+
+        if not self.uri or not self.user or not self.password:
+            raise ValueError("Neo4j config requires 'uri', 'user', and 'password'.")
+
+        self._driver = AsyncGraphDatabase.driver(self.uri, auth=(self.user, self.password))
+        logger.info("KnowledgeGraphService initialized for %s", self.uri)
 
     async def close(self):
-        """Closes the Neo4j driver connection."""
-        if self.driver:
-            await self.driver.close()
-            logger.info("KnowledgeGraphService connection to Neo4j closed.")
+        """Closes the underlying driver."""
+        await self._driver.close()
+        logger.info("KnowledgeGraphService closed.")
 
-    async def run_query(self, query: str, parameters: Dict = None) -> List[Dict]:
+    async def run_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
-        Executes a read-only Cypher query.
-        
-        Args:
-            query (str): The Cypher query.
-            parameters (Dict, optional): Parameters for the query.
-            
-        Returns:
-            List[Dict]: A list of result records (as dictionaries).
+        Runs a read-only query against the Neo4j database.
         """
-        if not self.driver:
-            logger.error("Driver not connected.")
-            return []
-            
-        try:
-            async with self.driver.session() as session:
-                result = await session.run(query, parameters)
-                records = [record.data() async for record in result]
-                return records
-        except Exception as e:
-            logger.error(f"Neo4j query failed: {e}. Query: {query}", exc_info=True)
-            return []
+        params = params or {}
+        logger.debug("KG read query: %s | params=%s", query, params)
+        async with self._driver.session(database=self.database) as session:
+            result = await session.run(query, **params)
+            records = [r.data() for r in await result.to_list()]
+            logger.debug("KG read result: %s rows", len(records))
+            return records
 
-    async def run_write_tx(self, query: str, parameters: Dict = None) -> bool:
+    async def run_write_tx(self, query: str, params: Optional[Dict[str, Any]] = None) -> None:
         """
-        Executes a write query within a transaction.
-        
-        Args:
-            query (str): The Cypher write query (e.g., CREATE, MERGE).
-            parameters (Dict, optional): Parameters for the query.
-            
-        Returns:
-            bool: True on success, False on failure.
+        Runs a write transaction with the given query/params.
         """
-        if not self.driver:
-            logger.error("Driver not connected.")
-            return False
-            
-        try:
-            async with self.driver.session() as session:
-                await session.write_transaction(self._execute_tx, query, parameters)
-            return True
-        except Exception as e:
-            logger.error(f"Neo4j write transaction failed: {e}. Query: {query}", exc_info=True)
-            return False
+        params = params or {}
+        logger.debug("KG write query: %s | params=%s", query, params)
+        async with self._driver.session(database=self.database) as session:
+            await session.execute_write(lambda tx: tx.run(query, **params))
+        logger.debug("KG write commit ok.")
 
-    @staticmethod
-    async def _execute_tx(tx, query: str, parameters: Dict = None):
-        """Internal helper for executing the transaction function."""
-        await tx.run(query, parameters)
-
-    # --- Example Specific Queries ---
-    
-    async def add_relationship(self, entity_a_id: str, entity_b_id: str, relationship: str):
+    async def upsert_entity(self, entity_id: str, entity_type: str, properties: Dict[str, Any]):
         """
-        Example: Creates a relationship between two entities.
-        
-        (Assumes nodes have a 'name' property as their ID)
+        Creates or updates an entity node.
+        """
+        query = """
+        MERGE (e:Entity {name: $entity_id})
+        ON CREATE SET e.type = $entity_type
+        SET e += $properties
+        """
+        await self.run_write_tx(
+            query,
+            {"entity_id": entity_id, "entity_type": entity_type, "properties": properties},
+        )
+
+    async def upsert_relation(self, entity_a_id: str, relation: str, entity_b_id: str, weight: float = 1.0):
+        """
+        Creates or updates a relation between two entities.
         """
         query = """
         MERGE (a:Entity {name: $entity_a})
         MERGE (b:Entity {name: $entity_b})
-        MERGE (a)-[r:""" + relationship.upper() + """]->(b)
-        RETURN r
+        MERGE (a)-[r:%s]->(b)
+        ON CREATE SET r.weight = $weight
+        SET r.weight = $weight
+        """ % relation
+        await self.run_write_tx(query, {"entity_a": entity_a_id, "entity_b": entity_b_id, "weight": weight})
+
+    async def delete_entity(self, entity_id: str):
+        """
+        Deletes an entity and all relationships.
+        """
+        query = """
+        MATCH (e:Entity {name: $entity_id})
+        DETACH DELETE e
+        """
+        await self.run_write_tx(query, {"entity_id": entity_id})
+
+    async def get_neighbors(self, entity_id: str, relation: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Returns neighbors connected with optional relation filter.
+        """
+        if relation:
+            query = f"""
+            MATCH (:Entity {{name: $entity_id}})-[r:{relation}]->(n:Entity)
+            RETURN n.name AS neighbor, n.type AS type, r.weight AS weight
+            """
+        else:
+            query = """
+            MATCH (:Entity {name: $entity_id})-[r]->(n:Entity)
+            RETURN n.name AS neighbor, n.type AS type, r.weight AS weight, type(r) AS relation
+            """
+        return await self.run_query(query, {"entity_id": entity_id})
+
+    async def connect_entities(self, entity_a_id: str, entity_b_id: str):
+        """
+        Example helper to connect two entities with a generic relation.
+        """
+        query = """
+        MATCH (a:Entity {name: $entity_a})
+        MATCH (b:Entity {name: $entity_b})
+        MERGE (a)-[:RELATED_TO]->(b)
         """
         await self.run_write_tx(query, {"entity_a": entity_a_id, "entity_b": entity_b_id})
 
@@ -119,8 +127,9 @@ class KnowledgeGraphService:
         """
         Example: Finds entities related to a given entity within N hops.
         """
-        if hops < 1: hops = 1
-        
+        if hops < 1:
+            hops = 1
+
         query = f"""
         MATCH (a:Entity {{name: $entity_id}})-[*1..{hops}]-(b:Entity)
         WHERE a <> b
