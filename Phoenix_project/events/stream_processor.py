@@ -1,134 +1,189 @@
-# events/stream_processor.py
-from collections import deque
-import math
 import asyncio
-import numpy as np
-from typing import Protocol, List, Dict, Any, AsyncGenerator
-import redis
-import hashlib
+import json
+import redis.asyncio as redis
+from typing import Dict, Any, List, Optional
+import aiohttp
 
-# Assuming an observability module exists for alerts
-# from observability import alert_manager
+from ..monitor.logging import get_logger
+from .event_distributor import EventDistributor
+from .risk_filter import RiskFilter
+from ..ai.data_adapter import DataAdapter
+from ..core.schemas.data_schema import MarketEvent, TickerData
 
-# --- [Sub-Task 2.2.1] News Client Abstraction ---
-class BaseNewsClient(Protocol):
-    """Abstract base class for a news fetching client."""
-    async def fetch(self) -> List[Dict[str, Any]]:
-        ...
-
-class BenzingaClient(BaseNewsClient):
-    """Placeholder implementation for a Benzinga Pro news client."""
-    async def fetch(self) -> List[Dict[str, Any]]:
-        return [{"source": "Benzinga", "headline": "BREAKING: Fed to raise rates by 25 bps"}]
-
-class AlphaVantageNewsClient(BaseNewsClient):
-    """Placeholder implementation for an Alpha Vantage news client."""
-    async def fetch(self) -> List[Dict[str, Any]]:
-        return [{"source": "AlphaVantage", "headline": "BREAKING: Fed to raise rates by 25 bps"}]
+logger = get_logger(__name__)
 
 class RealTimeDQM:
-    """
-    Performs real-time Data Quality Management on a stream of market data
-    using techniques like the exponentially weighted moving average (EWMA).
-    """
-    
-    def __init__(self, alpha=0.1, threshold_stdevs=3.0):
-        """
-        Initializes the DQM validator.
-        
-        Args:
-            alpha (float): The smoothing factor for the EWMA.
-            threshold_stdevs (float): Number of standard deviations to set the anomaly threshold.
-        """
-        self.alpha = alpha
-        self.threshold_stdevs = threshold_stdevs
-        
-        # Store EWMA and EWMSD (Exponentially Weighted Moving Standard Deviation) for each asset
-        self.ewma = {}
-        self.ewmsd = {}
-        
-        self.min_observations = 20 # Need at least 20 observations to start anomaly detection
-        self.observation_count = defaultdict(int)
+    """A simple real-time Data Quality Monitor."""
+    def __init__(self):
+        self.price_cache = {}
+        self.anomaly_threshold = 0.2 # 20% price jump
 
-    def check_anomaly(self, event: Dict[str, Any]) -> bool:
-        """
-        Checks a single event (e.g., a trade) for anomalies.
+    def check_price_anomaly(self, ticker_data: TickerData) -> bool:
+        """Checks for anomalous price jumps."""
+        symbol = ticker_data.symbol
+        new_price = ticker_data.close
         
-        Returns:
-            bool: True if the event is considered an anomaly, False otherwise.
-        """
-        # We only check events that have a price and asset
-        if event.get('type') != 'trade' or 'price' not in event or 'asset' not in event:
-            return False
-            
-        asset = event['asset']
-        price = event['price']
+        if symbol in self.price_cache:
+            last_price = self.price_cache[symbol]
+            if last_price > 0 and (abs(new_price - last_price) / last_price) > self.anomaly_threshold:
+                logger.warning(f"DQM ANOMALY: Price jump for {symbol} "
+                               f"({last_price} -> {new_price})")
+                self.price_cache[symbol] = new_price
+                return True # Anomaly detected
         
-        self.observation_count[asset] += 1
-        
-        # Initialize or update the EWMA
-        if asset not in self.ewma:
-            self.ewma[asset] = price
-            self.ewmsd[asset] = 0 # Initial standard deviation is 0
-            return False
-        else:
-            deviation = price - self.ewma[asset]
-            self.ewma[asset] = self.ewma[asset] + self.alpha * deviation
-            # Update EWMSD using an EWMA of the squared deviations
-            self.ewmsd[asset] = math.sqrt(
-                (1 - self.alpha) * (self.ewmsd[asset]**2 + self.alpha * deviation**2)
-            )
-
-        # Don't check for anomalies until we have enough data
-        if self.observation_count[asset] < self.min_observations:
-            return False
-            
-        # Check if the price is outside the dynamic threshold
-        threshold = self.threshold_stdevs * self.ewmsd[asset]
-        if abs(deviation) > threshold:
-            # alert_manager.send_alert(
-            #     "DataQualityAnomaly",
-            #     f"Anomalous price for {asset}: {price}. "
-            #     f"Expected range: {self.ewma[asset] - threshold} to {self.ewma[asset] + threshold}"
-            # )
-            return True
-        
-        return False
-
+        self.price_cache[symbol] = new_price
+        return False # No anomaly
 
 class StreamProcessor:
     """
-    [Epic 2.2] Aggregates events from multiple sources, deduplicates them, and runs DQM checks.
+    Connects to real-time data streams (e.g., Benzinga, AlphaVantage)
+    and processes incoming data.
+    
+    It performs:
+    1. Adaptation (Raw JSON -> Pydantic Schema)
+    2. Deduplication (using Redis)
+    3. Data Quality Monitoring (DQM)
+    4. Risk Filtering (fast, synchronous check)
+    5. Distribution (hands off high-value events to EventDistributor)
     """
-    def __init__(self, news_clients: List[BaseNewsClient], dqm_enabled: bool = True, config: Dict[str, Any] = None):
-        self.news_clients = news_clients
-        self.dqm_validator = RealTimeDQM() if dqm_enabled else None
-        # --- [Sub-Task 2.2.2] Deduplication Mechanism ---
-        self.redis_client = redis.Redis(host='localhost', port=6379, db=1, decode_responses=True) # Using db=1 to separate from queues
-        self.dedupe_ttl = config.get('deduplication_ttl_seconds', 600) if config else 600
 
-    async def _deduplicate_and_yield_events(self, all_events: List[Dict[str, Any]]) -> AsyncGenerator[Dict[str, Any], None]:
-        """Deduplicates events and yields unique ones."""
-        for event in all_events:
-            # Normalize headline for more robust deduplication
-            normalized_headline = event.get("headline", "").lower().strip()
-            # Atomically set the key with a 10-minute TTL if it does not already exist (nx=True).
-            # The command returns True if the key was set, False otherwise.
-            if normalized_headline and self.redis_client.set(normalized_headline, 1, ex=self.dedupe_ttl, nx=True):
-                yield event
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        event_distributor: EventDistributor,
+        risk_filter: RiskFilter,
+        data_adapter: DataAdapter
+    ):
+        self.config = config.get('stream_processor', {})
+        self.event_distributor = event_distributor
+        self.risk_filter = risk_filter
+        self.data_adapter = data_adapter
+        
+        self.dqm = RealTimeDQM()
+        
+        # Redis client for deduplication
+        self.redis_client = redis.from_url(
+            self.config.get('redis_url', 'redis://localhost:6379'),
+            decode_responses=True
+        )
+        self.dedup_key_prefix = "stream_dedup:"
+        self.dedup_expiry_sec = self.config.get('dedup_expiry_sec', 3600) # 1 hour
+        
+        # Stream sources
+        self.benzinga_ws_url = self.config.get('benzinga_ws_url')
+        # ... other stream configs ...
+        
+        self._is_running = False
 
-    async def process_events(self) -> AsyncGenerator[Dict[str, Any], None]:
-        """
-        The main event processing generator. Fetches from all sources, deduplicates,
-        validates, and yields a clean stream of events.
-        """
-        while True:
-            fetch_tasks = [client.fetch() for client in self.news_clients]
-            results = await asyncio.gather(*fetch_tasks)
-            all_events = [event for sublist in results for event in sublist]
-
-            async for unique_event in self._deduplicate_and_yield_events(all_events):
-                if not self.dqm_validator or not self.dqm_validator.check_anomaly(unique_event):
-                    yield unique_event
+    async def run(self):
+        """Starts all configured stream listeners."""
+        self._is_running = True
+        logger.info("Starting StreamProcessor...")
+        
+        tasks = []
+        if self.benzinga_ws_url:
+            tasks.append(asyncio.create_task(
+                self._listen_to_benzinga(self.benzinga_ws_url)
+            ))
             
-            await asyncio.sleep(10) # Poll every 10 seconds
+        # TODO: Add tasks for other streams (AlphaVantage, etc.)
+        
+        if not tasks:
+            logger.warning("No data streams configured. StreamProcessor will be idle.")
+            return
+
+        await asyncio.gather(*tasks)
+
+    def stop(self):
+        """Signals the processor to stop."""
+        logger.info("StreamProcessor received stop signal.")
+        self._is_running = False
+        # (The websocket tasks must handle this signal)
+
+    async def _listen_to_benzinga(self, ws_url: str):
+        """Main connection loop for a Benzinga websocket."""
+        logger.info(f"Connecting to Benzinga stream: {ws_url}")
+        
+        while self._is_running:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(ws_url) as ws:
+                        
+                        # TODO: Add authentication logic (e.g., sending auth message)
+                        
+                        async for msg in ws:
+                            if not self._is_running:
+                                break
+                                
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                await self._process_raw_message(msg.data, "Benzinga")
+                            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                                logger.warning(f"Benzinga websocket closed/errored: {msg.data}")
+                                break
+            
+            except Exception as e:
+                logger.error(f"Benzinga stream connection failed: {e}. Reconnecting in 5s...")
+                await asyncio.sleep(5) # Reconnect delay
+
+    async def _process_raw_message(self, raw_data: str, source: str):
+        """Handles a single raw message from any stream."""
+        try:
+            raw_event = json.loads(raw_data)
+            
+            # --- 1. Adaptation ---
+            # Standardize the data (e.g., Benzinga -> MarketEvent)
+            # We assume a 'type' field exists in the raw data
+            event_type = raw_event.get('type', 'unknown')
+            
+            event_object: Optional[Union[MarketEvent, TickerData]] = None
+            
+            if event_type == 'news':
+                event_object = self.data_adapter.adapt_news_event(raw_event)
+            elif event_type == 'price':
+                event_object = self.data_adapter.adapt_market_data(raw_event)
+            else:
+                logger.debug(f"Unknown event type received from {source}: {event_type}")
+                return
+
+            if not event_object:
+                # Adaptation failed or was a duplicate
+                return
+
+            # --- 2. Deduplication (using adapted event_id) ---
+            if isinstance(event_object, MarketEvent):
+                dedup_key = f"{self.dedup_key_prefix}{event_object.event_id}"
+                if await self.redis_client.set(dedup_key, "1", ex=self.dedup_expiry_sec, nx=True) is None:
+                    logger.debug(f"Discarding duplicate event: {event_object.event_id}")
+                    return
+            
+            # --- 3. Data Quality Monitoring (DQM) ---
+            if isinstance(event_object, TickerData):
+                if self.dqm.check_price_anomaly(event_object):
+                    # TODO: Log anomaly, but decide whether to discard
+                    pass
+                # Price data is usually not "published" to the orchestrator,
+                # but rather just updates the ContextBus state.
+                # (This logic is simplified)
+                # await self.context_bus.update_market_data(event_object)
+                return
+
+            # --- 4. High-Speed Risk Filtering ---
+            if isinstance(event_object, MarketEvent):
+                risk_match = self.risk_filter.check_event(event_object)
+                if risk_match:
+                    event_object.metadata['risk_filter_match'] = risk_match
+                    # (All risk events are high-value by default)
+                
+                # TODO: Add 'value' filter (e.g., based on symbols, tags)
+                is_high_value = True # For now, assume all news is high-value
+                
+                # --- 5. Distribution ---
+                if is_high_value:
+                    # Send the standardized, high-value event to the
+                    # processing queue.
+                    await self.event_distributor.publish(event_object)
+
+        except json.JSONDecodeError:
+            logger.warning(f"Received invalid JSON from {source}: {raw_data[:100]}...")
+        except Exception as e:
+            logger.error(f"Error processing raw message: {e}", exc_info=True)
