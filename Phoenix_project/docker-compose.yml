@@ -1,29 +1,92 @@
 version: '3.8'
 
 services:
-  
+  db:
+    image: postgres:15
+    container_name: phoenix_db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    volumes:
+      - phoenix_db_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: phoenix_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - phoenix_redis_data:/data
+
   api:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
     container_name: phoenix_api
+    env_file:
+      - .env
     ports:
-      - "5000:5000"
-    command: ["flask", "run", "--host=0.0.0.0", "--port=5000"]
-    environment:
-      # FIXED: 修正了 Python 导入路径，以匹配 /app 工作目录
-      - FLASK_APP=api.gateway:create_app
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    # 修复：
+    # 1. 移除了不必要的 "api." 前缀 (因为工作目录已是 /app)
+    # 2. 将目标从 :create_app() (工厂模式) 更改为 :app (实例模式)
+    #    以匹配 api/gateway.py 中的定义
+    command: gunicorn --bind 0.0.0.0:8000 api.gateway:app
     volumes:
       - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
 
   worker:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: phoenix_worker
-    # FIXED: 修正了 Celery 的 Python 导入路径，以匹配 /app 工作目录
-    # 假设 'app' 对象定义在 /app/worker.py 文件中
-    command: ["celery", "-A", "worker.app", "worker", "--loglevel=info"]
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - db
+    # 修复：确保 worker 也能找到根目录
+    command: celery -A worker.celery_app worker --loglevel=info
     volumes:
       - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+
+  monitor:
+    image: prom/prometheus
+    container_name: phoenix_monitor
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: phoenix_jupyter
+    env_file:
+      - .env
+    ports:
+      - "8888:8888"
+    command: jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token=''
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+
+volumes:
+  phoenix_db_data:
+  phoenix_redis_data:
 
