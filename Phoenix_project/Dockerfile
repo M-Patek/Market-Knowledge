@@ -8,8 +8,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Layer 15 dependencies (Prometheus, pytest, celery, pydantic)
-RUN pip install --no-cache-dir prometheus-client pytest celery pydantic
+# NOTE: 移除了多余的 pip install 命令。
+# 'prometheus-client', 'pytest', 'celery', 'pydantic' 已经包含在 requirements.txt 中。
 
 # Expose any necessary ports (e.g., for the API)
 EXPOSE 5000
@@ -18,4 +18,6 @@ EXPOSE 5000
 COPY . .
 
 # Default command (can be overridden in docker-compose)
-CMD ["python", "Phoenix_project/phoenix_project.py"]
+# FIXED: 路径已修正，以匹配 /app 工作目录
+CMD ["python", "phoenix_project.py"]
+
