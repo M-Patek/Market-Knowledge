@@ -15,8 +15,13 @@ from knowledge_graph_service import KnowledgeGraphService
 from ai.embedding_client import EmbeddingClient
 from backtesting.engine import BacktestingEngine
 # NOTE: 'ai/bayesian_fusion_engine.py' 在项目文件列表中不存在。
-# 必须保持注释，否则会导致 ModuleNotFoundError。
-# from ai.bayesian_fusion_engine import BayesianFusionEngine
+# FIXED: Refactored to ai.reasoning_ensemble.py per analysis
+from ai.reasoning_ensemble import ReasoningEnsemble # Was BayesianFusionEngine
+
+# NEW IMPORTS FOR RAG (Task 7)
+from ai.retriever import HybridRetriever, VectorDBClient # Imports dummy VectorDBClient
+from ai.temporal_db_client import TemporalDBClient
+from ai.tabular_db_client import TabularDBClient
 
 # Configure logger for this module (Layer 12)
 logger = get_logger(__name__)
@@ -55,6 +60,9 @@ def setup_dependencies():
     # NOTE: 已注释掉，因为 'l3_rules_engine.py' 文件缺失
     # l3_rules_engine = L3RulesEngine()
     # registry.register("l3_rules_engine", l3_rules_engine)
+    # FIXED: Registering the ReasoningEnsemble (aliased as bayesian_fusion_engine)
+    # under the old "l3_rules_engine" key as a compatibility shim.
+    # This relies on bayesian_fusion_engine being registered first (below).
 
     # Register Layer 10 service
     knowledge_graph_service = KnowledgeGraphService()
@@ -70,8 +78,35 @@ def setup_dependencies():
 
     # Register Layer 13 (L2) service
     # NOTE: 已注释掉，因为 'ai/bayesian_fusion_engine.py' 文件缺失
-    # bayesian_fusion_engine = BayesianFusionEngine()
-    # registry.register("bayesian_fusion_engine", bayesian_fusion_engine)
+    bayesian_fusion_engine = ReasoningEnsemble(config) # Instantiated with config
+    registry.register("bayesian_fusion_engine", bayesian_fusion_engine)
+    
+    # Register L3RulesEngine compatibility shim *after* bayesian_fusion_engine
+    registry.register("l3_rules_engine", bayesian_fusion_engine)
+    logger.info("ReasoningEnsemble registered under compatibility keys 'bayesian_fusion_engine' and 'l3_rules_engine'.")
+
+    # --- NEW RAG SERVICE REGISTRATION (Task 7) ---
+    logger.info("Registering RAG services...")
+    # Instantiate clients for the retriever
+    vector_db_client = VectorDBClient() # Uses dummy client from retriever.py
+    
+    # Pass in config subsections safely
+    temporal_db_client = TemporalDBClient(config.get('temporal_db', {}))
+    tabular_db_client = TabularDBClient(config.get('tabular_db', {}))
+    
+    # Get rerank config from the main system config
+    rerank_config = config.get('ai', {}).get('retriever', {}).get('rerank', {})
+    
+    # Instantiate and register the HybridRetriever
+    hybrid_retriever = HybridRetriever(
+        vector_db_client=vector_db_client,
+        temporal_db_client=temporal_db_client,
+        tabular_db_client=tabular_db_client,
+        rerank_config=rerank_config
+    )
+    registry.register("hybrid_retriever", hybrid_retriever)
+    logger.info("HybridRetriever (RAG) service registered.")
+
 
     logger.info("All core services instantiated and registered.")
 
@@ -86,4 +121,3 @@ if __name__ == "__main__":
     logger.info("Starting Phoenix Project simulation...")
     cognitive_engine.run_simulation()
     logger.info("Phoenix Project simulation finished.")
-
