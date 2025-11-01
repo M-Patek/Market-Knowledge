@@ -1,9 +1,9 @@
 from data_manager import DataManager
-from monitor.logging import get_logger # FIXED: Refactored import path
-from controller.orchestrator import Orchestrator as PipelineOrchestrator # FIXED: Corrected import path
+from monitor.logging import get_logger
+from controller.orchestrator import Orchestrator as PipelineOrchestrator
 from registry import registry
 from backtesting.engine import BacktestingEngine
-from ai.reasoning_ensemble import ReasoningEnsemble # FIXED: Refactored from BayesianFusionEngine
+from ai.reasoning_ensemble import ReasoningEnsemble
 
 # Configure logger for this module (Layer 12)
 logger = get_logger(__name__)
@@ -19,7 +19,7 @@ class CognitiveEngine:
         # self.l1_orchestrator = L1Orchestrator() # Replaced by Layer 9 orchestrator
         self.pipeline_orchestrator = PipelineOrchestrator()
         self.backtesting_engine: BacktestingEngine = registry.resolve("backtesting_engine") 
-        self.reasoning_ensemble: ReasoningEnsemble = registry.resolve("reasoning_ensemble") # REFACTORED: Using new key
+        self.reasoning_ensemble: ReasoningEnsemble = registry.resolve("reasoning_ensemble")
 
         logger.info("CognitiveEngine initialized.")
 
@@ -47,13 +47,11 @@ class CognitiveEngine:
 
         # --- Layer 14: Backtesting Feedback Loop ---
         logger.info("CognitiveEngine: Starting backtesting run...")
-        # backtesting_engine: BacktestingEngine = registry.resolve("backtesting_engine") # Already initialized in __init__
         metrics = self.backtesting_engine.run_backtest(all_signals)
         
         logger.info(f"CognitiveEngine: Backtest complete. Metrics: {metrics}")
         logger.info("CognitiveEngine: Feeding metrics back to L2 (ReasoningEnsemble)...")
         
-        # REFACTORED: Using new property name
         self.reasoning_ensemble.meta_update(metrics)
         
         logger.info("CognitiveEngine: Layer 14 feedback loop complete.")
