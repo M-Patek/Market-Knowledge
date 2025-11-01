@@ -2,7 +2,10 @@
 import tensorflow as tf
 import tensorflow_gnn as tfgnn
 from typing import List
-from ..core.schemas.data_schema import KnowledgeGraph # 修复：从 data_schema 导入
+import asyncio
+from ..api.gemini_pool_manager import GeminiPoolManager
+from ..ai.prompt_manager import PromptManager
+from ..core.schemas.data_schema import KnowledgeGraph 
 
 class GNNEncoder(tf.keras.Model):
     """
