@@ -1,12 +1,14 @@
 import asyncio
 from typing import List, Dict, Any
 
-from .data_manager import DataManager
-from .memory.vector_store import VectorStore
-from .ai.embedding_client import EmbeddingClient
-# 修复：'NewsArticle' (拼写错误) 改为 'NewsData'
-from .core.schemas.data_schema import NewsData
-from .monitor.logging import get_logger
+# 修复：
+# 1. 移除 'from .'，因为此文件位于根目录
+# 2. 'NewsArticle' 拼写错误改为 'NewsData'
+from data_manager import DataManager
+from memory.vector_store import VectorStore
+from ai.embedding_client import EmbeddingClient
+from core.schemas.data_schema import NewsData
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -100,10 +102,11 @@ class KnowledgeInjector:
                     
                 # Prepare documents for vector store
                 documents = []
-                for art, emb in zip(articles, embeddings):
+                # 修正：使用 art_index 访问 texts_to_embed
+                for art_index, (art, emb) in enumerate(zip(articles, embeddings)):
                     doc = {
                         "id": art.source_id,
-                        "text": texts_to_embed[art_index],
+                        "text": texts_to_embed[art_index], # 修正
                         "vector": emb,
                         "metadata": {
                             "symbol": art.symbols,
