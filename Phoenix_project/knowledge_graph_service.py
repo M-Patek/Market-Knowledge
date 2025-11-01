@@ -5,7 +5,7 @@ Handles the extraction, storage, and retrieval of structured knowledge
 from L1 agent outputs into a vector database or graph store.
 """
 
-from observability import get_logger
+from monitor.logging import get_logger
 
 # Configure logger for this module (Layer 12)
 logger = get_logger(__name__)
