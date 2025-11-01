@@ -1,229 +1,169 @@
-import os
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
-# FIX: Changed import from 'observability' to 'monitor.logging'
-from monitor.logging import get_logger
-from ai.embedding_client import EmbeddingClient
-from ai.relation_extractor import RelationExtractor
-from memory.vector_store import VectorStore
-from knowledge_graph_service import KnowledgeGraphService
-from data_manager import DataManager
-from core.schemas.data_schema import NewsArticle, Document
-from ai.prompt_manager import PromptManager
+from .data_manager import DataManager
+from .memory.vector_store import VectorStore
+from .ai.embedding_client import EmbeddingClient
+# 修复：'NewsArticle' (拼写错误) 改为 'NewsData'
+from .core.schemas.data_schema import NewsData
+from .monitor.logging import get_logger
 
-logger = get_logger('KnowledgeInjector')
+logger = get_logger(__name__)
 
 class KnowledgeInjector:
     """
-    Handles the ingestion pipeline:
-    1. Receives raw data (e.g., text, documents).
-    2. Processes and chunks the data.
-    3. Generates embeddings.
-    4. Extracts entities and relations for the Knowledge Graph.
-    5. Stores data in the Vector Store and Knowledge Graph.
+    A service that continuously streams data from the DataManager,
+    processes it (e.g., generates embeddings), and injects it into
+    a long-term memory store (like VectorStore).
     """
-    
-    def __init__(self, 
-                 config: Dict[str, Any], 
+
+    def __init__(self,
                  data_manager: DataManager,
                  vector_store: VectorStore,
-                 kg_service: KnowledgeGraphService,
-                 embedding_client: EmbeddingClient,
-                 gemini_pool: Optional[Any] = None): # Optional GeminiPoolManager
-        
-        self.config = config.get('knowledge_injector', {})
+                 embedding_client: EmbeddingClient):
+        """
+        Initialize the injector with necessary clients.
+        """
         self.data_manager = data_manager
         self.vector_store = vector_store
-        self.kg_service = kg_service
         self.embedding_client = embedding_client
-        self.gemini_pool = gemini_pool # Use the shared pool
-
-        # Initialize the Relation Extractor
-        # It needs access to an LLM, so we pass the pool
-        prompt_manager = PromptManager(config.get('prompts', {}))
-        self.relation_extractor = RelationExtractor(
-            gemini_pool=self.gemini_pool,
-            prompt_manager=prompt_manager,
-            config=config.get('relation_extractor', {})
-        )
-        
-        self.chunk_size = self.config.get('chunk_size', 1000)
-        self.chunk_overlap = self.config.get('chunk_overlap', 200)
-        
+        self._running = False
         logger.info("KnowledgeInjector initialized.")
 
-    async def inject_document(self, filepath: str, source: str) -> str:
+    async def start(self):
         """
-        Main entry point for ingesting a file (PDF, TXT, MD, etc.).
+        Starts the continuous injection background tasks.
         """
-        logger.info(f"Starting ingestion for file: {filepath} from source: {source}")
+        if self._running:
+            logger.warning("KnowledgeInjector is already running.")
+            return
+
+        self._running = True
+        logger.info("KnowledgeInjector started.")
+        
+        # Start background tasks for different data types
+        # (Using asyncio.create_task to run them concurrently)
+        self.news_task = asyncio.create_task(self.process_news_stream())
+        # self.market_task = asyncio.create_task(self.process_market_data_stream())
+        
+        # Add more tasks for other data types (e.g., filings, social media)
+        
         try:
-            # 1. Load and parse data using DataManager
-            documents: List[Document] = self.data_manager.load_document(filepath, source)
-            
-            if not documents:
-                logger.warning(f"No documents extracted from file: {filepath}")
-                return "Failed: No content extracted"
-
-            # 2. Process documents in parallel
-            tasks = [self._process_single_document(doc) for doc in documents]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            success_count = 0
-            fail_count = 0
-            for res in results:
-                if isinstance(res, Exception):
-                    logger.error(f"Failed to process a document chunk: {res}", exc_info=res)
-                    fail_count += 1
-                else:
-                    success_count += 1
-
-            logger.info(f"Ingestion complete for {filepath}. Success: {success_count}, Failed: {fail_count}")
-            return f"Ingestion complete. Success: {success_count}, Failed: {fail_count}"
-
+            await asyncio.gather(self.news_task) # Add other tasks here
+        except asyncio.CancelledError:
+            logger.info("KnowledgeInjector tasks cancelled.")
         except Exception as e:
-            logger.error(f"High-level error during document injection for {filepath}: {e}", exc_info=True)
-            return f"Failed: {str(e)}"
+            logger.error(f"Error in KnowledgeInjector run loop: {e}", exc_info=True)
+        finally:
+            self._running = False
+            logger.info("KnowledgeInjector stopped.")
 
-    async def inject_news_article(self, article: NewsArticle) -> bool:
+    def stop(self):
         """
-        Main entry point for ingesting a single NewsArticle object.
+        Stops the running background tasks.
         """
-        logger.info(f"Starting ingestion for NewsArticle: {article.article_id} ({article.headline})")
+        if not self._running:
+            logger.warning("KnowledgeInjector is not running.")
+            return
+            
+        logger.info("Stopping KnowledgeInjector...")
+        if self.news_task:
+            self.news_task.cancel()
+        
+        # Cancel other tasks...
+        
+        self._running = False
+
+    async def process_news_stream(self):
+        """
+        Processes the news data stream.
+        """
+        logger.info("Starting news stream processing...")
         try:
-            # Convert NewsArticle to a standard Document for processing
-            doc = Document(
-                doc_id=article.article_id,
-                content=f"{article.headline}\n\n{article.summary}\n\n{article.full_text}",
-                metadata={
-                    "source": article.source,
-                    "published_at": article.published_at.isoformat(),
-                    "url": article.url,
-                    "type": "NewsArticle",
-                    "symbols": ", ".join(article.symbols) if article.symbols else ""
-                }
-            )
-            
-            await self._process_single_document(doc)
-            logger.info(f"Successfully ingested NewsArticle: {article.article_id}")
-            return True
+            # data_manager.stream_data should be an async generator
+            async for news_batch in self.data_manager.stream_data(data_type='news'):
+                if not self._running:
+                    break
+                if not news_batch:
+                    await asyncio.sleep(1) # Wait if batch is empty
+                    continue
+                
+                # 修复：'NewsArticle' (拼写错误) 改为 'NewsData'
+                articles: List[NewsData] = [NewsData(**item) for item in news_batch]
+                
+                texts_to_embed = [self._format_news_for_embedding(art) for art in articles]
+                embeddings = await self.embedding_client.generate_embeddings(texts_to_embed)
+                
+                if not embeddings or len(embeddings) != len(articles):
+                    logger.warning("Mismatch between articles and generated embeddings count.")
+                    continue
+                    
+                # Prepare documents for vector store
+                documents = []
+                for art, emb in zip(articles, embeddings):
+                    doc = {
+                        "id": art.source_id,
+                        "text": texts_to_embed[art_index],
+                        "vector": emb,
+                        "metadata": {
+                            "symbol": art.symbols,
+                            "timestamp": art.timestamp.isoformat(),
+                            "source": art.source,
+                            "headline": art.headline
+                        }
+                    }
+                    documents.append(doc)
 
+                # Upsert (update or insert) documents into the vector store
+                await self.vector_store.upsert(documents)
+                logger.debug(f"Injected {len(documents)} news articles into VectorStore.")
+                
+        except asyncio.CancelledError:
+            logger.info("News stream processing cancelled.")
         except Exception as e:
-            logger.error(f"Error during NewsArticle injection for {article.article_id}: {e}", exc_info=True)
-            return False
+            logger.error(f"Error processing news stream: {e}", exc_info=True)
 
-    async def _process_single_document(self, doc: Document):
+    # 修复：'NewsArticle' (拼写错误) 改为 'NewsData'
+    def _format_news_for_embedding(self, article: NewsData) -> str:
         """
-        Processes a single Document object (which could be a chunk or a full doc).
+        Formats a news article object into a single string for embedding.
         """
+        # Combine key fields for better semantic meaning
+        return f"Headline: {article.headline}\nSource: {article.source}\nSummary: {article.summary or 'N/A'}\nContent: {article.content[:500]}..." # Truncate content
+
+    async def process_market_data_stream(self):
+        """
+        (Placeholder) Processes the market data stream.
+        This might involve calculating real-time features or landmarks
+        and storing them in the TemporalDB.
+        """
+        logger.info("Starting market data stream processing...")
         try:
-            # 1. Generate embedding for the document content
-            # This embedding represents the entire chunk/document
-            doc_embedding = await self.embedding_client.get_embedding(doc.content)
-            
-            if doc_embedding is None:
-                logger.warning(f"Failed to generate embedding for doc: {doc.doc_id}")
-                return
+            async for data_batch in self.data_manager.stream_data(data_type='market'):
+                if not self._running:
+                    break
+                if not data_batch:
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Example: Detect volatility spikes (a temporal event)
+                for data in data_batch:
+                    # (Logic to detect spike)
+                    is_spike = False 
+                    
+                    if is_spike:
+                        event = {
+                            "timestamp": data['timestamp'],
+                            "event_type": "volatility_spike",
+                            "symbol": data['symbol'],
+                            "metadata": {"volume": data['volume']}
+                        }
+                        # await self.temporal_db_client.insert_event(event) # Assumes we have this client
 
-            # 2. Store in VectorStore
-            await self.vector_store.upsert(
-                doc_id=doc.doc_id,
-                vector=doc_embedding,
-                text=doc.content,
-                metadata=doc.metadata
-            )
-            logger.debug(f"Upserted document chunk to VectorStore: {doc.doc_id}")
-
-            # 3. Extract and Store Knowledge Graph triples
-            # This is an async call to the RelationExtractor
-            triples = await self.relation_extractor.extract(doc.content)
-            
-            if triples:
-                await self.kg_service.add_triples(triples)
-                logger.debug(f"Added {len(triples)} triples to KG from doc: {doc.doc_id}")
-            else:
-                logger.debug(f"No triples extracted from doc: {doc.doc_id}")
-
+                pass # Placeholder
+        
+        except asyncio.CancelledError:
+            logger.info("Market data stream processing cancelled.")
         except Exception as e:
-            logger.error(f"Failed to process document {doc.doc_id}: {e}", exc_info=True)
-            # Re-raise to be caught by asyncio.gather
-            raise
+            logger.error(f"Error processing market data stream: {e}", exc_info=True)
 
-# Example of how this might be run (e.g., in a worker or script)
-async def main():
-    from config.system import load_config
-    from memory.vector_store import VectorStore
-    from knowledge_graph_service import KnowledgeGraphService
-    from ai.embedding_client import EmbeddingClient
-    from api.gemini_pool_manager import GeminiPoolManager
-    
-    # --- Configuration ---
-    config = load_config('config/system.yaml')
-    
-    # --- Dependencies ---
-    data_manager = DataManager(config, None) # Pass None for PipelineState if not needed
-    
-    vector_store = VectorStore(config.get('vector_store', {}))
-    await vector_store.initialize() # Initialize connection
-    
-    kg_service = KnowledgeGraphService(config.get('knowledge_graph', {}))
-    await kg_service.initialize() # Initialize connection
-    
-    gemini_pool = GeminiPoolManager(
-        api_key=os.environ.get("GEMINI_API_KEY"),
-        pool_size=config.get('llm', {}).get('gemini_pool_size', 5)
-    )
-    
-    embedding_client = EmbeddingClient(
-        gemini_pool=gemini_pool,
-        config=config.get('embedding_client', {})
-    )
-
-    # --- Injector ---
-    injector = KnowledgeInjector(
-        config=config,
-        data_manager=data_manager,
-        vector_store=vector_store,
-        kg_service=kg_service,
-        embedding_client=embedding_client,
-        gemini_pool=gemini_pool
-    )
-    
-    # --- Example Usage ---
-    
-    # 1. Inject a local file
-    filepath = "path/to/your/document.pdf"
-    if os.path.exists(filepath):
-        result_file = await injector.inject_document(filepath, source="local_pdf_upload")
-        print(result_file)
-    else:
-        print(f"File not found: {filepath}")
-
-    # 2. Inject a NewsArticle object (e.g., from a stream)
-    from datetime import datetime
-    sample_article = NewsArticle(
-        article_id="news_12345",
-        source="Financial Times",
-        headline="Major Tech Firm Announces Stock Split",
-        summary="A major tech firm announced a 5-for-1 stock split...",
-        full_text="...",
-        published_at=datetime.utcnow(),
-        url="https://example.com/news/12345",
-        symbols=["TECHCO"]
-    )
-    result_news = await injector.inject_news_article(sample_article)
-    print(f"News article injection success: {result_news}")
-
-    # --- Shutdown ---
-    await gemini_pool.close()
-    await kg_service.close()
-    logger.info("Shutdown complete.")
-
-if __name__ == "__main__":
-    # Note: Running this main requires an active event loop
-    # In a real scenario, this would be part of a larger async application
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.error(f"Failed to run KnowledgeInjector main: {e}")
