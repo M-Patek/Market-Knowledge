@@ -4,8 +4,10 @@ from datetime import datetime
 import json
 import os
 
-# 修复：路径从 'schemas.feature_schema' 改为 '..core.schemas.feature_schema'
-from ..core.schemas.feature_schema import FeatureDefinition
+# 修复：
+# 1. 导入 'Feature' 而不是 'FeatureDefinition'
+# 2. 导入路径从 'schemas.feature_schema' 改为 '..core.schemas.feature_schema'
+from ..core.schemas.feature_schema import Feature
 from ..monitor.logging import get_logger
 
 logger = get_logger(__name__)
@@ -31,7 +33,8 @@ class FeatureStore:
         self.config = config
         self.store_path = config.get('store_path', './feature_store_data')
         self.data_manager = data_manager
-        self.feature_definitions: Dict[str, FeatureDefinition] = {}
+        # 修复：使用 'Feature'
+        self.feature_definitions: Dict[str, Feature] = {}
         
         os.makedirs(self.store_path, exist_ok=True)
         self._load_definitions()
@@ -47,7 +50,8 @@ class FeatureStore:
             with open(def_path, 'r') as f:
                 defs_json = json.load(f)
                 for name, data in defs_json.items():
-                    self.feature_definitions[name] = FeatureDefinition(**data)
+                    # 修复：使用 'Feature'
+                    self.feature_definitions[name] = Feature(**data)
             logger.info(f"Loaded {len(self.feature_definitions)} feature definitions.")
         except Exception as e:
             logger.error(f"Error loading feature definitions: {e}")
@@ -66,7 +70,8 @@ class FeatureStore:
         except Exception as e:
             logger.error(f"Error saving feature definitions: {e}")
 
-    def register_feature(self, feature_def: FeatureDefinition):
+    # 修复：使用 'Feature'
+    def register_feature(self, feature_def: Feature):
         """
         Registers a new feature definition.
         """
@@ -90,9 +95,13 @@ class FeatureStore:
         # 1. Get required raw data
         # (This is simplified; real version needs date ranges, joins, etc.)
         try:
+            # 修复：假设 fdef 有 'lookback_days' 和 'computation_logic'
+            # 'Feature' schema 比较简单，我们从 fdef.metadata 中获取
+            lookback_days = fdef.metadata.get('lookback_days', 30) 
+            
             raw_data = await self.data_manager.get_historical_data(
                 symbol, 
-                start_date=end_date - pd.Timedelta(days=fdef.lookback_days + 5), # Add buffer
+                start_date=end_date - pd.Timedelta(days=lookback_days + 5), # Add buffer
                 end_date=end_date
             )
             if raw_data.empty:
@@ -105,17 +114,19 @@ class FeatureStore:
         # 2. Apply computation logic (Example: SMA)
         value = None
         try:
-            if fdef.computation_logic == 'SMA':
-                window = fdef.parameters.get('window', 20)
+            computation_logic = fdef.metadata.get('computation_logic', 'SMA') # 示例
+            
+            if computation_logic == 'SMA':
+                window = fdef.metadata.get('window', 20)
                 if len(raw_data) >= window:
                     value = raw_data['close'].rolling(window=window).mean().iloc[-1]
             
-            elif fdef.computation_logic == 'RSI':
+            elif computation_logic == 'RSI':
                 # Requires pandas_ta
                 pass # Placeholder
             
             else:
-                logger.warning(f"Computation logic '{fdef.computation_logic}' not implemented.")
+                logger.warning(f"Computation logic '{computation_logic}' not implemented.")
 
         except Exception as e:
             logger.error(f"Error during feature computation for {feature_name}: {e}")
@@ -150,8 +161,9 @@ class FeatureStore:
                 df.index.name = 'timestamp'
             
             # Add or update value
-            df.loc[timestamp, 'symbol'] = symbol
-            df.loc[timestamp, 'value'] = value
+            # 修正：确保索引是 Timestamp
+            df.loc[pd.Timestamp(timestamp), 'symbol'] = symbol
+            df.loc[pd.Timestamp(timestamp), 'value'] = value
             df = df[~df.index.duplicated(keep='last')] # Keep last value for timestamp
             
             df.to_csv(feature_file)
@@ -184,8 +196,8 @@ class FeatureStore:
                 # Filter for symbol and date range
                 symbol_df = df[
                     (df['symbol'] == symbol) & 
-                    (df.index >= start_date) & 
-                    (df.index <= end_date)
+                    (df.index >= pd.Timestamp(start_date)) & 
+                    (df.index <= pd.Timestamp(end_date))
                 ]
                 
                 if not symbol_df.empty:
