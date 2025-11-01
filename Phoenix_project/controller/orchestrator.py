@@ -51,3 +51,4 @@ class Orchestrator:
                 final_result.update(resolved_issues)
 
             return final_result # 这现在是一个 dict，匹配 Task 1 的输出
+
