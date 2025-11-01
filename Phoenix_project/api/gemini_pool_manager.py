@@ -1,7 +1,7 @@
 # Placeholder for Gemini client pool management
 
 # Configure logger for this module (Layer 12)
-from observability import get_logger
+from ..monitor.logging import get_logger # 修复：使用相对导入
 logger = get_logger(__name__)
 
 class GeminiPoolManager:
