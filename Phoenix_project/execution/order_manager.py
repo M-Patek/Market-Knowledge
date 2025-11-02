@@ -1,191 +1,114 @@
-import pandas as pd
-import numpy as np
-from typing import List, Dict, Any, Optional
-
+"""
+Order Manager
+- 接收 StrategySignal (目标投资组合)
+- 计算与当前持仓的差异
+- 生成并发送订单到 Broker Adapter
+- 跟踪订单状态
+"""
+from typing import Dict, List
+from monitor.logging import get_logger
+from .interfaces import IOrderManager, IBrokerAdapter, Order, Fill
 from .signal_protocol import StrategySignal
-from ..core.pipeline_state import PipelineState
 
-class Order:
+class OrderManager(IOrderManager):
     """
-    Represents a single execution order to be sent to a broker.
+    管理订单的生命周期，从信号生成到执行。
     """
-    def __init__(self, symbol: str, quantity: float, order_type: str = "MARKET", metadata: Dict = None):
-        self.symbol = symbol
-        self.quantity = quantity # Positive for buy, negative for sell
-        self.order_type = order_type
-        self.status = "NEW"
-        self.metadata = metadata or {}
-
-class OrderManager:
-    """
-    Responsible for translating a target portfolio (weights) into concrete
-    execution orders (shares).
     
-    It calculates the difference between the current portfolio and the target
-    portfolio and generates the necessary trades.
-    
-    In a live-trading version, this module would also manage order execution,
-    handle fills, and update the portfolio state. In this simulation,
-    it just generates the orders.
-    """
-
-    def __init__(self, config: Dict[str, Any]):
+    # 关键修正 (Error 4):
+    # 构造函数现在接受一个 Broker Adapter (依赖注入)
+    # 而不是在内部硬编码或不接受 adapter
+    def __init__(self, config: Dict, adapter: IBrokerAdapter):
         self.config = config
-        self.execution_config = config.get('execution_manager', {})
-        self.base_capital = config.get('base_capital', 1_000_000)
-        
-        # Slippage and commission simulation
-        self.simulate_costs = self.execution_config.get('simulate_costs', True)
-        self.slippage_bps = self.execution_config.get('slippage_basis_points', 5)
-        self.commission_per_share = self.execution_config.get('commission_per_share', 0.005)
+        self.adapter = adapter  # 存储注入的 adapter
+        self.logger = get_logger(self.__class__.__name__)
+        self.current_positions: Dict[str, float] = {} # (应从 adapter 加载)
+        self.active_orders: Dict[str, Order] = {}
+        self.logger.info(f"OrderManager initialized with adapter: {adapter.__class__.__name__}")
 
-    def generate_orders_from_signal(
-        self, 
-        signal: StrategySignal,
-        state: PipelineState
-    ) -> List[Order]:
-        """
-        Main entry point for the simulation.
-        Generates orders required to move from the current state to the target signal.
-        
-        Args:
-            signal (StrategySignal): The target portfolio state from the cognitive engine.
-            state (PipelineState): The current state of the system (portfolio, market data).
-            
-        Returns:
-            List[Order]: A list of orders to be "executed".
-        """
-        
-        orders = []
-        
-        # Get total portfolio value (Equity = Cash + Positions Value)
-        portfolio_value = self._calculate_portfolio_value(state)
-        
-        # Iterate over all assets defined in the signal (target portfolio)
-        for symbol, target_weight in signal.target_weights.items():
-            if symbol == 'CASH':
-                continue # Cash is handled implicitly
+    async def load_current_positions(self):
+        """从 Broker Adapter 加载当前持仓"""
+        try:
+            # (假设 adapter 有一个 get_positions 方法)
+            self.current_positions = await self.adapter.get_positions()
+            self.logger.info(f"Loaded positions: {self.current_positions}")
+        except Exception as e:
+            self.logger.error(f"Failed to load positions: {e}")
 
-            # 1. Calculate Target Position Value
-            target_value = portfolio_value * target_weight
+    async def generate_orders_from_signal(self, signal: StrategySignal):
+        """
+        根据信号(目标权重)和当前持仓计算并生成订单。
+        """
+        self.logger.info(f"Received signal: {signal.strategy_id} | Targets: {signal.target_weights}")
+        
+        # (确保持仓是最新的)
+        await self.load_current_positions()
+
+        # (获取总资产净值 - 假设)
+        total_equity = await self.adapter.get_total_equity() 
+        
+        orders_to_place: List[Order] = []
+        target_weights = signal.target_weights
+        
+        # (这是一个简化的差分逻辑)
+        # 1. 计算所有标的的目标美元价值
+        all_tickers = set(target_weights.keys()) | set(self.current_positions.keys())
+
+        for ticker in all_tickers:
+            target_weight = target_weights.get(ticker, 0.0)
+            target_value = total_equity * target_weight
             
-            # 2. Get Current Position Value
-            current_shares = state.portfolio.get(symbol, 0.0)
-            current_price = self._get_last_price(symbol, state)
+            current_value = self.current_positions.get(ticker, {}).get('market_value', 0.0)
             
-            if current_price is None:
-                # Can't trade if we don't have a price
-                print(f"[OrderManager] Warning: No price data for {symbol}. Skipping order generation.")
-                continue
-                
-            current_value = current_shares * current_price
+            delta_value = target_value - current_value
             
-            # 3. Calculate Delta
-            value_to_trade = target_value - current_value
-            
-            # 4. Convert Delta Value to Delta Shares
-            if abs(value_to_trade) > 0.01: # Avoid dust trades
-                shares_to_trade = value_to_trade / current_price
-                
-                # Simple rounding (a real system would be more complex)
-                quantity = round(shares_to_trade, 0) 
-                
-                if quantity != 0:
-                    order = Order(
-                        symbol=symbol,
-                        quantity=quantity,
-                        metadata={
-                            "target_weight": target_weight,
-                            "current_shares": current_shares,
-                            "target_value": target_value,
-                            "current_value": current_value,
-                            "price": current_price
-                        }
-                    )
-                    orders.append(order)
+            # (应用一个阈值，避免小额交易)
+            if abs(delta_value) > self.config.get('min_trade_value', 100): 
+                # (需要从 $ 转换到 数量 qty)
+                # (此处需要价格数据... 简化处理)
+                try:
+                    # (假设 adapter 有 get_last_price 方法)
+                    last_price = await self.adapter.get_last_price(ticker)
+                    if last_price <= 0:
+                        raise ValueError("Price is zero or negative")
+                        
+                    qty = delta_value / last_price
                     
-        return orders
+                    order = Order(
+                        ticker=ticker,
+                        qty=abs(qty),
+                        side="buy" if delta_value > 0 else "sell",
+                        order_type="market", # (或 "limit")
+                        # (limit_price=...)
+                    )
+                    orders_to_place.append(order)
+                    
+                except Exception as e:
+                    self.logger.error(f"Could not create order for {ticker}: {e}")
 
-    def simulate_execution(
-        self, 
-        orders: List[Order], 
-        state: PipelineState
-    ) -> (List[Dict[str, Any]], Dict[str, float]):
-        """
-        Simulates the execution of orders, applying slippage and commissions.
-        
-        Returns:
-            (List[Dict], Dict): A tuple of:
-            1. A list of "fill" records (dicts).
-            2. A dictionary of simulated costs (slippage, commissions).
-        """
-        if not self.simulate_costs:
-            return [], {"slippage_cost": 0, "commission_cost": 0}
+        # 2. 发送订单
+        await self.place_orders(orders_to_place)
 
-        fills = []
-        total_slippage_cost = 0
-        total_commission_cost = 0
-
+    async def place_orders(self, orders: List[Order]):
+        """将订单列表发送到 broker adapter"""
         for order in orders:
-            price = self._get_last_price(order.symbol, state)
-            if price is None:
-                continue
-            
-            # 1. Simulate Slippage
-            # Slippage is worse for the trader (buy higher, sell lower)
-            slippage_percent = (self.slippage_bps / 10000.0)
-            if order.quantity > 0: # Buy Order
-                fill_price = price * (1 + slippage_percent)
-                slippage_cost = (fill_price - price) * order.quantity
-            else: # Sell Order
-                fill_price = price * (1 - slippage_percent)
-                slippage_cost = (price - fill_price) * abs(order.quantity)
-                
-            total_slippage_cost += slippage_cost
+            try:
+                order_id = await self.adapter.place_order(order)
+                order.broker_order_id = order_id
+                self.active_orders[order_id] = order
+                self.logger.info(f"Placed order: {order.side} {order.qty} {order.ticker} | ID: {order_id}")
+            except Exception as e:
+                self.logger.error(f"Failed to place order for {order.ticker}: {e}")
 
-            # 2. Simulate Commission
-            commission = abs(order.quantity) * self.commission_per_share
-            total_commission_cost += commission
-            
-            # 3. Create fill record
-            fill_record = {
-                "symbol": order.symbol,
-                "quantity": order.quantity,
-                "execution_price": fill_price,
-                "ideal_price": price,
-                "slippage_cost": slippage_cost,
-                "commission_cost": commission,
-                "timestamp": state.timestamp
-            }
-            fills.append(fill_record)
-            
-        costs = {
-            "slippage_cost": total_slippage_cost,
-            "commission_cost": total_commission_cost,
-            "total_cost": total_slippage_cost + total_commission_cost
-        }
+    async def on_fill(self, fill_event: Fill):
+        """
+        处理来自 adapter 的订单成交事件。
+        """
+        self.logger.info(f"Received fill: {fill_event.status} {fill_event.filled_qty} {fill_event.ticker} @ {fill_event.avg_fill_price}")
+        # (更新持仓和活动订单列表)
+        if fill_event.order_id in self.active_orders:
+            if fill_event.status == "filled" or fill_event.status == "cancelled":
+                del self.active_orders[fill_event.order_id]
         
-        return fills, costs
-
-    def _calculate_portfolio_value(self, state: PipelineState) -> float:
-        """Calculates the total mark-to-market value of the portfolio."""
-        value = state.portfolio.get('CASH', self.base_capital)
-        
-        for symbol, shares in state.portfolio.items():
-            if symbol == 'CASH':
-                continue
-            price = self._get_last_price(symbol, state)
-            if price is not None:
-                value += shares * price
-                
-        return value
-
-    def _get_last_price(self, symbol: str, state: PipelineState) -> Optional[float]:
-        """Safely retrieves the last known price for a symbol."""
-        if symbol in state.market_data:
-            # Get the most recent TickerData object for this symbol
-            # Assuming state.market_data[symbol] is a list of TickerData, sorted by time
-            if state.market_data[symbol]:
-                return state.market_data[symbol][-1].close
-        
-        return None # No price data available
+        # (需要更新 self.current_positions)
+        await self.load_current_positions() 
