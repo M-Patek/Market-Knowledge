@@ -1,123 +1,117 @@
 from typing import Dict, Any, Optional
-
-# 修正：[FIX-ImportError]
-# 将所有 `..` 相对导入更改为从项目根目录开始的绝对导入，
-# 以匹配项目的标准约定 (如 phoenix_project.py 中所设定的)。
 from core.pipeline_state import PipelineState
-from core.schemas.fusion_result import FusionResult
-from ai.metacognitive_agent import MetacognitiveAgent
-# 'portfolio_constructor' 在同一目录 'cognitive/' 下，
-# 使用相对导入 `.` 是可以的，但为了统一，我们也使用绝对导入。
-from cognitive.portfolio_constructor import PortfolioConstructor, Portfolio
-from execution.signal_protocol import StrategySignal
+from ai.reasoning_ensemble import ReasoningEnsemble
+from evaluation.voter import Voter
+from evaluation.fact_checker import FactChecker
+from fusion.uncertainty_guard import UncertaintyGuard
 from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 class CognitiveEngine:
     """
-    The Cognitive Engine is the "brain" of the strategy.
-    It encapsulates the MetacognitiveAgent (which runs the AI pipeline)
-    and the PortfolioConstructor (which translates AI decisions into targets).
+    The "brain" of the system. This engine orchestrates the high-level
+    cognitive tasks: reasoning, evaluation, and decision-making.
     
-    Its main job is to take the current system state and an AI's fusion result,
-    and output a concrete StrategySignal (target portfolio weights).
+    It does *not* handle data ingestion or execution, but it receives
+    data from the PipelineState and its output (a FusionResult) is
+    used to generate signals.
     """
 
     def __init__(
         self,
-        config: Dict[str, Any],
-        metacognitive_agent: MetacognitiveAgent,
-        portfolio_constructor: PortfolioConstructor
+        reasoning_ensemble: ReasoningEnsemble,
+        fact_checker: FactChecker,
+        uncertainty_guard: UncertaintyGuard,
+        voter: Voter, # Example of another evaluation component
+        config: Dict[str, Any]
     ):
-        """
-        Initializes the CognitiveEngine.
-        
-        Args:
-            config: The main strategy configuration.
-            metacognitive_agent: The agent responsible for AI reasoning (RAG, ensemble, etc.).
-            portfolio_constructor: The module that builds the target portfolio.
-        """
+        self.reasoning_ensemble = reasoning_ensemble
+        self.fact_checker = fact_checker
+        self.uncertainty_guard = uncertainty_guard
+        self.voter = voter
         self.config = config
-        self.metacognitive_agent = metacognitive_agent
-        self.portfolio_constructor = portfolio_constructor
+        
+        # Thresholds from config
+        self.fact_check_threshold = self.config.get("fact_check_threshold", 0.7)
+        self.uncertainty_threshold = self.config.get("uncertainty_threshold", 0.6)
+        
         logger.info("CognitiveEngine initialized.")
 
-    async def run_cognitive_pipeline(
-        self, 
-        state: PipelineState
-    ) -> Optional[FusionResult]:
+    async def process_cognitive_cycle(self, pipeline_state: PipelineState) -> Dict[str, Any]:
         """
-        Runs the full AI reasoning pipeline on the *triggering event*
-        found in the current state.
+        Executes one full cognitive cycle.
         
-        Args:
-            state: The current PipelineState (must contain a 'triggering_event').
-            
-        Returns:
-            Optional[FusionResult]: The output from the MetacognitiveAgent,
-                                    or None if no event was processed.
+        1. Run the reasoning ensemble to get a preliminary decision.
+        2. (Optional) Fact-check the reasoning.
+        3. (Optional) Run other evaluations (e.gen., Voter).
+        4. Apply uncertainty guardrail to the final decision.
+        5. Return the final, guarded decision and related artifacts.
         """
+        logger.info("Starting cognitive cycle...")
         
-        if not state.triggering_event:
-            logger.warning("Cognitive pipeline run skipped: No triggering event in state.")
-            return None
+        # 1. Run Reasoning Ensemble
+        try:
+            fusion_result = await self.reasoning_ensemble.reason(pipeline_state)
+        except Exception as e:
+            logger.error(f"Cognitive cycle failed: ReasoningEnsemble error: {e}", exc_info=True)
+            return {"error": f"ReasoningEnsemble failed: {e}"}
             
-        logger.debug(f"Running cognitive pipeline for event: {state.triggering_event.event_id}")
+        pipeline_state.update_value("last_fusion_result", fusion_result)
         
-        # The MetacognitiveAgent handles RAG, the agent ensemble,
-        # fact-checking, arbitration, and uncertainty calculation.
-        fusion_result = await self.metacognitive_agent.process_event(
-            event=state.triggering_event,
-            market_context=state.get_all_market_data_as_list() # Provide all market data
-        )
+        # 2. Fact-check the reasoning (if confidence is high enough)
+        fact_check_report = None
+        if fusion_result.confidence >= self.fact_check_threshold:
+            logger.info("Running fact-checker on high-confidence reasoning...")
+            try:
+                fact_check_report = await self.fact_checker.check_facts(
+                    fusion_result.reasoning
+                )
+                pipeline_state.update_value("last_fact_check", fact_check_report)
+                
+                # TODO: Act on the fact-check report.
+                # If "support" is "Refuted", we should probably
+                # override the decision.
+                if fact_check_report.get("overall_support") == "Refuted":
+                    logger.warning("Fact-checker refuted reasoning! Overriding decision.")
+                    # This is a simple override. A better system might re-run
+                    # reasoning with the new info.
+                    fusion_result.final_decision = "HOLD"
+                    fusion_result.reasoning += "\n\n[OVERRIDE]: Original reasoning was refuted by fact-checker."
+                    fusion_result.confidence = 0.9 # High confidence in the HOLD
+                    
+            except Exception as e:
+                logger.error(f"Fact-checker failed: {e}", exc_info=True)
+                # Non-fatal, proceed with original decision
         
-        return fusion_result
+        # 3. Apply Uncertainty Guardrail
+        logger.info("Applying uncertainty guardrail...")
+        try:
+            guarded_decision = self.uncertainty_guard.apply_guardrail(
+                fusion_result,
+                threshold=self.uncertainty_threshold
+            )
+            
+            if guarded_decision.final_decision != fusion_result.final_decision:
+                logger.warning(
+                    f"Uncertainty guardrail triggered! "
+                    f"Original decision '{fusion_result.final_decision}' (Conf: {fusion_result.confidence:.2f}) "
+                    f"changed to '{guarded_decision.final_decision}'."
+                )
+                
+            pipeline_state.update_value("last_guarded_decision", guarded_decision)
+        
+        except Exception as e:
+            logger.error(f"Uncertainty guardrail failed: {e}", exc_info=True)
+            # Fatal error in a safety component. Default to HOLD.
+            guarded_decision = fusion_result
+            guarded_decision.final_decision = "ERROR_HOLD"
+            guarded_decision.reasoning = f"Uncertainty guard failed: {e}"
+            guarded_decision.confidence = 0.0
 
-    def generate_target_signal(
-        self,
-        state: PipelineState,
-        fusion_result: FusionResult
-    ) -> StrategySignal:
-        """
-        Generates the target portfolio weights based on the AI's decision.
+        logger.info(f"Cognitive cycle complete. Final decision: {guarded_decision.final_decision}")
         
-        Args:
-            state: The current PipelineState.
-            fusion_result: The output from the cognitive pipeline run.
-            
-        Returns:
-            StrategySignal: A standardized signal object with target weights.
-        """
-        
-        logger.debug(f"Generating target signal for event: {fusion_result.event_id}")
-        
-        # The PortfolioConstructor translates the (qualitative) AI decision
-        # and (quantitative) uncertainty score into a (quantitative)
-        # target portfolio (e.g., {"AAPL": 0.1, "CASH": 0.9}).
-        portfolio: Portfolio = self.portfolio_constructor.generate_optimized_portfolio(
-            state=state,
-            fusion_result=fusion_result
-        )
-        
-        # Package the portfolio into a standard StrategySignal
-        signal = StrategySignal(
-            strategy_id=state.strategy_name,
-            timestamp=state.timestamp,
-            target_weights=portfolio.weights,
-            metadata={
-                "event_id": fusion_result.event_id,
-                "ai_decision": fusion_result.final_decision.decision,
-                "ai_confidence": fusion_result.final_decision.confidence,
-                "cognitive_uncertainty": fusion_result.cognitive_uncertainty,
-                **portfolio.metadata # Include metadata from portfolio construction
-            }
-        )
-        
-        logger.info(f"Generated signal for {fusion_result.event_id}: "
-                    f"Decision: {signal.metadata['ai_decision']}, "
-                    f"Uncertainty: {signal.metadata['cognitive_uncertainty']:.2f}")
-        
-        return signal
-
-}
+        return {
+            "final_decision": guarded_decision, # This is a FusionResult object
+            "fact_check_report": fact_check_report
+        }
