@@ -1,92 +1,79 @@
+# Docker Compose for Phoenix Project
 version: '3.8'
 
 services:
-  db:
-    image: postgres:15
-    container_name: phoenix_db
+  
+  rabbitmq:
+    image: "rabbitmq:3.10-management"
     ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_USER=${DB_USER}
-      - POSTGRES_PASSWORD=${DB_PASSWORD}
-      - POSTGRES_DB=${DB_NAME}
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
     volumes:
-      - phoenix_db_data:/var/lib/postgresql/data
+      - rabbitmq_data:/var/lib/rabbitmq/
+    networks:
+      - phoenix_net
 
   redis:
-    image: redis:7-alpine
-    container_name: phoenix_redis
+    image: "redis:7.0-alpine"
     ports:
       - "6379:6379"
     volumes:
-      - phoenix_redis_data:/data
-
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: phoenix_api
-    env_file:
-      - .env
-    ports:
-      - "8000:8000"
-    depends_on:
-      - db
-      - redis
-    # 修复：
-    # 1. 移除了不必要的 "api." 前缀 (因为工作目录已是 /app)
-    # 2. 将目标从 :create_app() (工厂模式) 更改为 :app (实例模式)
-    #    以匹配 api/gateway.py 中的定义
-    command: gunicorn --bind 0.0.0.0:8000 interfaces.api_server:app
-    volumes:
-      - .:/app
-    environment:
-      - PYTHONUNBUFFERED=1
-      - PYTHONPATH=/app
+      - redis_data:/data
+    networks:
+      - phoenix_net
 
   worker:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: phoenix_worker
-    env_file:
-      - .env
+    command: >
+      celery
+        -A worker worker
+        --loglevel=INFO
+        -Q cognitive_workflow
+        -c 1 # (并发数 1)
     depends_on:
+      - rabbitmq
       - redis
-      - db
-    # 修复：[FIX-4] Celery app 实例在 'worker.py' 中名为 'app'，
-    # 而不是 'worker.celery_app'
-    command: celery -A worker:app worker --loglevel=info
+    env_file:
+      - .env # (确保 .env 文件存在)
+    networks:
+      - phoenix_net
     volumes:
-      - .:/app
-    environment:
-      - PYTHONUNBUFFERED=1
-      - PYTHONPATH=/app
+      - .:/app # (将当前目录挂载到 /app)
 
-  monitor:
-    image: prom/prometheus
-    container_name: phoenix_monitor
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
-
-  jupyter:
+  api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: phoenix_jupyter
+    
+    # 关键修正 (Error 10):
+    # Gunicorn 的入口点必须是定义了全局 'app' 实例的文件。
+    # 'interfaces.api_server:app' 是错误的，因为 'app' 在类内部。
+    # 'api.gateway:app' 是正确的 FastAPI 入口点。
+    command: >
+      gunicorn
+        -k uvicorn.workers.UvicornWorker
+        -w 4
+        -b 0.0.0.0:8000
+        api.gateway:app
+        
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - rabbitmq
     env_file:
       - .env
-    ports:
-      - "8888:8888"
-    command: jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token=''
+    networks:
+      - phoenix_net
     volumes:
       - .:/app
-    depends_on:
-      - db
-      - redis
+
+networks:
+  phoenix_net:
+    driver: bridge
 
 volumes:
-  phoenix_db_data:
-  phoenix_redis_data:
+  rabbitmq_data:
+  redis_data:
