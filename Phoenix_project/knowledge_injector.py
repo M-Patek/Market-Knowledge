@@ -1,8 +1,10 @@
 import asyncio
 from typing import Dict, Any, List
 
-from .monitor.logging import get_logger
-from .memory.vector_store import VectorStore
+# 修复：将相对导入 'from .monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
+# 修复：将相对导入 'from .memory.vector_store...' 更改为绝对导入
+from memory.vector_store import VectorStore
 # from .knowledge_graph_service import KnowledgeGraphService
 # from .ai.relation_extractor import RelationExtractor
 
