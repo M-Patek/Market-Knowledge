@@ -1,88 +1,83 @@
-"""
-Arbitrator Module.
+from typing import List, Dict, Any
+from ai.prompt_manager import PromptManager
+from api.gateway import APIGateway
+from ai.metacognitive_agent import MetacognitiveAgent
+from core.schemas.fusion_result import AgentDecision
+from monitor.logging import get_logger
 
-This component is responsible for resolving conflicts when the Synthesizer
-reports high cognitive uncertainty. It can trigger a secondary, more
-focused cognitive loop.
-"""
-import logging
-from typing import List, Optional
-
-# 修复：使用正确的相对导入
-from ..core.schemas.fusion_result import FusionResult, AgentDecision
-from ..ai.metacognitive_agent import MetacognitiveAgent
-from ..ai.ensemble_client import EnsembleClient
-
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class Arbitrator:
     """
-    Handles high-uncertainty scenarios by invoking a meta-cognitive agent
-    or a specialized "Arbitrator" agent to make a final decision.
+    A specialized evaluation agent that resolves conflicts between
+    the decisions of other AI agents.
+    
+    It uses a MetacognitiveAgent to perform the core analysis.
     """
 
-    def __init__(self, 
-                 uncertainty_threshold: float,
-                 meta_agent: MetacognitiveAgent):
-        """
-        Initializes the Arbitrator.
+    def __init__(
+        self,
+        api_gateway: APIGateway,
+        prompt_manager: PromptManager,
+        metacognitive_agent: MetacognitiveAgent
+    ):
+        self.api_gateway = api_gateway
+        self.prompt_manager = prompt_manager
+        self.metacognitive_agent = metacognitive_agent
+        self.prompt_name = "arbitrate_decisions" # Specific prompt
+        logger.info("Arbitrator initialized.")
 
+    async def arbitrate(self, context: str, agent_decisions: List[AgentDecision]) -> Dict[str, Any]:
+        """
+        Analyzes conflicting agent decisions and suggests a final,
+        arbitrated decision.
+        
         Args:
-            uncertainty_threshold: The cognitive uncertainty level (0.0 to 1.0)
-                                   above which arbitration is triggered.
-            meta_agent: A strong "Arbitrator" LLM agent, passed as a
-                        MetacognitiveAgent instance, to resolve the conflict.
-        """
-        self.uncertainty_threshold = uncertainty_threshold
-        self.meta_agent = meta_agent
-        if not self.meta_agent:
-            raise ValueError("Arbitrator requires a MetacognitiveAgent to function.")
-            
-        logger.info(f"Arbitrator initialized with threshold: {self.uncertainty_threshold}")
-
-    async def needs_arbitration(self, fusion_result: FusionResult) -> bool:
-        """
-        Checks if the given fusion result exceeds the uncertainty threshold.
-        """
-        needs_arbitration = fusion_result.cognitive_uncertainty > self.uncertainty_threshold
-        if needs_arbitration:
-            logger.warning(f"Arbitration needed: Uncertainty {fusion_result.cognitive_uncertainty:.3f} "
-                           f"> threshold {self.uncertainty_threshold:.3f}")
-        return needs_arbitration
-
-    async def resolve_conflict(self, 
-                               event_context: dict, 
-                               conflicting_decisions: List[AgentDecision]) -> Optional[dict]:
-        """
-        Invokes the MetacognitiveAgent to analyze the conflicting decisions
-        and produce a final, overriding judgment.
-
-        Args:
-            event_context: The original event and RAG context.
-            conflicting_decisions: The list of decisions that caused the conflict.
+            context (str): The shared context provided to all agents.
+            agent_decisions (List[AgentDecision]): The outputs from the AI ensemble.
 
         Returns:
-            A dictionary containing the arbitrator's final decision, or None.
+            Dict[str, Any]: A structured response, e.g.:
+            {
+                "summary_critique": "...",
+                "identified_biases": ["..."],
+                "suggested_decision": "BUY/SELL/HOLD",
+                "confidence": 0.0-1.0,
+                "reasoning": "..."
+            }
         """
-        logger.info(f"Resolving conflict for {len(conflicting_decisions)} decisions...")
         
+        # Check if there is actual conflict
+        decisions = {d.decision for d in agent_decisions}
+        if len(decisions) <= 1:
+            logger.info("Arbitrator: No conflict found. Skipping full arbitration.")
+            # Return a simple "no conflict" response
+            first_decision = agent_decisions[0]
+            return {
+                "summary_critique": "No significant conflict detected among agents.",
+                "identified_biases": [],
+                "suggested_decision": first_decision.decision,
+                "confidence": first_decision.confidence,
+                "reasoning": "Consensus was achieved by the ensemble."
+            }
+
+        logger.info(f"Arbitrator: Conflict detected ({decisions}). Running metacognitive analysis.")
+        
+        # Use the metacognitive agent with the "arbitrate_decisions" prompt
         try:
-            # The MetacognitiveAgent's "synthesize" method is used here
-            # with a prompt designed for arbitration (e.g., "arbitrator.json").
-            arbitrated_result = await self.meta_agent.synthesize(
-                event_context=event_context,
-                agent_decisions=conflicting_decisions
+            arbitration_result = await self.metacognitive_agent.critique_reasoning(
+                context=context,
+                agent_decisions=agent_decisions,
+                prompt_name=self.prompt_name
             )
+            return arbitration_result
             
-            if arbitrated_result:
-                logger.info("Conflict resolved by Arbitrator.")
-                # This result is expected to contain the fields
-                # 'fused_rationale', 'fused_sentiment', etc.
-                return arbitrated_result
-            else:
-                logger.error("Arbitrator meta-agent failed to produce a result.")
-                return None
-                
         except Exception as e:
-            logger.error(f"Error during conflict resolution: {e}", exc_info=True)
-            return None
+            logger.error(f"Error during arbitration: {e}", exc_info=True)
+            return {
+                "summary_critique": "Arbitration failed due to an internal error.",
+                "identified_biases": [],
+                "suggested_decision": "ERROR_HOLD",
+                "confidence": 0.0,
+                "reasoning": f"Arbitration failed: {e}"
+            }
