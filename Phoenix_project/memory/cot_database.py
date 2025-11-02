@@ -1,245 +1,173 @@
-"""
-CoT (Chain-of-Thought) Database
-
-Handles the saving and retrieval of the *entire* decision-making
-process (the "Chain of Thought") for auditability and review.
-
-This includes:
-1. The triggering event.
-2. The RAG evidence context provided.
-3. The individual agent decisions.
-4. The final fused result.
-
-Uses a PostgreSQL database (via asyncpg) for structured, reliable,
-and relational storage of these audit logs.
-"""
-import logging
-import asyncpg
-import json
+from typing import Dict, Any, Optional, List
 from datetime import datetime
-from typing import List, Dict, Any, Optional
-import uuid
+import asyncio
+import aiofiles
+import json
+import os
 
-# 修复：添加 pandas 导入
-import pandas as pd
+from core.schemas.fusion_result import FusionResult
+from monitor.logging import ESLogger
 
-# 修复：添加 FusionResult 导入 (用于类型提示)
-from ..core.schemas.fusion_result import FusionResult
-from ..core.schemas.data_schema import MarketEvent
-
-logger = logging.getLogger(__name__)
 
 class CoTDatabase:
     """
-    Manages the connection and read/write operations for the
-    PostgreSQL audit database.
+    A simple filesystem-based database to store the Chain-of-Thought (CoT)
+    reasoning traces (FusionResult objects) for auditing and analysis.
+
+    In a production system, this would be replaced by a robust database
+    (e.g., MongoDB, BigQuery, or a dedicated audit store).
     """
 
-    def __init__(self, database_url: str):
+    def __init__(self, config: Dict[str, Any], logger: ESLogger):
         """
         Initializes the CoTDatabase.
 
         Args:
-            database_url: The connection string for the PostgreSQL database
-                          (e.g., "postgresql://user:pass@host:port/db")
+            config: A dictionary containing configuration,
+                    specifically `db_path`.
+            logger: An instance of ESLogger for logging.
         """
-        self.database_url = database_url
-        self._pool: asyncpg.Pool = None
-        logger.info("CoTDatabase initialized.")
+        self.db_path = config.get("db_path", "./audit_traces")
+        self.logger = logger
+        self.lock = asyncio.Lock()
 
-    async def connect(self):
-        """Establishes the database connection pool."""
-        if not self._pool:
-            try:
-                self._pool = await asyncpg.create_pool(self.database_url)
-                logger.info("CoTDatabase connection pool established.")
-                await self.setup_schema()
-            except Exception as e:
-                logger.error(f"Failed to connect to CoTDatabase: {e}", exc_info=True)
-                self._pool = None
-                raise
+        # Ensure the database directory exists
+        try:
+            os.makedirs(self.db_path, exist_ok=True)
+            self.logger.log_info(
+                f"CoTDatabase initialized. Storage path: {self.db_path}"
+            )
+        except OSError as e:
+            self.logger.log_error(
+                f"Failed to create CoTDatabase directory at {self.db_path}: {e}",
+                exc_info=True,
+            )
+            raise
 
-    async def disconnect(self):
-        """Closes the database connection pool."""
-        if self._pool:
-            await self._pool.close()
-            self._pool = None
-            logger.info("CoTDatabase connection pool closed.")
+    def _get_filepath(self, event_id: str) -> str:
+        """Helper to get the file path for a given event ID."""
+        # Sanitize event_id to prevent path traversal issues
+        filename = "".join(c for c in event_id if c.isalnum() or c in ("-", "_", "."))
+        if not filename:
+            filename = f"invalid_event_id_{hash(event_id)}"
+        return os.path.join(self.db_path, f"{filename}.json")
 
-    async def execute(self, query: str, *args):
-        """Executes a query without returning results."""
-        if not self._pool:
-            raise ConnectionError("Database not connected. Call connect() first.")
-        async with self._pool.acquire() as conn:
-            await conn.execute(query, *args)
-
-    async def fetch(self, query: str, *args) -> List[asyncpg.Record]:
-        """Executes a query and returns all results."""
-        if not self._pool:
-            raise ConnectionError("Database not connected. Call connect() first.")
-        async with self._pool.acquire() as conn:
-            return await conn.fetch(query, *args)
-
-    async def fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
-        """Executes a query and returns a single result."""
-        if not self._pool:
-            raise ConnectionError("Database not connected. Call connect() first.")
-        async with self._pool.acquire() as conn:
-            return await conn.fetchrow(query, *args)
-
-    async def setup_schema(self):
+    async def store_trace(
+        self, event_id: str, trace_data: Dict[str, Any]
+    ) -> bool:
         """
-        Ensures the required tables for auditing exist.
-        """
-        logger.info("Setting up database schema...")
-        
-        # Table for the main pipeline run
-        await self.execute("""
-        CREATE TABLE IF NOT EXISTS pipeline_runs (
-            run_id UUID PRIMARY KEY,
-            run_timestamp TIMESTAMPTZ NOT NULL,
-            event_id VARCHAR(255),
-            task_name VARCHAR(255)
-        );
-        """)
-        
-        # Table for the triggering market events
-        await self.execute("""
-        CREATE TABLE IF NOT EXISTS market_events (
-            event_id VARCHAR(255) PRIMARY KEY,
-            source VARCHAR(100),
-            timestamp TIMESTAMPTZ NOT NULL,
-            content TEXT,
-            metadata JSONB
-        );
-        """)
-        
-        # Table for the retrieved evidence context
-        await self.execute("""
-        CREATE TABLE IF NOT EXISTS evidence_context (
-            run_id UUID PRIMARY KEY REFERENCES pipeline_runs(run_id),
-            retrieval_timestamp TIMESTAMPTZ NOT NULL,
-            vector_hits JSONB,
-            temporal_hits JSONB,
-            tabular_hits JSONB
-        );
-        """)
-        
-        # Table for the final fusion result
-        await self.execute("""
-        CREATE TABLE IF NOT EXISTS fusion_results (
-            run_id UUID PRIMARY KEY REFERENCES pipeline_runs(run_id),
-            fusion_timestamp TIMESTAMPTZ NOT NULL,
-            fused_confidence FLOAT,
-            fused_sentiment FLOAT,
-            fused_predicted_impact FLOAT,
-            cognitive_uncertainty FLOAT,
-            fused_rationale TEXT,
-            contributing_decisions JSONB
-        );
-        """)
-        
-        logger.info("Database schema setup complete.")
-
-    async def log_market_event(self, event: MarketEvent):
-        """
-        Logs a market event to the database.
-        Uses ON CONFLICT DO NOTHING to avoid duplicates.
-        """
-        query = """
-        INSERT INTO market_events (event_id, source, timestamp, content, metadata)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (event_id) DO NOTHING;
-        """
-        await self.execute(
-            query,
-            event.event_id,
-            event.source,
-            event.timestamp,
-            event.content,
-            json.dumps(event.metadata) if event.metadata else None
-        )
-
-    async def log_pipeline_run(self, 
-                               event: Optional[MarketEvent], 
-                               task_name: Optional[str],
-                               evidence: Dict[str, Any],
-                               # 修复：为 FusionResult 添加类型提示
-                               fusion_result: FusionResult
-                               ) -> str:
-        """
-        Logs a complete pipeline run in a single transaction.
+        Stores the full reasoning trace (FusionResult) for a given event.
 
         Args:
-            event: The triggering MarketEvent (if any).
-            task_name: The name of the scheduled task (if any).
-            evidence: The dictionary of RAG context.
-            fusion_result: The final FusionResult object.
+            event_id: The unique identifier for the event.
+            trace_data: The FusionResult object (as a dictionary).
 
         Returns:
-            The unique run_id for this logged run.
+            True if storage was successful, False otherwise.
         """
-        if not self._pool:
-            raise ConnectionError("Database not connected. Call connect() first.")
-            
-        run_id = uuid.uuid4()
-        # 修复：使用 pd.Timestamp.now()
-        now = pd.Timestamp.now(tz='UTC').to_pydatetime()
-        event_id = event.event_id if event else None
+        if not event_id:
+            self.logger.log_warning("store_trace called with empty event_id. Skipping.")
+            return False
 
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
+        filepath = self._get_filepath(event_id)
+        self.logger.log_debug(f"Storing trace for event {event_id} to {filepath}")
+
+        try:
+            async with self.lock:
+                async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
+                    # We serialize the Pydantic model (passed as dict)
+                    await f.write(json.dumps(trace_data, indent=2, default=str))
+            self.logger.log_info(f"Successfully stored trace for event {event_id}.")
+            return True
+        except Exception as e:
+            self.logger.log_error(
+                f"Failed to store trace for event {event_id}: {e}", exc_info=True
+            )
+            return False
+
+    async def retrieve_trace(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves the reasoning trace for a specific event ID.
+
+        Args:
+            event_id: The unique identifier for the event.
+
+        Returns:
+            The stored trace dictionary if found, otherwise None.
+        """
+        filepath = self._get_filepath(event_id)
+        self.logger.log_debug(f"Retrieving trace for event {event_id} from {filepath}")
+
+        if not os.path.exists(filepath):
+            self.logger.log_warning(f"No trace found for event {event_id} at {filepath}")
+            return None
+
+        try:
+            async with aiofiles.open(filepath, "r", encoding="utf-8") as f:
+                data = await f.read()
+            return json.loads(data)
+        except Exception as e:
+            self.logger.log_error(
+                f"Failed to retrieve or parse trace for event {event_id}: {e}",
+                exc_info=True,
+            )
+            return None
+
+    # --- Methods for AuditViewer (Inefficient examples) ---
+
+    async def query_by_time(
+        self, start_time: datetime, end_time: datetime, limit: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Inefficiently queries traces by time.
+        WARNING: This is a placeholder. It scales poorly.
+        """
+        self.logger.log_warning("query_by_time is highly inefficient on filesystem DB.")
+        traces = []
+        all_files = await self.get_all_keys()
+        
+        for event_id in all_files:
+            if len(traces) >= limit:
+                break
+            trace = await self.retrieve_trace(event_id)
+            if trace and "timestamp" in trace:
                 try:
-                    # 1. Log the market event (if it exists)
-                    if event:
-                        await self.log_market_event(event) # Uses internal execute
-
-                    # 2. Log the pipeline run
-                    await conn.execute(
-                        """
-                        INSERT INTO pipeline_runs (run_id, run_timestamp, event_id, task_name)
-                        VALUES ($1, $2, $3, $4)
-                        """,
-                        run_id, now, event_id, task_name
-                    )
+                    # Assuming timestamp is in a standard ISO format
+                    ts_str = trace["timestamp"]
+                    # Handle potential timezone info
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                     
-                    # 3. Log the evidence
-                    await conn.execute(
-                        """
-                        INSERT INTO evidence_context (run_id, retrieval_timestamp, vector_hits, temporal_hits, tabular_hits)
-                        VALUES ($1, $2, $3, $4, $5)
-                        """,
-                        run_id,
-                        evidence.get('retrieval_timestamp', now),
-                        json.dumps(evidence.get('vector_hits', [])),
-                        json.dumps(evidence.get('temporal_hits', [])),
-                        json.dumps(evidence.get('tabular_hits', []))
-                    )
+                    # Make sure times are comparable (e.g., all aware or all naive)
+                    # This is a complex topic, simplified here.
+                    if (
+                        ts.tzinfo is None
+                        and start_time.tzinfo is not None
+                        and end_time.tzinfo is not None
+                    ):
+                        # A-hoc: assume trace timestamp is UTC if others are
+                        ts = ts.replace(tzinfo=datetime.timezone.utc)
                     
-                    # 4. Log the fusion result
-                    await conn.execute(
-                        """
-                        INSERT INTO fusion_results (run_id, fusion_timestamp, fused_confidence, 
-                                                    fused_sentiment, fused_predicted_impact, 
-                                                    cognitive_uncertainty, fused_rationale, 
-                                                    contributing_decisions)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                        """,
-                        run_id,
-                        fusion_result.fusion_timestamp,
-                        fusion_result.fused_confidence,
-                        fusion_result.fused_sentiment,
-                        fusion_result.fused_predicted_impact,
-                        fusion_result.cognitive_uncertainty,
-                        fusion_result.fused_rationale,
-                        # Convert list of Pydantic models to list of dicts for JSON
-                        json.dumps([d.dict() for d in fusion_result.contributing_decisions])
-                    )
-                    
-                    logger.info(f"Successfully logged pipeline run: {run_id}")
-                    return str(run_id)
-
+                    if start_time <= ts <= end_time:
+                        traces.append(trace)
                 except Exception as e:
-                    logger.error(f"Failed to log pipeline run (transaction rolled back): {e}", exc_info=True)
-                    # Transaction is automatically rolled back
-                    raise
+                    self.logger.log_warning(
+                        f"Could not parse timestamp for event {event_id}: {e}"
+                    )
+        return traces
+
+    async def get_all_keys(self) -> List[str]:
+        """
+        Inefficiently gets all event IDs (filenames).
+        WARNING: This is a placeholder.
+        """
+        try:
+            async with self.lock:
+                files = [
+                    f.replace(".json", "")
+                    for f in os.listdir(self.db_path)
+                    if f.endswith(".json")
+                ]
+            return files
+        except Exception as e:
+            self.logger.log_error(f"Failed to list all keys in CoTDatabase: {e}")
+            return []
