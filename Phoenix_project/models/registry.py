@@ -6,11 +6,9 @@ from typing import Dict, Any
 import os
 
 # --- [修复] ---
-# 原: from ..monitor.logging import get_logger
-# 新: from ..monitor.logging import get_logger (models/ -> Phoenix_project/ -> monitor/)
-# 导入路径 '..' 依然正确
+# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
 # --- [修复结束] ---
-from ..monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
