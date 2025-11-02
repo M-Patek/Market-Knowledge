@@ -1,93 +1,94 @@
-from typing import Dict, Any, Optional
-from core.pipeline_state import PipelineState
+"""
+事件风险过滤器
+在事件进入认知引擎之前，对其进行初步过滤。
+(例如：过滤掉不相关的符号、低可信度来源的新闻)
+"""
+from typing import List, Dict, Any
+from config.loader import ConfigLoader
+
+# FIX (E1): 导入统一后的核心模式
 from core.schemas.data_schema import MarketData, NewsData
-from monitor.logging import get_logger
 
-logger = get_logger(__name__)
-
-class RiskFilter:
+class EventRiskFilter:
     """
-    A specialized event subscriber that listens to raw data events
-    and flags high-risk data (e.g., flash crashes, suspicious news).
+    根据 config/event_filter_config.yaml 中的规则过滤传入的事件。
+    """
     
-    This acts as an early warning system before the CognitiveEngine.
-    """
+    def __init__(self, config_loader: ConfigLoader):
+        self.config = config_loader.get_event_filter_config()
+        self.log_prefix = "EventRiskFilter:"
+        
+        self.min_news_confidence = self.config.get("min_news_confidence", 0.0)
+        self.allowed_sources = set(self.config.get("allowed_sources", []))
+        self.blocked_symbols = set(self.config.get("blocked_symbols", []))
+        
+        print(f"{self.log_prefix} Initialized.")
+        if self.allowed_sources:
+            print(f"{self.log_prefix} Allowed sources: {self.allowed_sources}")
+        if self.blocked_symbols:
+            print(f"{self.log_prefix} Blocked symbols: {self.blocked_symbols}")
 
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config.get("risk_filter", {})
-        
-        # Example threshold: 5% drop in one tick
-        self.price_drop_threshold = self.config.get("price_drop_threshold", 0.05)
-        self.volume_spike_factor = self.config.get("volume_spike_factor", 10.0) # 10x avg
-        
-        # Keywords for high-risk news
-        self.risk_keywords = set(self.config.get("risk_keywords", [
-            "fraud", "halt", "investigation", "crash", "plunge", "SEC"
-        ]))
-        
-        logger.info("RiskFilter initialized.")
-
-    async def on_market_data(self, pipeline_state: PipelineState, data: MarketData):
+    def filter_batch(self, data_batch: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         """
-        Callback for the 'market_data_raw' event.
-        Checks for flash crashes or extreme volume.
+        过滤整个数据批次。
         """
+        filtered_batch = {
+            "market_data": [],
+            "news_data": []
+            # economic_indicators 通常不过滤
+        }
         
-        # 1. Check for price drop
-        price_change_pct = (data.close - data.open) / data.open
-        if abs(price_change_pct) > self.price_drop_threshold:
-            reason = (
-                f"Potential flash crash/spike detected for {data.symbol}: "
-                f"{price_change_pct:+.2%} change in one tick."
-            )
-            logger.warning(reason)
-            await pipeline_state.event_distributor.publish(
-                "HIGH_RISK_DATA",
-                data_type="MarketData",
-                reason=reason,
-                data=data
-            )
+        # FIX (E1): 过滤 MarketData
+        if "market_data" in data_batch:
+            filtered_batch["market_data"] = [
+                data for data in data_batch["market_data"]
+                if self._filter_market_data(data)
+            ]
             
-        # 2. Check for volume spike
-        # This requires historical avg volume, which should be in PipelineState
-        avg_volume = pipeline_state.get_value(f"metrics.{data.symbol}.avg_volume", 0)
-        if avg_volume > 0 and data.volume > (avg_volume * self.volume_spike_factor):
-            reason = (
-                f"Extreme volume spike detected for {data.symbol}: "
-                f"{data.volume} vs avg {avg_volume}."
-            )
-            logger.warning(reason)
-            await pipeline_state.event_distributor.publish(
-                "HIGH_RISK_DATA",
-                data_type="MarketData",
-                reason=reason,
-                data=data
-            )
-
-    async def on_news_data(self, pipeline_state: PipelineState, data: NewsData):
-        """
-        Callback for the 'news_data_raw' event.
-        Checks for high-risk keywords.
-        """
+        # FIX (E1): 过滤 NewsData
+        if "news_data" in data_batch:
+            filtered_batch["news_data"] = [
+                data for data in data_batch["news_data"]
+                if self._filter_news_data(data)
+            ]
         
-        text_to_check = (data.headline + " " + (data.summary or "")).lower()
-        found_keywords = {kw for kw in self.risk_keywords if kw.lower() in text_to_check}
-        
-        if found_keywords:
-            reason = (
-                f"High-risk keywords {found_keywords} detected in news "
-                f"from {data.source}: {data.headline}"
-            )
-            logger.warning(reason)
-            await pipeline_state.event_distributor.publish(
-                "HIGH_RISK_DATA",
-                data_type="NewsData",
-                reason=reason,
-                data=data
-            )
+        # 保留其他数据类型
+        for key, value in data_batch.items():
+            if key not in filtered_batch:
+                filtered_batch[key] = value
+                
+        return filtered_batch
 
-    async def subscribe_to_events(self, event_distributor):
-        """Helper to subscribe to all relevant raw data events."""
-        await event_distributor.subscribe("market_data_raw", self.on_market_data)
-        await event_distributor.subscribe("news_data_raw", self.on_news_data)
-        logger.info("RiskFilter subscribed to raw data events.")
+    def _filter_market_data(self, data: MarketData) -> bool:
+        """
+        过滤市场数据的规则。
+        """
+        if data.symbol in self.blocked_symbols:
+            print(f"{self.log_prefix} Blocking market data for {data.symbol}")
+            return False
+        
+        # 示例：过滤掉异常的0成交量数据
+        if data.volume <= 0:
+            return False
+            
+        return True
+
+    def _filter_news_data(self, data: NewsData) -> bool:
+        """
+        过滤新闻事件的规则。
+        """
+        # 1. 按来源过滤
+        if self.allowed_sources and data.source not in self.allowed_sources:
+            return False
+            
+        # 2. 按符号过滤
+        if any(symbol in self.blocked_symbols for symbol in data.symbols):
+            print(f"{self.log_prefix} Blocking news {data.id} due to blocked symbol")
+            return False
+            
+        # 3. (假设) 按可信度过滤
+        confidence = data.metadata.get("confidence_score", 1.0)
+        if confidence < self.min_news_confidence:
+            return False
+            
+        return True
