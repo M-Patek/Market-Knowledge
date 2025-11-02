@@ -1,33 +1,42 @@
 """
-FusionResult Schema
-- 定义认知引擎中 "Fusion" (融合) 步骤的输出数据结构。
+定义认知引擎的输出：AgentDecision 和 FusionResult。
 """
 from pydantic import BaseModel, Field
-from typing import List, Optional, Any
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+
+# FIX (E3): 添加缺失的 AgentDecision schema
+class AgentDecision(BaseModel):
+    """
+    单个AI智能体的决策输出。
+    """
+    agent_name: str = Field(..., description="智能体名称 (e.g., 'technical_analyst')")
+    timestamp: datetime = Field(..., description="决策生成时间 (UTC)")
+    decision: str = Field(..., description="决策 (e.g., 'BULLISH', 'BEARISH', 'NEUTRAL')")
+    confidence: float = Field(..., description="置信度 (0.0 to 1.0)", ge=0.0, le=1.0)
+    reasoning: str = Field(..., description="决策的详细推理过程 (Chain of Thought)")
+    supporting_evidence: List[Dict[str, Any]] = Field(default_factory=list, description="支持该决策的数据点或引用")
+    error_analysis: Optional[str] = Field(None, description="智能体对其潜在错误的分析")
 
 class FusionResult(BaseModel):
     """
-    保存来自 MetacognitiveAgent 融合步骤的结构化输出。
+    认知引擎在分析一组 AgentDecision 后得出的最终融合结果。
+    这是认知层的主要输出，用于驱动投资组合构建。
     """
+    id: str = Field(..., description="融合结果的唯一ID")
+    timestamp: datetime = Field(..., description="融合决策生成时间 (UTC)")
     
-    # (假设的现有字段)
-    insights: List[Any] = Field(default_factory=list, description="融合后的见解列表")
-    confidence_scores: List[float] = Field(default_factory=list, description="每个见解的置信度")
+    # FIX (E3): 确保 FusionResult 包含 AgentDecision 列表
+    agent_decisions: List[AgentDecision] = Field(..., description="参与此次融合的所有智能体的决策")
     
-    # 关键修正 (Error 8):
-    # 添加 UncertaintyGuard (不确定性守卫) 所需的字段
+    final_decision: str = Field(..., description="最终的综合决策 (e.g., 'STRONG_BUY', 'SELL', 'HOLD')")
+    final_confidence: float = Field(..., description="最终决策的综合置信度", ge=0.0, le=1.0)
     
-    status: str = Field(default="PENDING", description="融合结果的状态 (e.g., PENDING, SUCCESS, FAILED)")
+    summary: str = Field(..., description="对所有推理的总结")
+    conflicts_identified: List[str] = Field(default_factory=list, description="识别出的智能体间的主要分歧点")
+    conflict_resolution: Optional[str] = Field(None, description="分歧的解决方案或仲裁结果")
     
-    final_decision: Optional[Any] = Field(None, description="融合后的最终决策或信号")
+    uncertainty_score: float = Field(..., description="量化的不确定性得分", ge=0.0, le=1.0)
+    uncertainty_dimensions: Dict[str, float] = Field(default_factory=dict, description="不确定性的分解 (e.g., 'data_gap', 'model_disagreement')")
     
-    error_message: Optional[str] = Field(None, description="如果 status 为 FAILED，记录错误信息")
-
-
-    class Config:
-        """
-        Pydantic 配置
-        """
-        # (允许模型中存在任意类型，例如复杂的分析对象)
-        arbitrary_types_allowed = True
-        validate_assignment = True
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="与此融合相关的其他元数据 (e.g., 'target_symbol')")
