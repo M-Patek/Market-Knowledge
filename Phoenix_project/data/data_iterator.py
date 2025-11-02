@@ -1,125 +1,160 @@
+"""
+Data Iterator for Backtesting Engine.
+
+This module provides a flexible way to iterate over historical data,
+simulating the passage of time and yielding data points (e.g.,
+MarketEvents, TickerData) as they would have occurred.
+"""
+import logging
 import pandas as pd
-from typing import Dict, Any, List, AsyncGenerator, Tuple
+from typing import Iterator, Union, List, Optional
+from datetime import datetime
+import json  # 修复：添加 json 导入
 
-from ..monitor.logging import get_logger
-from ..core.schemas.data_schema import MarketEvent, TickerData
-from ..ai.data_adapter import DataAdapter
+# 修复：添加 TickerData 并使用正确的相对导入
+from ..core.schemas.data_schema import TickerData, MarketEvent
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class DataIterator:
     """
-    (Backtesting) Responsible for loading, merging, and iterating through
-    historical data (both market data and news events) in chronological order.
+    Iterates over one or more time-indexed data sources (e.g., CSV, Parquet)
+    and yields data points in chronological order.
     """
-
-    def __init__(self, config: Dict[str, Any], data_adapter: DataAdapter):
+    
+    def __init__(self, file_paths: List[str], data_types: List[str], 
+                 start_date: datetime, end_date: datetime,
+                 timestamp_col: str = 'timestamp'):
         """
         Initializes the DataIterator.
-        
-        Args:
-            config (Dict, Any): The main strategy configuration.
-            data_adapter (DataAdapter): Used to standardize raw data from files.
-        """
-        self.config = config.get('data_iterator', {})
-        self.data_adapter = data_adapter
-        
-        # Paths to data files
-        self.market_data_path = self.config.get('market_data_path') # e.g., "data/market_data.csv"
-        self.event_data_path = self.config.get('event_data_path')   # e.g., "data/news_events.jsonl"
-        
-        self.start_date: pd.Timestamp = None
-        self.end_date: pd.Timestamp = None
-        
-        self.merged_data: pd.DataFrame = None
-        logger.info("DataIterator initialized.")
 
-    def setup(self, start_date: pd.Timestamp, end_date: pd.Timestamp):
-        """
-        Loads, merges, and filters all data for the backtest period.
-        
         Args:
-            start_date: The start of the backtest.
-            end_date: The end of the backtest.
+            file_paths: List of paths to the data files.
+            data_types: List of data types corresponding to each file 
+                        (e.g., 'ticker', 'market_event').
+            start_date: The simulation start date.
+            end_date: The simulation end date.
+            timestamp_col: The name of the timestamp column in the files.
         """
+        self.file_paths = file_paths
+        self.data_types = data_types
         self.start_date = start_date
         self.end_date = end_date
-        logger.info(f"Setting up DataIterator from {start_date} to {end_date}")
-
-        try:
-            # 1. Load Market Data (e.g., CSV)
-            # This is a placeholder; a real implementation would
-            # load data for all assets in the universe.
-            market_df = pd.read_csv(
-                self.market_data_path, 
-                parse_dates=['timestamp']
-            )
-            market_df = market_df.set_index('timestamp')
-            market_df['type'] = 'TickerData'
-            
-            # 2. Load Event Data (e.g., JSONL)
-            event_records = []
-            with open(self.event_data_path, 'r') as f:
-                for line in f:
-                    event_records.append(json.loads(line))
-            
-            event_df = pd.DataFrame(event_records)
-            event_df['timestamp'] = pd.to_datetime(event_df['created_at'])
-            event_df = event_df.set_index('timestamp')
-            event_df['type'] = 'MarketEvent'
-            
-            # 3. Merge and Sort
-            # We merge based on timestamp index
-            # This is a simplified merge; a real one is more complex
-            self.merged_data = pd.concat([market_df, event_df])
-            self.merged_data = self.merged_data.sort_index()
-            
-            # 4. Filter by Date Range
-            self.merged_data = self.merged_data.loc[self.start_date:self.end_date]
-            
-            if self.merged_data.empty:
-                raise ValueError("No data found for the specified backtest range.")
-                
-            logger.info(f"DataIterator setup complete. {len(self.merged_data)} total events loaded.")
-
-        except Exception as e:
-            logger.error(f"Failed to setup DataIterator: {e}", exc_info=True)
-            raise
-
-    async def __aiter__(self) -> AsyncGenerator[Tuple[pd.Timestamp, List[Dict]], None]:
-        """
-        Asynchronously yields data, grouped by timestamp.
+        self.timestamp_col = timestamp_col
+        self.combined_data = None
         
-        Yields:
-            (pd.Timestamp, List[Dict]): A tuple of (timestamp, list_of_events_at_this_time)
+        if len(file_paths) != len(data_types):
+            raise ValueError("file_paths and data_types must have the same length.")
+            
+        logger.info(f"DataIterator initialized for {len(file_paths)} sources.")
+
+    def setup(self):
         """
-        if self.merged_data is None:
-            logger.error("DataIterator not setup. Call setup() before iterating.")
+        Loads all data sources, combines them, sorts by time, and filters by date.
+        This is a one-time setup operation.
+        """
+        all_dfs = []
+        
+        for file_path, data_type in zip(self.file_paths, self.data_types):
+            try:
+                logger.info(f"Loading data from {file_path} as type '{data_type}'...")
+                # Simple loader, assumes CSV for this example
+                # In a real scenario, this would support parquet, feather, etc.
+                if file_path.endswith('.csv'):
+                    df = pd.read_csv(file_path)
+                elif file_path.endswith('.jsonl'):
+                    records = []
+                    with open(file_path, 'r') as f:
+                        for line in f:
+                            # 修复：使用 json.loads
+                            records.append(json.loads(line))
+                    df = pd.DataFrame(records)
+                else:
+                    logger.warning(f"Unsupported file type: {file_path}. Skipping.")
+                    continue
+                    
+                df[self.timestamp_col] = pd.to_datetime(df[self.timestamp_col])
+                df['data_type'] = data_type
+                df['source_file'] = file_path
+                all_dfs.append(df)
+                
+            except Exception as e:
+                logger.error(f"Failed to load data from {file_path}: {e}", exc_info=True)
+                
+        if not all_dfs:
+            logger.error("No data could be loaded. Cannot proceed.")
+            self.combined_data = pd.DataFrame()
             return
 
-        # Group all events by their timestamp (e.g., by day)
-        # The groupby operation iterates in chronological order
-        for timestamp, group in self.merged_data.groupby(self.merged_data.index):
+        # Combine, filter, and sort
+        logger.info("Combining and sorting all data sources...")
+        self.combined_data = pd.concat(all_dfs, ignore_index=True)
+        self.combined_data.sort_values(by=self.timestamp_col, inplace=True)
+        
+        # Filter by date range
+        self.combined_data = self.combined_data[
+            (self.combined_data[self.timestamp_col] >= self.start_date) &
+            (self.combined_data[self.timestamp_col] <= self.end_date)
+        ]
+        
+        logger.info(f"Setup complete. {len(self.combined_data)} total data points to iterate.")
+
+    def _parse_row(self, row: pd.Series) -> Optional[Union[TickerData, MarketEvent]]:
+        """
+        Parses a row from the combined DataFrame into a Pydantic schema.
+        """
+        data_type = row['data_type']
+        row_dict = row.to_dict()
+        
+        try:
+            if data_type == 'ticker':
+                # 修复：使用 TickerData schema
+                return TickerData(
+                    symbol=row_dict.get('symbol'),
+                    timestamp=row_dict.get(self.timestamp_col),
+                    open=row_dict.get('open'),
+                    high=row_dict.get('high'),
+                    low=row_dict.get('low'),
+                    close=row_dict.get('close'),
+                    volume=row_dict.get('volume')
+                )
+            elif data_type == 'market_event':
+                return MarketEvent(**row_dict)
+            else:
+                logger.warning(f"Unknown data_type in iterator: {data_type}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to parse row into schema {data_type}: {e}. Row: {row_dict}")
+            return None
+
+    def __iter__(self) -> Iterator[Union[TickerData, MarketEvent]]:
+        """
+        Returns the iterator object.
+        """
+        if self.combined_data is None:
+            logger.info("Running one-time setup...")
+            self.setup()
             
-            # Convert the DataFrame rows back to dicts
-            events_batch = group.to_dict('records')
+        self.current_index = 0
+        return self
+
+    def __next__(self) -> Union[TickerData, MarketEvent]:
+        """
+        Yields the next data point in chronological order.
+        """
+        if self.combined_data is None:
+            raise StopIteration("Data not loaded. Call setup() first or use in a for loop.")
             
-            # (Optional) Adapt the data using the DataAdapter
-            # This standardizes the data just-in-time
-            standardized_batch = []
-            for raw_event in events_batch:
-                if raw_event['type'] == 'MarketEvent':
-                    # We pass the dict representation for adaptation
-                    evt = self.data_adapter.adapt_news_event(raw_event)
-                    if evt: standardized_batch.append(evt.model_dump())
-                elif raw_event['type'] == 'TickerData':
-                    # TODO: This logic is flawed, TickerData needs to be reconstructed
-                    # from the raw CSV row, not adapted.
-                    # For now, just pass the dict.
-                    standardized_batch.append(raw_event)
+        if self.current_index < len(self.combined_data):
+            row = self.combined_data.iloc[self.current_index]
+            self.current_index += 1
             
-            if standardized_batch:
-                yield timestamp, standardized_batch
-                
-            # Simulate async time passage (e.g., for live-like backtesting)
-            await asyncio.sleep(0) # Yield control back to the event loop
+            parsed_item = self._parse_row(row)
+            if parsed_item:
+                return parsed_item
+            else:
+                # Skip bad rows and try to get the next one
+                return self.__next__()
+        else:
+            logger.info("DataIterator reached the end.")
+            raise StopIteration
