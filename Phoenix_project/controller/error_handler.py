@@ -1,150 +1,90 @@
-import traceback
-from typing import Optional
-
-from ..monitor.logging import get_logger
+import asyncio
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
-
-class CircuitBreaker:
-    """
-    A simple circuit breaker mechanism to stop the system
-    if too many consecutive errors occur.
-    """
-    def __init__(self, failure_threshold: int, recovery_timeout: int):
-        """
-        Initializes the circuit breaker.
-        
-        Args:
-            failure_threshold (int): Number of consecutive failures to trip.
-            recovery_timeout (int): Seconds to wait in 'OPEN' state before
-                                    moving to 'HALF_OPEN'.
-        """
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.failure_count = 0
-        self.state = "CLOSED" # Can be CLOSED, OPEN, HALF_OPEN
-        self.last_failure_time = None
-        
-        logger.info(f"CircuitBreaker initialized: Threshold={failure_threshold}, Timeout={recovery_timeout}s")
-
-    def is_open(self) -> bool:
-        """
-        Checks if the circuit is 'OPEN'. If it is, it checks if
-        the recovery timeout has passed to move to 'HALF_OPEN'.
-        
-        Returns:
-            bool: True if calls should be blocked (circuit is OPEN).
-        """
-        if self.state == "OPEN":
-            import time
-            if (time.time() - self.last_failure_time) > self.recovery_timeout:
-                self.state = "HALF_OPEN"
-                logger.warning("CircuitBreaker moving to HALF_OPEN state.")
-                return False # Allow one call through
-            else:
-                return True # Still in timeout, block call
-        
-        return False # Circuit is CLOSED or HALF_OPEN
-
-    def record_failure(self):
-        """Records a failure. Trips the circuit if threshold is met."""
-        self.failure_count += 1
-        if self.state == "HALF_OPEN":
-            # Failure in HALF_OPEN state, trip back to OPEN
-            self._trip()
-        elif self.failure_count >= self.failure_threshold:
-            self._trip()
-            
-    def record_success(self):
-        """Records a success. Resets the circuit if applicable."""
-        if self.state == "HALF_OPEN":
-            self.reset()
-            logger.info("CircuitBreaker reset to CLOSED state after HALF_OPEN success.")
-        elif self.failure_count > 0:
-            self.failure_count = 0
-            # logger.debug("CircuitBreaker failure count reset.")
-
-    def reset(self):
-        """Resets the circuit to the 'CLOSED' state."""
-        self.state = "CLOSED"
-        self.failure_count = 0
-        self.last_failure_time = None
-
-    def _trip(self):
-        """Trips the circuit to the 'OPEN' state."""
-        import time
-        self.state = "OPEN"
-        self.last_failure_time = time.time()
-        self.failure_count = 0 # Reset count after tripping
-        logger.error(f"CircuitBreaker TRIPPED! Moving to OPEN state for {self.recovery_timeout}s.")
-
 
 class ErrorHandler:
     """
     Centralized error handling component.
-    Includes a circuit breaker for critical, repeating failures.
+    Responds to critical errors, manages retries, and can trigger
+    system-wide safety mechanisms (like circuit breakers).
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initializes the ErrorHandler.
+    def __init__(self, config: dict):
+        self.config = config.get("error_handler", {})
+        self.max_retries = self.config.get("max_retries", 3)
+        self.retry_delay_base = self.config.get("retry_delay_base_s", 5) # 5s
         
-        Args:
-            config (Dict, Any): The main system configuration.
-        """
-        self.config = config.get('error_handler', {})
-        self.circuit_breaker = CircuitBreaker(
-            failure_threshold=self.config.get('circuit_breaker_threshold', 5),
-            recovery_timeout=self.config.get('circuit_breaker_timeout_sec', 300)
-        )
+        # Track failures for specific components
+        self.failure_counts = {}
         
-        # This logger is for the ErrorHandler itself
-        self.logger = logger 
+        logger.info("ErrorHandler initialized.")
 
-    def handle_error(
-        self, 
-        error: Exception, 
-        context: str, 
-        is_critical: bool = False,
-        audit_manager: Optional[Any] = None
+    async def handle_error(
+        self,
+        error: Exception,
+        component: str,
+        context: dict,
+        # We need a way to trigger actions, e.g., via the orchestrator
+        # or event distributor, passed during init.
+        # For simplicity, we'll just log and suggest actions.
     ):
         """
-        Main error handling method.
+        Main error handling entry point.
         
         Args:
             error (Exception): The exception that occurred.
-            context (str): A string describing where the error happened (e.g., "StreamProcessor").
-            is_critical (bool): If True, this failure counts against the circuit breaker.
-            audit_manager (Optional[AuditManager]): To log the error to the audit trail.
+            component (str): Name of the component that failed (e.g., "CognitiveEngine").
+            context (dict): Context about what was happening (e.g., "decision_id").
         """
         
-        error_message = f"Error in {context}: {type(error).__name__} - {error}"
-        self.logger.error(error_message, exc_info=True)
+        decision_id = context.get("decision_id", "N/A")
+        logger.error(
+            f"Critical error in component '{component}' during cycle '{decision_id}': {error}",
+            exc_info=True
+        )
         
-        # 1. Log to audit trail
-        if audit_manager:
-            try:
-                audit_manager.log_system_error(error, context)
-            except Exception as audit_e:
-                self.logger.critical(f"Failed to log error to audit trail: {audit_e}")
+        # Update failure count
+        self.failure_counts[component] = self.failure_counts.get(component, 0) + 1
         
-        # 2. Update Circuit Breaker
-        if is_critical:
-            self.logger.warning(f"Recording CRITICAL failure for circuit breaker. Context: {context}")
-            self.circuit_breaker.record_failure()
+        # --- Decision Logic ---
+        
+        # 1. Check for retries (if applicable to the error type)
+        # This is complex; the *caller* usually manages its own retries.
+        # This handler is more for *unrecoverable* errors.
+        
+        # 2. Check for circuit breaker
+        if self.failure_counts[component] > self.max_retries:
+            logger.critical(
+                f"Component '{component}' has failed {self.failure_counts[component]} consecutive times. "
+                "This may require a circuit breaker!"
+            )
+            # In a real system:
+            # await self.risk_manager.trip_circuit_breaker(
+            #     f"Component '{component}' failed repeatedly."
+            # )
             
-            if self.circuit_breaker.is_open():
-                self.logger.critical("Circuit breaker is OPEN. System operations may be paused.")
-                # TODO: Add logic to actually *stop* the system (e.g., signal LoopManager)
-                self.notify_admin(f"CRITICAL: Circuit Breaker TRIPPED due to error in {context}")
-
-    def notify_admin(self, message: str, subject: str = "Phoenix System Alert"):
-        """
-        Placeholder for sending an alert to an administrator (e.g., email, PagerDuty).
+        # 3. Send notification (e.g., to Sentry, PagerDuty)
+        await self.send_alert(error, component, context)
         
-        Args:
-            message (str): The alert message.
-            subject (str): The alert subject.
-        """
-        self.logger.critical(f"ADMIN_NOTIFICATION (Placeholder): {subject} - {message}")
-        # TODO: Implement actual notification logic (e.g., SMTP, OpsGenie API)
+        # 4. Determine recovery strategy
+        # For now, we just log. A real handler might try to
+        # restart a component or switch to a fallback.
+        
+    async def send_alert(self, error: Exception, component: str, context: dict):
+        """Placeholder for sending an alert to an external system."""
+        alert_message = (
+            f"Phoenix Alert:\n"
+            f"Component: {component}\n"
+            f"Error: {str(error)}\n"
+            f"Context: {context}\n"
+        )
+        # TODO: Integrate with Sentry, PagerDuty, Slack, etc.
+        logger.info(f"--- ALERT (Placeholder) ---\n{alert_message}")
+        await asyncio.sleep(0.01) # Simulate async I/O
+
+    def reset_failure_count(self, component: str):
+        """Resets the failure count for a component upon success."""
+        if component in self.failure_counts:
+            logger.info(f"Component '{component}' recovered. Resetting failure count.")
+            self.failure_counts[component] = 0
