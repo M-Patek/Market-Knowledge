@@ -1,198 +1,126 @@
+"""
+测试 DataManager (已更新)
+"""
 import pytest
+from unittest.mock import MagicMock, patch
 import pandas as pd
-from pydantic import ValidationError
+from datetime import datetime
 
-# 修正：[FIX-ImportError]
-# 将所有 `..` 相对导入更改为从项目根目录开始的绝对导入，
-# 以匹配 `conftest.py` 设置的 sys.path 约定。
 from data_manager import DataManager
-from core.pipeline_state import PipelineState
-from core.schemas.config_schema import StrategyConfig
+from config.loader import ConfigLoader
 
-# Mock configuration based on config_schema.py
-# This is required for DataManager(config) initialization
-MOCK_CONFIG_DICT = {
-    "start_date": "2020-01-01",
-    "end_date": "2023-01-01",
-    "asset_universe": ["AAPL", "MSFT"],
-    "market_breadth_tickers": ["^VIX"],
-    "log_level": "INFO",
-    "data_sources": {
-        "priority": ["yfinance"],
-        "providers": {
-            "yfinance": {"api_key_env_var": "NOT_USED"},
-            "alpha_vantage": {"api_key_env_var": "AV_API_KEY"}
-        },
-        "network": {
-            "user_agent": "PhoenixTest",
-            "proxy": {},
-            "request_timeout": 30,
-            "retry_attempts": 3,
-            "retry_backoff_factor": 1
-        },
-        "health_probes": {
-            "failure_threshold": 3,
-            "cooldown_minutes": 10
-        }
-    },
-    "sma_period": 20,
-    "rsi_period": 14,
-    "rsi_overbought_threshold": 70,
-    "opportunity_score_threshold": 70,
-    "vix_high_threshold": 30,
-    "vix_low_threshold": 15,
-    "capital_modifier_high_vix": 0.5,
-    "capital_modifier_normal_vix": 1.0,
-    "capital_modifier_low_vix": 1.2,
-    "initial_cash": 1000000,
-    "commission_rate": 0.001,
-    "max_total_allocation": 0.9,
-    "ai_ensemble_config": {
-        "enable": True,
-        "config_file_path": "config/ai/ensemble_config.yaml"
-    },
-    "ai_mode": "hybrid",
-    "walk_forward": {
-        "start_date": "2020-01-01",
-        "end_date": "2023-12-31",
-        "training_days": 365,
-        "validation_days": 90,
-        "step_days": 90
-    },
-    "execution_model": {
-        "impact_coefficient": 0.1,
-        "max_volume_share": 0.1,
-        "min_trade_notional": 1000
-    },
-    "position_sizer": {
-        "method": "volatility_parity",
-        "parameters": {"lookback_period": 20}
-    },
-    "optimizer": {
-        "study_name": "phoenix_strategy_opt",
-        "n_trials": 100,
-        "parameters": {
-            "sma_period": [10, 50],
-            "rsi_period": [10, 30]
-        }
-    },
-    "observability": {
-        "metrics_port": 8001
-    },
-    "audit": {
-        "s3_bucket_name": "phoenix-audit-logs"
-    },
-    "data_manager": {
-        "cache_dir": "test_cache"
-    }
-}
-
-# Validate the mock config against the schema
-try:
-    MOCK_CONFIG = StrategyConfig(**MOCK_CONFIG_DICT)
-except ValidationError as e:
-    print("FATAL: Mock config is invalid!")
-    print(e)
-    pytest.fail("Mock config does not match StrategyConfig schema.")
-
+# FIX (E10): 重写测试以使用模拟的 ConfigLoader
 
 @pytest.fixture
-def data_manager():
-    """Fixture to create a DataManager instance for testing."""
-    # 修正：[FIX-TypeError-DataManager]
-    # 匹配 data_manager.py 中已修正的构造函数
-    state = PipelineState()
-    return DataManager(
-        config=MOCK_CONFIG_DICT, 
-        pipeline_state=state, 
-        cache_dir="test_cache"
-    )
-
-def test_data_manager_init(data_manager):
-    """Tests if the DataManager initializes correctly."""
-    assert data_manager is not None
-    assert data_manager.config == MOCK_CONFIG_DICT.get('data_manager', {})
-    assert data_manager.cache_dir == "test_cache"
-
-@pytest.mark.skip(reason="Requires live yfinance API call")
-def test_get_historical_data_live(data_manager):
+def mock_config_loader() -> ConfigLoader:
     """
-    Tests fetching real data from yfinance.
-    This test is skipped by default to avoid network dependency.
+    模拟一个 ConfigLoader。
     """
-    symbol = "AAPL"
-    start_date = pd.Timestamp("2022-01-01")
-    end_date = pd.Timestamp("2022-01-10")
-    
-    data = data_manager.get_historical_data(symbol, start_date, end_date)
-    
-    assert data is not None
-    assert not data.empty
-    assert isinstance(data, pd.DataFrame)
-    assert data.index.min() >= start_date
-    assert data.index.max() <= end_date
-    assert list(data.columns) == ['open', 'high', 'low', 'close', 'volume']
+    loader = MagicMock(spec=ConfigLoader)
+    # (E5 Fix) 模拟 DataManager 所需的配置
+    loader.get_system_config.return_value = {
+        "data_store": {
+            "local_base_path": "/test/data"
+        }
+    }
+    return loader
 
-def test_get_historical_data_mocked(data_manager, mocker):
-    """Tests fetching data when yfinance is mocked."""
-    
-    # 1. Create mock data
-    mock_df = pd.DataFrame({
-        'Open': [100, 101],
-        'High': [102, 102],
-        'Low': [99, 100],
-        'Close': [101, 101],
-        'Volume': [1000, 1200],
-        'Dividends': [0, 0],
-        'Stock Splits': [0, 0]
-    }, index=pd.to_datetime(['2022-01-03', '2022-01-04']))
-    # yfinance returns tz-aware, localize to UTC
-    mock_df.index = mock_df.index.tz_localize('UTC')
+@pytest.fixture
+def sample_data_catalog() -> dict:
+    """
+    返回一个示例数据目录。
+    """
+    return {
+        "market_data_AAPL": {
+            "path": "market/aapl.parquet",
+            "format": "parquet",
+            "timestamp_col": "timestamp"
+        },
+        "news_events": {
+            "path": "news/events.csv",
+            "format": "csv",
+            "timestamp_col": "date"
+        }
+    }
 
-    # 2. Mock the yf.Ticker().history() call
-    mock_ticker = mocker.MagicMock()
-    mock_ticker.history.return_value = mock_df
-    mocker.patch("yfinance.Ticker", return_value=mock_ticker)
-    
-    # 3. Define dates
-    symbol = "MSFT"
-    start_date = pd.Timestamp("2022-01-01")
-    end_date = pd.Timestamp("2022-01-10")
+@pytest.fixture
+def data_manager(mock_config_loader: ConfigLoader, sample_data_catalog: dict) -> DataManager:
+    """
+    返回一个使用模拟依赖项的 DataManager 实例。
+    """
+    # (E5 Fix) 使用正确的构造函数
+    return DataManager(config_loader=mock_config_loader, data_catalog=sample_data_catalog)
 
-    # 4. Call the function
-    data = data_manager.get_historical_data(symbol, start_date, end_date)
-    
-    # 5. Assertions
-    assert data is not None
-    assert not data.empty
-    assert list(data.columns) == ['open', 'high', 'low', 'close', 'volume']
-    assert data.loc['2022-01-03']['close'] == 101
-    # Check that yf.Ticker().history was called correctly
-    mock_ticker.history.assert_called_with(start='2022-01-01', end='2022-01-11')
-    
-    # 6. Test caching
-    # Call again
-    data_cached = data_manager.get_historical_data(symbol, start_date, end_date)
-    # yf.Ticker().history should NOT be called again
-    assert mock_ticker.history.call_count == 1
-    pd.testing.assert_frame_equal(data, data_cached)
+# --- 模拟 Pandas 读取 ---
+@pytest.fixture
+def mock_parquet_data() -> pd.DataFrame:
+    """
+    模拟从 Parquet 文件读取的 DataFrame。
+    """
+    return pd.DataFrame({
+        'open': [150], 'high': [151], 'low': [149], 'close': [150.5], 'volume': [1000]
+    }, index=[pd.to_datetime("2023-01-01 10:00:00", utc=True)])
 
-def test_data_manager_empty_response(data_manager, mocker):
-    """Tests that an empty DataFrame is returned on yfinance failure."""
+@pytest.fixture
+def mock_csv_data() -> pd.DataFrame:
+    """
+    模拟从 CSV 文件读取的 DataFrame。
+    """
+    return pd.DataFrame({
+        'id': ['news1'], 'source': ['Reuters'], 'content': ['Test'], 'date': [pd.to_datetime("2023-01-01 09:00:00", utc=True)]
+    })
+
+# 使用 patch 来模拟 os.path.exists 和 pandas I/O
+@patch('os.path.exists', return_value=True)
+@patch('pandas.read_parquet')
+def test_load_market_data(mock_read_parquet, mock_exists, data_manager: DataManager, mock_parquet_data: pd.DataFrame):
+    """
+    测试 get_market_data 是否正确加载、缓存和过滤数据。
+    """
+    mock_read_parquet.return_value = mock_parquet_data
     
-    # 1. Mock yf.Ticker().history() to return an empty DF
-    mock_ticker = mocker.MagicMock()
-    mock_ticker.history.return_value = pd.DataFrame()
-    mocker.patch("yfinance.Ticker", return_value=mock_ticker)
+    start_date = datetime(2023, 1, 1, 0, 0, 0)
+    end_date = datetime(2023, 1, 2, 0, 0, 0)
     
-    # 2. Call the function
-    data = data_manager.get_historical_data(
-        "FAIL", 
-        pd.Timestamp("2022-01-01"), 
-        pd.Timestamp("2022-01-10")
-    )
+    # 1. 第一次调用（加载）
+    dfs = data_manager.get_market_data(["AAPL"], start_date, end_date)
     
-    # 3. Assertions
-    assert data is not None
-    assert data.empty
-    assert isinstance(data, pd.DataFrame)
+    assert "AAPL" in dfs
+    assert len(dfs["AAPL"]) == 1
+    assert dfs["AAPL"].iloc[0]['close'] == 150.5
+    
+    # 验证 pd.read_parquet 被调用
+    mock_read_parquet.assert_called_once_with("/test/data/market/aapl.parquet")
+    
+    # 2. 第二次调用（从缓存）
+    mock_read_parquet.reset_mock()
+    dfs_cached = data_manager.get_market_data(["AAPL"], start_date, end_date)
+    
+    # 验证 pd.read_parquet *没有* 被再次调用
+    mock_read_parquet.assert_not_called()
+    assert len(dfs_cached["AAPL"]) == 1
+
+@patch('os.path.exists', return_value=True)
+@patch('pandas.read_csv')
+def test_fetch_data_for_batch(mock_read_csv, mock_exists, data_manager: DataManager, mock_csv_data: pd.DataFrame):
+    """
+    测试 fetch_data_for_batch 是否正确转换数据为 Pydantic 模式。
+    (我们只测试 NewsData，因为 MarketData 在上一个测试中已覆盖)
+    """
+    mock_read_csv.return_value = mock_csv_data
+    
+    start_date = datetime(2023, 1, 1, 0, 0, 0)
+    end_date = datetime(2023, 1, 2, 0, 0, 0)
+    
+    # (模拟 DataManager，使其不加载 MarketData)
+    data_manager.data_catalog = {"news_events": data_manager.data_catalog["news_events"]}
+    
+    batch = data_manager.fetch_data_for_batch(start_date, end_date, [])
+    
+    assert len(batch["market_data"]) == 0
+    assert len(batch["news_data"]) == 1
+    
+    news_item = batch["news_data"][0]
+    # (E1 Fix) 验证它是否是 NewsData
+    assert news_item.id == "news1"
+    assert news_item.source == "Reuters"
