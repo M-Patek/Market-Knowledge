@@ -2,7 +2,9 @@
 import logging
 import torch
 import numpy as np
-from drl.drl_model_registry import DRLModelRegistry
+# 修复：[FIX-1] 路径从 'drl.drl_model_registry' 更改为 '..models.registry'
+# 并将类名从 'DRLModelRegistry' 更改为 'ModelRegistry'
+from ..models.registry import ModelRegistry
 from typing import Dict, Any
 
 class CounterfactualTester:
@@ -18,7 +20,8 @@ class CounterfactualTester:
         return {}
 
     def run_drl_adversarial_test(self, 
-                                 model_registry: DRLModelRegistry, 
+                                 # 修复：[FIX-1]
+                                 model_registry: ModelRegistry, 
                                  run_id: str, 
                                  actor_name: str, 
                                  test_states: np.ndarray, 
