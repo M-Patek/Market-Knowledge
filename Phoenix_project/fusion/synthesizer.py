@@ -9,10 +9,12 @@ import logging
 import numpy as np
 from typing import List, Dict, Any, Optional
 
-from ..ai.metacognitive_agent import MetacognitiveAgent
-# 修复：使用正确的相对导入
-from ..core.schemas.fusion_result import AgentDecision, FusionResult
-from ..core.schemas.data_schema import MarketEvent
+# 修复：将相对导入 'from ..ai.metacognitive_agent...' 更改为绝对导入
+from ai.metacognitive_agent import MetacognitiveAgent
+# 修复：将相对导入 'from ..core.schemas.fusion_result...' 更改为绝对导入
+from core.schemas.fusion_result import AgentDecision, FusionResult
+# 修复：将相对导入 'from ..core.schemas.data_schema...' 更改为绝对导入
+from core.schemas.data_schema import MarketEvent
 
 logger = logging.getLogger(__name__)
 
