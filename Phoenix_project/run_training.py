@@ -1,113 +1,108 @@
-import typer
+"""
+训练执行脚本
+用于离线训练和验证 AI/DRL 模型。
+"""
+
+import argparse
+import json
 import os
-import sys
-from typing_extensions import Annotated
+from typing import Dict, Any
 
-# --- [修复] ---
-# 将项目根目录添加到 Python 路径
-# 这样我们就可以从 `training...` 或 `config...` 导入
-project_root = os.path.abspath(os.path.dirname(__file__))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-# --- [修复结束] ---
+from config.loader import ConfigLoader
+from data_manager import DataManager
+from monitor.logging import setup_logging, get_logger
 
-from config.loader import load_config
-from monitor.logging import get_logger
+# (根据需要导入具体的训练器)
+from training.walk_forward_trainer import WalkForwardTrainer
+from training.drl.multi_agent_trainer import MultiAgentTrainer
+from training.engine import BacktestingEngine # 用于评估
+from training.drl.trading_env import TradingEnv # DRL 环境
 
-# 动态导入训练器，如果路径修复正确，这里应该能工作
-try:
-    # 导入现在位于 training/ 目录下的模块
-    from training.base_trainer import BaseTrainer
-    from training.walk_forward_trainer import WalkForwardTrainer
-    from training.drl.multi_agent_trainer import MultiAgentTrainer
-    from training.drl.trading_env import TradingEnv
-    from data_manager import DataManager # 假设 DataManager 和 State 保持在顶层
-    from core.pipeline_state import PipelineState
-
-except ImportError as e:
-    print(f"CRITICAL Error: 无法导入训练器模块。")
-    print(f"请确保文件已按 REFACTOR_PLAN.md 迁移, 并且所有依赖都已安装。")
-    print(f"Details: {e}")
-    sys.exit(1)
-
-logger = get_logger('TrainingRunner')
-app = typer.Typer(help="凤凰计划 - 离线模型训练器入口 (Offline Model Trainer Entrypoint)")
-
-def load_deps(config_path: str):
-    """加载通用的配置和依赖"""
-    logger.info(f"从 {config_path} 加载配置...")
-    config = load_config(config_path)
-    if not config:
-        logger.error("配置加载失败。")
-        raise typer.Abort()
-    return config
-
-@app.command("wf", help="运行滚动优化 (Walk-Forward) 训练器。")
-def run_walk_forward(
-    config_path: Annotated[str, typer.Option(help="系统配置文件路径。")] = "config/system.yaml"
-):
+def load_data_catalog(config_loader: ConfigLoader) -> Dict[str, Any]:
     """
-    启动基于历史数据的滚动优化（Walk-Forward）训练。
-    这将产出 MetaLearner 或其他基础模型。
+    加载数据目录。
     """
-    logger.info("--- 启动滚动优化 (WF) 训练 ---")
+    catalog_path = config_loader.get_system_config().get("data_catalog_path", "data_catalog.json")
+    if not os.path.exists(catalog_path):
+        get_logger(__name__).error(f"Data catalog not found at {catalog_path}")
+        return {}
     try:
-        config = load_deps(config_path)
+        with open(catalog_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        get_logger(__name__).error(f"Failed to load data catalog: {e}", exc_info=True)
+        return {}
+
+def main():
+    parser = argparse.ArgumentParser(description="Phoenix Project - Model Training")
+    parser.add_argument(
+        '--config_path', 
+        type=str, 
+        default='config', 
+        help='Path to the configuration directory.'
+    )
+    parser.add_argument(
+        '--trainer', 
+        type=str, 
+        required=True, 
+        choices=['walk_forward', 'drl_multi_agent'], 
+        help='The type of trainer to run.'
+    )
+    # (可以添加更多参数，如 start_date, end_date, symbols)
+    
+    args = parser.parse_args()
+    
+    setup_logging()
+    logger = get_logger(__name__)
+    logger.info(f"Starting training process: {args.trainer}")
+
+    try:
+        # 1. 加载配置和数据
+        config_loader = ConfigLoader(args.config_path)
+        data_catalog = load_data_catalog(config_loader)
         
-        # 1. 初始化 DataManager 和 State (训练器需要)
-        pipeline_state = PipelineState()
-        cache_dir = config.get('data_manager', {}).get('cache_dir', 'data_cache')
-        data_manager = DataManager(config, pipeline_state, cache_dir=cache_dir)
+        # FIX (E5): DataManager 构造函数需要 ConfigLoader，而不是 dict
+        data_manager = DataManager(config_loader, data_catalog)
         
         # 2. 初始化训练器
-        wf_trainer = WalkForwardTrainer(config, data_manager)
-        
-        # 3. 运行训练 (假设是异步的)
-        # asyncio.run(wf_trainer.run_training_loop())
-        
-        logger.info("滚动优化 (WF) 训练（模拟）完成。")
-        logger.info("请确保 'run_training.py' 中的异步/同步调用与 'WalkForwardTrainer' 一致。")
-        
-    except Exception as e:
-        logger.error(f"WF 训练失败: {e}", exc_info=True)
-        raise typer.Abort()
+        if args.trainer == 'walk_forward':
+            # (示例：初始化 WalkForwardTrainer)
+            backtest_engine = BacktestingEngine(data_manager, config_loader)
+            trainer = WalkForwardTrainer(
+                engine=backtest_engine,
+                config_loader=config_loader
+            )
+            # (需要设置参数)
+            # trainer.run_optimization(...)
 
-@app.command("drl", help="运行 DRL (深度强化学习) 智能体训练器。")
-def run_drl_trainer(
-    config_path: Annotated[str, typer.Option(help="系统配置文件路径。")] = "config/system.yaml"
-):
-    """
-    启动 DRL 智能体（例如 AlphaAgent, RiskAgent）的离线训练。
-    这将在模拟环境 (TradingEnv) 中运行数千次迭代。
-    """
-    logger.info("--- 启动 DRL 智能体训练 ---")
-    try:
-        config = load_deps(config_path)
-        
-        # 1. 初始化 DataManager 和 State (环境需要)
-        pipeline_state = PipelineState()
-        cache_dir = config.get('data_manager', {}).get('cache_dir', 'data_cache')
-        data_manager = DataManager(config, pipeline_state, cache_dir=cache_dir)
-        
-        # 2. 初始化 DRL 环境
-        drl_env = TradingEnv(config, data_manager)
-        
-        # 3. 初始化 DRL 训练器
-        drl_trainer = MultiAgentTrainer(config, drl_env)
-        
-        # 4. 运行训练 (假设是异步的)
-        # asyncio.run(drl_trainer.train_agents())
-        
-        # 5. 保存模型 (例如到 models/ 目录)
-        # drl_trainer.save_models("models/drl_agents_v1")
-        
-        logger.info("DRL 智能体训练（模拟）完成。")
-        logger.info("模型将保存到 'models/' 目录。")
-        
+        elif args.trainer == 'drl_multi_agent':
+            # (示例：初始化 DRL Trainer)
+            
+            # 1. 创建 DRL 环境
+            # (需要从 DataManager 加载数据并传入)
+            # df_market = data_manager.get_market_data(...)
+            env_config = config_loader.get_system_config().get("drl_env", {})
+            trading_env = TradingEnv(
+                # market_data=df_market, 
+                **env_config
+            )
+            
+            # 2. 创建训练器
+            trainer_config = config_loader.get_system_config().get("drl_trainer", {})
+            trainer = MultiAgentTrainer(
+                env=trading_env,
+                **trainer_config
+            )
+            
+            logger.info("Starting DRL Multi-Agent training...")
+            trainer.train()
+            logger.info("DRL training complete.")
+
+        else:
+            logger.error(f"Unknown trainer type: {args.trainer}")
+
     except Exception as e:
-        logger.error(f"DRL 训练失败: {e}", exc_info=True)
-        raise typer.Abort()
+        logger.error(f"Training failed: {e}", exc_info=True)
 
 if __name__ == "__main__":
-    app()
-
+    main()
