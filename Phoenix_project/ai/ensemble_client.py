@@ -1,147 +1,136 @@
-"""
-Ensemble Client for managing parallel execution of multiple AI agents.
-
-This client takes a common context (retrieved evidence), sends it to multiple
-specialized AI agents (defined in prompts/ and agents/), and collects their
-standardized outputs (AgentDecision).
-"""
-import logging
+from typing import Dict, Any, List, Optional
 import asyncio
-from typing import List, Dict, Any
+from core.schemas.fusion_result import AgentDecision  # This import will fail, needs to be fixed
+from api.gateway import APIGateway
+from ai.prompt_manager import PromptManager
+from monitor.logging import get_logger
 
-from .prompt_manager import PromptManager
-from .prompt_renderer import PromptRenderer
-from ..api.gemini_pool_manager import GeminiPoolManager
-# 修复：使用正确的相对导入
-from ..core.schemas.fusion_result import AgentDecision
+logger = get_logger(__name__)
 
-logger = logging.getLogger(__name__)
-
-class EnsembleClient:
+class AIEnsembleClient:
     """
-    Manages concurrent API calls to a pool of AI agents.
+    Manages running multiple AI agents/models in parallel or sequence
+    to generate a diverse set of opinions or analyses.
     """
 
-    def __init__(self, 
-                 agent_registry_path: str,
-                 prompt_manager: PromptManager,
-                 prompt_renderer: PromptRenderer,
-                 gemini_pool: GeminiPoolManager):
-        """
-        Initializes the EnsembleClient.
-
-        Args:
-            agent_registry_path: Path to the YAML file defining the agents.
-            prompt_manager: Instance of PromptManager to load prompt templates.
-            prompt_renderer: Instance of PromptRenderer to fill templates.
-            gemini_pool: Instance of GeminiPoolManager to execute API calls.
-        """
-        self.agent_registry_path = agent_registry_path
+    def __init__(self, api_gateway: APIGateway, prompt_manager: PromptManager, agent_configs: Dict[str, Any]):
+        self.api_gateway = api_gateway
         self.prompt_manager = prompt_manager
-        self.prompt_renderer = prompt_renderer
-        self.gemini_pool = gemini_pool
-        self.agents = self._load_agent_registry()
-        logger.info(f"EnsembleClient initialized with {len(self.agents)} agents.")
+        self.agent_configs = agent_configs  # Config for each agent in the ensemble
+        logger.info(f"AIEnsembleClient initialized with {len(agent_configs)} agents.")
 
-    def _load_agent_registry(self) -> Dict[str, Any]:
-        """Loads agent definitions from the registry YAML."""
-        # This would typically load a YAML file.
-        # For simplicity, we'll use a mock registry if loading fails.
-        try:
-            # Placeholder: In a real app, use ConfigLoader
-            # config = ConfigLoader.load_yaml(self.agent_registry_path)
-            # return config.get('agents', {})
-            
-            # Mocking for this example:
-            mock_agents = {
-                "Analyst": {"model": "gemini-1.5-pro", "prompt_name": "analyst"},
-                "FactChecker": {"model": "gemini-1.5-flash", "prompt_name": "fact_checker"},
-                "ContextObserver": {"model": "gemini-1.5-flash", "prompt_name": "context_observer"}
-            }
-            logger.warning("Using mock agent registry. Implement YAML loading.")
-            return mock_agents
-            
-        except Exception as e:
-            logger.error(f"Failed to load agent registry from {self.agent_registry_path}: {e}", exc_info=True)
-            return {}
-
-    async def execute_ensemble(self, 
-                               evidence_context: Dict[str, Any], 
-                               event: Dict[str, Any]) -> List[AgentDecision]:
+    async def run_ensemble(self, context: str, base_prompt_name: str, context_data: Dict[str, Any]) -> List[AgentDecision]:
         """
-        Executes all registered agents in parallel against the given context.
-
+        Runs all configured agents in the ensemble against the given context.
+        
         Args:
-            evidence_context: The dictionary of retrieved evidence (RAG context).
-            event: The triggering event (e.g., a MarketEvent as a dict).
+            context (str): The formatted context string for the prompt.
+            base_prompt_name (str): The base name of the prompt (e.g., "analyst").
+                                    Agents might use variants like "analyst_optimistic".
+            context_data (Dict[str, Any]): Raw context data for agents that might need it.
 
         Returns:
-            A list of AgentDecision objects, one for each successful agent response.
+            List[AgentDecision]: A list of decisions, one from each agent.
         """
         tasks = []
-        for agent_name, agent_config in self.agents.items():
+        for agent_name, config in self.agent_configs.items():
+            prompt_name = config.get("prompt_name", base_prompt_name)
+            model_id = config.get("model_id", "gemini-pro") # Default model
+            
             task = self._run_agent(
                 agent_name=agent_name,
-                agent_config=agent_config,
-                evidence_context=evidence_context,
-                event=event
+                model_id=model_id,
+                prompt_name=prompt_name,
+                context=context,
+                config=config
             )
             tasks.append(task)
             
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Filter out failed tasks (which return None)
-        successful_decisions = [res for res in results if res is not None]
-        
-        logger.info(f"Ensemble execution complete. Received {len(successful_decisions)} decisions out of {len(self.agents)} agents.")
-        return successful_decisions
+        decisions: List[AgentDecision] = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Agent execution failed: {result}", exc_info=True)
+            elif result:
+                decisions.append(result)
+                
+        logger.info(f"Ensemble run complete. Generated {len(decisions)} valid decisions.")
+        return decisions
 
-    async def _run_agent(self, 
-                         agent_name: str, 
-                         agent_config: Dict[str, Any], 
-                         evidence_context: Dict[str, Any], 
-                         event: Dict[str, Any]) -> AgentDecision | None:
+    async def _run_agent(self, agent_name: str, model_id: str, prompt_name: str, context: str, config: Dict[str, Any]) -> Optional[AgentDecision]:
         """
-        Prepares, executes, and parses the output for a single agent.
+        Internal method to run a single agent and parse its output.
         """
+        logger.debug(f"Running agent '{agent_name}' using model '{model_id}' and prompt '{prompt_name}'.")
+        
+        # Get prompt and apply agent-specific persona/instructions
+        persona = config.get("persona", "You are a helpful assistant.")
+        prompt = self.prompt_manager.get_prompt(
+            prompt_name,
+            context=context,
+            persona=persona,
+            # Pass other config items as potential template variables
+            **config
+        )
+        
+        if not prompt:
+            logger.error(f"Could not get prompt '{prompt_name}' for agent '{agent_name}'.")
+            return None
+
         try:
-            # 1. Get the prompt template
-            prompt_name = agent_config.get("prompt_name")
-            prompt_template = self.prompt_manager.get_prompt(prompt_name)
-            if not prompt_template:
-                logger.error(f"Agent {agent_name}: Prompt template '{prompt_name}' not found.")
-                return None
-
-            # 2. Render the prompt
-            full_prompt = self.prompt_renderer.render(
-                template_content=prompt_template,
-                context=evidence_context,
-                event=event
+            raw_response = await self.api_gateway.send_request(
+                model_name=model_id,
+                prompt=prompt,
+                temperature=config.get("temperature", 0.5),
+                max_tokens=config.get("max_tokens", 1000),
+                stop_sequences=config.get("stop_sequences", None)
             )
             
-            # 3. Execute the LLM call
-            model_name = agent_config.get("model", "gemini-1.5-pro")
+            return self._parse_agent_response(raw_response, agent_name, model_id)
             
-            # We expect the agent to return a JSON object matching AgentDecision
-            response_json = await self.gemini_pool.generate_json(
-                model_name=model_name,
-                prompt=full_prompt,
-                system_prompt="You are a financial expert. Respond ONLY with the requested JSON schema."
-            )
-            
-            if not response_json:
-                logger.warning(f"Agent {agent_name} did not return a valid JSON response.")
-                return None
-
-            # 4. Parse and validate the response
-            # Add agent_name to the response data before validation
-            response_json['agent_name'] = agent_name 
-            
-            # 修复：使用 AgentDecision schema
-            decision = AgentDecision(**response_json)
-            logger.debug(f"Agent {agent_name} decision: {decision.sentiment}, {decision.confidence}")
-            return decision
-
         except Exception as e:
-            logger.error(f"Error running agent {agent_name}: {e}", exc_info=True)
+            logger.error(f"Error running agent '{agent_name}': {e}", exc_info=True)
+            return None
+
+    def _parse_agent_response(self, response: str, agent_name: str, model_id: str) -> Optional[AgentDecision]:
+        """
+        Parses the raw string response from an LLM into a structured AgentDecision.
+        This needs to be robust, perhaps expecting JSON or a specific format.
+        
+        Placeholder implementation: Assumes a simple "DECISION: [BUY/SELL/HOLD]" format.
+        A real implementation *must* expect a more structured output, like JSON.
+        """
+        logger.debug(f"Parsing response from '{agent_name}': {response[:100]}...")
+        
+        # --- This is a critical parsing step ---
+        # In a robust system, the prompt would request JSON output,
+        # and we would parse it here.
+        
+        # Example: Simple keyword parsing (Fragile!)
+        decision_str = "HOLD" # Default
+        if "BUY" in response.upper():
+            decision_str = "BUY"
+        elif "SELL" in response.upper():
+            decision_str = "SELL"
+        
+        # Placeholder for confidence - this should come from the LLM
+        confidence = 0.75 
+        
+        # Placeholder for reasoning - this should be the bulk of the response
+        reasoning = response
+        
+        try:
+            decision = AgentDecision(
+                agent_name=agent_name,
+                model_id=model_id,
+                decision=decision_str,
+                confidence=confidence,
+                reasoning=reasoning,
+                raw_response=response
+            )
+            return decision
+        except Exception as e:
+            # This could happen if AgentDecision validation fails
+            logger.error(f"Failed to create AgentDecision for '{agent_name}': {e}", exc_info=True)
             return None
