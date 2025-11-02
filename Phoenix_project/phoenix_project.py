@@ -55,14 +55,21 @@ async def initialize_system():
         if not gemini_api_key:
             logger.warning("未设置 GEMINI_API_KEY。LLM 功能将被禁用。")
         
-        gemini_pool = GeminiPoolManager(
-            api_key=gemini_api_key,
-            pool_size=config.get('llm', {}).get('gemini_pool_size', 5)
-        )
-        logger.info(f"GeminiPoolManager 已初始化，大小为 {config.get('llm', {}).get('gemini_pool_size', 5)}")
+        # 修复：[FIX-9] 'GeminiPoolManager' 的 __init__ 需要一个
+        # 'config' 字典，而不是 'api_key' 和 'pool_size'
+        llm_config = config.get('llm', {})
+        llm_config['api_key'] = gemini_api_key # 将 key 注入到配置中
+        llm_config['pool_size'] = llm_config.get('gemini_pool_size', 5)
+
+        gemini_pool = GeminiPoolManager(config=llm_config)
+        logger.info(f"GeminiPoolManager 已初始化，大小为 {llm_config['pool_size']}")
 
         # 3. 初始化核心状态和数据管理
-        pipeline_state = PipelineState()
+        # 修复：[FIX-16] 匹配 PipelineState 的签名
+        pipeline_config = config.get('pipeline', {})
+        pipeline_state = PipelineState(
+            max_recent_events=pipeline_config.get('max_recent_events', 100)
+        )
         cache_dir = config.get('data_manager', {}).get('cache_dir', 'data_cache')
         data_manager = DataManager(config, pipeline_state, cache_dir=cache_dir)
         logger.info("PipelineState 和 DataManager 已初始化。")
@@ -194,4 +201,3 @@ if __name__ == "__main__":
             sys.exit(1)
     # 如果 'celery' 在 'sys.argv[0]' 中，则不执行 asyncio.run(main())
     # Celery 会自己处理启动
-
