@@ -1,18 +1,18 @@
 Phoenix Project - Operational Runbook
-Version: 1.0
-Last Updated: 2025-10-11
+Version: 2.0 (Updated)
+Last Updated: 2025-10-17
 Contact: Phoenix Project Team
 
-1. System Overview
+System Overview
 The Phoenix Project is a comprehensive quantitative trading research platform. It automates the entire backtesting pipeline, including data acquisition, feature calculation, AI-enhanced analysis, strategy execution simulation, and reporting.
 
-The system can be run in two primary modes as configured in config.yaml:
+The system can be run in two primary modes as configured in config/system.yaml:
 
 Single Backtest: A single run of the strategy with a fixed set of parameters.
 
 Walk-Forward Optimization: A rigorous, scientific process that repeatedly trains parameters on one historical period and validates them on a subsequent, unseen period.
 
-2. Prerequisites & Setup
+Prerequisites & Setup
 a. Clone the Repository
 git clone <repository_url>
 cd Phoenix_project
@@ -33,11 +33,15 @@ cp env.example .env
 
 Open the .env file with a text editor.
 
-Fill in your actual API keys for the services you intend to use (e.g., ALPHA_VANTAGE_API_KEY, GEMINI_API_KEY). The variable names must match those specified in config.yaml.
+Fill in your actual API keys for the services you intend to use (e.g., ALPHA_VANTAGE_API_KEY, GEMINI_API_KEY). The variable names must match those specified in config/system.yaml.
 
-3. Core Operations
+Core Operations
 a. Configure the Run
-All operations are controlled by the central config.yaml file. Before running, open this file and configure:
+All operations are controlled by the central configuration file.
+
+[CRITICAL UPDATE] The main config file is config/system.yaml, not config.yaml.
+
+Before running, open config/system.yaml and configure:
 
 start_date & end_date
 
@@ -47,50 +51,42 @@ walk_forward -> enabled: true or enabled: false
 
 ai_mode: Set to off, raw, or processed.
 
-b. Running a Single Backtest
-Ensure walk_forward: enabled is set to false in config.yaml.
+b. Running the System
+The main entry point is phoenix_project.py. This script starts the main asynchronous loop for the Orchestrator and EventDistributor.
 
 Run the script:
 
 python phoenix_project.py
 
-Expected Output:
-
-The console will show structured JSON logs for the backtest process.
-
-Upon completion, a phoenix_report_single.html file and a phoenix_plot.png will be generated in the root directory.
-
-c. Running a Walk-Forward Optimization
-Ensure walk_forward: enabled is set to true in config.yaml.
-
-Run the script:
-
-python phoenix_project.py
+Note: This script is designed to run as a persistent service. For backtesting or walk-forward analysis (as mentioned in the config/system.yaml), you will likely use a different entry point (e.g., scripts/run_backtest.py or similar, which may need to be invoked via run_cli.py).
 
 Expected Output:
 
-The console will log the progress for each training and testing window.
+The console will show structured JSON logs from loguru as the system initializes.
 
-A phoenix_walk_forward_study.db (SQLite file) will be created to store optimization results.
+The system will log messages from the Orchestrator (e.g., running decision loop) and EventDistributor (e.g., consuming events).
 
-An HTML report (phoenix_report_wf_X.html) will be generated for each out-of-sample test window.
+c. Running Data Validation
+To ensure data quality before ingestion, use the validation script:
 
-4. Validation & Monitoring
+python scripts/validate_dataset.py /path/to/your/data.jsonl --type market_event
+
+Validation & Monitoring
 a. Review the HTML Report
-Open the generated .html report in a web browser. Key items to validate:
+(For Backtesting/Walk-Forward runs) Open the generated .html report in a web browser. Key items to validate:
 
-Final Portfolio Value & Total Return: The primary performance indicators.
+Final Portfolio Value & Total Return.
 
-Sharpe Ratio & Max Drawdown: Key risk-adjusted return metrics.
+Sharpe Ratio & Max Drawdown.
 
-Trade Statistics: Check the total number of trades and the win rate.
+Trade Statistics: Total trades and win rate.
 
-Equity Curve Plot: Visually inspect the equity curve for periods of high volatility or long drawdowns.
+Equity Curve Plot.
 
 b. Check Prometheus Metrics
 While the script is running, the system exposes a Prometheus metrics endpoint.
 
-URL: http://localhost:8000 (or the port configured in config.yaml)
+URL: http://localhost:8000 (or the port configured in config/system.yaml)
 
 Key Metrics to Monitor:
 
@@ -100,9 +96,9 @@ phoenix_provider_requests_total{provider="..."}: See which data providers are be
 
 phoenix_provider_errors_total{provider="..."}: CRITICAL ALARM. A high or rapidly increasing number of errors indicates a problem with a data provider.
 
-phoenix_ai_call_latency_seconds: Monitor the performance of the AI model APIs.
+phoenix_ai_call_latency_seconds: Monitor the performance of the AI model APIs (e.g., Gemini).
 
-5. Troubleshooting & Critical Alarms
+Troubleshooting & Critical Alarms
 Alarm: phoenix_provider_errors_total is high.
 
 Diagnosis: An external data provider is likely down or the API key is invalid.
@@ -115,19 +111,19 @@ Verify the corresponding API key in your .env file is correct.
 
 Check the status page of the data provider's website.
 
-Mitigation: The system is designed with a fallback and circuit breaker mechanism. It will automatically try the next provider in the priority list. If all providers fail for a ticker, it will be excluded from that day's run.
+Mitigation: The system is designed with a fallback and circuit breaker mechanism. It will automatically try the next provider in the priority list.
 
 Issue: Pydantic validation error on startup.
 
-Diagnosis: The config.yaml file has an invalid value or a missing required field.
+Diagnosis: The config/system.yaml file has an invalid value or a missing required field.
 
 Response:
 
 Carefully read the error message in the console. It will specify which field is incorrect (e.g., end_date must be strictly after start_date).
 
-Correct the specified field in config.yaml and re-run the script.
+Correct the specified field in config/system.yaml and re-run the script.
 
-Issue: AI analysis is not working.
+Issue: AI analysis is not working (e.g., gemini_pool errors).
 
 Diagnosis: There may be an issue with the AI model API key, the prompt templates, or the network connection.
 
