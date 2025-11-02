@@ -1,147 +1,179 @@
-from typing import Dict, Any, List, Optional
+"""
+数据管理器 (DataManager)
+负责从各种来源（CSV, Parquet, 数据库）加载、缓存和提供数据。
+"""
 import pandas as pd
+from typing import List, Dict, Optional, Any
+from datetime import datetime
+import os
+
+# FIX (E1): 导入统一后的核心模式
 from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
 from config.loader import ConfigLoader
-from data.data_iterator import DataIterator
-from monitor.logging import get_logger
-
-logger = get_logger(__name__)
 
 class DataManager:
     """
-    Handles loading, caching, and serving all data required by the system.
-    It abstracts the data sources (e.g., APIs, databases, local files).
+    集中管理所有数据的加载和访问。
+    在真实系统中，这将连接到数据库或数据仓库。
+    在当前版本中，它主要从文件（如 Parquet 或 CSV）加载数据。
     """
-
-    def __init__(self, config_loader: ConfigLoader):
+    
+    # FIX (E5): 构造函数需要 ConfigLoader，而不是 dict
+    def __init__(self, config_loader: ConfigLoader, data_catalog: Dict[str, Any]):
         self.config_loader = config_loader
-        self.data_catalog = self._load_data_catalog()
-        
-        # In-memory cache for loaded data (e.g., for backtesting)
+        self.data_catalog = data_catalog
         self.data_cache: Dict[str, pd.DataFrame] = {}
         
-        logger.info(f"DataManager initialized. Found {len(self.data_catalog)} entries in catalog.")
-
-    def _load_data_catalog(self) -> Dict[str, Any]:
-        """Loads the data catalog file."""
+        # data_base_path 可能在 system.yaml 中定义
         try:
-            # Assuming data_catalog.json is in the root
-            catalog = self.config_loader.load_json("data_catalog.json")
-            return catalog.get("datasets", {})
-        except Exception as e:
-            logger.error(f"Failed to load data_catalog.json: {e}", exc_info=True)
-            return {}
+            self.data_base_path = self.config_loader.get_system_config()["data_store"]["local_base_path"]
+        except KeyError:
+            print("Warning: 'data_store.local_base_path' not in system config. Using relative path.")
+            self.data_base_path = "." # 回退到相对路径
+            
+        print(f"DataManager initialized. Base data path: {self.data_base_path}")
 
-    def _load_dataset(self, dataset_id: str) -> Optional[pd.DataFrame]:
+    def _load_data(self, data_id: str) -> pd.DataFrame:
         """
-        Loads a single dataset from the path specified in the catalog.
-        Caches the result in memory.
+        内部辅助函数：根据 data_catalog 中的定义加载数据。
         """
-        if dataset_id in self.data_cache:
-            return self.data_cache[dataset_id]
+        if data_id not in self.data_catalog:
+            raise ValueError(f"Data ID '{data_id}' not found in data_catalog.json")
             
-        if dataset_id not in self.data_catalog:
-            logger.error(f"Dataset '{dataset_id}' not found in data catalog.")
-            return None
-            
-        dataset_info = self.data_catalog[dataset_id]
-        file_path = dataset_info.get("path")
-        file_type = dataset_info.get("type", "csv")
+        if data_id in self.data_cache:
+            return self.data_cache[data_id]
+
+        config = self.data_catalog[data_id]
+        file_path = os.path.join(self.data_base_path, config["path"])
         
-        if not file_path:
-            logger.error(f"No path specified for dataset '{dataset_id}'.")
-            return None
-            
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Data file not found at: {file_path}")
+
+        print(f"Loading data '{data_id}' from {file_path}...")
+        
         try:
-            # TODO: Handle relative paths correctly from project root
-            # Assuming file_path is relative to project root
-            
-            if file_type == "csv":
-                df = pd.read_csv(file_path, parse_dates=["timestamp"])
-            elif file_type == "parquet":
+            if config["format"] == "parquet":
                 df = pd.read_parquet(file_path)
-                if "timestamp" in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+            elif config["format"] == "csv":
+                df = pd.read_csv(file_path)
             else:
-                logger.error(f"Unsupported file type '{file_type}' for dataset '{dataset_id}'.")
-                return None
+                raise ValueError(f"Unsupported data format: {config['format']}")
                 
-            logger.info(f"Successfully loaded dataset '{dataset_id}' from {file_path}. Shape: {df.shape}")
-            self.data_cache[dataset_id] = df
+            # 确保时间戳列被正确解析并设为索引
+            if "timestamp_col" in config:
+                ts_col = config["timestamp_col"]
+                df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+                df = df.set_index(ts_col).sort_index()
+            
+            self.data_cache[data_id] = df
             return df
-            
-        except FileNotFoundError:
-            logger.error(f"Data file not found: {file_path}")
-            return None
+        
         except Exception as e:
-            logger.error(f"Failed to load dataset '{dataset_id}': {e}", exc_info=True)
+            print(f"Error loading data '{data_id}': {e}")
+            raise
+
+    def get_market_data(self, symbols: List[str], start_date: datetime, end_date: datetime) -> Dict[str, pd.DataFrame]:
+        """
+        获取一个或多个资产的市场数据 (OHLCV)。
+        """
+        result = {}
+        for symbol in symbols:
+            # 假设 data_catalog 中的 ID 对应于 "market_data_{SYMBOL}"
+            data_id = f"market_data_{symbol.upper()}"
+            try:
+                df = self._load_data(data_id)
+                result[symbol] = df[ (df.index >= start_date) & (df.index <= end_date) ]
+            except (ValueError, FileNotFoundError) as e:
+                print(f"Warning: Could not load market data for {symbol}. {e}")
+                
+        return result
+
+    def get_news_data(self, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
+        """
+        获取所有来源的新闻/事件数据。
+        """
+        try:
+            # 假设 data_catalog 中有一个ID叫 "news_events"
+            df = self._load_data("news_events")
+            return df[ (df.index >= start_date) & (df.index <= end_date) ]
+        except (ValueError, FileNotFoundError) as e:
+            print(f"Warning: Could not load news data. {e}")
             return None
 
-    def get_backtest_iterator(self, market_data_ids: List[str], news_data_id: Optional[str] = None) -> DataIterator:
+    def get_economic_indicators(self, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
         """
-        Pre-loads all necessary data for a backtest and returns
-        a DataIterator instance.
-        
-        Args:
-            market_data_ids (List[str]): List of dataset IDs for market data.
-                                         The catalog entry *must* contain a 'symbol'.
-            news_data_id (Optional[str]): Dataset ID for news data.
-            
-        Returns:
-            DataIterator
+        获取宏观经济指标。
         """
-        logger.info("Preparing backtest data iterator...")
-        
-        market_data_dfs: Dict[str, pd.DataFrame] = {}
-        for dataset_id in market_data_ids:
-            symbol = self.data_catalog.get(dataset_id, {}).get("symbol")
-            if not symbol:
-                logger.error(f"Dataset '{dataset_id}' in catalog has no 'symbol' defined. Skipping.")
-                continue
-                
-            df = self._load_dataset(dataset_id)
-            if df is not None:
-                market_data_dfs[symbol] = df
-                
-        news_data_df = None
-        if news_data_id:
-            news_data_df = self._load_dataset(news_data_id)
-            
-        if not market_data_dfs:
-            raise ValueError("No valid market data could be loaded for the backtest.")
-            
-        return DataIterator(
-            market_data_dfs=market_data_dfs,
-            news_data_df=news_data_df
-        )
+        try:
+            # 假设 data_catalog 中有一个ID叫 "economic_indicators"
+            df = self._load_data("economic_indicators")
+            return df[ (df.index >= start_date) & (df.index <= end_date) ]
+        except (ValueError, FileNotFoundError) as e:
+            print(f"Warning: Could not load economic indicators. {e}")
+            return None
 
-    async def fetch_live_data(self) -> Dict[str, List[Any]]:
+    def fetch_data_for_batch(self, start_time: datetime, end_time: datetime, symbols: List[str]) -> Dict[str, List[Any]]:
         """
-        Fetches new data from live APIs.
-        This is a placeholder for a real implementation.
-        
-        Returns:
-            A dictionary of data lists, e.g.:
-            {"market_data": [MarketData(...)], "news_data": [NewsData(...)]}
+        为 Orchestrator 的一个周期获取所需的所有数据，并转换为 Pydantic 模式。
         """
-        logger.warning("fetch_live_data is a placeholder and not implemented.")
-        # --- Placeholder Implementation ---
-        # 1. Connect to live data provider (e.g., Alpaca, Polygon)
-        # 2. Get data since `last_data_ingest_time`
-        # 3. Parse data into Pydantic models
-        # 4. Return the batch
+        # 1. 获取 MarketData (DataFrame)
+        market_dfs = self.get_market_data(symbols, start_time, end_time)
         
-        await asyncio.sleep(0.1) # Simulate async I/O
+        # 2. 获取 NewsData (DataFrame)
+        news_df = self.get_news_data(start_time, end_time)
         
-        # Example dummy data
-        dummy_market_data = MarketData(
-            symbol="DUMMY",
-            timestamp=datetime.utcnow(),
-            open=100, high=101, low=99, close=100.5, volume=10000
-        )
+        # 3. 获取 EconomicIndicators (DataFrame)
+        econ_df = self.get_economic_indicators(start_time, end_time)
         
-        return {
-            "market_data": [dummy_market_data],
+        # --- 转换为 Pydantic 模式 ---
+        
+        batch_result = {
+            "market_data": [],
             "news_data": [],
-            "economic_data": []
+            "economic_indicators": []
         }
+
+        # FIX (E1): 转换为 MarketData
+        for symbol, df in market_dfs.items():
+            for ts, row in df.iterrows():
+                batch_result["market_data"].append(
+                    MarketData(
+                        symbol=symbol,
+                        timestamp=ts.to_pydatetime(), # 转换 pandas Timestamp
+                        open=row['open'],
+                        high=row['high'],
+                        low=row['low'],
+                        close=row['close'],
+                        volume=row['volume']
+                    )
+                )
+        
+        # FIX (E1): 转换为 NewsData
+        if news_df is not None:
+            for ts, row in news_df.iterrows():
+                 batch_result["news_data"].append(
+                    NewsData(
+                        id=row['id'],
+                        source=row['source'],
+                        timestamp=ts.to_pydatetime(),
+                        symbols=row.get('symbols', []),
+                        content=row['content'],
+                        headline=row.get('headline')
+                    )
+                )
+
+        # FIX (E1): 转换为 EconomicIndicator
+        if econ_df is not None:
+            for ts, row in econ_df.iterrows():
+                 batch_result["economic_indicators"].append(
+                    EconomicIndicator(
+                        id=row['id'],
+                        name=row['name'],
+                        timestamp=ts.to_pydatetime(),
+                        value=row['value'],
+                        expected=row.get('expected'),
+                        previous=row.get('previous')
+                    )
+                )
+                
+        return batch_result
