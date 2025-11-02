@@ -1,138 +1,133 @@
 """
-Strategy Handler
-- 加载和管理一个或多个交易策略
-- 将 Orchestrator 的事件分派给相关策略
+策略处理器 (Strategy Handler)
+(这是一个遗留或特定策略的封装器，似乎已在 phoenix_project.py 中被绕过)
+
+它封装了 CognitiveEngine 和 PortfolioConstructor，
+似乎是用于响应特定的外部信号（StrategySignal）？
 """
+
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+
+# (核心组件)
 from cognitive.engine import CognitiveEngine
-from data_manager import DataManager
-from ai.metacognitive_agent import MetacognitiveAgent
 from cognitive.portfolio_constructor import PortfolioConstructor
+from core.pipeline_state import PipelineState
+from core.schemas.data_schema import Order, PortfolioState
+
+# FIX (E6): 从 signal_protocol 导入 (不存在的) StrategySignal
+# 我们将在 signal_protocol.py 中添加一个占位符
+from execution.signal_protocol import StrategySignal 
+
+# (AI/RAG 组件 - 用于初始化)
+from ai.retriever import Retriever
+from ai.ensemble_client import EnsembleClient
+from ai.metacognitive_agent import MetacognitiveAgent
+from ai.reasoning_ensemble import ReasoningEnsemble
+from evaluation.arbitrator import Arbitrator
+from evaluation.fact_checker import FactChecker
+from ai.prompt_manager import PromptManager
+from api.gateway import IAPIGateway
+from api.gemini_pool_manager import GeminiPoolManager
+from memory.vector_store import VectorStore
+from memory.cot_database import CoTDatabase
+from config.loader import ConfigLoader
+from sizing.base import IPositionSizer
+from sizing.fixed_fraction import FixedFractionSizer # 示例
+
 from monitor.logging import get_logger
-from typing import Dict, Any
 
-class BaseStrategy:
-    """策略的基类"""
-    def __init__(self, config):
-        self.config = config
-        self.logger = get_logger(self.__class__.__name__)
-        self.logger.info(f"Strategy {self.__class__.__name__} initialized.")
-
-    async def on_data(self, data_event):
-        """处理传入的市场数据"""
-        raise NotImplementedError
-
-    async def run_cognitive_cycle(self):
-        """执行策略的认知循环"""
-        raise NotImplementedError
-
-class RomanLegionStrategy(BaseStrategy):
-    """
-    一个具体的策略实现示例。
-    """
-    
-    # 关键修正 (Error 3): 
-    # 构造函数现在接受由外部(Orchestrator/StrategyHandler)注入的依赖
-    def __init__(
-        self, 
-        config: Dict[str, Any], 
-        data_manager: DataManager,
-        metacognitive_agent: MetacognitiveAgent,
-        portfolio_constructor: PortfolioConstructor
-    ):
-        """
-        使用依赖注入初始化策略。
-        """
-        super().__init__(config)
-        self.data_manager = data_manager 
-        
-        # 关键修正: 使用注入的依赖项来构建 CognitiveEngine
-        # 而不是错误地传递 data_manager
-        self.cognitive_engine = CognitiveEngine(
-            config=self.config.get('cognitive_engine', {}),
-            metacognitive_agent=metacognitive_agent,
-            portfolio_constructor=portfolio_constructor
-        )
-        
-        self.logger.info("RomanLegionStrategy components initialized.")
-
-    async def on_data(self, data_event):
-        """处理传入的市场数据"""
-        self.logger.debug(f"Received data event: {data_event.get('type')}")
-        # (策略的数据处理逻辑)
-        pass
-
-    async def run_cognitive_cycle(self):
-        """
-        执行策略的认知循环并返回信号。
-        """
-        self.logger.info("Running cognitive cycle...")
-        # 1. (获取策略所需的数据)
-        # market_data = self.data_manager.get_latest_data(...)
-        
-        # 2. (运行认知引擎)
-        # fusion_result = await self.cognitive_engine.run_cycle(market_data)
-        
-        # 3. (生成信号)
-        # signal = self.portfolio_constructor.generate_signal(fusion_result)
-        # return signal
-        
-        # (模拟返回一个信号)
-        from execution.signal_protocol import StrategySignal
-        return StrategySignal(
-            strategy_id="RomanLegion_v1",
-            target_weights={"AAPL": 0.5, "MSFT": 0.5}
-        )
+logger = get_logger(__name__)
 
 class StrategyHandler:
     """
-    加载、保存和协调所有活动策略。
+    封装了从外部信号到订单的完整认知和构造流程。
     """
-    def __init__(self, config, data_manager, metacognitive_agent, portfolio_constructor):
-        self.config = config
-        self.data_manager = data_manager
-        self.metacognitive_agent = metacognitive_agent
-        self.portfolio_constructor = portfolio_constructor
-        self.strategies: Dict[str, BaseStrategy] = {}
-        self.logger = get_logger(self.__class__.__name__)
-        self.load_strategies()
-
-    def load_strategies(self):
-        """
-        根据配置加载策略。
-        """
-        self.logger.info("Loading strategies...")
-        # (此处应有逻辑根据 config 加载策略)
-        # 示例:
-        strategy_config = self.config.get('strategy_handler', {}).get('strategies', [])
+    def __init__(self, config_loader: ConfigLoader, position_sizer: Optional[IPositionSizer] = None):
         
-        if not strategy_config:
-            self.logger.warning("No strategies defined in config. Loading default RomanLegionStrategy.")
-            # 修正: 确保在创建时注入所有依赖项
-            self.strategies['RomanLegion_v1'] = RomanLegionStrategy(
-                config=self.config, # (传递相关配置)
-                data_manager=self.data_manager,
+        self.config_loader = config_loader
+        self.log_prefix = "StrategyHandler:"
+        
+        # 1. 初始化 AI 栈 (与 phoenix_project.py 中的 _setup_cognitive_engine 类似)
+        try:
+            gemini_pool = GeminiPoolManager()
+            api_gateway = APIGateway(gemini_pool)
+            prompt_manager = PromptManager(config_loader.config_path)
+            vector_store = VectorStore()
+            cot_db = CoTDatabase()
+            
+            self.retriever = Retriever(vector_store, cot_db)
+            
+            agent_registry = config_loader.get_agent_registry()
+            self.ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry)
+            self.metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
+            self.arbitrator = Arbitrator(api_gateway, prompt_manager)
+            self.fact_checker = FactChecker(api_gateway, prompt_manager)
+            
+            self.reasoning_ensemble = ReasoningEnsemble(
+                retriever=self.retriever,
+                ensemble_client=self.ensemble_client,
                 metacognitive_agent=self.metacognitive_agent,
-                portfolio_constructor=self.portfolio_constructor
+                arbitrator=self.arbitrator,
+                fact_checker=self.fact_checker
             )
+            
+            # FIX (E5): CognitiveEngine 构造函数参数错误
+            # 原本传入了不正确的依赖项
+            self.cognitive_engine = CognitiveEngine(
+                reasoning_ensemble=self.reasoning_ensemble,
+                fact_checker=self.fact_checker
+            )
+            
+            # 2. 初始化投资组合构造器
+            self.position_sizer = position_sizer or FixedFractionSizer() # 使用默认
+            
+            self.portfolio_constructor = PortfolioConstructor(
+                position_sizer=self.position_sizer
+            )
+            logger.info(f"{self.log_prefix} Initialized.")
+            
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Initialization failed: {e}", exc_info=True)
+            raise
 
-    async def run_all_cognitive_cycles(self):
+    def process_signals(self, signal: StrategySignal, state: PipelineState) -> List[Order]:
         """
-        触发所有策略的认知循环。
+        处理传入的 (外部) 策略信号。
         """
-        signals = []
-        for name, strategy in self.strategies.items():
-            try:
-                signal = await strategy.run_cognitive_cycle()
-                if signal:
-                    signals.append(signal)
-            except Exception as e:
-                self.logger.error(f"Error running cognitive cycle for strategy {name}: {e}")
-        return signals
+        logger.info(f"{self.log_prefix} Processing external signal for {signal.symbol} at {signal.timestamp}")
+        
+        # 1. 运行认知推理
+        # (注意：这里的 target_symbols 和 timestamp 来自外部信号)
+        fusion_result = self.cognitive_engine.run_inference(
+            target_symbols=[signal.symbol],
+            timestamp=signal.timestamp
+        )
+        
+        if not fusion_result:
+            logger.warning(f"{self.log_prefix} Cognitive engine produced no result for {signal.symbol}")
+            return []
 
-    async def on_event(self, event):
-        """
-        将事件分派给所有策略。
-        """
-        for strategy in self.strategies.values():
-            if hasattr(strategy, 'on_event'):
-                await strategy.on_event(event)
+        # 2. 转换为内部信号
+        signal_obj = self.portfolio_constructor.translate_decision_to_signal(fusion_result)
+        
+        if not signal_obj:
+            logger.warning(f"{self.log_prefix} Portfolio constructor failed to translate decision {fusion_result.id}")
+            return []
+            
+        # 3. 获取当前投资组合状态
+        portfolio_state = state.get_latest_portfolio_state()
+        if not portfolio_state:
+            logger.error(f"{self.log_prefix} Cannot generate orders, PipelineState has no PortfolioState.")
+            # (在真实系统中，我们可能需要从 TradeLifecycleManager 初始化一个)
+            return []
+
+        # 4. 生成订单
+        orders = self.portfolio_constructor.generate_orders(
+            signals=[signal_obj],
+            portfolio_state=portfolio_state
+        )
+        
+        logger.info(f"{self.log_prefix} Generated {len(orders)} orders for {signal.symbol}")
+        
+        return orders
