@@ -13,8 +13,9 @@ This service acts as an abstraction layer over the chosen KG backend.
 import logging
 from typing import Optional, List, Dict, Any
 
-# 修复：从根目录开始使用绝对导入，移除 `.`
+# 修复：将相对导入 'from .ai.tabular_db_client...' 更改为绝对导入
 from ai.tabular_db_client import TabularDBClient # Example: Using PG for storage
+# 修复：将相对导入 'from .core.schemas.data_schema...' 更改为绝对导入
 from core.schemas.data_schema import KnowledgeGraph, KGNode, KGRelation
 
 logger = logging.getLogger(__name__)
