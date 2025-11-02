@@ -1,138 +1,188 @@
-"""
-Synthesizer Module.
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import asyncio
+from typing import Any, Dict, List, Optional, Tuple
 
-Fuses multiple AgentDecisions into a single, robust FusionResult.
-It uses a combination of algorithmic methods (e.g., Bayesian averaging)
-and a MetacognitiveAgent (LLM) to generate the final output.
-"""
-import logging
-import numpy as np
-from typing import List, Dict, Any, Optional
-
-# 修复：将相对导入 'from ..ai.metacognitive_agent...' 更改为绝对导入
 from ai.metacognitive_agent import MetacognitiveAgent
-# 修复：将相对导入 'from ..core.schemas.fusion_result...' 更改为绝对导入
-from core.schemas.fusion_result import AgentDecision, FusionResult
-# 修复：将相对导入 'from ..core.schemas.data_schema...' 更改为绝对导入
-from core.schemas.data_schema import MarketEvent
+from ai.prompt_manager import PromptManager
+from ai.reasoning_ensemble import ReasoningEnsemble
+from evaluation.critic import Critic
+from evaluation.fact_checker import FactChecker
+from memory.cot_database import CoTDatabase
+from monitor.logging import get_logger
+from core.schemas.fusion_result import FusionResultSchema
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
 
 class Synthesizer:
     """
-    Fuses a list of AgentDecisions into a single FusionResult.
+    Synthesizes information from multiple sources to generate a comprehensive
+    and coherent understanding of the market state.
     """
 
-    def __init__(self, metacognitive_agent: Optional[MetacognitiveAgent] = None):
-        """
-        Initializes the Synthesizer.
-
-        Args:
-            metacognitive_agent: An optional LLM agent used for
-                                 generating a qualitative rationale.
-        """
+    def __init__(
+        self,
+        prompt_manager: PromptManager,
+        reasoning_ensemble: ReasoningEnsemble,
+        metacognitive_agent: MetacognitiveAgent,
+        cot_database: CoTDatabase,
+        fact_checker: FactChecker,
+        critic: Critic,
+        max_iterations: int = 3,
+        confidence_threshold: float = 0.85,
+    ):
+        self.prompt_manager = prompt_manager
+        self.reasoning_ensemble = reasoning_ensemble
         self.metacognitive_agent = metacognitive_agent
+        self.cot_database = cot_database
+        self.fact_checker = fact_checker
+        self.critic = critic
+        self.max_iterations = max_iterations
+        self.confidence_threshold = confidence_threshold
         logger.info("Synthesizer initialized.")
 
-    def _calculate_cognitive_uncertainty(self, decisions: List[AgentDecision]) -> float:
+    async def synthesize(
+        self,
+        context: Dict[str, Any],
+        retrieved_data: List[Dict[str, Any]],
+        planner_insights: Dict[str, Any],
+    ) -> FusionResultSchema:
         """
-        Calculates a measure of disagreement (uncertainty) among agents.
-        A simple approach is the variance of their sentiment scores.
-        """
-        if len(decisions) < 2:
-            return 0.0  # No disagreement if 0 or 1 agent
-
-        sentiments = [d.sentiment for d in decisions]
-        variance = np.var(sentiments)
-        
-        # Normalize variance. Max variance for scores in [-1, 1] is 1.0
-        # (e.g., half at -1, half at 1).
-        normalized_uncertainty = np.clip(variance, 0.0, 1.0)
-        return float(normalized_uncertainty)
-
-    def _fuse_scores_bayesian(self, decisions: List[AgentDecision]) -> Dict[str, float]:
-        """
-        Fuses scores using a confidence-weighted average (Bayesian-inspired).
-        
-        - Agents with higher confidence get a stronger "vote".
-        - This prevents a low-confidence "gamble" from skewing the result.
-        """
-        if not decisions:
-            return {"sentiment": 0.0, "impact": 0.0, "confidence": 0.0}
-
-        total_confidence = sum(d.confidence for d in decisions)
-        
-        if total_confidence == 0:
-            # If all agents are 0 confidence, result is neutral 0 confidence
-            return {"sentiment": 0.0, "impact": 0.0, "confidence": 0.0}
-
-        # Weighted average for sentiment and impact
-        fused_sentiment = sum(d.sentiment * d.confidence for d in decisions) / total_confidence
-        fused_impact = sum(d.predicted_impact * d.confidence for d in decisions) / total_confidence
-        
-        # Fused confidence could be the max, average, or a more complex model.
-        # Using the average confidence of the "winning" side is robust.
-        # For simplicity here, we use the weighted average confidence.
-        fused_confidence = total_confidence / len(decisions) # Simple average
-        
-        return {
-            "sentiment": float(fused_sentiment), 
-            "impact": float(fused_impact), 
-            "confidence": float(fused_confidence)
-        }
-
-    async def synthesize(self, 
-                         event: MarketEvent,
-                         context: Dict[str, Any], 
-                         decisions: List[AgentDecision]) -> Optional[FusionResult]:
-        """
-        Orchestrates the fusion process.
+        Performs iterative synthesis of information to generate a market hypothesis.
 
         Args:
-            event: The original MarketEvent being analyzed.
-            context: The full RAG evidence context.
-            decisions: The list of AgentDecision objects from the ensemble.
+            context: The current pipeline state and context.
+            retrieved_data: A list of data artifacts retrieved from various sources.
+            planner_insights: Insights generated by the planning agent.
 
         Returns:
-            A single FusionResult object, or None if fusion fails.
+            A FusionResultSchema object containing the synthesized hypothesis,
+            confidence score, and supporting evidence.
         """
-        if not decisions:
-            logger.warning("Cannot synthesize: No agent decisions provided.")
-            return None
+        logger.info("Starting synthesis process.")
+        synthesis_history = []
+        current_hypothesis = None
+        current_confidence = 0.0
+        current_evidence = []
 
-        try:
-            # 1. Algorithmic Fusion (Quantitative)
-            fused_scores = self._fuse_scores_bayesian(decisions)
-            cognitive_uncertainty = self._calculate_cognitive_uncertainty(decisions)
-            
-            # 2. Metacognitive Fusion (Qualitative Rationale)
-            fused_rationale = "Algorithmic fusion complete."
-            if self.metacognitive_agent:
-                event_context = {"event": event.dict(), "context": context}
-                meta_result = await self.metacognitive_agent.synthesize(event_context, decisions)
-                
-                if meta_result and 'fused_rationale' in meta_result:
-                    fused_rationale = meta_result['fused_rationale']
-                    # Optional: Allow the meta-agent to override scores
-                    # fused_scores['sentiment'] = meta_result.get('fused_sentiment', fused_scores['sentiment'])
-                    # ...
-                else:
-                    logger.warning("Metacognitive agent failed to provide a rationale.")
-            
-            # 3. Assemble the final result
-            # 修复：使用 FusionResult schema
-            fusion_result = FusionResult(
-                fused_confidence=fused_scores['confidence'],
-                fused_sentiment=fused_scores['sentiment'],
-                fused_predicted_impact=fused_scores['impact'],
-                cognitive_uncertainty=cognitive_uncertainty,
-                fused_rationale=fused_rationale,
-                contributing_decisions=decisions
+        for iteration in range(self.max_iterations):
+            logger.info(f"Synthesis iteration {iteration + 1}/{self.max_iterations}")
+
+            # 1. Generate new insights using the reasoning ensemble
+            reasoning_results = await self.reasoning_ensemble.reason(
+                context=context,
+                data=retrieved_data,
+                planner_insights=planner_insights,
+                previous_hypothesis=current_hypothesis,
             )
-            
-            logger.info(f"Synthesis complete. Uncertainty: {cognitive_uncertainty:.3f}, Sentiment: {fused_scores['sentiment']:.3f}")
-            return fusion_result
 
-        except Exception as e:
-            logger.error(f"Error during synthesis: {e}", exc_info=True)
-            return None
+            # Store CoT results for audit and future retrieval
+            await self.cot_database.add_reasoning_results(reasoning_results)
+
+            # 2. Metacognitive agent reflects on the reasoning results
+            (
+                refined_hypothesis,
+                confidence,
+                identified_gaps,
+                conflicts,
+            ) = self.metacognitive_agent.reflect(
+                reasoning_results=reasoning_results,
+                synthesis_history=synthesis_history,
+                current_context=context,
+            )
+
+            # 3. Fact-checking and Criticism
+            fact_check_results = await self.fact_checker.batch_check(
+                [refined_hypothesis], context
+            )
+            critic_feedback = await self.critic.critique(
+                refined_hypothesis, context, fact_check_results
+            )
+
+            # 4. Refine based on feedback
+            # In a real implementation, this might involve another call to the
+            # metacognitive agent or a specific refinement prompt.
+            # For simplicity, we'll use the feedback to adjust confidence.
+            if not fact_check_results[0]["is_supported"] or critic_feedback["errors"]:
+                confidence *= 0.8  # Penalize for unsupported or criticized hypothesis
+                logger.warning(
+                    f"Hypothesis penalized due to fact-check/criticism. New confidence: {confidence}"
+                )
+
+            # Update history
+            synthesis_history.append(
+                {
+                    "iteration": iteration,
+                    "hypothesis": refined_hypothesis,
+                    "confidence": confidence,
+                    "gaps": identified_gaps,
+                    "conflicts": conflicts,
+                    "fact_check": fact_check_results[0],
+                    "critic_feedback": critic_feedback,
+                }
+            )
+
+            current_hypothesis = refined_hypothesis
+            current_confidence = confidence
+            # Simplified evidence aggregation
+            current_evidence = list(
+                {
+                    item["source_id"]
+                    for result in reasoning_results
+                    for item in result["supporting_evidence"]
+                }
+            )
+
+            logger.info(
+                f"Iteration {iteration + 1} hypothesis: {current_hypothesis}"
+            )
+            logger.info(f"Iteration {iteration + 1} confidence: {current_confidence}")
+
+            # 5. Check termination condition
+            if (
+                current_confidence >= self.confidence_threshold
+                and not identified_gaps
+                and not conflicts
+            ):
+                logger.info(
+                    f"Met confidence threshold ({self.confidence_threshold}) with no gaps or conflicts. Terminating synthesis."
+                )
+                break
+            elif iteration < self.max_iterations - 1:
+                logger.info("Continuing to next synthesis iteration.")
+                # Here, you might trigger a re-planning or re-retrieval step
+                # based on identified_gaps and conflicts. For this example,
+                # we'll just loop with the refined hypothesis.
+                pass
+            else:
+                logger.warning(
+                    f"Reached max iterations ({self.max_iterations}) without meeting threshold."
+                )
+
+        final_result = FusionResultSchema(
+            hypothesis=current_hypothesis,
+            confidence=current_confidence,
+            supporting_evidence=current_evidence,
+            uncertainty={
+                "gaps": synthesis_history[-1]["gaps"],
+                "conflicts": synthesis_history[-1]["conflicts"],
+            },
+            synthesis_history=synthesis_history,
+        )
+
+        logger.info(f"Final synthesized hypothesis: {final_result.hypothesis}")
+        logger.info(f"Final confidence: {final_result.confidence}")
+
+        return final_result
