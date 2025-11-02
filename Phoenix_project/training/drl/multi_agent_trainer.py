@@ -5,23 +5,17 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from typing import Dict, Any
 
 # --- [修复] ---
-# 原: from .trading_env import TradingEnv
-# 新: from .trading_env import TradingEnv (依然正确)
-#
-# 原: from .agents.alpha_agent import AlphaAgent
-# 新: from .agents.alpha_agent import AlphaAgent (依然正确)
-#
-# 原: from ..utils.replay_buffer import ReplayBuffer
-# 新: from ...utils.replay_buffer import ReplayBuffer (training/drl/ -> training/ -> Phoenix_project/ -> utils/)
-#
-# 原: from ..monitor.logging import get_logger
-# 新: from ...monitor.logging import get_logger (training/drl/ -> training/ -> Phoenix_project/ -> monitor/)
+# 修复：将相对导入 'from .trading_env...' 更改为绝对导入
+from training.drl.trading_env import TradingEnv
+# 修复：将相对导入 'from .agents.alpha_agent...' 更改为绝对导入
+from training.drl.agents.alpha_agent import AlphaAgent
+# 修复：将相对导入 'from .agents.risk_agent...' 更改为绝对导入
+from training.drl.agents.risk_agent import RiskAgent
+# 修复：将相对导入 'from ...utils.replay_buffer...' 更改为绝对导入
+from utils.replay_buffer import ReplayBuffer
+# 修复：将相对导入 'from ...monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
 # --- [修复结束] ---
-from .trading_env import TradingEnv
-from .agents.alpha_agent import AlphaAgent
-from .agents.risk_agent import RiskAgent
-from ...utils.replay_buffer import ReplayBuffer
-from ...monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
