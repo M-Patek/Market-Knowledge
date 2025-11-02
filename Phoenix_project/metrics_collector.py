@@ -2,7 +2,8 @@ from prometheus_client import start_http_server, Counter, Gauge, Histogram
 import time
 from typing import Dict, Any
 
-from .monitor.logging import get_logger
+# 修复：将相对导入 'from .monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
