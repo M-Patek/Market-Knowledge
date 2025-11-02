@@ -5,7 +5,8 @@ import google.generativeai as genai
 from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
 
-from ..monitor.logging import get_logger
+# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
