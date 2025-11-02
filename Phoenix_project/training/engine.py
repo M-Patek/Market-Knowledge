@@ -1,12 +1,14 @@
 import pandas as pd
-from typing import Dict, Any, Optional
+# 修复：[FIX-15] 添加 'Callable' 用于类型提示
+from typing import Dict, Any, Optional, Callable
 
 from ..core.pipeline_state import PipelineState
 from ..data.data_iterator import DataIterator
 from ..controller.orchestrator import Orchestrator
 from ..execution.trade_lifecycle_manager import TradeLifecycleManager
 from ..monitor.logging import get_logger
-from ..output.renderer import ReportRenderer
+# 修复：[FIX-15] 导入 'render_report' (函数)，而不是 'ReportRenderer' (类)
+from ..output.renderer import render_report
 
 logger = get_logger(__name__)
 
@@ -22,7 +24,8 @@ class BacktestingEngine:
         data_iterator: DataIterator,
         orchestrator: Orchestrator,
         trade_lifecycle_manager: TradeLifecycleManager,
-        report_renderer: ReportRenderer
+        # 修复：[FIX-15] 更新类型提示和参数名称
+        report_renderer_func: Callable
     ):
         """
         Initializes the BacktestingEngine.
@@ -32,14 +35,15 @@ class BacktestingEngine:
             data_iterator: Provides the historical event stream (data).
             orchestrator: The "brain" that processes events and generates signals.
             trade_lifecycle_manager: Manages the simulated portfolio state.
-            report_renderer: Generates the final performance report.
+            report_renderer_func: 生成报告的函数。
         """
         self.config = config
         self.backtest_config = config.get('backtesting', {})
         self.data_iterator = data_iterator
         self.orchestrator = orchestrator
         self.trade_lifecycle_manager = trade_lifecycle_manager
-        self.report_renderer = report_renderer
+        # 修复：[FIX-15]
+        self.report_renderer = report_renderer_func
         
         self.start_date = pd.to_datetime(self.backtest_config.get('start_date'))
         self.end_date = pd.to_datetime(self.backtest_config.get('end_date'))
@@ -62,6 +66,7 @@ class BacktestingEngine:
         # 3. Main Event Loop
         logger.info("Starting event loop...")
         event_count = 0
+        timestamp = self.start_date # 修复：[FIX-10] 初始化 timestamp
         try:
             # The DataIterator yields (timestamp, [events_at_this_timestamp])
             async for timestamp, events_batch in self.data_iterator:
@@ -115,7 +120,9 @@ class BacktestingEngine:
                 logger.warning("No PnL history found. Cannot generate report.")
                 return
 
-            report_html = self.report_renderer.generate_html_report(
+            # 修复：[FIX-15] 直接调用函数，
+            # 而不是 'generate_html_report' 方法
+            report_html = self.report_renderer(
                 pnl_history=pnl_history,
                 trade_log=trade_log,
                 config=self.config
