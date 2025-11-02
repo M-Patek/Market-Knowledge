@@ -1,145 +1,112 @@
-import asyncio
-from datetime import datetime
+"""
+管道状态 (PipelineState)
+一个内存中的对象，用于存储系统在两个周期之间的状态。
+"""
 from typing import Dict, Any, List, Optional
 from collections import deque
-from copy import deepcopy
-from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
-from core.schemas.fusion_result import FusionResult, AgentDecision
+from datetime import datetime
+
+# FIX (E1, E2, E3): 导入统一的模式
+from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator, PortfolioState
+from core.schemas.fusion_result import AgentDecision, FusionResult
+
 from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 class PipelineState:
     """
-    A thread-safe, asynchronous state manager for the application.
-    It holds all data, decisions, and portfolio information for
-    a single processing cycle.
-    
-    Uses asyncio.Lock to ensure safe concurrent access, although
-    in the current design, it's mostly accessed serially within
-    the main cycle. The lock is good practice.
+    管理系统的当前状态，包括最新的数据、持仓和决策。
     """
 
-    def __init__(self, initial_state: Optional[Dict[str, Any]] = None):
-        self._state: Dict[str, Any] = {
-            # --- Core Timestamps ---
-            "current_time": datetime.utcnow(),
-            "cycle_start_time": None,
-            "last_successful_cycle_time": None,
-            "last_data_ingest_time": None,
-            
-            # --- Cycle-specific IDs ---
-            "current_decision_id": None,
-            
-            # --- Raw Data Buffers (Time-Windowed) ---
-            "market_data": deque(maxlen=200), # Store last N ticks
-            "news_data": deque(maxlen=50),   # Store last N articles
-            "economic_data": deque(maxlen=50),
-            
-            # --- Cognitive Artifacts (from last cycle) ---
-            "last_formatted_context": None,
-            "last_agent_decisions": [], # List[AgentDecision]
-            "last_arbitration": None,
-            "last_fusion_result": None, # FusionResult
-            "last_fact_check": None,
-            "last_guarded_decision": None, # FusionResult
-            
-            # --- Execution & Portfolio State ---
-            "portfolio": {
-                "cash": 100000.0,
-                "total_value": 100000.0,
-                "positions": {} # e.g., {"AAPL": {"size": 10, "avg_price": 150.0, "market_value": ...}}
-            },
-            "open_orders": [], # List[Order]
-            "trade_history": deque(maxlen=1000), # List[Execution]
-            
-            # --- System Health ---
-            "last_cycle_time_ms": 0.0,
-            "system_status": "RUNNING", # RUNNING, DEGRADED, CIRCUIT_BREAKER
-            
-            **(initial_state or {})
-        }
-        self._lock = asyncio.Lock()
-        logger.info("PipelineState initialized.")
+    # FIX (E5): 更改构造函数以接受配置或初始状态
+    def __init__(self, initial_state: Optional[Dict[str, Any]] = None, max_history: int = 100):
+        
+        self.max_history = max_history
+        self.log_prefix = "PipelineState:"
+        
+        if initial_state:
+            self.current_time: datetime = initial_state.get("current_time", datetime.utcnow())
+            self.portfolio_state: PortfolioState = initial_state.get("portfolio_state")
+            # ... 其他状态的恢复
+        else:
+            self.current_time: datetime = datetime.min
+            self.portfolio_state: Optional[PortfolioState] = None
 
-    async def get_value(self, key: str, default: Any = None) -> Any:
-        """Safely get a value from the state."""
-        async with self._lock:
-            return deepcopy(self._state.get(key, default))
+        # 存储历史数据 (用于回溯分析)
+        self.market_data_history: deque[MarketData] = deque(maxlen=self.max_history)
+        self.news_history: deque[NewsData] = deque(maxlen=self.max_history)
+        self.econ_history: deque[EconomicIndicator] = deque(maxlen=self.max_history)
+        
+        # FIX (E3): 存储 AgentDecision 和 FusionResult
+        self.decision_history: deque[AgentDecision] = deque(maxlen=self.max_history)
+        self.fusion_history: deque[FusionResult] = deque(maxlen=self.max_history)
+        
+        logger.info(f"{self.log_prefix} Initialized. Max history size: {self.max_history}")
 
-    async def update_value(self, key: str, value: Any):
-        """Safely update a single key in the state."""
-        async with self._lock:
-            self._state[key] = value
-            # logger.debug(f"State updated: {key} = {value}")
+    def update_time(self, new_time: datetime):
+        self.current_time = new_time
 
-    async def update_state(self, updates: Dict[str, Any]):
-        """Safely update multiple keys in the state."""
-        async with self._lock:
-            for key, value in updates.items():
-                # Handle special deque appends
-                if key in ("market_data", "news_data", "economic_data") and isinstance(value, list):
-                    self._state[key].extend(value)
-                elif key in ("market_data", "news_data", "economic_data") and not isinstance(value, (list, deque)):
-                     self._state[key].append(value)
-                elif key == "trade_history" and isinstance(value, list):
-                    self._state[key].extend(value)
-                elif key == "trade_history" and not isinstance(value, (list, deque)):
-                    self._state[key].append(value)
-                else:
-                    self._state[key] = value
-            # logger.debug(f"Batch state update applied: {updates.keys()}")
+    def update_portfolio_state(self, new_state: PortfolioState):
+        self.portfolio_state = new_state
+        logger.debug(f"{self.log_prefix} Portfolio state updated to {new_state.timestamp}")
 
-    async def get_full_state_copy(self) -> Dict[str, Any]:
-        """Return a deep copy of the entire state dictionary."""
-        async with self._lock:
-            return deepcopy(self._state)
-
-    # --- Convenience Accessors for Context Building ---
-
-    async def get_full_context(self) -> Dict[str, List[Any]]:
+    def update_data_batch(self, data_batch: Dict[str, List[Any]]):
         """
-        Get all data needed to build a context snapshot for the AI.
-        Returns copies to prevent mutation.
+        将新一批的数据添加到历史记录中。
         """
-        async with self._lock:
-            return {
-                "market_data": list(self._state["market_data"]),
-                "news_data": list(self._state["news_data"]),
-                "economic_data": list(self._state["economic_data"]),
-                # Add other context-relevant data here
+        # FIX (E1): 使用正确的键
+        if "market_data" in data_batch:
+            self.market_data_history.extend(data_batch["market_data"])
+            
+        if "news_data" in data_batch:
+            self.news_history.extend(data_batch["news_data"])
+            
+        if "economic_indicators" in data_batch:
+            self.econ_history.extend(data_batch["economic_indicators"])
+            
+        logger.debug(f"{self.log_prefix} Data history updated.")
+
+    def update_ai_outputs(self, fusion_result: FusionResult):
+        """
+        存储 AI 决策的结果。
+        """
+        self.fusion_history.append(fusion_result)
+        
+        # FIX (E3): 存储 AgentDecision
+        if fusion_result.agent_decisions:
+            self.decision_history.extend(fusion_result.agent_decisions)
+            
+        logger.debug(f"{self.log_prefix} AI outputs updated with FusionID {fusion_result.id}")
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        """
+        创建系统当前状态的快照，用于持久化。
+        """
+        return {
+            "current_time": self.current_time,
+            "portfolio_state": self.portfolio_state.model_dump() if self.portfolio_state else None,
+            "history_counts": {
+                "market_data": len(self.market_data_history),
+                "news": len(self.news_history),
+                "fusion_results": len(self.fusion_history)
             }
-
-    async def get_full_context_formatted(self) -> str:
+            # 注意：不序列化完整的 deque 历史，以避免快照过大
+        }
+        
+    def get_latest_market_data(self, symbol: str) -> Optional[MarketData]:
         """
-        Get the last formatted context string.
-        Assumes DataAdapter has run and stored this.
+        (示例) 从历史中获取最新的市场数据。
+        FIX (E10): 替换 test_pipeline_state 中使用的旧方法
         """
-        async with self._lock:
-            return self._state.get("last_formatted_context", "No context available.")
-
-    async def get_latest_market_data(self, symbol: str) -> Optional[MarketData]:
-        """Get the most recent market data for a specific symbol."""
-        async with self._lock:
-            for data in reversed(self._state["market_data"]):
-                if data.symbol == symbol:
-                    return deepcopy(data)
-            return None
-    
-    async def get_portfolio(self) -> Dict[str, Any]:
-        """Safely get a copy of the portfolio."""
-        async with self._lock:
-            return deepcopy(self._state["portfolio"])
-
-    async def update_portfolio(self, portfolio_update: Dict[str, Any]):
+        for data in reversed(self.market_data_history):
+            if data.symbol == symbol:
+                return data
+        return None
+        
+    def get_latest_portfolio_state(self) -> Optional[PortfolioState]:
         """
-        Safely update the portfolio state.
-        This is typically called by the OrderManager or a portfolio
-        update service.
+        (示例) 获取最新的投资组合状态。
+        FIX (E10): 替换 test_pipeline_state 中使用的旧方法
         """
-        async with self._lock:
-            # Perform a deep merge
-            # This is simplified. A real update would be more careful,
-            # especially with nested dicts like 'positions'.
-            self._state["portfolio"].update(portfolio_update)
-            logger.info("Portfolio state updated.")
+        return self.portfolio_state
