@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, Mock
 import backtrader as bt
 from execution.interfaces import IBrokerAdapter, Order
 from execution.order_manager import OrderManager
-from execution.adapters import BacktraderBrokerAdapter
+# 修复：[FIX-12] 'BacktraderBrokerAdapter' 被重命名为 'SimulatedBrokerAdapter'
+from execution.adapters import SimulatedBrokerAdapter
 
 # --- Mocks and Fixtures ---
 
@@ -105,10 +106,10 @@ def test_order_manager_respects_min_notional(mock_broker_adapter, mock_strategy)
     mock_broker_adapter.place_order.assert_not_called()
 
 # --- BacktraderBrokerAdapter Tests ---
-
+# 修复：[FIX-12] 重命名测试中的类
 def test_adapter_places_buy_order(mock_strategy):
     """Tests if the adapter correctly calls strategy.buy."""
-    adapter = BacktraderBrokerAdapter(broker=MagicMock())
+    adapter = SimulatedBrokerAdapter(broker=MagicMock())
     order = Order(ticker="TEST_TICKER", side="BUY", size=50.0, limit_price=101.0)
     
     result_order = adapter.place_order(mock_strategy, order)
@@ -123,7 +124,7 @@ def test_adapter_places_buy_order(mock_strategy):
 
 def test_adapter_places_sell_order(mock_strategy):
     """Tests if the adapter correctly calls strategy.sell."""
-    adapter = BacktraderBrokerAdapter(broker=MagicMock())
+    adapter = SimulatedBrokerAdapter(broker=MagicMock())
     order = Order(ticker="TEST_TICKER", side="SELL", size=50.0, limit_price=99.0)
 
     result_order = adapter.place_order(mock_strategy, order)
@@ -138,7 +139,7 @@ def test_adapter_places_sell_order(mock_strategy):
 
 def test_adapter_rejects_unfillable_buy_order(mock_strategy):
     """Tests that a buy order with a limit price below the bar's low is rejected."""
-    adapter = BacktraderBrokerAdapter(broker=MagicMock())
+    adapter = SimulatedBrokerAdapter(broker=MagicMock())
     # Limit price of $97 is below the bar's low of $98
     order = Order(ticker="TEST_TICKER", side="BUY", size=50.0, limit_price=97.0)
     
