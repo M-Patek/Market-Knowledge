@@ -1,170 +1,190 @@
+"""
+Hyperparameter Optimizer
+
+Uses Bayesian optimization (e.g., via scikit-optimize) to find the
+best set of parameters for a given strategy or model.
+"""
 import logging
-from typing import Dict, Any, Callable
-from functools import partial
+from typing import List, Dict, Any, Callable
+from skopt import gp_minimize
+from skopt.space import Real, Integer, Categorical
+from skopt.utils import use_named_args
 
-# 修正：导入 'optuna' 库，这个库之前缺失了
-import optuna
+# 修复：添加 pandas 导入
+import pandas as pd
 
-from backtesting.engine import BacktestEngine
-from data_manager import DataManager
+from .backtesting.engine import BacktestingEngine
+from .config.loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
 
 class Optimizer:
     """
-    使用 Optuna 框架的超参数优化器。
-    
-    它通过在回测引擎上运行多次试验来
-    为策略（例如 RomanLegionStrategy）找到最佳参数。
-    (Task 17 - 参数优化)
+    Wraps the optimization process, handling parameter spaces
+    and objective function evaluation.
     """
 
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        backtest_engine: BacktestEngine,
-        data_manager: DataManager
-    ):
+    def __init__(self, 
+                 param_space_config: List[Dict[str, Any]],
+                 objective_function: Callable,
+                 config_loader: ConfigLoader):
         """
-        初始化优化器。
-        
-        Args:
-            config (Dict[str, Any]): 'optimizer' 部分的配置。
-            backtest_engine (BacktestEngine): 用于运行每次试验的回测引擎。
-            data_manager (DataManager): 用于为回测获取数据。
-        """
-        self.config = config.get('optimizer', {})
-        self.backtest_engine = backtest_engine
-        self.data_manager = data_manager
-        
-        self.study_name = self.config.get('study_name', 'phoenix_optimization')
-        self.n_trials = self.config.get('n_trials', 100)
-        self.storage_url = self.config.get('storage_url', 'sqlite:///optuna_study.db')
-        
-        logger.info(f"Optimizer initialized: Study='{self.study_name}', Trials={self.n_trials}")
+        Initializes the Optimizer.
 
-    def run_optimization(self) -> optuna.Study:
+        Args:
+            param_space_config: A list of dictionaries defining the
+                                search space, e.g.,
+                                [{'type': 'Real', 'name': 'rsi_window', 'low': 5, 'high': 30}]
+            objective_function: The function to minimize (e.g., -Sharpe Ratio).
+                                It must accept (config_loader, **params).
+            config_loader: The main ConfigLoader, which will be *copied*
+                           and *mutated* with new params for each run.
         """
-        执行完整的优化过程。
+        self.param_space = self._build_param_space(param_space_config)
+        self.param_names = [p.name for p in self.param_space]
+        self.objective_function = objective_function
+        self.config_loader = config_loader
         
-        Returns:
-            optuna.Study: 完成的 Optuna 研究对象。
+        logger.info(f"Optimizer initialized with parameter space: {self.param_names}")
+
+    def _build_param_space(self, config: List[Dict[str, Any]]) -> List:
+        """Converts the config dict into a list of skopt.space dimensions."""
+        space = []
+        for p in config:
+            p_type = p.pop('type')
+            p_name = p.pop('name')
+            if p_type == 'Real':
+                space.append(Real(name=p_name, **p))
+            elif p_type == 'Integer':
+                space.append(Integer(name=p_name, **p))
+            elif p_type == 'Categorical':
+                space.append(Categorical(name=p_name, **p))
+            else:
+                raise ValueError(f"Unsupported parameter type: {p_type}")
+        return space
+
+    @use_named_args(dimensions=None) # Will be set dynamically
+    def _objective(self, **params) -> float:
         """
-        logger.info(f"Starting optimization study '{self.study_name}' for {self.n_trials} trials...")
+        Internal wrapper for the objective function.
+        
+        This function receives the parameters from `gp_minimize`,
+        updates a *copy* of the config, and runs the objective function.
+        """
+        logger.debug(f"Testing parameters: {params}")
         
         try:
-            # 1. 创建或加载一个 Optuna 研究
-            study = optuna.create_study(
-                study_name=self.study_name,
-                storage=self.storage_url,
-                load_if_exists=True,
-                direction='maximize' # 我们想要最大化夏普比率
-            )
-
-            # 2. 定义目标函数
-            # 我们使用 partial 来 "冻结" objective 函数的 self, data 参数
-            objective_func = partial(
-                self._objective,
-                strategy_class=self.backtest_engine.strategy_class # 假设引擎持有策略类
-            )
-
-            # 3. 运行优化
-            study.optimize(
-                objective_func,
-                n_trials=self.n_trials,
-                timeout=self.config.get('timeout_seconds', None)
-            )
-
-            # 4. 记录最佳结果
-            logger.info("Optimization complete.")
-            logger.info(f"Best trial: {study.best_trial.number}")
-            logger.info(f"Best value (Sharpe Ratio): {study.best_value}")
-            logger.info(f"Best params: {study.best_params}")
+            # 1. Create a deep copy of the config to mutate
+            temp_config_loader = self.config_loader.deep_copy()
             
-            return study
-
-        except Exception as e:
-            logger.error(f"Optimization study '{self.study_name}' failed: {e}", exc_info=True)
-            raise
-
-    def _objective(self, trial: optuna.Trial, strategy_class: Any) -> float:
-        """
-        Optuna 的目标函数。
-        
-        对于给定的试验，它：
-        1. 建议一组超参数。
-        2. 使用这些参数运行回测。
-        3. 返回要最大化的指标 (例如夏普比率)。
-        
-        Args:
-            trial: 当前的 Optuna 试验对象。
-            strategy_class: 要实例化的策略类 (例如 RomanLegionStrategy)。
+            # 2. Update the config with the new parameters
+            # This assumes parameters are in a flat structure or
+            # we use a helper to update nested keys.
+            # Example: temp_config_loader.update_param('strategy.rsi_window', params['rsi_window'])
             
-        Returns:
-            float: 该试验的夏普比率。
-        """
-        
-        # 1. 建议超参数
-        # (这需要与策略的 __init__ 匹配)
-        params_config = self.config.get('parameters', {})
-        strategy_params = {}
-        
-        # 示例：为 SMA 周期采样
-        if 'sma_short' in params_config:
-            strategy_params['sma_short'] = trial.suggest_int(
-                'sma_short', 
-                params_config['sma_short']['low'], 
-                params_config['sma_short']['high']
-            )
-        if 'sma_long' in params_config:
-             strategy_params['sma_long'] = trial.suggest_int(
-                'sma_long', 
-                params_config['sma_long']['low'], 
-                params_config['sma_long']['high']
-            )
-        # 示例：为 RSI 阈值采样
-        if 'rsi_overbought' in params_config:
-            strategy_params['rsi_overbought'] = trial.suggest_int(
-                'rsi_overbought', 
-                params_config['rsi_overbought']['low'], 
-                params_config['rsi_overbought']['high']
-            )
+            # For this example, let's assume we update a 'strategy' block
+            strategy_config = temp_config_loader.get_config('strategy', {})
+            strategy_config.update(params)
+            temp_config_loader.set_config('strategy', strategy_config)
             
-        logger.debug(f"Trial {trial.number}: Testing params {strategy_params}")
-
-        try:
-            # 2. 准备回测数据 (从 DataManager)
-            # (这应该使用配置中的标准回测日期/资产)
-            backtest_data = self.data_manager.get_data_for_backtest(
-                assets=self.config.get('assets', ['SPY']),
-                start_date=self.config.get('start_date', '2020-01-01'),
-                end_date=self.config.get('end_date', '2023-01-01')
-            )
+            # 3. Run the user-provided objective function
+            # The user's function is responsible for running the backtest
+            result = self.objective_function(config_loader=temp_config_loader, **params)
             
-            # 3. 合并配置
-            # 创建一个新的配置 dict，注入建议的参数
-            trial_config = self.backtest_engine.config.copy() # 使用引擎的基础配置
-            trial_config['strategy']['parameters'] = strategy_params
-
-            # 4. 运行回测
-            results_df = self.backtest_engine.run(
-                data=backtest_data,
-                strategy_class=strategy_class, # 传递策略类
-                config=trial_config # 传递特定于试验的配置
-            )
-            
-            # 5. 提取要最大化的指标
-            sharpe_ratio = results_df.get('Sharpe Ratio', 0.0)
-            
-            # 处理回测失败或夏普比率为 NaN 的情况
-            if pd.isna(sharpe_ratio):
-                sharpe_ratio = 0.0
+            # 4. Handle NaN/Inf results (common in backtesting)
+            # 修复：使用 pd.isna
+            if pd.isna(result) or not pd.Series(result).is_finite().all():
+                logger.warning(f"Objective function returned invalid value (NaN/Inf) for params: {params}. Returning +inf.")
+                # We are minimizing, so return a very bad score
+                return float('inf')
                 
-            logger.debug(f"Trial {trial.number}: Sharpe Ratio = {sharpe_ratio}")
+            logger.info(f"Params: {params} -> Objective Score: {result:.4f}")
+            return result
             
-            return sharpe_ratio
-
         except Exception as e:
-            logger.warning(f"Trial {trial.number} failed: {e}", exc_info=True)
-            # 告诉 Optuna 这次试验失败了
-            raise optuna.exceptions.TrialPruned()
+            logger.error(f"Error during objective evaluation with params {params}: {e}", exc_info=True)
+            # Return a very bad score on failure
+            return float('inf')
+
+    def run_optimization(self, n_calls: int = 50, n_initial_points: int = 10) -> Dict[str, Any]:
+        """
+        Executes the Bayesian optimization process.
+
+        Args:
+            n_calls: Total number of optimization runs.
+            n_initial_points: Number of random points to sample before
+                              building the surrogate model.
+        Returns:
+            A dictionary containing the best parameters and the best score.
+        """
+        logger.info(f"Starting optimization: n_calls={n_calls}, n_initial_points={n_initial_points}")
+        
+        # Dynamically set the dimensions for the @use_named_args decorator
+        self._objective.__skopt_dimensions__ = self.param_space
+        
+        result = gp_minimize(
+            func=self._objective,
+            dimensions=self.param_space,
+            n_calls=n_calls,
+            n_initial_points=n_initial_points,
+            acq_func="EI", # Expected Improvement
+            random_state=42,
+            verbose=False
+        )
+        
+        best_params = {name: val for name, val in zip(self.param_names, result.x)}
+        best_score = result.fun
+        
+        logger.info(f"Optimization complete.")
+        logger.info(f"Best Score: {best_score:.4f}")
+        logger.info(f"Best Parameters: {best_params}")
+        
+        return {
+            "best_score": best_score,
+            "best_params": best_params,
+            "optimization_result": result
+        }
+
+# --- Example Objective Function (to be defined by the user) ---
+
+def example_sharpe_objective(config_loader: ConfigLoader, **params) -> float:
+    """
+    An example objective function that runs a backtest and returns
+    the negative Sharpe ratio (since we want to minimize).
+    
+    Args:
+        config_loader: The *mutated* ConfigLoader with new params.
+        **params: The parameters being tested.
+        
+    Returns:
+        The score to be minimized (e.g., -Sharpe Ratio).
+    """
+    
+    # 1. Initialize components using the *temp_config_loader*
+    # (This is a simplified example)
+    
+    # data_iterator = DataIterator(config_loader.get_config('data'))
+    # pipeline_state = PipelineState(config_loader.get_config('portfolio'))
+    # strategy_handler = MyStrategy(config_loader=config_loader, pipeline_state=pipeline_state)
+    # ... (build other components)
+    
+    # engine = BacktestingEngine(
+    #     data_iterator=data_iterator,
+    #     strategy_handler=strategy_handler,
+    #     ...
+    # )
+    
+    # 2. Run the backtest
+    # results = engine.run()
+    
+    # 3. Get the metric to optimize
+    # sharpe_ratio = results.get('sharpe_ratio', 0.0)
+    
+    # --- Mocked Result ---
+    # Simulate a result based on params for demonstration
+    rsi_window = params.get('rsi_window', 14)
+    # Simulate a simple curve where the best Sharpe is at window=20
+    sharpe_ratio = 1.5 - ((rsi_window - 20) ** 2) / 200.0
+    
+    # We want to *minimize* the *negative* Sharpe ratio
+    return -sharpe_ratio
