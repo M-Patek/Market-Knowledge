@@ -1,101 +1,135 @@
-import pandas as pd
-import logging
-from typing import Dict, Any, Union
+"""
+Adapts raw data streams (e.g., from websockets, APIs) into standardized
+Pydantic schemas defined in core.schemas.data_schema.
 
-from ..core.schemas.data_schema import MarketEvent, TickerData
+This acts as an anti-corruption layer, ensuring that the rest of the
+system consumes clean, validated, and consistent data structures.
+"""
+import logging
+from typing import Union, Optional, Dict, Any
+from pydantic import ValidationError
+
+# 修复：添加 TickerData 并使用正确的相对导入
+from ..core.schemas.data_schema import MarketEvent, EconomicEvent, TickerData
 
 logger = logging.getLogger(__name__)
 
 class DataAdapter:
     """
-    Adapts heterogeneous data inputs (e.g., news, market data) into a standardized
-    format (MarketEvent, TickerData schemas) for the AI pipeline.
+    Transforms raw data payloads (dicts, JSON strings) into standardized
+    Pydantic models.
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.seen_event_ids = set()
+    def __init__(self):
+        """
+        Initializes the DataAdapter.
+        """
+        self.schema_map = {
+            "market_event": MarketEvent,
+            "economic_event": EconomicEvent,
+            "ticker_data": TickerData,
+        }
+        logger.info("DataAdapter initialized.")
 
-    def adapt_market_data(self, raw_data: Dict[str, Any]) -> Union[TickerData, None]:
+    def parse_data(self, raw_data: Dict[str, Any], data_type: str) -> Optional[Union[MarketEvent, EconomicEvent, TickerData]]:
         """
-        Adapts raw market data (e.g., from AlphaVantage) to the TickerData schema.
+        Parses a raw data dictionary into a specified Pydantic schema.
+
+        Args:
+            raw_data: The raw data dictionary.
+            data_type: The key for the target schema (e.g., 'market_event').
+
+        Returns:
+            A Pydantic model instance if parsing is successful, None otherwise.
         """
+        schema = self.schema_map.get(data_type)
+        
+        if not schema:
+            logger.warning(f"No schema found for data_type: {data_type}")
+            return None
+            
         try:
-            # Example adaptation logic
-            # This needs to be customized based on the actual raw_data structure
-            if "Time Series (Daily)" in raw_data:
-                time_series = raw_data["Time Series (Daily)"]
-                # Get the most recent date
-                recent_date = sorted(time_series.keys(), reverse=True)[0]
-                data = time_series[recent_date]
-                
-                ticker_data = TickerData(
-                    symbol=raw_data["Meta Data"]["2. Symbol"],
-                    timestamp=pd.to_datetime(recent_date),
-                    open=float(data["1. open"]),
-                    high=float(data["2. high"]),
-                    low=float(data["3. low"]),
-                    close=float(data["4. close"]),
-                    volume=int(data["5. volume"]),
-                    source="AlphaVantage"
-                )
-                return ticker_data
+            # Attempt to parse and validate the raw data
+            # This is where Pydantic works its magic
+            validated_data = schema(**raw_data)
+            return validated_data
             
-            logger.warning(f"Failed to adapt market data: Unknown format {raw_data.keys()}")
+        except ValidationError as e:
+            logger.error(f"Data validation failed for data_type {data_type}. Error: {e}. Raw data: {str(raw_data)[:200]}...")
             return None
-
         except Exception as e:
-            self._handle_error(f"Error adapting market data for {raw_data.get('Meta Data', {}).get('2. Symbol')}", e)
+            logger.error(f"An unexpected error occurred during data parsing for {data_type}. Error: {e}")
             return None
 
-    def adapt_news_event(self, raw_event: Dict[str, Any]) -> Union[MarketEvent, None]:
+    def adapt_market_event(self, raw_event: Dict[str, Any]) -> Optional[MarketEvent]:
         """
-        Adapts raw news data (e.g., from Benzinga) to the MarketEvent schema.
-        Includes basic deduplication.
+        Helper method to specifically adapt a market event.
+        
+        This might include more complex logic, like field remapping,
+        before validation.
         """
-        try:
-            event_id = raw_event.get('id') or raw_event.get('uuid')
+        # Example: Simple remapping if fields didn't match
+        # if 'title' in raw_event and 'headline' not in raw_event:
+        #     raw_event['headline'] = raw_event.pop('title')
             
-            # Deduplication check
-            if not event_id or event_id in self.seen_event_ids:
-                logger.info(f"Skipping duplicate or invalid event: {event_id}")
-                return None
-            
-            self.seen_event_ids.add(event_id)
+        return self.parse_data(raw_event, "market_event")
 
-            # Example adaptation logic for Benzinga
-            if 'title' in raw_event and 'created_at' in raw_event:
-                market_event = MarketEvent(
-                    event_id=event_id,
-                    timestamp=pd.to_datetime(raw_event['created_at']),
-                    source=raw_event.get('source', 'Benzinga'),
-                    headline=raw_event['title'],
-                    summary=raw_event.get('body', ''),
-                    symbols=self._extract_symbols(raw_event.get('stocks', [])),
-                    url=raw_event.get('url'),
-                    metadata={
-                        'authors': [author['name'] for author in raw_event.get('authors', [])],
-                        'primary_symbol': raw_event.get('primary_symbol'),
-                        'tags': [tag['name'] for tag in raw_event.get('tags', [])]
-                    }
-                )
-                return market_event
+    def adapt_ticker_data(self, raw_tick: Dict[str, Any]) -> Optional[TickerData]:
+        """
+        Helper method to specifically adapt a raw ticker data point.
+        """
+        # Business logic for adaptation can go here
+        # e.g., converting units, parsing non-standard timestamps
+        return self.parse_data(raw_tick, "ticker_data")
 
-            logger.warning(f"Failed to adapt news event: Missing required fields {raw_event.keys()}")
-            return None
+# Example Usage (if run directly for testing)
+if __name__ == "__main__":
+    import datetime
+    
+    logging.basicConfig(level=logging.INFO)
+    
+    adapter = DataAdapter()
+    
+    # 1. Test MarketEvent
+    raw_news = {
+        "event_id": "news_12345",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "source": "Test Source",
+        "headline": "This is a test headline",
+        "content": "Full content of the test news.",
+        "symbols": ["TEST", "TICKER"],
+        "metadata": {"sentiment": 0.8}
+    }
+    
+    market_event = adapter.adapt_market_event(raw_news)
+    if market_event:
+        logger.info(f"Successfully adapted MarketEvent: {market_event.headline}")
+        logger.info(market_event.json())
+        
+    # 2. Test TickerData (NEW)
+    raw_tick = {
+        "symbol": "TEST",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "open": 100.0,
+        "high": 101.0,
+        "low": 99.5,
+        "close": 100.5,
+        "volume": 10000
+    }
+    
+    ticker_data = adapter.adapt_ticker_data(raw_tick)
+    if ticker_data:
+        logger.info(f"Successfully adapted TickerData for: {ticker_data.symbol}")
+        logger.info(ticker_data.json())
 
-        except Exception as e:
-            self._handle_error(f"Error adapting news event {raw_event.get('id')}", e)
-            return None
-
-    def _extract_symbols(self, stocks_data: List[Dict[str, Any]]) -> List[str]:
-        """Utility to extract ticker symbols from nested stock data."""
-        symbols = []
-        for stock in stocks_data:
-            if isinstance(stock, dict) and 'symbol' in stock:
-                symbols.append(stock['symbol'])
-        return list(set(symbols)) # Return unique symbols
-
-    def _handle_error(self, message: str, error: Exception):
-        """Centralized error logging."""
-        logger.error(f"{message}: {error}", exc_info=True)
+    # 3. Test Failed Validation
+    raw_bad_news = {
+        "event_id": "news_678",
+        "source": "Bad Source",
+        # 'timestamp' is missing (required)
+        "headline": "This will fail"
+    }
+    
+    bad_event = adapter.adapt_market_event(raw_bad_news)
+    if not bad_event:
+        logger.info("Successfully caught validation error for bad market event.")
