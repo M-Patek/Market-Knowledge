@@ -1,194 +1,245 @@
-import sqlite3
-from typing import Dict, Any, List, Optional
+"""
+CoT (Chain-of-Thought) Database
+
+Handles the saving and retrieval of the *entire* decision-making
+process (the "Chain of Thought") for auditability and review.
+
+This includes:
+1. The triggering event.
+2. The RAG evidence context provided.
+3. The individual agent decisions.
+4. The final fused result.
+
+Uses a PostgreSQL database (via asyncpg) for structured, reliable,
+and relational storage of these audit logs.
+"""
+import logging
+import asyncpg
 import json
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import uuid
 
-from ..monitor.logging import get_logger
+# 修复：添加 pandas 导入
+import pandas as pd
 
-logger = get_logger(__name__)
+# 修复：添加 FusionResult 导入 (用于类型提示)
+from ..core.schemas.fusion_result import FusionResult
+from ..core.schemas.data_schema import MarketEvent
+
+logger = logging.getLogger(__name__)
 
 class CoTDatabase:
     """
-    Manages a local SQLite database for storing "Chains of Thought" (CoT)
-    and other complex reasoning artifacts from the AI pipeline.
-    
-    This provides a persistent, queryable, and auditable record of *how*
-    the AI reached its conclusions, which is more structured than
-    a simple JSONL audit log.
+    Manages the connection and read/write operations for the
+    PostgreSQL audit database.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, database_url: str):
         """
         Initializes the CoTDatabase.
-        
+
         Args:
-            config: Main system configuration. Expects 'cot_database.db_path'.
+            database_url: The connection string for the PostgreSQL database
+                          (e.g., "postgresql://user:pass@host:port/db")
         """
-        db_config = config.get('cot_database', {})
-        self.db_path = db_config.get('db_path', 'logs/cot_audit.db')
-        self.conn = None
-        logger.info(f"CoTDatabase initialized at: {self.db_path}")
+        self.database_url = database_url
+        self._pool: asyncpg.Pool = None
+        logger.info("CoTDatabase initialized.")
 
-    def connect(self):
-        """Establishes the SQLite connection and creates tables."""
-        try:
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self.conn.row_factory = sqlite3.Row # Access results by column name
-            self._create_tables()
-            logger.info(f"CoTDatabase connected and tables verified.")
-        except Exception as e:
-            logger.error(f"Failed to connect to CoTDatabase: {e}", exc_info=True)
-            raise
+    async def connect(self):
+        """Establishes the database connection pool."""
+        if not self._pool:
+            try:
+                self._pool = await asyncpg.create_pool(self.database_url)
+                logger.info("CoTDatabase connection pool established.")
+                await self.setup_schema()
+            except Exception as e:
+                logger.error(f"Failed to connect to CoTDatabase: {e}", exc_info=True)
+                self._pool = None
+                raise
 
-    def close(self):
-        """Closes the SQLite connection."""
-        if self.conn:
-            self.conn.close()
-            self.conn = None
-            logger.info("CoTDatabase connection closed.")
-            
-    def _create_tables(self):
-        """Creates the necessary tables if they don't exist."""
-        with self.conn:
-            # Main table for each pipeline run
-            self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS pipeline_runs (
-                event_id TEXT PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                headline TEXT,
-                final_decision TEXT,
-                confidence REAL,
-                cognitive_uncertainty REAL,
-                status TEXT
-            );
-            """)
-            
-            # Table for individual agent decisions in a run
-            self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS agent_decisions (
-                decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL,
-                agent_id TEXT NOT NULL,
-                decision TEXT,
-                confidence REAL,
-                justification TEXT,
-                metadata_json TEXT,
-                FOREIGN KEY (event_id) REFERENCES pipeline_runs (event_id)
-            );
-            """)
-            
-            # Table for the raw RAG context used
-            self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS retrieval_context (
-                context_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL,
-                retrieval_type TEXT, -- e.g., 'vector', 'temporal'
-                context_json TEXT,
-                FOREIGN KEY (event_id) REFERENCES pipeline_runs (event_id)
-            );
-            """)
+    async def disconnect(self):
+        """Closes the database connection pool."""
+        if self._pool:
+            await self._pool.close()
+            self._pool = None
+            logger.info("CoTDatabase connection pool closed.")
 
-    def log_pipeline_run(self, fusion_result: 'FusionResult'):
+    async def execute(self, query: str, *args):
+        """Executes a query without returning results."""
+        if not self._pool:
+            raise ConnectionError("Database not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            await conn.execute(query, *args)
+
+    async def fetch(self, query: str, *args) -> List[asyncpg.Record]:
+        """Executes a query and returns all results."""
+        if not self._pool:
+            raise ConnectionError("Database not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(query, *args)
+
+    async def fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
+        """Executes a query and returns a single result."""
+        if not self._pool:
+            raise ConnectionError("Database not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            return await conn.fetchrow(query, *args)
+
+    async def setup_schema(self):
         """
-        Logs a complete pipeline run (FusionResult) to the database
-        in a transactional manner.
+        Ensures the required tables for auditing exist.
+        """
+        logger.info("Setting up database schema...")
         
-        Args:
-            fusion_result (FusionResult): The Pydantic model output.
-        """
-        if not self.conn:
-            logger.error("Database not connected. Cannot log pipeline run.")
-            return
-
-        try:
-            with self.conn:
-                # 1. Insert into main 'pipeline_runs' table
-                self.conn.execute(
-                    """
-                    INSERT INTO pipeline_runs 
-                        (event_id, timestamp, headline, final_decision, confidence, cognitive_uncertainty, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(event_id) DO UPDATE SET
-                        timestamp = excluded.timestamp,
-                        headline = excluded.headline,
-                        final_decision = excluded.final_decision,
-                        confidence = excluded.confidence,
-                        cognitive_uncertainty = excluded.cognitive_uncertainty,
-                        status = excluded.status
-                    """,
-                    (
-                        fusion_result.event_id,
-                        fusion_result.pipeline_io.get('event_data', {}).get('timestamp', pd.Timestamp.now().isoformat()),
-                        fusion_result.pipeline_io.get('event_data', {}).get('headline', ''),
-                        fusion_result.final_decision.decision,
-                        fusion_result.final_decision.confidence,
-                        fusion_result.cognitive_uncertainty,
-                        fusion_result.status
-                    )
-                )
-                
-                # 2. Delete old agent decisions for this event_id to avoid duplicates
-                self.conn.execute("DELETE FROM agent_decisions WHERE event_id = ?", (fusion_result.event_id,))
-                
-                # 3. Insert new agent decisions
-                for decision in fusion_result.agent_decisions:
-                    self.conn.execute(
-                        """
-                        INSERT INTO agent_decisions
-                            (event_id, agent_id, decision, confidence, justification, metadata_json)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            fusion_result.event_id,
-                            decision.agent_id,
-                            decision.decision,
-                            decision.confidence,
-                            decision.justification,
-                            json.dumps(decision.metadata)
-                        )
-                    )
-                
-                # TODO: Add logic to log retrieval_context
-                
-        except Exception as e:
-            logger.error(f"Failed to log pipeline run {fusion_result.event_id} to CoTDatabase: {e}", exc_info=True)
-
-    def get_run_by_event_id(self, event_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieves a full pipeline run, including all agent decisions.
+        # Table for the main pipeline run
+        await self.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_runs (
+            run_id UUID PRIMARY KEY,
+            run_timestamp TIMESTAMPTZ NOT NULL,
+            event_id VARCHAR(255),
+            task_name VARCHAR(255)
+        );
+        """)
         
+        # Table for the triggering market events
+        await self.execute("""
+        CREATE TABLE IF NOT EXISTS market_events (
+            event_id VARCHAR(255) PRIMARY KEY,
+            source VARCHAR(100),
+            timestamp TIMESTAMPTZ NOT NULL,
+            content TEXT,
+            metadata JSONB
+        );
+        """)
+        
+        # Table for the retrieved evidence context
+        await self.execute("""
+        CREATE TABLE IF NOT EXISTS evidence_context (
+            run_id UUID PRIMARY KEY REFERENCES pipeline_runs(run_id),
+            retrieval_timestamp TIMESTAMPTZ NOT NULL,
+            vector_hits JSONB,
+            temporal_hits JSONB,
+            tabular_hits JSONB
+        );
+        """)
+        
+        # Table for the final fusion result
+        await self.execute("""
+        CREATE TABLE IF NOT EXISTS fusion_results (
+            run_id UUID PRIMARY KEY REFERENCES pipeline_runs(run_id),
+            fusion_timestamp TIMESTAMPTZ NOT NULL,
+            fused_confidence FLOAT,
+            fused_sentiment FLOAT,
+            fused_predicted_impact FLOAT,
+            cognitive_uncertainty FLOAT,
+            fused_rationale TEXT,
+            contributing_decisions JSONB
+        );
+        """)
+        
+        logger.info("Database schema setup complete.")
+
+    async def log_market_event(self, event: MarketEvent):
+        """
+        Logs a market event to the database.
+        Uses ON CONFLICT DO NOTHING to avoid duplicates.
+        """
+        query = """
+        INSERT INTO market_events (event_id, source, timestamp, content, metadata)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (event_id) DO NOTHING;
+        """
+        await self.execute(
+            query,
+            event.event_id,
+            event.source,
+            event.timestamp,
+            event.content,
+            json.dumps(event.metadata) if event.metadata else None
+        )
+
+    async def log_pipeline_run(self, 
+                               event: Optional[MarketEvent], 
+                               task_name: Optional[str],
+                               evidence: Dict[str, Any],
+                               # 修复：为 FusionResult 添加类型提示
+                               fusion_result: FusionResult
+                               ) -> str:
+        """
+        Logs a complete pipeline run in a single transaction.
+
         Args:
-            event_id (str): The event ID.
-            
+            event: The triggering MarketEvent (if any).
+            task_name: The name of the scheduled task (if any).
+            evidence: The dictionary of RAG context.
+            fusion_result: The final FusionResult object.
+
         Returns:
-            Optional[Dict]: A consolidated dictionary, or None if not found.
+            The unique run_id for this logged run.
         """
-        if not self.conn:
-            logger.error("Database not connected.")
-            return None
+        if not self._pool:
+            raise ConnectionError("Database not connected. Call connect() first.")
             
-        try:
-            # 1. Get main run
-            run_data = self.conn.execute("SELECT * FROM pipeline_runs WHERE event_id = ?", (event_id,)).fetchone()
-            if not run_data:
-                return None
-                
-            run_result = dict(run_data)
-            
-            # 2. Get agent decisions
-            agent_decisions_raw = self.conn.execute("SELECT * FROM agent_decisions WHERE event_id = ?", (event_id,)).fetchall()
-            
-            agent_decisions = []
-            for row in agent_decisions_raw:
-                decision = dict(row)
-                decision['metadata'] = json.loads(decision.pop('metadata_json', '{}'))
-                agent_decisions.append(decision)
-                
-            run_result['agent_decisions'] = agent_decisions
-            
-            # TODO: Add logic to retrieve retrieval_context
-            
-            return run_result
-            
-        except Exception as e:
-            logger.error(f"Failed to retrieve run {event_id} from CoTDatabase: {e}", exc_info=True)
-            return None
+        run_id = uuid.uuid4()
+        # 修复：使用 pd.Timestamp.now()
+        now = pd.Timestamp.now(tz='UTC').to_pydatetime()
+        event_id = event.event_id if event else None
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # 1. Log the market event (if it exists)
+                    if event:
+                        await self.log_market_event(event) # Uses internal execute
+
+                    # 2. Log the pipeline run
+                    await conn.execute(
+                        """
+                        INSERT INTO pipeline_runs (run_id, run_timestamp, event_id, task_name)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        run_id, now, event_id, task_name
+                    )
+                    
+                    # 3. Log the evidence
+                    await conn.execute(
+                        """
+                        INSERT INTO evidence_context (run_id, retrieval_timestamp, vector_hits, temporal_hits, tabular_hits)
+                        VALUES ($1, $2, $3, $4, $5)
+                        """,
+                        run_id,
+                        evidence.get('retrieval_timestamp', now),
+                        json.dumps(evidence.get('vector_hits', [])),
+                        json.dumps(evidence.get('temporal_hits', [])),
+                        json.dumps(evidence.get('tabular_hits', []))
+                    )
+                    
+                    # 4. Log the fusion result
+                    await conn.execute(
+                        """
+                        INSERT INTO fusion_results (run_id, fusion_timestamp, fused_confidence, 
+                                                    fused_sentiment, fused_predicted_impact, 
+                                                    cognitive_uncertainty, fused_rationale, 
+                                                    contributing_decisions)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        """,
+                        run_id,
+                        fusion_result.fusion_timestamp,
+                        fusion_result.fused_confidence,
+                        fusion_result.fused_sentiment,
+                        fusion_result.fused_predicted_impact,
+                        fusion_result.cognitive_uncertainty,
+                        fusion_result.fused_rationale,
+                        # Convert list of Pydantic models to list of dicts for JSON
+                        json.dumps([d.dict() for d in fusion_result.contributing_decisions])
+                    )
+                    
+                    logger.info(f"Successfully logged pipeline run: {run_id}")
+                    return str(run_id)
+
+                except Exception as e:
+                    logger.error(f"Failed to log pipeline run (transaction rolled back): {e}", exc_info=True)
+                    # Transaction is automatically rolled back
+                    raise
