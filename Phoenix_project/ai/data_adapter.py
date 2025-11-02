@@ -1,145 +1,101 @@
+"""
+AI数据适配器
+将来自 DataManager 的原始数据转换为 AI 模型（特别是 RAG）可以理解的格式。
+"""
 from typing import List, Dict, Any, Union
-import pandas as pd
+
+# FIX (E1): 导入统一后的核心模式
 from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
 
-class DataAdapter:
+class AIDataAdapter:
     """
-    Transforms and formats diverse data types (market, news, etc.)
-    into a unified string representation suitable for LLM prompts.
+    将 Pydantic 数据模式转换为适用于 RAG 检索的文本块或结构化元数据。
     """
 
-    def __init__(self, config: Dict[str, Any] = None):
-        self.config = config or {}
-        # Max tokens per data type to avoid overly long prompts
-        self.max_market_tokens = self.config.get("max_market_tokens", 1024)
-        self.max_news_tokens = self.config.get("max_news_tokens", 1024)
-        self.max_economic_tokens = self.config.get("max_economic_tokens", 512)
+    def __init__(self):
+        # 可以在此处初始化模板引擎或格式化工具
+        pass
 
-    def format_market_data(self, market_data: List[MarketData]) -> str:
-        """Converts a list of MarketData objects into a compact string."""
-        if not market_data:
-            return "No recent market data available."
-
-        # Create a DataFrame for easy manipulation
-        try:
-            df = pd.DataFrame([md.model_dump() for md in market_data])
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.sort_values(by="timestamp", ascending=False)
-            
-            # Summarize: Get latest, and maybe some aggregates
-            latest = df.iloc[0]
-            summary = (
-                f"Latest Market Data ({latest['symbol']} at {latest['timestamp']}):\n"
-                f"Open: {latest['open']:.2f}, High: {latest['high']:.2f}, "
-                f"Low: {latest['low']:.2f}, Close: {latest['close']:.2f}, "
-                f"Volume: {latest['volume']}\n"
-            )
-            
-            # Add simple trend info
-            if len(df) > 1:
-                prev_close = df.iloc[1]['close']
-                change = latest['close'] - prev_close
-                change_pct = (change / prev_close) * 100
-                summary += f"Change: {change:+.2f} ({change_pct:+.2f}%)\n"
-            
-            # Simple technical indicator (e.g., 5-period SMA)
-            if len(df) >= 5:
-                sma_5 = df['close'].head(5).mean()
-                summary += f"5-Period SMA: {sma_5:.2f}\n"
-
-            # Truncate if necessary (simplified token counting)
-            if len(summary) > self.max_market_tokens:
-                summary = summary[:self.max_market_tokens] + "... [Truncated]"
-                
-            return summary
-        except Exception as e:
-            return f"Error formatting market data: {e}"
-
-    def format_news_data(self, news_data: List[NewsData]) -> str:
-        """Converts a list of NewsData objects into a compact string."""
-        if not news_data:
-            return "No recent news available."
-
-        # Sort by timestamp, most recent first
-        sorted_news = sorted(news_data, key=lambda x: x.timestamp, reverse=True)
-        
-        output = "Recent News:\n"
-        total_len = len(output)
-        
-        for item in sorted_news:
-            # Format: [Timestamp] (Source) Headline: Summary
-            headline = item.headline or "No Headline"
-            summary = item.summary or "No Summary"
-            source = item.source or "Unknown Source"
-            
-            entry = (
-                f"- [{item.timestamp.isoformat()}] ({source}) {headline}: {summary}\n"
-            )
-            
-            if total_len + len(entry) > self.max_news_tokens:
-                output += "... [Truncated]"
-                break
-                
-            output += entry
-            total_len += len(entry)
-            
-        return output
-
-    def format_economic_data(self, economic_data: List[EconomicIndicator]) -> str:
-        """Converts a list of EconomicIndicator objects into a compact string."""
-        if not economic_data:
-            return "No recent economic indicators available."
-            
-        # Sort by timestamp, most recent first
-        sorted_data = sorted(economic_data, key=lambda x: x.timestamp, reverse=True)
-
-        output = "Recent Economic Indicators:\n"
-        total_len = len(output)
-
-        for item in sorted_data:
-            # Format: [Timestamp] Indicator: Value (Previous: X, Consensus: Y)
-            entry = f"- [{item.timestamp.isoformat()}] {item.name}: {item.value}"
-            details = []
-            if item.previous:
-                details.append(f"Previous: {item.previous}")
-            if item.consensus:
-                details.append(f"Consensus: {item.consensus}")
-            
-            if details:
-                entry += f" ({'; '.join(details)})\n"
-            else:
-                entry += "\n"
-
-            if total_len + len(entry) > self.max_economic_tokens:
-                output += "... [Truncated]"
-                break
-                
-            output += entry
-            total_len += len(entry)
-            
-        return output
-
-    def format_context(self, context: Dict[str, List[Any]]) -> str:
+    def format_market_data(self, data_points: List[MarketData]) -> List[Dict[str, Any]]:
         """
-        Takes a dictionary of context data (from PipelineState)
-        and formats it all into a single string.
+        将 MarketData 列表转换为 RAG 文档（文本 + 元数据）。
         """
-        formatted_strings = []
+        documents = []
+        if not data_points:
+            return documents
         
-        if "market_data" in context:
-            formatted_strings.append(
-                self.format_market_data(context["market_data"])
+        # 示例：为RAG创建文档
+        # 实际实现可能更复杂，例如计算TA指标并将其转为文本
+        for dp in data_points:
+            text_content = (
+                f"On {dp.timestamp.date()} for {dp.symbol}, the market data was: "
+                f"Open={dp.open}, High={dp.high}, Low={dp.low}, Close={dp.close}, Volume={dp.volume}."
             )
-        if "news_data" in context:
-            formatted_strings.append(
-                self.format_news_data(context["news_data"])
-            )
-        if "economic_data" in context:
-            formatted_strings.append(
-                self.format_economic_data(context["economic_data"])
-            )
-        
-        # Add other data types as needed
-        # ...
+            metadata = {
+                "source": "market_data",
+                "symbol": dp.symbol,
+                "timestamp": dp.timestamp.isoformat(),
+                "doc_type": "MarketData"
+            }
+            # 在RAG中，ID通常是唯一的
+            doc_id = f"market_{dp.symbol}_{dp.timestamp.isoformat()}"
+            documents.append({"id": doc_id, "text": text_content, "metadata": metadata})
+            
+        return documents
 
-        return "\n\n".join(formatted_strings)
+    def format_news_data(self, data_points: List[NewsData]) -> List[Dict[str, Any]]:
+        """
+        将 NewsData 列表转换为 RAG 文档（文本 + 元数据）。
+        这是最直接的 RAG 应用。
+        """
+        documents = []
+        for dp in data_points:
+            text_content = f"Headline: {dp.headline}\n\n{dp.content}"
+            metadata = {
+                "source": dp.source,
+                "symbols": ",".join(dp.symbols), # 元数据通常不支持列表
+                "timestamp": dp.timestamp.isoformat(),
+                "doc_type": "NewsData"
+            }
+            documents.append({"id": dp.id, "text": text_content, "metadata": metadata})
+        return documents
+
+    def format_economic_data(self, data_points: List[EconomicIndicator]) -> List[Dict[str, Any]]:
+        """
+        将 EconomicIndicator 列表转换为 RAG 文档（文本 + 元数据）。
+        """
+        documents = []
+        for dp in data_points:
+            text_content = (
+                f"Economic Indicator release on {dp.timestamp.date()}: {dp.name}. "
+                f"Actual: {dp.value}. "
+                f"Expected: {dp.expected if dp.expected is not None else 'N/A'}. "
+                f"Previous: {dp.previous if dp.previous is not None else 'N/A'}."
+            )
+            metadata = {
+                "source": "economic_data",
+                "indicator_id": dp.id,
+                "timestamp": dp.timestamp.isoformat(),
+                "doc_type": "EconomicIndicator"
+            }
+            doc_id = f"econ_{dp.id}_{dp.timestamp.isoformat()}"
+            documents.append({"id": doc_id, "text": text_content, "metadata": metadata})
+        return documents
+
+    def adapt_batch(self, batch: Dict[str, List[Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        处理来自 DataIterator 的整个数据批次。
+        """
+        adapted_batch = {}
+        
+        # FIX (E1): 使用正确的键名 (基于 data_manager.py 的 fetch_data)
+        if "market_data" in batch:
+            adapted_batch["market_data"] = self.format_market_data(batch["market_data"])
+            
+        if "news_data" in batch:
+            adapted_batch["news_data"] = self.format_news_data(batch["news_data"])
+            
+        if "economic_indicators" in batch:
+            adapted_batch["economic_indicators"] = self.format_economic_data(batch["economic_indicators"])
+            
+        return adapted_batch
