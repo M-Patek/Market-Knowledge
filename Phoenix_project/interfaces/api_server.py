@@ -1,112 +1,245 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
 import asyncio
-from typing import Dict, Any, List
+import threading
+from typing import Dict, Any, List, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor
 
-# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
-from monitor.logging import get_logger
-# 修复：将相对导入 'from ..controller.orchestrator...' 更改为绝对导入
-from controller.orchestrator import Orchestrator
-# 修复：将相对导入 'from ..core.schemas.data_schema...' 更改为绝对导入
-from core.schemas.data_schema import MarketEvent
+from flask import Flask, request, jsonify, render_template, abort
+from flask_cors import CORS
+import uvicorn
+from pydantic import BaseModel, ValidationError
 
-logger = get_logger(__name__)
+from monitor.logging import ESLogger
+from core.pipeline_state import PipelineState
+from context_bus import ContextBus
+
+# Pydantic models for request validation
+class EventInput(BaseModel):
+    source: str
+    timestamp: str
+    event_type: str
+    data: Dict[str, Any]
+    metadata: Optional[Dict[str, Any]] = None
+
+class ManualOverrideInput(BaseModel):
+    component: str
+    action: str  # e.g., "PAUSE", "RESUME", "TRIGGER_RUN"
+    parameters: Optional[Dict[str, Any]] = None
 
 class APIServer:
     """
-    Provides an external REST API interface for the Phoenix project.
-    Allows injecting events and querying system state.
-    
-    (Note: This is an alternative to api_gateway.py, using a different
-    class name but similar functionality.)
+    Provides an external API interface (e.g., REST) for the system.
+
+    This server allows external systems to:
+    1. Inject new data/events into the system.
+    2. Query the current state of the system or specific components.
+    3. Manually override or control system behavior (e.g., pause, resume).
+    4. View system audit logs or performance metrics.
     """
-    
-    def __init__(self, orchestrator: Orchestrator, config: Dict[str, Any]):
-        self.app = FastAPI(
-            title="Phoenix Project API Server",
-            description="API for event injection and system control.",
-            version="2.0.1"
-        )
-        self.orchestrator = orchestrator
-        self.config = config.get('api_server', {}) # Use 'api_server' key
-        self.host = self.config.get('host', '0.0.0.0')
-        self.port = self.config.get('port', 8000)
-        
-        self.server: Optional[uvicorn.Server] = None
-        self._shutdown_event = asyncio.Event()
-        
-        self._setup_routes()
-        logger.info(f"APIServer initialized. Routes registered.")
 
-    def _setup_routes(self):
-        """Binds API endpoints to their handler functions."""
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        context_bus: ContextBus,
+        logger: ESLogger,
+        audit_viewer: Any,  # Replace with actual AuditViewer class
+    ):
+        self.app = Flask(__name__, template_folder='../templates')
+        CORS(self.app)  # Enable CORS for all routes
+        self.host = host
+        self.port = port
+        self.context_bus = context_bus
+        self.logger = logger
+        self.audit_viewer = audit_viewer
+        self.executor = ThreadPoolExecutor(max_workers=5)
+        self.main_loop = asyncio.get_event_loop()
         
-        @self.app.post("/v1/events/inject", status_code=202)
-        async def inject_event(event: MarketEvent):
+        self._register_routes()
+        self.logger.log_info(f"APIServer initialized. Will run on {self.host}:{self.port}")
+
+    def _register_routes(self):
+        """Registers all Flask routes."""
+        
+        @self.app.route("/", methods=["GET"])
+        def index():
+            """Serves a simple status/dashboard page."""
+            # This could be expanded to a rich dashboard
+            return render_template("circuit_breaker.html", status=self.get_system_status())
+
+        @self.app.route("/api/v1/health", methods=["GET"])
+        def health_check():
+            """Endpoint for health checks (e.g., K8s liveness probe)."""
+            return jsonify({"status": "healthy"}), 200
+
+        @self.app.route("/api/v1/status", methods=["GET"])
+        def get_status():
+            """Returns the overall system status from the ContextBus."""
+            return jsonify(self.get_system_status()), 200
+
+        @self.app.route("/api/v1/event", methods=["POST"])
+        def inject_event():
             """
-            Asynchronously injects a new MarketEvent into the system.
+            Endpoint to inject a new event into the system.
+            The event is published to the 'external_events' topic.
             """
             try:
-                # Schedule the processing, don't block the API response
-                asyncio.create_task(self.orchestrator.process_event(event))
-                
-                logger.info(f"Accepted event for injection: {event.event_id}")
-                return {"status": "accepted", "event_id": event.event_id}
-            
-            except Exception as e:
-                logger.error(f"Failed to accept event {event.event_id}: {e}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+                event_data = EventInput(**request.json)
+            except ValidationError as e:
+                self.logger.log_warning(f"Invalid event payload received: {e}")
+                return jsonify({"error": "Invalid payload", "details": e.errors()}), 400
 
-        @self.app.get("/v1/system/status")
-        async def get_system_status() -> Dict[str, Any]:
-            """Retrieves the current operational status from the orchestrator."""
             try:
-                status = self.orchestrator.get_status()
-                return status
-            except Exception as e:
-                logger.error(f"Failed to retrieve system status: {e}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+                # Run the async publish in the main event loop
+                future = asyncio.run_coroutine_threadsafe(
+                    self.context_bus.publish("external_events", event_data.model_dump()),
+                    self.main_loop
+                )
+                future.result(timeout=5)  # Wait for confirmation
                 
-        @self.app.get("/health")
-        async def health_check():
-            """Basic health check endpoint."""
-            return {"status": "ok"}
+                self.logger.log_info(f"Successfully injected event from source: {event_data.source}")
+                return jsonify({"status": "event_received", "event_id": event_data.metadata.get("event_id", "N/A") if event_data.metadata else "N/A"}), 202
+            except Exception as e:
+                self.logger.log_error(f"Failed to inject event: {e}", exc_info=True)
+                return jsonify({"error": "Failed to process event"}), 500
 
-    async def run(self):
+        @self.app.route("/api/v1/control", methods=["POST"])
+        def manual_override():
+            """
+            Endpoint for manual control/override of system components.
+            Publishes a control message to the ContextBus.
+            """
+            try:
+                control_data = ManualOverrideInput(**request.json)
+            except ValidationError as e:
+                self.logger.log_warning(f"Invalid control payload received: {e}")
+                return jsonify({"error": "Invalid payload", "details": e.errors()}), 400
+
+            try:
+                topic = f"control_{control_data.component}"
+                message = {
+                    "action": control_data.action,
+                    "parameters": control_data.parameters
+                }
+                
+                # Run the async publish in the main event loop
+                future = asyncio.run_coroutine_threadsafe(
+                    self.context_bus.publish(topic, message),
+                    self.main_loop
+                )
+                future.result(timeout=5)
+
+                self.logger.log_info(f"Manual control command '{control_data.action}' sent to '{control_data.component}'")
+                return jsonify({"status": "command_sent", "topic": topic, "action": control_data.action}), 200
+            except Exception as e:
+                self.logger.log_error(f"Failed to send control command: {e}", exc_info=True)
+                return jsonify({"error": "Failed to process command"}), 500
+
+        @self.app.route("/api/v1/audit", methods=["GET"])
+        def get_audit_logs():
+            """
+            Retrieves audit logs. Uses the AuditViewer.
+            """
+            try:
+                limit = request.args.get("limit", 100, type=int)
+                component = request.args.get("component", type=str)
+                
+                # Run the sync audit_viewer call in a separate thread
+                future = self.executor.submit(
+                    self.audit_viewer.query_logs,
+                    limit=limit,
+                    component_filter=component
+                )
+                logs = future.result(timeout=10)
+                
+                return jsonify(logs), 200
+            except Exception as e:
+                self.logger.log_error(f"Failed to retrieve audit logs: {e}", exc_info=True)
+                return jsonify({"error": "Failed to retrieve logs"}), 500
+
+    def get_system_status(self) -> Dict[str, Any]:
         """
-        Starts the FastAPI server using uvicorn.
-        This is an awaitable method designed to be run as an asyncio task.
+        Fetches the current system status from the ContextBus.
+        This is a synchronous helper.
         """
-        logger.info(f"Starting APIServer on {self.host}:{self.port}")
-        
+        try:
+            # We need to run the async get_status in the main loop
+            future = asyncio.run_coroutine_threadsafe(
+                self.context_bus.get_status(),
+                self.main_loop
+            )
+            return future.result(timeout=2)
+        except Exception as e:
+            self.logger.log_warning(f"Could not retrieve system status: {e}")
+            return {"error": "Failed to retrieve system status"}
+
+    def run(self):
+        """
+        Starts the Uvicorn server in a separate thread.
+        This allows the APIServer to run alongside the main async application.
+        """
+        self.logger.log_info("Starting APIServer in a new thread.")
         config = uvicorn.Config(
             self.app,
             host=self.host,
             port=self.port,
-            log_level="info",
-            loop="asyncio"
+            log_level="warning",
         )
-        self.server = uvicorn.Server(config)
+        server = uvicorn.Server(config)
         
-        # Start the server
-        server_task = asyncio.create_task(self.server.serve())
-        
-        # Wait for either shutdown signal or server failure
-        await asyncio.wait(
-            [server_task, self._shutdown_event.wait()],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        
-        # If shutdown was signaled, gracefully stop the server
-        if self._shutdown_event.is_set():
-            logger.info("APIServer shutdown signaled. Stopping uvicorn...")
-            self.server.should_exit = True
-            await server_task # Wait for server to exit
-            
-        logger.info("APIServer has stopped.")
+        # Run the server in a separate thread
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        self.logger.log_info(f"Uvicorn server started in thread: {thread.name}")
+        return thread
 
-    def stop(self):
-        """Signals the uvicorn server to shut down."""
-        logger.info("APIServer received stop signal.")
-        self._shutdown_event.set()
+if __name__ == "__main__":
+    # Example usage (for testing)
+    
+    # Mock components
+    class MockContextBus:
+        async def publish(self, topic, message):
+            print(f"MockPublish to {topic}: {message}")
+            return True
+        
+        async def get_status(self):
+            print("MockGetStatus called")
+            return {"main_loop": "RUNNING", "last_event_time": "2023-01-01T12:00:00Z"}
+            
+    class MockLogger:
+        def log_info(self, msg): print(f"INFO: {msg}")
+        def log_warning(self, msg): print(f"WARNING: {msg}")
+        def log_error(self, msg, exc_info=None): print(f"ERROR: {msg}")
+
+    class MockAuditViewer:
+        def query_logs(self, limit, component_filter):
+            print(f"MockQueryLogs: limit={limit}, component={component_filter}")
+            return [{"timestamp": "2023-01-01T12:00:00Z", "component": "test", "message": "Test log"}]
+
+    # Set up a new event loop for the main thread
+    main_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(main_loop)
+
+    mock_bus = MockContextBus()
+    mock_logger = MockLogger()
+    mock_audit = MockAuditViewer()
+    
+    api_server = APIServer(
+        host="0.0.0.0",
+        port=8080,
+        context_bus=mock_bus,
+        logger=mock_logger,
+        audit_viewer=mock_audit
+    )
+    
+    # Run the server in a thread (as it would be in the main app)
+    api_server.run()
+    
+    print("API Server is running in the background.")
+    print("Access http://0.0.0.0:8080/ or http://0.0.0.0:8080/api/v1/health")
+    
+    try:
+        # Keep the main thread alive to let the server thread run
+        main_loop.run_forever()
+    except KeyboardInterrupt:
+        print("Shutting down...")
+        main_loop.stop()
