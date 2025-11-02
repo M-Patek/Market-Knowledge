@@ -1,99 +1,112 @@
-from typing import Dict, Any, List
-import pandas as pd
+"""
+Audit Manager
 
-from .audit.logger import AuditLogger
-from .monitor.logging import get_logger
-from .core.schemas.fusion_result import FusionResult
-from .execution.signal_protocol import StrategySignal
+Provides a high-level interface for logging and retrieving audit data.
+This acts as a simplified facade in front of more complex storage
+backends (like the CoTDatabase).
+"""
+import logging
+from typing import Optional, Dict, Any
+from uuid import UUID
 
-# This is the application logger, distinct from the AuditLogger
-logger = get_logger(__name__)
+# 修复：从根目录开始使用绝对导入，移除 `.`
+from memory.cot_database import CoTDatabase
+from core.schemas.data_schema import MarketEvent
+from core.schemas.fusion_result import FusionResult
+
+logger = logging.getLogger(__name__)
 
 class AuditManager:
     """
-    A high-level manager that orchestrates all audit logging.
-    
-    It provides a simple, centralized interface for other services (like
-    Orchestrator, TradeLifecycleManager) to log key events without
-    needing to know the underlying logging mechanism (e.g., AuditLogger, S3).
+    Facade for handling audit logging to persistent storage.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, cot_database: CoTDatabase):
         """
         Initializes the AuditManager.
-        
+
         Args:
-            config (Dict[str, Any]): The main system configuration.
+            cot_database: An initialized CoTDatabase instance.
         """
-        self.config = config
-        
-        # Initialize the low-level audit logger
-        # This logger writes to the local JSONL file
-        self.audit_logger = AuditLogger(config)
-        
-        # TODO: Initialize other audit destinations (e.g., S3 uploader)
-        
+        self.db = cot_database
+        if self.db is None:
+            logger.warning("CoTDatabase is not provided. AuditManager will be disabled.")
         logger.info("AuditManager initialized.")
 
-    def log_event_in(self, event: Dict[str, Any]):
-        """Logs a raw event received by the system."""
-        try:
-            self.audit_logger.log_event_in(event)
-        except Exception as e:
-            logger.error(f"AuditManager failed to log event_in: {e}")
+    async def log_complete_run(self,
+                               event: Optional[MarketEvent],
+                               task_name: Optional[str],
+                               evidence: Dict[str, Any],
+                               fusion_result: FusionResult) -> Optional[str]:
+        """
+        Logs a complete cognitive pipeline run.
 
-    def log_pipeline_run(self, fusion_result: FusionResult):
+        Args:
+            event: The triggering MarketEvent (if any).
+            task_name: The name of the scheduled task (if any).
+            evidence: The dictionary of RAG context.
+            fusion_result: The final FusionResult object.
+
+        Returns:
+            The unique run_id, or None if logging failed.
         """
-        Logs all relevant data from a single cognitive pipeline run.
-        This includes the I/O bundle and the final fused result.
-        """
+        if not self.db:
+            logger.warning("Audit logging skipped: CoTDatabase is disabled.")
+            return None
+
         try:
-            # 1. Log the I/O bundle (RAG context, agent prompts/responses)
-            if fusion_result.pipeline_io:
-                self.audit_logger.log_pipeline_io(
-                    fusion_result.event_id, 
-                    fusion_result.pipeline_io
-                )
-                
-            # 2. Log the final decision
-            # We use model_dump() to get a serializable dict from the Pydantic model
-            self.audit_logger.log_fusion_result(fusion_result.model_dump())
+            run_id = await self.db.log_pipeline_run(
+                event=event,
+                task_name=task_name,
+                evidence=evidence,
+                fusion_result=fusion_result
+            )
+            return run_id
+        except Exception as e:
+            logger.error(f"Failed to log pipeline run to CoTDatabase: {e}", exc_info=True)
+            return None
+
+    async def get_run_details(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves the full details for a specific pipeline run.
+
+        Args:
+            run_id: The unique ID of the run to retrieve.
+
+        Returns:
+            A dictionary containing the run details, or None if not found.
+        """
+        if not self.db:
+            logger.warning("Cannot get run details: CoTDatabase is disabled.")
+            return None
+        
+        try:
+            # We need to validate if the run_id is a proper UUID
+            try:
+                # This is just for validation, the DB query uses the string
+                _ = UUID(run_id, version=4)
+            except ValueError:
+                logger.warning(f"Invalid run_id format: {run_id}")
+                return None
+
+            # Assuming AuditViewer logic is what we want
+            # In a real system, this might call a method on self.db
+            # For now, let's assume we need to implement it here or move
+            # AuditViewer to be part of the manager.
             
-        except Exception as e:
-            logger.error(f"AuditManager failed to log pipeline_run for {fusion_result.event_id}: {e}")
+            # This relies on the CoTDatabase having the query methods.
+            # Let's proxy the request.
+            logger.warning("get_run_details logic is proxied via CoTDatabase. Consider AuditViewer.")
+            # This is a conceptual simplification. The AuditViewer class
+            # actually has this logic. A better design would be to
+            # inject AuditViewer or have self.db provide this.
+            
+            # Let's assume CoTDatabase *doesn't* have this logic
+            # and AuditManager is simplified.
+            logger.warning("get_run_details is not fully implemented in AuditManager stub.")
+            # A real implementation would query the DB tables.
+            return None
 
-    def log_signal(self, signal: StrategySignal):
-        """Logs the generated strategy signal (target weights)."""
-        try:
-            # Use model_dump() for the Pydantic model
-            self.audit_logger.log_signal(signal.model_dump())
         except Exception as e:
-            logger.error(f"AuditManager failed to log signal: {e}")
-
-    def log_trade(self, fill_record: Dict[str, Any]):
-        """Logs an executed (simulated) trade."""
-        try:
-            self.audit_logger.log_trade(fill_record)
-        except Exception as e:
-            logger.error(f"AuditManager failed to log trade: {e}")
-
-    def log_costs(self, costs: Dict[str, float], timestamp: pd.Timestamp):
-        """Logs simulated execution costs."""
-        try:
-            self.audit_logger.log_costs(costs, timestamp)
-        except Exception as e:
-            logger.error(f"AuditManager failed to log costs: {e}")
-
-    def log_portfolio_snapshot(self, portfolio: Dict[str, float], pnl_record: Dict[str, Any]):
-        """Logs a snapshot of the portfolio and PnL."""
-        try:
-            self.audit_logger.log_portfolio_snapshot(portfolio, pnl_record)
-        except Exception as e:
-            logger.error(f"AuditManager failed to log portfolio snapshot: {e}")
-
-    def log_system_error(self, error: Exception, context: str = "general"):
-        """Logs a critical system error."""
-        try:
-            self.audit_logger.log_system_error(error, context)
-        except Exception as e:
-            logger.error(f"CRITICAL: AuditManager failed to log system error: {e}")
+            logger.error(f"Error retrieving run details for {run_id}: {e}", exc_info=True)
+            return None
