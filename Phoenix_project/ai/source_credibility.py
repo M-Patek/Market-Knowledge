@@ -1,110 +1,142 @@
-import json
-from typing import Dict, Any, List
+from typing import Dict, Any, Optional
 from urllib.parse import urlparse
-from ..monitor.logging import get_logger
+from api.gateway import APIGateway
+from ai.prompt_manager import PromptManager
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
-class SourceCredibilityModel:
+class SourceCredibility:
     """
-    Assesses the credibility of information sources based on predefined scores.
-    This acts as a simple, rule-based model.
+    Assesses the credibility of an information source (e.g., news website)
+    using both a predefined list and dynamic LLM analysis.
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initializes the model with credibility scores from the config.
+    def __init__(self, api_gateway: APIGateway, prompt_manager: PromptManager, config: Dict[str, Any]):
+        self.api_gateway = api_gateway
+        self.prompt_manager = prompt_manager
         
-        Args:
-            config (Dict[str, Any]): Expects a 'source_credibility' key containing
-                                      a dictionary mapping domain names to scores (0.0 - 1.0).
-        """
-        self.credibility_scores = config.get('source_credibility', {})
-        if not self.credibility_scores:
-            logger.warning("Source credibility scores are not defined in config. Using defaults.")
-            self.credibility_scores = {
-                "default": 0.5,
-                "reuters.com": 0.9,
-                "bloomberg.com": 0.9,
-                "wsj.com": 0.85,
-                "sec.gov": 0.95,
-                "benzinga.com": 0.75,
-                "finance.yahoo.com": 0.7,
-                "twitter.com": 0.4, # Highly variable, depends on user
-                "seekingalpha.com": 0.6,
-                "default_structured_db": 0.9, # Internal DBs are generally trusted
-                "default_temporal_db": 0.8,
-            }
+        # Predefined list of trusted/untrusted sources
+        # Example: {"bloomberg.com": 0.9, "randomblog.com": 0.2}
+        self.known_sources: Dict[str, float] = config.get("known_sources", {})
         
-        logger.info(f"SourceCredibilityModel initialized with {len(self.credibility_scores)} sources.")
+        self.prompt_name = "assess_source_credibility"
+        logger.info(f"SourceCredibility initialized with {len(self.known_sources)} known sources.")
 
-    def score_sources(self, context_bundle: Dict[str, List[Dict[str, Any]]]) -> Dict[str, float]:
-        """
-        Scores all sources found in the RAG context bundle.
-        
-        Args:
-            context_bundle (Dict[str, List[Dict[str, Any]]]): The output from the Retriever,
-                e.g., {"vector_context": [...], "temporal_context": [...], ...}
-        
-        Returns:
-            Dict[str, float]: A dictionary mapping unique source identifiers (like
-                              event_id or domain) to a credibility score.
-        """
-        scores = {}
-        
-        # Score Vector Context (e.g., news articles)
-        for item in context_bundle.get('vector_context', []):
-            try:
-                source_domain = self._extract_domain(item.get('metadata', {}).get('url'))
-                score = self.credibility_scores.get(source_domain, self.credibility_scores.get('default', 0.5))
-                # Use event_id as the unique key for this piece of context
-                scores[item.get('id', source_domain)] = score
-            except Exception as e:
-                logger.warning(f"Failed to score vector context item {item.get('id')}: {e}")
-
-        # Score Temporal Context (e.g., past events)
-        for item in context_bundle.get('temporal_context', []):
-            try:
-                source_id = item.get('source', 'default_temporal_db')
-                score = self.credibility_scores.get(source_id, self.credibility_scores.get('default', 0.5))
-                scores[item.get('id', source_id)] = score
-            except Exception as e:
-                logger.warning(f"Failed to score temporal context item {item.get('id')}: {e}")
-
-        # Score Structured Context (e.g., financial data)
-        for item in context_bundle.get('structured_context', []):
-            try:
-                source_id = item.get('source', 'default_structured_db')
-                score = self.credibility_scores.get(source_id, self.credibility_scores.get('default_structured_db', 0.9))
-                scores[item.get('id', source_id)] = score
-            except Exception as e:
-                logger.warning(f"Failed to score structured context item {item.get('id')}: {e}")
-                
-        return scores
-
-    def _extract_domain(self, url: str) -> str:
-        """
-        Utility to extract the netloc (domain) from a URL.
-        
-        Examples:
-            "https.api.benzinga.com/..." -> "benzinga.com"
-            "www.wsj.com/articles/..." -> "wsj.com"
-        """
-        if not url:
-            return "unknown"
+    def _get_domain(self, source_url: str) -> Optional[str]:
+        """Extracts the netloc (domain) from a URL."""
         try:
-            parsed_url = urlparse(url)
-            domain = parsed_url.netloc
-            if not domain:
-                return "unknown"
+            parsed = urlparse(source_url)
+            return parsed.netloc.replace("www.", "")
+        except Exception:
+            return None
+
+    async def assess_credibility(self, source_name: str, source_url: Optional[str] = None, article_snippet: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Assesses the credibility of a source.
+        
+        Args:
+            source_name (str): The name of the source (e.g., "Bloomberg", "ZeroHedge").
+            source_url (Optional[str]): The URL of the source or article.
+            article_snippet (Optional[str]): A snippet of text to help the LLM assess bias.
+
+        Returns:
+            Dict[str, Any]: e.g., {"score": 0.85, "rating": "High", "reasoning": "..."}
+        """
+        
+        # 1. Check predefined list
+        domain = None
+        if source_url:
+            domain = self._get_domain(source_url)
+            if domain and domain in self.known_sources:
+                score = self.known_sources[domain]
+                rating = self._score_to_rating(score)
+                logger.info(f"Found known source '{domain}'. Score: {score}")
+                return {
+                    "score": score,
+                    "rating": rating,
+                    "reasoning": f"Source '{domain}' is on the predefined list with a score of {score}.",
+                    "source": "Predefined List"
+                }
+
+        # 2. If not in list, use LLM to assess
+        logger.info(f"Source '{source_name}' (Domain: {domain}) not in known list. Assessing with LLM.")
+        
+        prompt = self.prompt_manager.get_prompt(
+            self.prompt_name,
+            source_name=source_name,
+            source_url=source_url or "N/A",
+            article_snippet=article_snippet or "N/A"
+        )
+        
+        if not prompt:
+            logger.error(f"Could not get prompt '{self.prompt_name}'.")
+            return self._error_response("Prompt missing")
+
+        try:
+            raw_response = await self.api_gateway.send_request(
+                model_name="gemini-pro",
+                prompt=prompt,
+                temperature=0.2,
+                max_tokens=300
+            )
             
-            # Clean common subdomains like 'www' or 'api'
-            parts = domain.split('.')
-            if len(parts) > 2 and parts[0] in ['www', 'api', 'finance']:
-                return '.'.join(parts[1:])
-            
-            return domain
+            return self._parse_assessment_response(raw_response, source_name)
             
         except Exception as e:
-            logger.debug(f"Could not parse domain from URL '{url}': {e}")
-            return "unknown"
+            logger.error(f"Error assessing credibility for '{source_name}': {e}", exc_info=True)
+            return self._error_response(str(e))
+
+    def _score_to_rating(self, score: float) -> str:
+        """Converts a numeric score (0-1) to a rating."""
+        if score >= 0.8: return "High"
+        if score >= 0.6: return "Moderate-High"
+        if score >= 0.4: return "Moderate-Low"
+        if score >= 0.2: return "Low"
+        return "Very Low"
+
+    def _parse_assessment_response(self, response: str, source_name: str) -> Dict[str, Any]:
+        """
+        Parses the LLM response.
+        
+        Assumes format:
+        SCORE: [0.0-1.0]
+        RATING: [RATING]
+        REASONING: [Text]
+        """
+        try:
+            score = 0.5 # Default
+            rating = "Moderate-Low"
+            reasoning = response
+
+            lines = response.split('\n')
+            for line in lines:
+                if line.upper().startswith("SCORE:"):
+                    score = float(line.split(":", 1)[1].strip())
+                elif line.upper().startswith("RATING:"):
+                    rating = line.split(":", 1)[1].strip()
+                elif line.upper().startswith("REASONING:"):
+                    reasoning = line.split(":", 1)[1].strip()
+            
+            score = max(0.0, min(1.0, score))
+            
+            logger.info(f"LLM assessment for '{source_name}': Score {score} ({rating})")
+            return {
+                "score": score,
+                "rating": rating,
+                "reasoning": reasoning,
+                "source": "LLM Assessment"
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to parse assessment response: {e}. Response: {response[:100]}...")
+            return self._error_response(f"Parsing failed: {e}")
+
+    def _error_response(self, error_msg: str) -> Dict[str, Any]:
+        """Returns a standardized error dictionary."""
+        return {
+            "score": 0.5,
+            "rating": "Unknown",
+            "reasoning": f"Failed to assess credibility: {error_msg}",
+            "source": "Error"
+        }
