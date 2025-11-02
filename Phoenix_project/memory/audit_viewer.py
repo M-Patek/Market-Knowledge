@@ -1,151 +1,126 @@
-import pandas as pd
-from typing import Dict, Any, List, Optional
-import json
+"""
+Audit Viewer
+A simple CLI or web tool to query and view audit logs
+stored in the CoTDatabase (PostgreSQL).
+"""
 import logging
+from datetime import datetime, timedelta
+import pandas as pd
+from typing import Optional
 
-# 修正: 'CoTDatabase' 在 'cot_database.py' 中不存在。
-# 正确的类名是 'CoTDatabaseConnection'。
-from memory.cot_database import CoTDatabaseConnection
+# 修复：使用正确的相对导入
+from .cot_database import CoTDatabase
 
 logger = logging.getLogger(__name__)
 
 class AuditViewer:
     """
-    一个用于查询和格式化来自 CoT (思维链) 数据库的
-    人类可读审计追踪的工具。
-    (Task 16 - 审计追踪查看器)
+    Provides methods to query the audit database.
     """
-    
-    def __init__(self, db_path: str):
+
+    def __init__(self, cot_database: CoTDatabase):
         """
-        初始化审计查看器。
-        
+        Initializes the AuditViewer.
+
         Args:
-            db_path (str): CoT (SQLite) 数据库文件的路径。
+            cot_database: An initialized CoTDatabase instance.
         """
-        # 修正: 实例化 CoTDatabaseConnection
-        self.db = CoTDatabaseConnection(db_path)
-        logger.info(f"AuditViewer initialized with database: {db_path}")
+        self.db = cot_database
+        logger.info("AuditViewer initialized.")
 
-    def get_full_trace_by_id(self, decision_id: str) -> Optional[Dict[str, Any]]:
+    async def get_recent_runs(self, limit: int = 10) -> Optional[pd.DataFrame]:
         """
-        检索与单个决策 ID 相关联的完整思维链。
+        Retrieves the most recent pipeline runs.
         """
-        logger.debug(f"Retrieving full trace for decision_id: {decision_id}")
+        query = """
+        SELECT run_id, run_timestamp, event_id, task_name
+        FROM pipeline_runs
+        ORDER BY run_timestamp DESC
+        LIMIT $1
+        """
         try:
-            # 修正: 调用 CoTDatabaseConnection 上的方法
-            records = self.db.get_trace_by_decision_id(decision_id)
-            if not records:
-                logger.warning(f"No audit trace found for decision_id: {decision_id}")
+            records = await self.db.fetch(query, limit)
+            if records:
+                return pd.DataFrame(records, columns=['run_id', 'run_timestamp', 'event_id', 'task_name'])
+            return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"Error fetching recent runs: {e}", exc_info=True)
+            return None
+
+    async def get_run_details(self, run_id: str) -> Optional[dict]:
+        """
+        Retrieves all details for a specific run_id, including
+        the event, evidence, and fusion result.
+        """
+        details = {}
+        
+        try:
+            # 1. Get the main run
+            run_query = "SELECT * FROM pipeline_runs WHERE run_id = $1"
+            run_data = await self.db.fetchrow(run_query, run_id)
+            if not run_data:
+                logger.warning(f"No run found with run_id: {run_id}")
                 return None
+            details['run_info'] = dict(run_data)
             
-            # 格式化输出
-            return self._format_trace(records)
-        
-        except Exception as e:
-            logger.error(f"Error retrieving trace for {decision_id}: {e}", exc_info=True)
-            return None
-
-    def get_recent_decisions(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """
-        检索最近的 N 个决策及其摘要。
-        """
-        logger.debug(f"Retrieving last {limit} decisions")
-        try:
-            # 修正: 调用 CoTDatabaseConnection 上的方法
-            records = self.db.get_recent_decisions(limit)
-            
-            # 聚合每个 decision_id 的记录
-            decisions = {}
-            for rec in records:
-                did = rec['decision_id']
-                if did not in decisions:
-                    decisions[did] = {
-                        "decision_id": did,
-                        "timestamp": rec['timestamp'],
-                        "steps": []
-                    }
-                decisions[did]['steps'].append(rec)
-            
-            # 格式化每个决策
-            formatted_decisions = []
-            for did, data in decisions.items():
-                formatted = self._format_summary(data['steps'])
-                formatted['decision_id'] = did
-                formatted['timestamp'] = data['timestamp']
-                formatted_decisions.append(formatted)
+            # 2. Get the triggering event
+            event_id = run_data['event_id']
+            if event_id:
+                event_query = "SELECT * FROM market_events WHERE event_id = $1"
+                event_data = await self.db.fetchrow(event_query, event_id)
+                details['triggering_event'] = dict(event_data) if event_data else "Event ID not found"
                 
-            return formatted_decisions
+            # 3. Get the evidence context
+            evidence_query = "SELECT * FROM evidence_context WHERE run_id = $1"
+            evidence_data = await self.db.fetchrow(evidence_query, run_id)
+            details['evidence_context'] = dict(evidence_data) if evidence_data else "No evidence found"
+
+            # 4. Get the fusion result
+            fusion_query = "SELECT * FROM fusion_results WHERE run_id = $1"
+            fusion_data = await self.db.fetchrow(fusion_query, run_id)
+            details['fusion_result'] = dict(fusion_data) if fusion_data else "No fusion result found"
+
+            return details
             
         except Exception as e:
-            logger.error(f"Error retrieving recent decisions: {e}", exc_info=True)
-            return []
-
-    def _format_trace(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        将原始数据库记录格式化为结构化的 JSON 追踪。
-        """
-        if not records:
-            return {}
-            
-        # 按时间戳排序
-        records.sort(key=lambda r: r['timestamp'])
-        
-        trace = {
-            "decision_id": records[0]['decision_id'],
-            "start_time": records[0]['timestamp'],
-            "end_time": records[-1]['timestamp'],
-            "steps": []
-        }
-        
-        for rec in records:
-            step = {
-                "step_name": rec['step_name'],
-                "timestamp": rec['timestamp'],
-                "status": rec['status'],
-                "context": self._safe_json_load(rec['context']),
-                "output": self._safe_json_load(rec['output']),
-                "error": rec['error']
-            }
-            trace['steps'].append(step)
-            
-        return trace
-
-    def _format_summary(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        从完整的追踪记录中提取一个高级摘要。
-        """
-        summary = {
-            "overall_status": "FAILURE" if any(r['status'] == 'FAILURE' for r in records) else "SUCCESS",
-            "total_steps": len(records),
-            "final_decision": None,
-            "error_step": None
-        }
-        
-        # 按时间戳排序
-        records.sort(key=lambda r: r['timestamp'])
-
-        for rec in records:
-            if rec['status'] == 'FAILURE':
-                summary['error_step'] = rec['step_name']
-            
-            # 假设最后一步或 'PortfolioConstruction' 包含最终决策
-            if rec['step_name'] == 'PortfolioConstruction' and rec['status'] == 'SUCCESS':
-                output = self._safe_json_load(rec['output'])
-                summary['final_decision'] = output.get('target_weights', 'N/A')
-
-        # 如果未找到特定步骤，则使用最后一步
-        if summary['final_decision'] is None and records:
-             output = self._safe_json_load(records[-1]['output'])
-             summary['final_decision'] = output if isinstance(output, dict) else str(output)
-
-        return summary
-
-    def _safe_json_load(self, text_data: Optional[str]) -> Any:
-        """安全地将 JSON 字符串解析为 Python 对象。"""
-        if text_data is None:
+            logger.error(f"Error fetching details for run_id {run_id}: {e}", exc_info=True)
             return None
-        try:
-            return json.loads(text_data)
-        except json.JSONDecodeError:
-            return text_data # 如果不是 JSON，则按原样返回文本
+
+# Example CLI Usage
+if __name__ == "__main__":
+    import asyncio
+    import os
+    import json
+    
+    logging.basicConfig(level=logging.INFO)
+    
+    # Requires a running PostgreSQL DB defined in env vars
+    DB_URL = os.environ.get("POSTGRES_URL")
+    
+    if not DB_URL:
+        logger.error("POSTGRES_URL environment variable not set. Cannot run example.")
+    else:
+        async def main():
+            db = CoTDatabase(database_url=DB_URL)
+            await db.connect()
+            
+            viewer = AuditViewer(cot_database=db)
+            
+            print("--- Fetching recent runs ---")
+            recent_runs = await viewer.get_recent_runs(limit=5)
+            if recent_runs is not None:
+                print(recent_runs.to_string())
+                
+                if not recent_runs.empty:
+                    # Get details for the most recent run
+                    latest_run_id = recent_runs.iloc[0]['run_id']
+                    print(f"\n--- Fetching details for run_id: {latest_run_id} ---")
+                    
+                    details = await viewer.get_run_details(latest_run_id)
+                    if details:
+                        # Use pandas to pretty-print JSON-like dicts
+                        print(json.dumps(details, indent=2, default=str))
+            
+            await db.disconnect()
+
+        asyncio.run(main())
