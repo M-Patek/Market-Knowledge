@@ -3,28 +3,35 @@ import os
 import sys
 from typing_extensions import Annotated
 
+# --- [修复] ---
 # 将项目根目录添加到 Python 路径
-# 这样我们就可以 `from training.walk_forward_trainer`
+# 这样我们就可以从 `training...` 或 `config...` 导入
 project_root = os.path.abspath(os.path.dirname(__file__))
 if project_root not in sys.path:
     sys.path.append(project_root)
+# --- [修复结束] ---
 
 from config.loader import load_config
 from monitor.logging import get_logger
 
 # 动态导入训练器，如果路径修复正确，这里应该能工作
 try:
+    # 导入现在位于 training/ 目录下的模块
     from training.base_trainer import BaseTrainer
     from training.walk_forward_trainer import WalkForwardTrainer
     from training.drl.multi_agent_trainer import MultiAgentTrainer
-    # from training.drl.trading_env import TradingEnv
+    from training.drl.trading_env import TradingEnv
+    from data_manager import DataManager # 假设 DataManager 和 State 保持在顶层
+    from core.pipeline_state import PipelineState
+
 except ImportError as e:
-    print(f"Error: 无法导入训练器模块。请确保文件已按 REFACTOR_PLAN.md 迁移。")
+    print(f"CRITICAL Error: 无法导入训练器模块。")
+    print(f"请确保文件已按 REFACTOR_PLAN.md 迁移, 并且所有依赖都已安装。")
     print(f"Details: {e}")
     sys.exit(1)
 
 logger = get_logger('TrainingRunner')
-app = typer.Typer(help="凤凰计划 - 离线模型训练器入口")
+app = typer.Typer(help="凤凰计划 - 离线模型训练器入口 (Offline Model Trainer Entrypoint)")
 
 def load_deps(config_path: str):
     """加载通用的配置和依赖"""
@@ -47,17 +54,19 @@ def run_walk_forward(
     try:
         config = load_deps(config_path)
         
-        # 1. 初始化 DataManager (训练器需要它来获取历史数据)
-        # ( ... 此处需要初始化 DataManager ... )
+        # 1. 初始化 DataManager 和 State (训练器需要)
+        pipeline_state = PipelineState()
+        cache_dir = config.get('data_manager', {}).get('cache_dir', 'data_cache')
+        data_manager = DataManager(config, pipeline_state, cache_dir=cache_dir)
         
         # 2. 初始化训练器
-        # wf_trainer = WalkForwardTrainer(config, data_manager)
+        wf_trainer = WalkForwardTrainer(config, data_manager)
         
-        # 3. 运行训练
-        # await wf_trainer.run_training_loop()
+        # 3. 运行训练 (假设是异步的)
+        # asyncio.run(wf_trainer.run_training_loop())
         
         logger.info("滚动优化 (WF) 训练（模拟）完成。")
-        logger.info("请将 'run_training.py' 中的依赖项（如 DataManager）初始化补全。")
+        logger.info("请确保 'run_training.py' 中的异步/同步调用与 'WalkForwardTrainer' 一致。")
         
     except Exception as e:
         logger.error(f"WF 训练失败: {e}", exc_info=True)
@@ -75,20 +84,25 @@ def run_drl_trainer(
     try:
         config = load_deps(config_path)
         
-        # 1. 初始化 DRL 环境
-        # drl_env = TradingEnv(config)
+        # 1. 初始化 DataManager 和 State (环境需要)
+        pipeline_state = PipelineState()
+        cache_dir = config.get('data_manager', {}).get('cache_dir', 'data_cache')
+        data_manager = DataManager(config, pipeline_state, cache_dir=cache_dir)
         
-        # 2. 初始化 DRL 训练器
-        # drl_trainer = MultiAgentTrainer(config, drl_env)
+        # 2. 初始化 DRL 环境
+        drl_env = TradingEnv(config, data_manager)
         
-        # 3. 运行训练
-        # await drl_trainer.train_agents()
+        # 3. 初始化 DRL 训练器
+        drl_trainer = MultiAgentTrainer(config, drl_env)
         
-        # 4. 保存模型 (例如到 models/ 目录)
-        # drl_trainer.save_models("models/drl_agents_v1.zip")
+        # 4. 运行训练 (假设是异步的)
+        # asyncio.run(drl_trainer.train_agents())
+        
+        # 5. 保存模型 (例如到 models/ 目录)
+        # drl_trainer.save_models("models/drl_agents_v1")
         
         logger.info("DRL 智能体训练（模拟）完成。")
-        logger.info("请将 'run_training.py' 中的依赖项（如 TradingEnv）初始化补全。")
+        logger.info("模型将保存到 'models/' 目录。")
         
     except Exception as e:
         logger.error(f"DRL 训练失败: {e}", exc_info=True)
@@ -96,3 +110,4 @@ def run_drl_trainer(
 
 if __name__ == "__main__":
     app()
+
