@@ -1,163 +1,216 @@
 """
 Celery Worker
-- 定义和注册 Celery 任务
-- 构建核心服务 (Orchestrator)
-- 运行认知工作流
+负责异步执行 Orchestrator 任务。
 """
 import os
-import asyncio
 from celery import Celery
-from kombu import Queue
 
-from monitor.logging import get_logger, setup_logging
+# (导入所有组件以进行初始化)
 from config.loader import ConfigLoader
-from core.pipeline_state import PipelineState
 from data_manager import DataManager
-from strategy_handler import StrategyHandler
-from execution.order_manager import OrderManager
-from execution.adapters import AlpacaAdapter # (假设使用 Alpaca)
+from core.pipeline_state import PipelineState
 from events.event_distributor import EventDistributor
-from controller.orchestrator import Orchestrator
-from api.gemini_pool_manager import GeminiPoolManager
-from ai.metacognitive_agent import MetacognitiveAgent
+from events.risk_filter import EventRiskFilter
+from events.stream_processor import StreamProcessor
+from cognitive.engine import CognitiveEngine
 from cognitive.portfolio_constructor import PortfolioConstructor
+from cognitive.risk_manager import RiskManager
+from execution.order_manager import OrderManager
+from execution.trade_lifecycle_manager import TradeLifecycleManager
+
+# FIX (E6): 导入 AlpacaAdapter (我们将在 adapters.py 中添加它)
+from execution.adapters import SimulatedBrokerAdapter, AlpacaAdapter
+from controller.orchestrator import Orchestrator
+from controller.error_handler import ErrorHandler
+from audit_manager import AuditManager
+from snapshot_manager import SnapshotManager
+from metrics_collector import MetricsCollector
+from monitor.logging import setup_logging, get_logger
+
+# (AI/RAG components)
+from ai.retriever import Retriever
+from ai.ensemble_client import EnsembleClient
+from ai.metacognitive_agent import MetacognitiveAgent
+from ai.reasoning_ensemble import ReasoningEnsemble
+from evaluation.arbitrator import Arbitrator
+from evaluation.fact_checker import FactChecker
+from ai.prompt_manager import PromptManager
+from api.gateway import APIGateway
+from api.gemini_pool_manager import GeminiPoolManager
+from memory.vector_store import VectorStore
+from memory.cot_database import CoTDatabase
+from sizing.fixed_fraction import FixedFractionSizer
+import json
 
 # --- Celery App Setup ---
-setup_logging()
-logger = get_logger(__name__)
-
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672//")
-
-app = Celery(
-    "phoenix_worker",
-    broker=RABBITMQ_URL,
-    backend=REDIS_URL,
+celery_app = Celery(
+    'phoenix_worker',
+    broker=os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
+    backend=os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
 )
-app.conf.update(
-    task_queues=(Queue("cognitive_workflow"),),
-    task_default_queue="cognitive_workflow",
-    task_serializer="json",
-    result_serializer="json",
-    accept_content=["json"],
-    timezone="UTC",
-    enable_utc=True,
+celery_app.conf.update(
+    task_track_started=True,
+    broker_connection_retry_on_startup=True
 )
 
-# --- 全局 Orchestrator 实例 ---
-# (在 Celery worker 中，在任务执行前构建)
-orchestrator_instance = None
+# --- 全局单例 (Global Singleton) ---
+# 避免在每个 Celery 任务中都重新初始化整个应用程序
+orchestrator_instance: Orchestrator = None
 
-def build_orchestrator():
+def build_orchestrator() -> Orchestrator:
     """
-    关键修正 (Error 4):
-    重构此函数以正确构建 Orchestrator 及其所有依赖项。
-    这必须与 controller/orchestrator.py 的 __init__ 签名严格匹配。
+    FIX (E5): 重写此函数以正确初始化 Orchestrator 及其所有依赖项。
     """
-    logger.info("Building core components for Orchestrator...")
+    
+    global orchestrator_instance
+    if orchestrator_instance:
+        return orchestrator_instance
+
+    setup_logging()
+    logger = get_logger(__name__)
+    logger.info("Worker: Building new Orchestrator instance...")
     
     try:
-        # 1. 加载配置
-        config_loader = ConfigLoader()
-        config = config_loader.get_system_config()
-
-        # 2. 核心状态和管理器
-        pipeline_state = PipelineState()
-        data_manager = DataManager(config.get('data_manager', {}))
-        event_distributor = EventDistributor()
-
-        # 3. AI 和 API Pool (这些是 MetacognitiveAgent 的依赖)
-        gemini_pool = GeminiPoolManager(config.get('gemini', {}))
+        # 1. Config
+        config_path = os.environ.get('PHOENIX_CONFIG_PATH', 'config')
+        config_loader = ConfigLoader(config_path)
         
-        # 4. 认知组件 (这些是 StrategyHandler 的依赖)
-        metacognitive_agent = MetacognitiveAgent(
-            config=config.get('metacognitive_agent', {}),
-            gemini_pool=gemini_pool
-            # (可能还需要其他依赖, e.g., prompt_manager)
-        )
-        portfolio_constructor = PortfolioConstructor(
-            config=config.get('portfolio_constructor', {})
-            # (可能还需要其他依赖)
-        )
+        # 2. Data
+        catalog_path = config_loader.get_system_config().get("data_catalog_path", "data_catalog.json")
+        with open(catalog_path, 'r') as f:
+            data_catalog = json.load(f)
+            
+        # 3. Core Components
+        error_handler = ErrorHandler()
         
-        # 5. 执行组件 (这些是 OrderManager 和 Orchestrator 的依赖)
-        # 修正: OrderManager 构造函数需要一个 adapter
-        broker_adapter = AlpacaAdapter(config.get('execution', {}).get('alpaca', {}))
-        order_manager = OrderManager(
-            config=config.get('execution', {}), 
-            adapter=broker_adapter
-        )
+        # (E5 Fix)
+        data_manager = DataManager(config_loader, data_catalog)
+        
+        # (E5 Fix)
+        max_history = config_loader.get_system_config().get("max_pipeline_history", 100)
+        pipeline_state = PipelineState(initial_state=None, max_history=max_history)
+        
+        audit_manager = AuditManager(config_loader)
+        snapshot_manager = SnapshotManager(config_loader)
 
-        # 6. 策略处理器
-        strategy_handler = StrategyHandler(
-            config=config.get('strategy_handler', {}),
-            data_manager=data_manager,
+        # 4. Event Stream
+        event_filter = EventRiskFilter(config_loader)
+        stream_processor = StreamProcessor()
+
+        # 5. Execution
+        # (E6 Fix - 检查 Alpaca)
+        broker_config = config_loader.get_system_config().get("broker", {})
+        if broker_config.get("type") == "alpaca":
+            broker = AlpacaAdapter(
+                api_key=os.environ.get(broker_config.get("api_key_env")),
+                api_secret=os.environ.get(broker_config.get("api_secret_env")),
+                base_url=broker_config.get("base_url")
+            )
+        else:
+            logger.warning("Defaulting to SimulatedBrokerAdapter for worker.")
+            broker = SimulatedBrokerAdapter()
+            
+        initial_cash = config_loader.get_system_config().get("trading", {}).get("initial_cash", 1000000)
+        trade_lifecycle_manager = TradeLifecycleManager(initial_cash=initial_cash)
+        order_manager = OrderManager(broker)
+
+        # 6. AI/Cognitive (与 phoenix_project.py 相同)
+        gemini_pool = GeminiPoolManager()
+        api_gateway = APIGateway(gemini_pool)
+        prompt_manager = PromptManager(config_loader.config_path)
+        vector_store = VectorStore()
+        cot_db = CoTDatabase()
+        retriever = Retriever(vector_store, cot_db)
+        agent_registry = config_loader.get_agent_registry()
+        ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry)
+        metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
+        arbitrator = Arbitrator(api_gateway, prompt_manager)
+        fact_checker = FactChecker(api_gateway, prompt_manager)
+        
+        reasoning_ensemble = ReasoningEnsemble(
+            retriever=retriever,
+            ensemble_client=ensemble_client,
             metacognitive_agent=metacognitive_agent,
-            portfolio_constructor=portfolio_constructor
+            arbitrator=arbitrator,
+            fact_checker=fact_checker
         )
+        
+        cognitive_engine = CognitiveEngine(
+            reasoning_ensemble=reasoning_ensemble,
+            fact_checker=fact_checker
+        )
+            
+        # 7. Portfolio
+        sizer = FixedFractionSizer() # 示例
+        portfolio_constructor = PortfolioConstructor(position_sizer=sizer)
+        risk_manager = RiskManager(config_loader)
 
-        # 7. 实例化 Orchestrator
-        # 修正: 使用 controller.orchestrator.py 中的正确签名
-        orchestrator = Orchestrator(
-            config_loader=config_loader,
+        # 8. Monitoring
+        metrics_collector = MetricsCollector(config_loader)
+
+        # 9. 创建 Orchestrator 实例
+        orchestrator_instance = Orchestrator(
             pipeline_state=pipeline_state,
             data_manager=data_manager,
-            strategy_handler=strategy_handler,
+            event_filter=event_filter,
+            stream_processor=stream_processor,
+            cognitive_engine=cognitive_engine,
+            portfolio_constructor=portfolio_constructor,
+            risk_manager=risk_manager,
             order_manager=order_manager,
-            event_distributor=event_distributor
-            # 注意: gemini_pool 和 celery_app 不直接注入 Orchestrator
-            # 它们被注入到 Orchestrator 的 *依赖项* 中
+            trade_lifecycle_manager=trade_lifecycle_manager,
+            snapshot_manager=snapshot_manager,
+            metrics_collector=metrics_collector,
+            audit_manager=audit_manager,
+            error_handler=error_handler
         )
         
-        logger.info("Orchestrator built successfully.")
-        return orchestrator
-        
+        logger.info("Worker: New Orchestrator instance built and cached.")
+        return orchestrator_instance
+    
     except Exception as e:
-        logger.error(f"Failed to build Orchestrator: {e}", exc_info=True)
-        return None
+        logger.error(f"Worker: Failed to build Orchestrator: {e}", exc_info=True)
+        # (在 Celery 中，我们可能希望任务失败而不是让 worker 崩溃)
+        raise
 
 # --- Celery Tasks ---
 
-@app.on_after_configure.connect
-def setup_periodic_tasks(sender, **kwargs):
-    """设置定时任务"""
-    sender.add_periodic_task(
-        60.0,  # (e.g., 每60秒运行一次)
-        run_cognitive_workflow.s(),
-        name="Run Cognitive Workflow",
-    )
-
-@app.task(name="run_cognitive_workflow", bind=True)
-def run_cognitive_workflow(self, *args, **kwargs):
+@celery_app.task(name='phoenix.run_main_cycle')
+def run_main_cycle_task():
     """
-    Celery 任务，用于执行主认知工作流。
+    Celery 任务，用于执行一个 Orchestrator 周期。
     """
-    global orchestrator_instance
-    
+    logger = get_logger('phoenix.run_main_cycle')
     try:
-        if orchestrator_instance is None:
-            logger.info("Orchestrator not found. Building...")
-            orchestrator_instance = build_orchestrator()
-            if orchestrator_instance is None:
-                logger.error("Failed to build orchestrator. Task cannot run.")
-                return "BUILD_FAILURE"
-
-        logger.info("Running cognitive workflow task...")
+        logger.info("Task: run_main_cycle_task started...")
+        # (获取或构建单例)
+        orchestrator = build_orchestrator()
         
-        # 关键修正 (Error 5):
-        # Orchestrator 中没有 'run_cognitive_workflow' 方法。
-        # 调用正确的主循环入口点 'run_main_loop_async'。
-        asyncio.run(orchestrator_instance.run_main_loop_async())
+        # FIX (E7): 调用 run_main_cycle() 而不是 run_main_loop_async()
+        orchestrator.run_main_cycle() 
         
-        logger.info("Cognitive workflow task finished.")
-        return "SUCCESS"
+        logger.info("Task: run_main_cycle_task finished.")
         
     except Exception as e:
-        logger.error(f"Error during cognitive workflow task: {e}", exc_info=True)
-        # (可以添加重试逻辑)
-        raise self.retry(exc=e, countdown=60)
+        logger.error(f"Task: run_main_cycle_task failed: {e}", exc_info=True)
+        # (可选: 重试)
+        # raise self.retry(exc=e, countdown=60)
 
-if __name__ == "__main__":
-    # 此 worker 通过 celery CLI 启动:
-    # celery -A worker worker --loglevel=info -Q cognitive_workflow
-    logger.info("Starting Celery worker...")
+@celery_app.on_after_configure.connect
+def setup_periodic_tasks(sender, **kwargs):
+    """
+    (可选) 如果使用 Celery Beat，可以在这里设置定时任务。
+    这替代了 controller/scheduler.py。
+    """
+    # 示例：每5分钟运行一次
+    # sender.add_periodic_task(
+    #     300.0,
+    #     run_main_cycle_task.s(),
+    #     name='Run main cycle every 5 minutes'
+    # )
+    pass
+
+if __name__ == '__main__':
+    # 直接运行 worker (用于开发)
+    # celery -A worker worker --loglevel=info
+    celery_app.worker_main(argv=['worker', '--loglevel=info'])
