@@ -1,174 +1,167 @@
-import asyncio
-from typing import Dict, Any, List, Optional, Tuple
+"""
+Multi-source Retriever for the RAG system.
 
-from ..data_manager import DataManager
+This module is responsible for fetching context (evidence) from various
+data stores in parallel to provide a comprehensive knowledge base for
+the AI agents.
+"""
+import logging
+import asyncio
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timedelta
+import pandas as pd
+
+# 修复：添加 TickerData 并使用正确的相对导入
+from ..core.schemas.data_schema import MarketEvent, TickerData
 from ..memory.vector_store import VectorStore
 from .temporal_db_client import TemporalDBClient
 from .tabular_db_client import TabularDBClient
-from .embedding_client import EmbeddingClient
-from ..monitor.logging import get_logger
-from ..core.schemas.data_schema import MarketEvent, TickerData
+from ..config.loader import ConfigLoader
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class Retriever:
     """
-    Performs hybrid RAG (Retrieval-Augmented Generation) by querying multiple
-    data sources (Vector, Temporal, Tabular) in parallel to build a
-    comprehensive context bundle.
+    Orchestrates parallel data retrieval from vector, temporal, and tabular stores.
     """
 
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        data_manager: DataManager,
-        vector_store: VectorStore,
-        temporal_db: TemporalDBClient,
-        tabular_db: TabularDBClient,
-        embedding_client: EmbeddingClient
-    ):
-        """
-        Initializes the Retriever with clients for all required data sources.
-        """
-        self.config = config.get('retriever', {})
-        self.data_manager = data_manager
+    def __init__(self, vector_store: VectorStore, 
+                 temporal_db: TemporalDBClient, 
+                 tabular_db: TabularDBClient):
+        
         self.vector_store = vector_store
         self.temporal_db = temporal_db
         self.tabular_db = tabular_db
-        self.embedding_client = embedding_client
         
-        # Get retrieval parameters from config
-        self.vector_top_k = self.config.get('vector_top_k', 5)
-        self.temporal_window_days = self.config.get('temporal_window_days', 7)
-        
-        logger.info("Retriever initialized.")
+        if not all([vector_store, temporal_db, tabular_db]):
+            raise ValueError("All data stores (Vector, Temporal, Tabular) must be provided.")
+            
+        logger.info("Retriever initialized with Vector, Temporal, and Tabular stores.")
 
-    async def retrieve_hybrid_context(
-        self, 
-        event: MarketEvent, 
-        market_context: Optional[List[TickerData]] = None
-    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+    async def retrieve_evidence(self, 
+                                query: str, 
+                                symbols: List[str], 
+                                end_time: datetime, 
+                                top_k_vector: int = 10,
+                                window_days: int = 7) -> Dict[str, Any]:
         """
-        Main entry point for hybrid retrieval. Executes all retrieval tasks concurrently.
+        Gathers all necessary evidence for a given query and context.
 
         Args:
-            event: The triggering MarketEvent.
-            market_context: Optional list of recent TickerData.
+            query: The main query or headline to search for.
+            symbols: List of symbols involved.
+            end_time: The reference "now" timestamp for retrieval.
+            top_k_vector: Number of vector documents to retrieve.
+            window_days: Number of past days to look back for temporal data.
 
         Returns:
-            A tuple containing:
-            1. context_bundle (Dict): The consolidated results, e.g.,
-               {"vector_context": [...], "temporal_context": [...], "structured_context": [...]}
-            2. metadata (Dict): Auditing metadata about the retrieval process.
+            A dictionary containing all retrieved evidence, structured by source.
         """
-        logger.debug(f"Starting hybrid retrieval for event: {event.event_id}")
+        start_time = end_time - timedelta(days=window_days)
         
-        # Create the text to be used for semantic search
-        query_text = f"Headline: {event.headline}\nSummary: {event.summary}"
+        # Create a list of tasks to run concurrently
+        tasks = [
+            self.vector_store.search(query, top_k_vector, filter_dict={"symbols": symbols}),
+            self.temporal_db.search_events(symbols, start_time, end_time),
+            self.tabular_db.get_financials(symbols, end_time),
+            self.temporal_db.get_market_data(symbols, start_time, end_time) # For recent price action
+        ]
         
-        # Create tasks for each retrieval source
-        tasks = {
-            "vector": asyncio.create_task(self._retrieve_vector_context(query_text, event)),
-            "temporal": asyncio.create_task(self._retrieve_temporal_context(event)),
-            "structured": asyncio.create_task(self._retrieve_structured_context(event)),
-            "market": asyncio.create_task(self._retrieve_market_context(event, market_context))
-        }
-        
-        # Wait for all tasks to complete
-        await asyncio.wait(tasks.values())
-
-        # Consolidate results
-        context_bundle = {}
-        metadata = {"tasks": {}}
-
-        for name, task in tasks.items():
-            try:
-                result, meta = task.result()
-                context_bundle[f"{name}_context"] = result
-                metadata['tasks'][name] = {"status": "success", **meta}
-            except Exception as e:
-                logger.error(f"Retrieval task '{name}' failed for event {event.event_id}: {e}", exc_info=True)
-                context_bundle[f"{name}_context"] = []
-                metadata['tasks'][name] = {"status": "error", "message": str(e)}
-
-        logger.info(f"Hybrid retrieval complete for event: {event.event_id}")
-        return context_bundle, metadata
-
-    async def _retrieve_vector_context(self, query_text: str, event: MarketEvent) -> Tuple[List[Dict], Dict]:
-        """Retrieves semantic context from the VectorStore (e.g., Pinecone)."""
-        start_time = asyncio.get_event_loop().time()
-        
-        # Get embedding for the query text
-        query_embedding = await self.embedding_client.get_embedding(query_text, cache_key=f"query_{event.event_id}")
-        if not query_embedding:
-            logger.warning(f"Could not generate query embedding for event: {event.event_id}")
-            return [], {"duration_ms": 0, "hits": 0, "error": "Embedding generation failed"}
-
-        # Search vector store
-        # TODO: Add metadata filters (e.g., date range, source)
-        results = await self.vector_store.search(
-            query_embedding=query_embedding,
-            top_k=self.vector_top_k
-        )
-        
-        duration_ms = (asyncio.get_event_loop().time() - start_time) * 1000
-        metadata = {"duration_ms": duration_ms, "hits": len(results), "query_snippet": query_text[:100]}
-        
-        return results, metadata
-
-    async def _retrieve_temporal_context(self, event: MarketEvent) -> Tuple[List[Dict], Dict]:
-        """Retrieves time-series context from the TemporalDB (e.g., Elasticsearch)."""
-        start_time = asyncio.get_event_loop().time()
-        
-        end_time = event.timestamp
-        start_time_filter = end_time - pd.Timedelta(days=self.temporal_window_days)
-        
-        results = await self.temporal_db.search_events(
-            symbols=event.symbols,
-            start_time=start_time_filter,
-            end_time=end_time
-        )
-        
-        # Filter out the triggering event itself
-        results = [r for r in results if r.get('event_id') != event.event_id]
-        
-        duration_ms = (asyncio.get_event_loop().time() - start_time) * 1000
-        metadata = {"duration_ms": duration_ms, "hits": len(results), "window_days": self.temporal_window_days}
-        
-        return results, metadata
-
-    async def _retrieve_structured_context(self, event: MarketEvent) -> Tuple[List[Dict], Dict]:
-        """Retrieves structured financial data from the TabularDB (e.g., PostgreSQL)."""
-        start_time = asyncio.get_event_loop().time()
-        
-        # Example: Get latest financial metrics for the event's symbols
-        all_metrics = []
-        for symbol in event.symbols:
-            metrics = await self.tabular_db.get_latest_financials(symbol)
-            if metrics:
-                all_metrics.append(metrics)
-                
-        duration_ms = (asyncio.get_event_loop().time() - start_time) * 1000
-        metadata = {"duration_ms": duration_ms, "symbols_queried": len(event.symbols), "hits": len(all_metrics)}
-        
-        return all_metrics, metadata
-
-    async def _retrieve_market_context(self, event: MarketEvent, market_context: Optional[List[TickerData]]) -> Tuple[List[Dict], Dict]:
-        """Packages the already-provided market context."""
-        start_time = asyncio.get_event_loop().time()
-        
-        if not market_context:
-            # If not provided, fetch it (less efficient)
-            # This is a fallback
-            logger.warning(f"Market context not provided for event {event.event_id}. Fetching...")
-            # This logic should be more robust, getting data for all symbols
-            # For now, just return empty
-            results_list = []
-        else:
-            # Convert Pydantic models to dicts for the context bundle
-            results_list = [ticker.model_dump() for ticker in market_context]
+        try:
+            # Run tasks in parallel
+            results = await asyncio.gather(*tasks)
             
-        duration_ms = (asyncio.get_event_loop().time() - start_time) * 1000
-        metadata = {"duration_ms": duration_ms, "series_count": len(results_list)}
+            vector_results, temporal_events, tabular_data, market_data = results
+            
+            # Structure the final output
+            evidence = {
+                "retrieval_timestamp": datetime.now().isoformat(),
+                "query": query,
+                "context_window": {"start": start_time.isoformat(), "end": end_time.isoformat()},
+                "vector_context": [doc.to_dict() for doc in vector_results] if vector_results else [],
+                "temporal_context": [event.dict() for event in temporal_events] if temporal_events else [],
+                "tabular_context": tabular_data if tabular_data else {},
+                "market_context": [tick.dict() for tick in market_data] if market_data else [],
+            }
+            
+            logger.info(f"Retrieved evidence for query '{query}': "
+                        f"{len(evidence['vector_context'])} vector docs, "
+                        f"{len(evidence['temporal_context'])} temporal events, "
+                        f"{len(evidence['tabular_context'])} tabular records, "
+                        f"{len(evidence['market_context'])} market data points.")
+            
+            return evidence
+            
+        except Exception as e:
+            logger.error(f"Error during parallel evidence retrieval: {e}", exc_info=True)
+            return {"error": str(e), "vector_context": [], "temporal_context": [], "tabular_context": {}, "market_context": []}
+
+# Example usage (simulated)
+if __name__ == "__main__":
+    
+    logging.basicConfig(level=logging.INFO)
+    
+    # --- Mock Data Stores ---
+    class MockVectorStore:
+        async def search(self, query, top_k, filter_dict=None):
+            logger.info(f"[MockVector] Searching for '{query}' with filter {filter_dict}")
+            # Mock a document
+            class MockDoc:
+                def to_dict(self):
+                    return {"id": "vec_123", "content": "Mock vector content about " + query, "score": 0.9}
+            return [MockDoc()]
+
+    class MockTemporalDB:
+        async def search_events(self, symbols, start, end):
+            logger.info(f"[MockTemporal] Searching for events for {symbols} from {start} to {end}")
+            return [MarketEvent(event_id="evt_456", timestamp=datetime.now(), source="MockSource",
+                                headline="Mock event headline", content="...", symbols=symbols)]
         
-        return results_list, metadata
+        async def get_market_data(self, symbols, start, end):
+            logger.info(f"[MockTemporal] Searching for market data for {symbols} from {start} to {end}")
+            return [TickerData(symbol=s, timestamp=datetime.now(), open=1, high=2, low=1, close=2, volume=1000) for s in symbols]
+
+    class MockTabularDB:
+        async def get_financials(self, symbols, end_time):
+            logger.info(f"[MockTabular] Getting financials for {symbols}")
+            return {s: {"latest_eps": 1.25, "pe_ratio": 20.5} for s in symbols}
+
+    # --- Run Example ---
+    async def main():
+        retriever = Retriever(
+            vector_store=MockVectorStore(),
+            temporal_db=MockTemporalDB(),
+            tabular_db=MockTabularDB()
+        )
+        
+        query_headline = "Major tech breakthrough announced by AAPL"
+        query_symbols = ["AAPL", "MSFT"]
+        query_time = datetime.now()
+        
+        evidence = await retriever.retrieve_evidence(
+            query=query_headline,
+            symbols=query_symbols,
+            end_time=query_time
+        )
+        
+        import json
+        print("\n--- Retrieved Evidence ---")
+        print(json.dumps(evidence, indent=2, default=str))
+        print("--------------------------")
+        
+        # Test error handling
+        class FailingVectorStore:
+            async def search(self, query, top_k, filter_dict=None):
+                raise Exception("Vector store connection failed!")
+        
+        retriever_fail = Retriever(
+            vector_store=FailingVectorStore(),
+            temporal_db=MockTemporalDB(),
+            tabular_db=MockTabularDB()
+        )
+        evidence_fail = await retriever_fail.retrieve_evidence(query_headline, query_symbols, query_time)
+        print("\n--- Failed Retrieval ---")
+        print(json.dumps(evidence_fail, indent=2, default=str))
+        print("------------------------")
+
+    asyncio.run(main())
