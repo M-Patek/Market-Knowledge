@@ -1,167 +1,124 @@
-"""
-Multi-source Retriever for the RAG system.
-
-This module is responsible for fetching context (evidence) from various
-data stores in parallel to provide a comprehensive knowledge base for
-the AI agents.
-"""
-import logging
-import asyncio
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
-import pandas as pd
+from ai.embedding_client import EmbeddingClient
+from memory.vector_store import VectorStore
+from memory.cot_database import CoTDatabase
+from monitor.logging import get_logger
 
-# 修复：添加 TickerData 并使用正确的相对导入
-from ..core.schemas.data_schema import MarketEvent, TickerData
-from ..memory.vector_store import VectorStore
-from .temporal_db_client import TemporalDBClient
-from .tabular_db_client import TabularDBClient
-from ..config.loader import ConfigLoader
-
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class Retriever:
     """
-    Orchestrates parallel data retrieval from vector, temporal, and tabular stores.
+    Retrieves relevant information from various memory stores
+    (VectorStore, CoTDatabase) to build context for the AI agents.
     """
 
-    def __init__(self, vector_store: VectorStore, 
-                 temporal_db: TemporalDBClient, 
-                 tabular_db: TabularDBClient):
-        
+    def __init__(
+        self,
+        vector_store: VectorStore,
+        cot_database: CoTDatabase,
+        embedding_client: EmbeddingClient
+    ):
         self.vector_store = vector_store
-        self.temporal_db = temporal_db
-        self.tabular_db = tabular_db
-        
-        if not all([vector_store, temporal_db, tabular_db]):
-            raise ValueError("All data stores (Vector, Temporal, Tabular) must be provided.")
-            
-        logger.info("Retriever initialized with Vector, Temporal, and Tabular stores.")
+        self.cot_database = cot_database
+        self.embedding_client = embedding_client
+        logger.info("Retriever initialized.")
 
-    async def retrieve_evidence(self, 
-                                query: str, 
-                                symbols: List[str], 
-                                end_time: datetime, 
-                                top_k_vector: int = 10,
-                                window_days: int = 7) -> Dict[str, Any]:
+    async def retrieve_relevant_context(
+        self,
+        query: str,
+        top_k_vector: int = 5,
+        top_k_cot: int = 3,
+        metadata_filter: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, List[Any]]:
         """
-        Gathers all necessary evidence for a given query and context.
-
+        Retrieves context from all available stores based on a query.
+        
         Args:
-            query: The main query or headline to search for.
-            symbols: List of symbols involved.
-            end_time: The reference "now" timestamp for retrieval.
-            top_k_vector: Number of vector documents to retrieve.
-            window_days: Number of past days to look back for temporal data.
+            query (str): The search query (e.g., summary of recent events,
+                         or a specific question).
+            top_k_vector (int): Number of results from VectorStore.
+            top_k_cot (int): Number of results from CoTDatabase.
+            metadata_filter (Optional[Dict[str, Any]]): Filter for vector search.
 
         Returns:
-            A dictionary containing all retrieved evidence, structured by source.
+            A dictionary containing the retrieved "vector_chunks" and "cot_traces".
         """
-        start_time = end_time - timedelta(days=window_days)
+        logger.info(f"Retrieving context for query: {query[:50]}...")
         
-        # Create a list of tasks to run concurrently
-        tasks = [
-            self.vector_store.search(query, top_k_vector, filter_dict={"symbols": symbols}),
-            self.temporal_db.search_events(symbols, start_time, end_time),
-            self.tabular_db.get_financials(symbols, end_time),
-            self.temporal_db.get_market_data(symbols, start_time, end_time) # For recent price action
-        ]
-        
+        # 1. Generate embedding for the query
         try:
-            # Run tasks in parallel
-            results = await asyncio.gather(*tasks)
-            
-            vector_results, temporal_events, tabular_data, market_data = results
-            
-            # Structure the final output
-            evidence = {
-                "retrieval_timestamp": datetime.now().isoformat(),
-                "query": query,
-                "context_window": {"start": start_time.isoformat(), "end": end_time.isoformat()},
-                "vector_context": [doc.to_dict() for doc in vector_results] if vector_results else [],
-                "temporal_context": [event.dict() for event in temporal_events] if temporal_events else [],
-                "tabular_context": tabular_data if tabular_data else {},
-                "market_context": [tick.dict() for tick in market_data] if market_data else [],
-            }
-            
-            logger.info(f"Retrieved evidence for query '{query}': "
-                        f"{len(evidence['vector_context'])} vector docs, "
-                        f"{len(evidence['temporal_context'])} temporal events, "
-                        f"{len(evidence['tabular_context'])} tabular records, "
-                        f"{len(evidence['market_context'])} market data points.")
-            
-            return evidence
-            
+            query_embedding = await self.embedding_client.get_embedding(query)
+            if not query_embedding:
+                logger.error("Failed to generate query embedding. Cannot perform vector search.")
+                vector_chunks = []
+            else:
+                # 2. Query VectorStore
+                vector_chunks = await self.vector_store.search(
+                    query_embedding=query_embedding,
+                    top_k=top_k_vector,
+                    metadata_filter=metadata_filter
+                )
+                logger.info(f"Retrieved {len(vector_chunks)} chunks from VectorStore.")
+                
         except Exception as e:
-            logger.error(f"Error during parallel evidence retrieval: {e}", exc_info=True)
-            return {"error": str(e), "vector_context": [], "temporal_context": [], "tabular_context": {}, "market_context": []}
+            logger.error(f"Error during vector retrieval: {e}", exc_info=True)
+            vector_chunks = []
 
-# Example usage (simulated)
-if __name__ == "__main__":
-    
-    logging.basicConfig(level=logging.INFO)
-    
-    # --- Mock Data Stores ---
-    class MockVectorStore:
-        async def search(self, query, top_k, filter_dict=None):
-            logger.info(f"[MockVector] Searching for '{query}' with filter {filter_dict}")
-            # Mock a document
-            class MockDoc:
-                def to_dict(self):
-                    return {"id": "vec_123", "content": "Mock vector content about " + query, "score": 0.9}
-            return [MockDoc()]
+        # 3. Query CoTDatabase (e.g., by keyword matching on the query)
+        try:
+            # CoTDatabase search might be simpler (e.g., keyword or tag based)
+            # This is a placeholder for a real search implementation
+            cot_traces = await self.cot_database.search_traces(
+                keywords=query.split(), # Simple keyword search
+                limit=top_k_cot
+            )
+            logger.info(f"Retrieved {len(cot_traces)} traces from CoTDatabase.")
+        except Exception as e:
+            logger.error(f"Error during CoT retrieval: {e}", exc_info=True)
+            cot_traces = []
 
-    class MockTemporalDB:
-        async def search_events(self, symbols, start, end):
-            logger.info(f"[MockTemporal] Searching for events for {symbols} from {start} to {end}")
-            return [MarketEvent(event_id="evt_456", timestamp=datetime.now(), source="MockSource",
-                                headline="Mock event headline", content="...", symbols=symbols)]
-        
-        async def get_market_data(self, symbols, start, end):
-            logger.info(f"[MockTemporal] Searching for market data for {symbols} from {start} to {end}")
-            return [TickerData(symbol=s, timestamp=datetime.now(), open=1, high=2, low=1, close=2, volume=1000) for s in symbols]
+        return {
+            "vector_chunks": vector_chunks,
+            "cot_traces": cot_traces
+        }
 
-    class MockTabularDB:
-        async def get_financials(self, symbols, end_time):
-            logger.info(f"[MockTabular] Getting financials for {symbols}")
-            return {s: {"latest_eps": 1.25, "pe_ratio": 20.5} for s in symbols}
-
-    # --- Run Example ---
-    async def main():
-        retriever = Retriever(
-            vector_store=MockVectorStore(),
-            temporal_db=MockTemporalDB(),
-            tabular_db=MockTabularDB()
+    async def retrieve_for_context_window(
+        self,
+        base_query: str,
+        max_tokens: int,
+        # ... other params
+    ) -> str:
+        """
+        A more advanced retrieval method that fetches context and formats it
+        to fit within a specific token limit for an LLM prompt.
+        """
+        # This is a complex task ("RAG pipeline")
+        # 1. Retrieve more than needed
+        retrieved_data = await self.retrieve_relevant_context(
+            base_query, top_k_vector=10, top_k_cot=5
         )
         
-        query_headline = "Major tech breakthrough announced by AAPL"
-        query_symbols = ["AAPL", "MSFT"]
-        query_time = datetime.now()
+        # 2. Re-rank results (e.g., using a cross-encoder, not implemented)
         
-        evidence = await retriever.retrieve_evidence(
-            query=query_headline,
-            symbols=query_symbols,
-            end_time=query_time
-        )
+        # 3. Stuff into context window
+        formatted_context = "--- Relevant Knowledge ---\n\n"
         
-        import json
-        print("\n--- Retrieved Evidence ---")
-        print(json.dumps(evidence, indent=2, default=str))
-        print("--------------------------")
-        
-        # Test error handling
-        class FailingVectorStore:
-            async def search(self, query, top_k, filter_dict=None):
-                raise Exception("Vector store connection failed!")
-        
-        retriever_fail = Retriever(
-            vector_store=FailingVectorStore(),
-            temporal_db=MockTemporalDB(),
-            tabular_db=MockTabularDB()
-        )
-        evidence_fail = await retriever_fail.retrieve_evidence(query_headline, query_symbols, query_time)
-        print("\n--- Failed Retrieval ---")
-        print(json.dumps(evidence_fail, indent=2, default=str))
-        print("------------------------")
+        # Add CoT traces first (often high-value)
+        for trace in retrieved_data["cot_traces"]:
+            trace_text = f"Previous Reasoning ({trace['timestamp']}):\n{trace['reasoning']}\nDecision: {trace['decision']}\n\n"
+            if len(formatted_context) + len(trace_text) > max_tokens:
+                break
+            formatted_context += trace_text
+            
+        # Add vector chunks
+        for chunk in retrieved_data["vector_chunks"]:
+            chunk_text = f"Retrieved Document (Source: {chunk.get('source', 'N/A')}):\n{chunk.get('text', '')}\n\n"
+            if len(formatted_context) + len(chunk_text) > max_tokens:
+                break
+            formatted_context += chunk_text
 
-    asyncio.run(main())
+        if len(formatted_context) > max_tokens:
+             formatted_context = formatted_context[:max_tokens] + "... [Truncated]"
+             
+        logger.info(f"Assembled context window of {len(formatted_context)} chars.")
+        return formatted_context
