@@ -1,188 +1,271 @@
+"""
+Custom Gymnasium (OpenAI Gym) Environment for DRL Trading Agents.
+
+This environment defines the state space, action space, and reward
+function for training a Deep Reinforcement Learning agent.
+"""
+import gymnasium as gym
 import numpy as np
 import pandas as pd
-# 修正: 'gym' 已被 'gymnasium' 替代。我们已在 requirements.txt 中添加 gymnasium
-import gymnasium as gym
 from gymnasium import spaces
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 
-from data.data_iterator import DataIterator
-from execution.order_manager import OrderManager
-from core.pipeline_state import PipelineState
+# 修复：使用正确的相对导入
+from ..data.data_iterator import DataIterator
+from ..core.pipeline_state import PipelineState
+from ..core.schemas.data_schema import TickerData, MarketEvent
 
 class TradingEnv(gym.Env):
     """
-    一个符合 OpenAI Gym 规范的交易环境，用于强化学习。
-    (Task 1.2 - DRL 基础设施)
+    A trading environment for DRL agents.
     
-    这个环境模拟了在一个时间序列上进行买入/卖出/持有的决策过程。
+    State Space:
+    - Current holdings (e.g., [cash_pct, asset1_pct, asset2_pct])
+    - Market features (e.g., price history, volatility)
+    
+    Action Space:
+    - Target weights for each asset (e.g., [asset1_target_pct, asset2_target_pct])
     """
-    metadata = {'render.modes': ['human']}
+    
+    metadata = {'render_modes': ['human', 'ansi']}
 
     def __init__(self, 
                  data_iterator: DataIterator, 
-                 order_manager: OrderManager,
                  initial_capital: float = 100000.0,
-                 lookback_window: int = 30,
-                 **kwargs):
+                 lookback_window: int = 30):
         """
-        初始化交易环境。
+        Initializes the trading environment.
 
         Args:
-            data_iterator: 提供市场数据的迭代器。
-            order_manager: 处理订单执行和投资组合管理的对象。
-            initial_capital: 模拟开始时的初始资金。
-            lookback_window: 代理在每一步可以看到的历史数据天数。
-            **kwargs: 传递给父类的其他参数 (例如 'ticker')。
+            data_iterator: A (pre-setup) DataIterator for the training period.
+            initial_capital: Starting capital for the portfolio.
+            lookback_window: How many past time steps of market data to
+                             include in the state.
         """
         super(TradingEnv, self).__init__()
         
         self.data_iterator = data_iterator
-        self.order_manager = order_manager
         self.initial_capital = initial_capital
         self.lookback_window = lookback_window
         
-        # 从迭代器获取特征数量
-        # (lookback_window, num_features)
-        self.num_features = self.data_iterator.get_feature_count()
+        self.assets = self._get_assets() # Get list of assets from data
+        self.num_assets = len(self.assets)
         
-        # 动作空间: 0: 卖出, 1: 持有, 2: 买入
-        self.action_space = spaces.Discrete(3) 
+        self.pipeline_state = PipelineState(initial_capital=initial_capital, assets=self.assets)
+
+        # --- Define Action Space ---
+        # Action is the target *weight* for each asset.
+        # We have N assets. Action space is Box(0, 1) for each.
+        # The agent's output will be post-processed (e.g., softmax)
+        # to ensure weights sum to 1.
+        self.action_space = spaces.Box(
+            low=0.0, high=1.0, shape=(self.num_assets,), dtype=np.float32
+        )
+
+        # --- Define State Space ---
+        # 1. Portfolio holdings (N assets + 1 for cash)
+        holdings_shape = (self.num_assets + 1,)
+        # 2. Market data (e.g., N assets * 5 features (OHLCV) * K lookback)
+        # For simplicity, let's use normalized 'close' price lookback
+        market_shape = (self.num_assets, self.lookback_window)
         
-        # 观测空间: (窗口大小, 特征数量)
-        # 例如: 过去30天的 (Open, High, Low, Close, Volume, RSI, SMA)
-        self.observation_space = spaces.Box(
-            low=-np.inf, 
-            high=np.inf, 
-            shape=(self.lookback_window, self.num_features), 
+        # Use a Dict space to combine them
+        self.observation_space = spaces.Dict({
+            "holdings": spaces.Box(low=0.0, high=1.0, shape=holdings_shape, dtype=np.float32),
+            "market": spaces.Box(low=-np.inf, high=np.inf, shape=market_shape, dtype=np.float32)
+        })
+        
+        # Internal state
+        self._market_data_history = self._init_history() # Stores market data
+        self._iterator = iter(self.data_iterator)
+        self._current_tick = None
+        self._terminated = False
+        self._truncated = False
+
+    def _get_assets(self) -> List[str]:
+        """Helper to extract unique asset symbols from the data."""
+        # This assumes the iterator's data is loaded
+        if self.data_iterator.combined_data is None:
+            self.data_iterator.setup()
+        
+        all_symbols = self.data_iterator.combined_data[
+            self.data_iterator.combined_data['data_type'] == 'ticker'
+        ]['symbol'].unique()
+        return list(all_symbols)
+
+    def _init_history(self) -> pd.DataFrame:
+        """Initializes an empty DataFrame to store market history."""
+        columns = pd.MultiIndex.from_product([self.assets, ['open', 'high', 'low', 'close', 'volume']])
+        return pd.DataFrame(columns=columns)
+
+    def _update_history(self, tick: TickerData):
+        """Adds a new tick to the history, maintaining the lookback window."""
+        if tick.symbol not in self.assets:
+            return
+            
+        timestamp = tick.timestamp
+        # Use loc to add/update the row for this timestamp
+        for field in ['open', 'high', 'low', 'close', 'volume']:
+            self._market_data_history.loc[timestamp, (tick.symbol, field)] = getattr(tick, field)
+            
+        # Ensure data is sorted by time
+        self._market_data_history.sort_index(inplace=True)
+        
+        # Maintain the lookback window size (optional, can grow)
+        if len(self._market_data_history) > self.lookback_window * 2: # Keep a buffer
+             self._market_data_history = self._market_data_history.iloc[-self.lookback_window:]
+
+    def _get_next_tick(self) -> Optional[TickerData]:
+        """Gets the next TickerData point from the iterator."""
+        while True:
+            try:
+                item = next(self._iterator)
+                if isinstance(item, TickerData):
+                    self._current_tick = item
+                    return item
+                # We skip MarketEvents in this simple env
+                elif isinstance(item, MarketEvent):
+                    continue
+            except StopIteration:
+                return None
+
+    def _get_observation(self) -> Dict[str, np.ndarray]:
+        """Constructs the observation dict from the current state."""
+        
+        # 1. Holdings
+        holdings = self.pipeline_state.get_portfolio_weights() # Assumes this method exists
+        holdings_array = np.array(
+            [holdings.get(asset, 0.0) for asset in self.assets] + [holdings.get('cash', 0.0)],
             dtype=np.float32
         )
         
-        # 内部状态
-        self.current_step = 0
-        self.done = False
-        self.portfolio_value = self.initial_capital
-        self.return_history = [] # 存储每日回报
-
-    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None) -> tuple[np.ndarray, dict]:
-        """
-        重置环境到初始状态。
-        """
-        if seed is not None:
-            super().reset(seed=seed)
+        # 2. Market Data (normalized close prices for lookback)
+        market_obs = np.zeros((self.num_assets, self.lookback_window), dtype=np.float32)
+        
+        if not self._market_data_history.empty:
+            # Get the 'close' price columns
+            close_prices = self._market_data_history.xs('close', level=1, axis=1)
+            # Get the last K rows
+            recent_prices = close_prices.iloc[-self.lookback_window:]
             
-        self.current_step = 0
-        self.done = False
-        self.data_iterator.reset()
-        self.order_manager.reset_portfolio(self.initial_capital)
-        self.portfolio_value = self.initial_capital
-        self.return_history = []
-
-        # 获取初始观测
-        obs = self._get_observation()
-        
-        # 填充回看窗口 (在模拟开始前)
-        # 我们跳过前 `lookback_window` 步来预热状态
-        for _ in range(self.lookback_window):
-             _, done = self.data_iterator.next()
-             if done:
-                 raise ValueError("数据集太短，无法填充初始回看窗口")
-        
-        obs = self._get_observation()
-        self.current_step = self.lookback_window
-        
-        info = self._get_info()
-        return obs, info
-
-    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
-        """
-        在环境中执行一个步骤 (一个交易日)。
-
-        Args:
-            action (int): 代理选择的动作 (0=卖, 1=持有, 2=买)。
-
-        Returns:
-            tuple: (observation, reward, done, truncated, info)
-        """
-        if self.done:
-            # 如果环境已结束，返回最后的状态
-            obs = self._get_observation()
-            return obs, 0.0, self.done, False, self._get_info()
-
-        # 1. 获取当前市场数据 (用于执行)
-        current_data_slice, self.done = self.data_iterator.next()
-        if self.done:
-            # 数据结束
-            obs = self._get_observation()
-            return obs, 0.0, self.done, False, self._get_info()
+            # Simple normalization (price / first_price)
+            normalized_prices = recent_prices / (recent_prices.iloc[0] + 1e-6) - 1.0
             
-        self.current_step += 1
-        
-        # 2. 获取当前投资组合价值 (T-1)
-        value_t_minus_1 = self.order_manager.get_portfolio_value(current_data_slice)
+            # Fill the observation array
+            for i, asset in enumerate(self.assets):
+                if asset in normalized_prices.columns:
+                    # Pad if history is shorter than lookback window
+                    data = normalized_prices[asset].values
+                    pad_len = self.lookback_window - len(data)
+                    market_obs[i, :] = np.pad(data, (pad_len, 0), 'constant')
 
-        # 3. 将 DRL 动作转换为 OrderManager 信号
-        # 这是一个简化的映射：
-        # 0 (卖): 平仓所有多头头寸
-        # 1 (持有): 不做操作
-        # 2 (买): 分配 100% 资金做多
-        
-        signal_pct = 0.0 # 默认为持有 (或平仓)
-        if action == 2: # 买入
-            signal_pct = 1.0
-        elif action == 0: # 卖出
-            signal_pct = 0.0 # 目标仓位为 0%
-            
-        # 假设我们只交易 data_iterator.ticker
-        ticker = self.data_iterator.get_current_ticker()
-        if ticker:
-            # 生成目标信号
-            target_signal = {ticker: signal_pct}
-            
-            # 4. OrderManager 执行交易
-            # OrderManager 会处理滑点、佣金和投资组合更新
-            self.order_manager.process_signals(
-                signals=target_signal, 
-                data_slice=current_data_slice
-            )
-
-        # 5. 获取新的投资组合价值 (T)
-        self.portfolio_value = self.order_manager.get_portfolio_value(current_data_slice)
-        
-        # 6. 计算奖励 (Reward)
-        # 奖励 = (T 时价值) - (T-1 时价值)
-        reward = self.portfolio_value - value_t_minus_1
-        self.return_history.append(reward) # 存储绝对回报
-
-        # 7. 获取下一个观测
-        obs = self._get_observation()
-        
-        # 8. 获取信息
-        info = self._get_info()
-
-        return obs, reward, self.done, False, info
-
-    def _get_observation(self) -> np.ndarray:
-        """
-        从数据迭代器获取当前的回看窗口。
-        """
-        return self.data_iterator.get_lookback_window(self.lookback_window)
-
-    def _get_info(self) -> dict:
-        """
-        返回关于当前步骤的附加信息。
-        """
         return {
-            "step": self.current_step,
-            "portfolio_value": self.portfolio_value,
-            "cash": self.order_manager.portfolio.get('CASH', 0),
-            "positions": self.order_manager.portfolio
+            "holdings": holdings_array,
+            "market": market_obs
         }
 
+    def _calculate_reward(self, prev_value: float, current_value: float) -> float:
+        """Calculates the reward for the step."""
+        # Simple reward: percentage change in portfolio value
+        if prev_value == 0:
+            return 0.0
+        return (current_value - prev_value) / prev_value
+
+    def reset(self, seed=None, options=None):
+        """Resets the environment to the beginning."""
+        super().reset(seed=seed)
+        
+        self.pipeline_state = PipelineState(initial_capital=self.initial_capital, assets=self.assets)
+        self._market_data_history = self._init_history()
+        self._iterator = iter(self.data_iterator)
+        self._terminated = False
+        self._truncated = False
+
+        # Pre-fill the lookback window
+        for _ in range(self.lookback_window):
+            tick = self._get_next_tick()
+            if tick:
+                self._update_history(tick)
+            else:
+                self_truncated = True # Not enough data to even start
+                break
+        
+        observation = self._get_observation()
+        info = {}
+        
+        return observation, info
+
+    def step(self, action: np.ndarray):
+        """Takes a step in the environment."""
+        if self.is_done():
+            return self._get_observation(), 0.0, self._terminated, self._truncated, {"error": "Environment is done."}
+
+        # 1. Get portfolio value *before* the action
+        prev_portfolio_value = self.pipeline_state.get_total_portfolio_value()
+
+        # 2. Apply the action
+        # The action is target weights [w1, w2, ..., wN]
+        # Post-process: softmax to ensure sum-to-1
+        target_weights = np.exp(action) / np.sum(np.exp(action))
+        
+        # Update pipeline state with target weights
+        weights_dict = {asset: weight for asset, weight in zip(self.assets, target_weights)}
+        self.pipeline_state.update_target_weights(weights_dict)
+
+        # 3. Advance time to the next tick
+        tick = self._get_next_tick()
+        
+        if tick is None:
+            # End of data
+            self._terminated = True
+            current_portfolio_value = prev_portfolio_value
+        else:
+            # Update history and pipeline state with new prices
+            self._update_history(tick)
+            self.pipeline_state.update_time(tick.timestamp)
+            # Update market prices *before* calculating new value
+            self.pipeline_state.update_market_prices({tick.symbol: tick.close})
+            
+            # 4. Simulate trades (rebalancing)
+            # In a real env, this involves a TradeLifecycleManager
+            # For simplicity here, we assume rebalancing happens instantly
+            # and portfolio value is just updated based on new prices.
+            self.pipeline_state.rebalance_to_targets()
+            
+            # 5. Get new portfolio value
+            current_portfolio_value = self.pipeline_state.get_total_portfolio_value()
+
+        # 6. Calculate reward
+        reward = self._calculate_reward(prev_portfolio_value, current_portfolio_value)
+        
+        # 7. Check for termination (e.g., bankruptcy)
+        if current_portfolio_value < self.initial_capital * 0.2: # 80% drawdown
+            self._truncated = True # Truncated, not terminated (agent failed)
+        
+        observation = self._get_observation()
+        info = {
+            "timestamp": self._current_tick.timestamp if self._current_tick else None,
+            "portfolio_value": current_portfolio_value,
+            "reward": reward
+        }
+        
+        return observation, reward, self._terminated, self._truncated, info
+
+    def is_done(self) -> bool:
+        """Checks if the episode is finished."""
+        return self._terminated or self._truncated
+
     def render(self, mode='human'):
-        """
-        (可选) 渲染环境状态。
-        """
-        if mode == 'human':
-            print(f"Step: {self.current_step}")
-            print(f"Portfolio Value: {self.portfolio_value:.2f}")
-            print(f"Positions: {self.order_manager.portfolio}")
+        """Renders the environment state."""
+        if mode == 'ansi':
+            return (
+                f"Time: {self.pipeline_state.get_current_time()}\n"
+                f"Value: {self.pipeline_state.get_total_portfolio_value():.2f}\n"
+                f"Weights: {self.pipeline_state.get_portfolio_weights()}\n"
+            )
+        elif mode == 'human':
+            print(self.render(mode='ansi'))
+
+    def close(self):
+        """Cleans up the environment."""
+        pass
