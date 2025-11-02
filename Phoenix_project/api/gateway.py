@@ -1,137 +1,158 @@
-from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
-from typing import Dict, Any, List
+"""
+API Gateway (FastAPI Server)
+
+This module provides the external-facing REST API for the Phoenix project.
+It allows:
+- Health checks.
+- Manually injecting events (e.g., from a webhook).
+- Querying the system state (e.g., current portfolio).
+- Triggering specific tasks (e.g., a manual rebalance).
+"""
+import logging
 import uvicorn
-import asyncio
+from fastapi import FastAPI, Depends, HTTPException, Body
+from typing import Dict, Any
 
-from ..monitor.logging import get_logger
-from ..controller.orchestrator import Orchestrator
-from ..context_bus import ContextBus
+# 修复：添加 pandas 导入
+import pandas as pd
+
 from ..core.schemas.data_schema import MarketEvent
+from ..controller.orchestrator import Orchestrator
+from ..core.pipeline_state import PipelineState
+# A dependency injection system would be better here
+# For now, we assume a global or passed 'orchestrator' instance
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
-class APIGateway:
+# --- Globals (to be replaced by proper dependency injection) ---
+# This is simplified for the example. In a real app,
+# the orchestrator would be initialized and passed properly.
+orchestrator: Orchestrator = None
+pipeline_state: PipelineState = None
+
+def get_orchestrator() -> Orchestrator:
+    """Dependency injector for the Orchestrator."""
+    if orchestrator is None:
+        raise HTTPException(status_code=503, detail="Orchestrator is not initialized.")
+    return orchestrator
+
+def get_pipeline_state() -> PipelineState:
+    """Dependency injector for the PipelineState."""
+    if pipeline_state is None:
+        raise HTTPException(status_code=503, detail="PipelineState is not initialized.")
+    return pipeline_state
+
+# --- FastAPI App ---
+app = FastAPI(
+    title="Phoenix Project API Gateway",
+    description="API for interacting with the Phoenix cognitive trading system."
+)
+
+@app.on_event("startup")
+async def startup_event():
     """
-    Provides an external REST API interface for the Phoenix project.
-    Allows injecting events and querying system state.
+    Handles application startup.
+    In a real app, this is where you'd initialize the main components
+    (Orchestrator, DB connections, etc.) and assign them to the globals.
     """
-    
-    def __init__(self, orchestrator: Orchestrator, context_bus: ContextBus, config: Dict[str, Any]):
-        self.app = FastAPI(
-            title="Phoenix Project API Gateway",
-            description="API for event injection and system control.",
-            version="2.0.0"
-        )
-        self.orchestrator = orchestrator
-        self.context_bus = context_bus
-        self.config = config.get('api_gateway', {})
-        self.host = self.config.get('host', '0.0.0.0')
-        self.port = self.config.get('port', 8000)
+    logger.info("API Gateway starting up...")
+    # --- This is where the main app components would be built ---
+    # global orchestrator, pipeline_state
+    # config = ConfigLoader(...)
+    # pipeline_state = PipelineState(...)
+    # ... (build all dependencies)
+    # orchestrator = Orchestrator(...)
+    logger.warning("API running in 'stub' mode. Orchestrator/State are not initialized.")
+    # For testing, we can create dummy objects
+    if pipeline_state is None:
+        global pipeline_state
+        pipeline_state = PipelineState(initial_capital=100000)
+    logger.info("Dummy PipelineState created for API testing.")
+
+
+@app.get("/health", tags=["System"])
+async def get_health():
+    """Returns a health check response."""
+    return {
+        "status": "ok",
+        "timestamp": pd.Timestamp.now().isoformat(),
+        "service": "Phoenix API Gateway"
+    }
+
+@app.post("/inject/market_event", tags=["Events"])
+async def inject_market_event(
+    event: MarketEvent,
+    orch: Orchestrator = Depends(get_orchestrator)
+):
+    """
+    Manually injects a MarketEvent into the system.
+    This bypasses the StreamProcessor.
+    """
+    try:
+        logger.info(f"API: Injecting event_id: {event.event_id}")
+        # The orchestrator handles this asynchronously
+        await orch.on_event(event)
+        return {"status": "success", "message": "Event received and queued."}
+    except Exception as e:
+        logger.error(f"API: Error injecting event: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/state/portfolio", tags=["State"])
+async def get_portfolio_state(
+    state: PipelineState = Depends(get_pipeline_state)
+):
+    """
+    Returns the current portfolio state (positions, cash, value).
+    """
+    try:
+        return {
+            "timestamp": state.get_current_time(),
+            "total_value": state.get_total_portfolio_value(),
+            "positions": state.get_all_positions(),
+            "cash": state.get_cash()
+        }
+    except Exception as e:
+        logger.error(f"API: Error getting portfolio state: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/actions/trigger_rebalance", tags=["Actions"])
+async def trigger_rebalance(
+    orch: Orchestrator = Depends(get_orchestrator)
+):
+    """
+    Manually triggers a scheduled task (e.g., "daily_rebalance").
+    """
+    try:
+        task_name = "manual_rebalance_trigger"
+        trigger_time = pd.Timestamp.now().to_pydatetime()
+        logger.info(f"API: Manually triggering task: {task_name}")
         
-        self._setup_routes()
-        logger.info(f"API Gateway initialized. Routes registered.")
-
-    def _setup_routes(self):
-        """Binds API endpoints to their handler functions."""
+        # This will dispatch the task via the orchestrator
+        await orch.on_scheduled_task(task_name, trigger_time)
         
-        @self.app.post("/v1/events/inject", status_code=202)
-        async def inject_event(event: MarketEvent):
-            """
-            Asynchronously injects a new MarketEvent into the system.
-            This simulates an event coming from a data stream.
-            """
-            try:
-                # Don't block the API response; schedule the processing
-                # The orchestrator is expected to handle this asynchronously
-                asyncio.create_task(self.orchestrator.process_event(event))
-                
-                logger.info(f"Accepted event for injection: {event.event_id}")
-                return {"status": "accepted", "event_id": event.event_id}
-            
-            except Exception as e:
-                logger.error(f"Failed to accept event {event.event_id}: {e}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+        return {"status": "success", "message": f"Task '{task_name}' dispatched."}
+    except Exception as e:
+        logger.error(f"API: Error triggering rebalance: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-        @self.app.get("/v1/system/status")
-        async def get_system_status(self) -> Dict[str, Any]:
-            """
-Example:
-            {"status": "running", "active_tasks": 5, "mode": "paper_trading"}
-            """
-            try:
-                status = self.orchestrator.get_status()
-                return status
-            except Exception as e:
-                logger.error(f"Failed to retrieve system status: {e}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
-        @self.app.get("/v1/context/state")
-        async def get_context_state(self) -> Dict[str, Any]:
-            """
-            Retrieves the current state snapshot from the ContextBus.
-            """
-            try:
-                state = self.context_bus.get_current_state()
-                # We need to serialize this, as it might contain complex objects
-                # For now, just return the dict representation
-                # A proper implementation would use Pydantic models
-                return {
-                    "last_update": state.get('timestamp'),
-                    "active_symbols": list(state.get('market_data', {}).keys()),
-                    "recent_events_count": len(state.get('recent_events', []))
-                }
-            except Exception as e:
-                logger.error(f"Failed to retrieve context state: {e}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
-                
-        @self.app.get("/health")
-        async def health_check():
-            """Basic health check endpoint."""
-            return {"status": "ok"}
-
-    def run(self):
-        """
-        Starts the FastAPI server using uvicorn.
-        This is a blocking call.
-        """
-        logger.info(f"Starting API Gateway server on {self.host}:{self.port}")
-        try:
-            uvicorn.run(
-                self.app,
-                host=self.host,
-                port=self.port,
-                log_level="info"
-            )
-        except Exception as e:
-            logger.error(f"API Gateway server failed to start: {e}", exc_info=True)
-            raise
-
-# Example usage (if run as main)
 if __name__ == "__main__":
-    # This is for testing purposes only.
-    # In production, this would be launched by the main phoenix_project.py
+    """
+    Main entry point to run the API server directly.
+    """
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
-    logger.info("Running API Gateway in standalone test mode.")
+    logger.info("Starting API Gateway server...")
     
-    # Mock dependencies
-    class MockOrchestrator:
-        async def process_event(self, event):
-            logger.info(f"[Mock] Processing event: {event.event_id}")
-            await asyncio.sleep(0.1) # Simulate async work
-        
-        def get_status(self):
-            return {"status": "running_mock", "active_tasks": 0, "mode": "mock"}
-            
-    class MockContextBus:
-        def get_current_state(self):
-            return {"timestamp": pd.Timestamp.now(), "market_data": {"AAPL": {}}, "recent_events": []}
-
-    mock_config = {"api_gateway": {"host": "127.0.0.1", "port": 8000}}
+    # This assumes the main components (Orchestrator, etc.)
+    # are initialized elsewhere and passed to this app.
+    # For standalone running, the `startup_event` will log warnings.
     
-    gateway = APIGateway(
-        orchestrator=MockOrchestrator(),
-        context_bus=MockContextBus(),
-        config=mock_config
+    uvicorn.run(
+        "api.gateway:app", # Points to this file (gateway.py) and the app object
+        host="0.0.0.0",
+        port=8000,
+        reload=True, # Enable reload for development
+        log_level="info"
     )
-    gateway.run()
