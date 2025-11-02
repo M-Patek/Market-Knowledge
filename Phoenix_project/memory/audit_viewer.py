@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 from typing import Optional
 
-# 修复：使用正确的相对导入
-from .cot_database import CoTDatabase
+# 修复：将相对导入 'from .cot_database...' 更改为绝对导入
+from memory.cot_database import CoTDatabase
 
 logger = logging.getLogger(__name__)
 
