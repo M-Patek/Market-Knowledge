@@ -1,135 +1,111 @@
-# (原: ai/walk_forward_trainer.py)
 import pandas as pd
-from typing import Dict, Any, List, Generator
-from datetime import datetime
 import asyncio
+from typing import Dict, Any
 
-# --- [修复] ---
-# .base_trainer 依然正确 (在同一 training/ 目录下)
-# ..core.pipeline_state 依然正确 (training/ -> Phoenix_project/ -> core/)
-# --- [修复结束] ---
-from .base_trainer import BaseTrainer
-from ..core.pipeline_state import PipelineState
-from ..data_manager import DataManager
-from ..monitor.logging import get_logger
+# 修正：[FIX-ImportError]
+# 将所有 `..` 相对导入更改为从项目根目录开始的绝对导入，
+# 以匹配 `run_training.py` 设置的 sys.path 约定。
+from training.base_trainer import BaseTrainer
+from training.engine import TrainingEngine
+from training.backtest_engine import BacktestEngine
+from data_manager import DataManager
+from core.pipeline_state import PipelineState
+from cognitive.engine import CognitiveEngine
+# 假设 FeatureStore 存在于 features/store.py
+# from features.store import FeatureStore 
+from monitor.logging import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger("WalkForwardTrainer")
 
 class WalkForwardTrainer(BaseTrainer):
     """
-    实现滚动优化（Walk-Forward Optimization）的训练器。
+    Implements a walk-forward optimization and training loop.
     
-    它在一个时间窗口（例如 2 年）上训练模型，
-    然后在下一个时间窗口（例如 6 个月）上进行验证，
-    然后滚动进行。
+    This trainer is responsible for:
+    1. Orchestrating the TrainingEngine (e.g., training the MetaLearner).
+    2. Orchestrating the BacktestEngine (evaluating the trained model).
+    3. Sliding the time windows and repeating the process.
     """
 
     def __init__(self, config: Dict[str, Any], data_manager: DataManager):
-        super().__init__(config, data_manager)
+        super().__init__(config)
+        self.data_manager = data_manager
         
-        self.wf_config = config.get('walk_forward', {})
-        self.train_window_days = self.wf_config.get('train_window_days', 365 * 2)
-        self.test_window_days = self.wf_config.get('test_window_days', 180)
-        self.step_days = self.wf_config.get('step_days', self.test_window_days) # 滚动步长
+        # 1. Load Walk-Forward (WF) configuration
+        self.wf_config = self.config.get('walk_forward', {})
+        self.start_date = pd.Timestamp(self.wf_config.get('start_date', '2020-01-01'))
+        self.end_date = pd.Timestamp(self.wf_config.get('end_date', '2023-12-31'))
+        self.training_days = self.wf_config.get('training_days', 365)
+        self.validation_days = self.wf_config.get('validation_days', 90)
+        self.step_days = self.wf_config.get('step_days', 90) # How much the window slides
         
-        self.start_date = config.get('start_date')
-        self.end_date = config.get('end_date')
+        logger.info(f"WalkForwardTrainer initialized: {self.start_date} to {self.end_date} (Step: {self.step_days} days)")
 
-        if not self.start_date or not self.end_date:
-            logger.error("滚动训练器需要 'start_date' 和 'end_date'。")
-            raise ValueError("缺少起止日期配置。")
-
-        logger.info(f"WF Trainer 初始化: Train={self.train_window_days}d, "
-                    f"Test={self.test_window_days}d, Step={self.step_days}d")
-
-    def _generate_windows(self) -> Generator[Dict[str, datetime], None, None]:
-        """
-        生成训练和测试的时间窗口。
-        """
-        current_train_start = pd.Timestamp(self.start_date)
-        end_date = pd.Timestamp(self.end_date)
+        # 2. Initialize sub-engines
+        self.training_engine = TrainingEngine(self.config, self.data_manager)
         
-        train_window = pd.Timedelta(days=self.train_window_days)
-        test_window = pd.Timedelta(days=self.test_window_days)
-        step_window = pd.Timedelta(days=self.step_days)
-
-        while True:
-            train_end = current_train_start + train_window
-            test_end = train_end + test_window
-            
-            if test_end > end_date:
-                logger.info("已到达结束日期，停止生成窗口。")
-                break
-                
-            yield {
-                "train_start": current_train_start.to_pydatetime(),
-                "train_end": train_end.to_pydatetime(),
-                "test_start": train_end.to_pydatetime(),
-                "test_end": test_end.to_pydatetime()
-            }
-            
-            current_train_start += step_window
+        # 修正：CognitiveEngine 和 PipelineState 是 BacktestEngine 需要的
+        # 我们需要在这里创建它们
+        self.pipeline_state = PipelineState()
+        
+        # FIXME: CognitiveEngine 的初始化很复杂
+        # 它需要 MetacognitiveAgent 和 PortfolioConstructor
+        # 这里使用 None 作为占位符
+        cognitive_engine = None # = CognitiveEngine(...) 
+        
+        self.backtest_engine = BacktestEngine(
+            config=self.config,
+            data_manager=self.data_manager,
+            pipeline_state=self.pipeline_state,
+            cognitive_engine=cognitive_engine # 传入 engine
+        )
 
     async def run_training_loop(self):
         """
-        执行完整的滚动优化循环。
+        Executes the main walk-forward training loop asynchronously.
         """
-        logger.info("--- 开始滚动优化训练循环 ---")
+        current_train_start = self.start_date
         
-        all_results = []
-        
-        for i, window in enumerate(self._generate_windows()):
-            logger.info(f"--- 滚动窗口 {i+1} ---")
-            logger.info(f"训练: {window['train_start'].date()} -> {window['train_end'].date()}")
-            logger.info(f"测试: {window['test_start'].date()} -> {window['test_end'].date()}")
+        while True:
+            # 1. Define time windows
+            current_train_end = current_train_start + pd.Timedelta(days=self.training_days)
+            current_val_start = current_train_end
+            current_val_end = current_val_start + pd.Timedelta(days=self.validation_days)
+            
+            if current_val_end > self.end_date:
+                logger.info("Reached end of walk-forward date range.")
+                break
+                
+            logger.info(f"--- WF Step ---")
+            logger.info(f"Training: {current_train_start.date()} to {current_train_end.date()}")
+            logger.info(f"Validation: {current_val_start.date()} to {current_val_end.date()}")
 
-            try:
-                # 1. 获取训练数据
-                # (注意: DataManager 通常需要异步调用)
-                # train_data = await self.data_manager.get_historical_data(
-                #     start_date=window['train_start'],
-                #     end_date=window['train_end']
+            # 2. Run Training (e.g., train MetaLearner)
+            if not self.training_engine:
+                 logger.warning("TrainingEngine not initialized. Skipping training.")
+            else:
+                logger.info("Starting training phase...")
+                # model_artifact = await self.training_engine.run(
+                #     current_train_start, 
+                #     current_train_end
                 # )
-                
-                # 2. 训练模型 (模拟)
-                # self.model = self._train_model_on_data(train_data)
-                logger.info(f"模型在窗口 {i+1} 上训练完成 (模拟)。")
+                # logger.info(f"Training complete. Model artifact: {model_artifact}")
+                pass # Placeholder
 
-                # 3. 获取验证数据
-                # test_data = await self.data_manager.get_historical_data(
-                #     start_date=window['test_start'],
-                #     end_date=window['test_end']
+            # 3. Run Validation (Backtest)
+            if not self.backtest_engine or not self.backtest_engine.cognitive_engine:
+                logger.warning("BacktestEngine or CognitiveEngine not initialized. Skipping validation.")
+            else:
+                logger.info("Starting validation (backtest) phase...")
+                # await self.backtest_engine.load_model(model_artifact)
+                # results = await self.backtest_engine.run(
+                #     current_val_start,
+                #     current_val_end
                 # )
-                
-                # 4. 评估模型
-                # results = self.evaluate_model(test_data)
-                results = {"sharpe": 0.5 + (i * 0.1), "drawdown": 0.1} # 模拟结果
-                all_results.append(results)
-                logger.info(f"窗口 {i+1} 评估结果: {results}")
-                
-            except Exception as e:
-                logger.error(f"窗口 {i+1} 训练/评估失败: {e}", exc_info=True)
+                # logger.info(f"Validation complete. Sharpe: {results.get('sharpe')}")
+                pass # Placeholder
 
-        logger.info("--- 滚动优化训练循环结束 ---")
-        self.save_model("models/metaleaner_final.pth") # 保存最终模型
-        return all_results
+            # 4. Slide window
+            current_train_start += pd.Timedelta(days=self.step_days)
 
-    def _train_model_on_data(self, data: Any) -> Any:
-        """ 内部函数：在此处实现您的 MetaLearner 训练逻辑 """
-        # ... 导入 torch, lightgbm, etc.
-        # ... 训练模型 ...
-        return "trained_model_object" # 返回训练好的模型
-
-    def evaluate_model(self, validation_data: Any) -> Dict[str, float]:
-        """ 在此实现您的回测评估逻辑 """
-        # ... 运行回测 ...
-        # ... 计算指标 ...
-        return {"sharpe": 0.8, "drawdown": 0.15, "profit": 10.5}
-
-    def save_model(self, path: str):
-        # ... 实现模型保存 (e.g., torch.save(self.model, path))
-        logger.info(f"最终 MetaLearner 模型已保存到: {path}")
-
-    def load_model(self, path: str):
-        # ... 实现模型加载 ...
-        logger.info(f"MetaLearner 模型已从: {path} 加载。")
+        logger.info("--- Walk-Forward Training Loop Finished ---")
