@@ -1,116 +1,123 @@
-import numpy as np
-import pandas as pd
-from typing import Dict, Any
+from typing import List, Dict, Any, Optional
+from core.pipeline_state import PipelineState
+from core.schemas.data_schema import Order, Signal
+from monitor.logging import get_logger
 
-from ..core.pipeline_state import PipelineState
-from ..data_manager import DataManager
+logger = get_logger(__name__)
 
 class RiskManager:
     """
-    Dynamically adjusts capital allocation based on AI uncertainty and market volatility.
-    It provides a "capital modifier" (0.0 to 1.0) that scales the
-    portfolio's overall exposure.
+    Provides pre-trade and post-trade risk checks.
+    It can veto orders or signals based on predefined rules.
     """
 
-    def __init__(self, config, data_manager: DataManager):
-        """
-        Initializes the RiskManager.
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config.get("risk_manager", {})
         
-        Args:
-            config: The main strategy configuration object.
-            data_manager: Client to access historical market data.
-        """
-        self.config = config
-        self.risk_config = config.get('risk_manager', {})
-        self.data_manager = data_manager
+        # Pre-trade limits
+        self.max_order_value = self.config.get("max_order_value", 20000) # Max $20k per order
+        self.max_order_quantity = self.config.get("max_order_quantity", 1000) # Max 1000 shares
         
-        # Uncertainty scaling parameters
-        self.uncertainty_sensitivity = self.risk_config.get('uncertainty_sensitivity', 1.5)
-        self.min_capital_modifier = self.risk_config.get('min_capital_modifier', 0.2)
+        # Portfolio limits
+        self.max_portfolio_drawdown = self.config.get("max_portfolio_drawdown", 0.15) # 15%
+        self.max_position_concentration = self.config.get("max_position_concentration", 0.20) # 20%
         
-        # Volatility target parameters
-        self.use_vol_target = self.risk_config.get('use_volatility_target', True)
-        self.target_annual_vol = self.risk_config.get('target_annual_volatility', 0.15)
-        self.vol_lookback_days = self.risk_config.get('volatility_lookback_days', 60)
-        self.portfolio_index_ticker = self.risk_config.get('portfolio_index_ticker', 'SPY')
+        # Circuit breaker
+        self.circuit_breaker_tripped = False
+        self.circuit_breaker_reason = ""
+        
+        logger.info("RiskManager initialized.")
 
-        
-    def calculate_capital_modifier(
-        self, 
-        cognitive_uncertainty: float, 
-        state: PipelineState
-    ) -> float:
-        """
-        Calculates the final capital modifier by combining uncertainty and volatility.
+    def trip_circuit_breaker(self, reason: str):
+        """Trips the system-wide circuit breaker, halting all new trades."""
+        if not self.circuit_breaker_tripped:
+            logger.critical(f"CIRCUIT BREAKER TRIPPED: {reason}")
+            self.circuit_breaker_tripped = True
+            self.circuit_breaker_reason = reason
+            # This should also publish an event
+            # await pipeline_state.event_distributor.publish("CIRCUIT_BREAKER", reason=reason)
 
-        Args:
-            cognitive_uncertainty (float): The uncertainty score from the AI (0.0 to 1.0).
-            state: The current PipelineState.
+    def reset_circuit_breaker(self):
+        """Resets the circuit breaker (manual action)."""
+        logger.warning("Circuit breaker is being reset.")
+        self.circuit_breaker_tripped = False
+        self.circuit_breaker_reason = ""
 
-        Returns:
-            float: The capital modifier (e.g., 0.75), bounded between
-                   min_capital_modifier and 1.0.
+    def check_portfolio_risk(self, pipeline_state: PipelineState):
         """
-        
-        # 1. Calculate modifier from AI Uncertainty
-        # We use an exponential decay function.
-        # High uncertainty -> low modifier
-        # uncertainty = 0.0 -> modifier = 1.0
-        # uncertainty = 1.0 -> modifier = e^(-sensitivity)
-        uncertainty_modifier = np.exp(-self.uncertainty_sensitivity * cognitive_uncertainty)
-        
-        # 2. Calculate modifier from Market Volatility
-        if self.use_vol_target:
-            vol_modifier = self._calculate_volatility_modifier(state)
-        else:
-            vol_modifier = 1.0
-            
-        # 3. Combine modifiers (e.g., by taking the minimum)
-        # This ensures we always respect the most conservative constraint.
-        combined_modifier = min(uncertainty_modifier, vol_modifier)
-        
-        # 4. Enforce floor
-        final_modifier = max(self.min_capital_modifier, combined_modifier)
-        
-        return final_modifier
+        Checks overall portfolio health (e.g., drawdown).
+        This can trip the circuit breaker.
+        """
+        if self.circuit_breaker_tripped:
+            return # Already tripped
 
-    def _calculate_volatility_modifier(self, state: PipelineState) -> float:
-        """
-        Calculates a modifier based on a portfolio-level volatility target.
-        Modifier = Target Vol / Realized Vol
-        If Realized Vol is high, modifier is < 1.0
-        If Realized Vol is low, modifier is > 1.0 (capped at 1.0)
-        """
-        try:
-            # Get historical data for the portfolio index (e.g., SPY)
-            end_date = state.timestamp
-            start_date = end_date - pd.Timedelta(days=self.vol_lookback_days * 2) # Get extra data for rolling calc
-            
-            index_data = self.data_manager.get_historical_data(
-                self.portfolio_index_ticker,
-                start_date,
-                end_date
-            )
-            
-            if index_data.empty or len(index_data) < self.vol_lookback_days:
-                # Not enough data, return neutral modifier
-                return 1.0
+        portfolio_metrics = pipeline_state.get_value("portfolio_metrics", {})
+        drawdown = portfolio_metrics.get("current_drawdown", 0.0)
+        
+        if drawdown > self.max_portfolio_drawdown:
+            reason = f"Maximum portfolio drawdown exceeded ({drawdown:.2%} > {self.max_portfolio_drawdown:.2%})"
+            self.trip_circuit_breaker(reason)
 
-            # Calculate realized volatility
-            returns = index_data['close'].pct_change()
-            # Annualized std dev of returns
-            realized_vol = returns.rolling(window=self.vol_lookback_days).std().iloc[-1] * np.sqrt(252)
+    async def validate_signal(self, signal: Signal, pipeline_state: PipelineState) -> Optional[str]:
+        """
+        Checks a signal *before* it's turned into an order.
+        Returns a rejection reason string if invalid, or None if valid.
+        """
+        if self.circuit_breaker_tripped:
+            return f"Circuit breaker tripped: {self.circuit_breaker_reason}"
             
-            if realized_vol == 0:
-                return 1.0 # Avoid division by zero
-                
-            # Calculate modifier
-            vol_modifier = self.target_annual_vol / realized_vol
+        if abs(signal.direction) > 1:
+            return "Invalid signal direction."
             
-            # Cap the modifier at 1.0 (we don't "lever up" if vol is low)
-            return min(vol_modifier, 1.0)
+        if not (0.0 <= signal.strength <= 1.0):
+            return f"Invalid signal strength: {signal.strength}"
             
-        except Exception as e:
-            # In case of data error, fail safe
-            print(f"[RiskManager] Error calculating volatility modifier: {e}")
-            return 1.0 # Return neutral modifier
+        # Add more signal-level checks (e.g., duplicate signals)
+        
+        return None # Signal is valid
+
+    async def validate_order(self, order: Order, pipeline_state: PipelineState) -> Optional[str]:
+        """
+        Performs pre-trade checks on a generated order.
+        Returns a rejection reason string if invalid, or None if valid.
+        """
+        if self.circuit_breaker_tripped:
+            return f"Circuit breaker tripped: {self.circuit_breaker_reason}"
+
+        # Get context
+        market_data = pipeline_state.get_latest_market_data(order.symbol)
+        if not market_data:
+            return "No market data available to price order."
+            
+        current_price = market_data.close
+        order_value = abs(order.quantity * current_price)
+        
+        # 1. Check order-level limits
+        if order_value > self.max_order_value:
+            return f"Order value ${order_value:.2f} exceeds max limit ${self.max_order_value:.2f}"
+            
+        if abs(order.quantity) > self.max_order_quantity:
+            return f"Order quantity {order.quantity} exceeds max limit {self.max_order_quantity}"
+            
+        # 2. Check portfolio-level impact (concentration)
+        portfolio = pipeline_state.get_value("portfolio", {})
+        total_value = portfolio.get("total_value", 0)
+        if total_value == 0:
+            return "Portfolio value is zero."
+            
+        positions = portfolio.get("positions", {})
+        current_position = positions.get(order.symbol, {})
+        current_value = current_position.get("market_value", 0)
+        
+        # Calculate post-trade value
+        post_trade_value = current_value + (order.quantity * current_price)
+        
+        # Calculate post-trade concentration
+        post_trade_concentration = abs(post_trade_value) / total_value
+        
+        if post_trade_concentration > self.max_position_concentration:
+            return f"Order would increase position concentration to {post_trade_concentration:.2%}, exceeding limit {self.max_position_concentration:.2%}"
+
+        # Add more checks (e.g., buying power)
+        
+        return None # Order is valid
