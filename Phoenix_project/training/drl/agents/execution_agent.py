@@ -1,95 +1,60 @@
-import torch
-import torch.nn as nn
+# (原: drl/agents/execution_agent.py)
 from typing import Dict, Any
 
+# --- [修复] ---
+# 原: from .base_agent import BaseAgent
+# 新: from .base_agent import BaseAgent (依然正确)
+#
+# 原: from ...execution.interfaces import Order
+# 新: from ....execution.interfaces import Order (training/drl/agents/ -> ... -> execution/)
+# --- [修复结束] ---
 from .base_agent import BaseAgent
+from ....execution.interfaces import Order
+from ....monitor.logging import get_logger
+
+logger = get_logger(__name__)
 
 class ExecutionAgent(BaseAgent):
     """
-    A DRL agent responsible for optimizing trade execution.
-    Its goal is to minimize slippage and market impact given a
-    target order (e.g., from the AlphaAgent or PortfolioConstructor).
-    
-    Observation: Market micro-structure (LOB, VWAP), remaining order size, time left.
-    Action: How much to trade *now* (e.g., % of remaining order).
+    (在线推理) 执行智能体 (ExecutionAgent)。
+    负责将一个大订单（例如来自 AlphaAgent 的信号）
+    拆分成小订单，以最小化市场冲击。
     """
+    def __init__(self, config: Dict[str, Any], model_path: str):
+        super().__init__(config, model_path)
+        logger.info(f"ExecutionAgent (DRL) 已初始化，模型路径: {model_path}")
 
-    def __init__(self, observation_space, action_space, network: nn.Module, config: Dict[str, Any]):
+    def generate_execution_plan(self, target_order: Order, lob_snapshot: Dict[str, Any]) -> Any:
         """
-        Initializes the ExecutionAgent.
+        (在线推理)
+        为目标订单生成执行计划 (拆单)。
         """
-        super().__init__(
-            agent_id="execution_agent",
-            observation_space=observation_space,
-            action_space=action_space,
-            network=network,
-            config=config
-        )
-        self.agent_type = "execution"
+        
+        # 1. 预处理 LOB 和订单信息，转换为 DRL 状态 (obs)
+        # obs = self._preprocess_observation(target_order, lob_snapshot)
+        obs = "dummy_exec_obs" # 模拟
+        
+        # 2. DRL 模型预测动作 (例如，这一步执行 20%)
+        # action, _states = self.model.predict(obs, deterministic=True)
+        action = [0.2] # 模拟
+        
+        trade_percentage = action[0]
+        
+        logger.debug(f"ExecutionAgent 决策: 执行 {trade_percentage:.2%}")
+        
+        return {
+            "trade_percentage": trade_percentage,
+            "metadata": {"agent": "ExecutionAgent_DRL_v1"}
+        }
 
-    def compute_action(self, observation: torch.Tensor) -> torch.Tensor:
+    def _preprocess_observation(self, order: Order, lob: Dict) -> Any:
         """
-        Computes the action (e.g., % of order to execute) based on the observation.
-        
-        Args:
-            observation (torch.Tensor): The current state observation.
-            
-        Returns:
-            torch.Tensor: The action to take.
+        将在线推理数据转换为 DRL 环境 (ExecutionEnv) 所需的观测空间。
         """
-        dist = self.network(observation)
-        action = dist.sample()
-        self.last_log_prob = dist.log_prob(action)
-        
-        # Action is likely a percentage (0 to 1)
-        action = torch.clamp(action, 0.0, 1.0)
-        
-        return action
-
-    def compute_reward(self, state: Any, action: Any, next_state: Any) -> float:
-        """
-        Defines the reward function for the ExecutionAgent.
-        The goal is to minimize slippage (Implementation Shortfall).
-        
-        Reward = (Benchmark_Price - Execution_Price) * Shares_Executed
-        
-        Args:
-            state: The state when the action was taken.
-            action: The action (e.g., 0.2 -> execute 20% of remaining).
-            next_state: The resulting state.
-            
-        Returns:
-            float: The reward.
-        """
-        
-        try:
-            # Benchmark price (e.g., price when the order was received)
-            benchmark_price = state['benchmark_price']
-            
-            # Actual execution price from this step
-            execution_price = next_state['execution_price']
-            
-            # Number of shares executed in this step
-            shares_executed = next_state['shares_executed']
-            
-            # Direction of the trade (1 for buy, -1 for sell)
-            trade_direction = state['trade_direction'] # 1 or -1
-            
-            # Calculate slippage (implementation shortfall)
-            # For BUY: (Benchmark - Exec_Price) -> we want Exec_Price to be low
-            # For SELL: (Exec_Price - Benchmark) -> we want Exec_Price to be high
-            # This can be unified:
-            slippage_per_share = (benchmark_price - execution_price) * trade_direction
-            
-            # Reward is total slippage cost/gain
-            reward = slippage_per_share * shares_executed
-            
-            # Penalize for not executing the full order by the end
-            if next_state['is_terminal'] and next_state['shares_remaining'] > 0:
-                # Heavy penalty for leftover shares
-                reward -= next_state['shares_remaining'] * self.config.get('leftover_penalty_factor', 1.0)
-                
-            return reward
-
-        except Exception as e:
-            return 0.0
+        # ... 
+        # 1. 计算剩余订单百分比
+        # 2. 计算剩余时间百分比
+        # 3. (可选) 从 LOB 提取特征
+        # ...
+        # return observation_array
+        pass
