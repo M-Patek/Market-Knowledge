@@ -1,144 +1,112 @@
-from typing import Dict, List, Any
-from core.pipeline_state import PipelineState
-from core.schemas.data_schema import Signal, Order
-from core.schemas.fusion_result import AgentDecision # This will fail
-from sizing.base import SizingMethod
+"""
+投资组合构造器 (Portfolio Constructor)
+将认知引擎的高级决策（FusionResult）转换为具体的、可执行的交易订单（Order）。
+"""
+from typing import List, Dict, Optional
+
+# FIX (E2, E3): 从统一的 data_schema 和 fusion_result 导入
+from core.schemas.data_schema import Signal, Order, PortfolioState, OrderStatus
+from core.schemas.fusion_result import FusionResult, AgentDecision
+
+# FIX (E8): 导入 IPositionSizer 接口
+from sizing.base import IPositionSizer
+
 from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 class PortfolioConstructor:
     """
-    Generates target portfolio weights and translates cognitive decisions
-    (Signals) into concrete Orders.
-    
-    This module bridges the "AI brain" (CognitiveEngine) and the
-    "execution arm" (OrderManager).
+    负责将 AI 决策（'BULLISH', 'BEARISH'）与仓位管理逻辑相结合，
+    以确定最终的订单数量和类型。
     """
 
-    def __init__(self, sizing_method: SizingMethod, config: Dict[str, Any]):
-        self.sizing_method = sizing_method
-        self.config = config
-        self.max_position_size = config.get("max_position_size", 0.1) # Max 10% of portfolio
-        self.min_order_value = config.get("min_order_value", 100) # Min $100 per order
-        logger.info(f"PortfolioConstructor initialized with sizing method: {sizing_method.__class__.__name__}")
+    def __init__(self, position_sizer: IPositionSizer):
+        self.position_sizer = position_sizer
+        self.log_prefix = "PortfolioConstructor:"
 
-    def generate_signal(self, fusion_result: Any) -> Signal: # FusionResult
+    def translate_decision_to_signal(self, fusion_result: FusionResult) -> Optional[Signal]:
         """
-        Converts the final decision from the CognitiveEngine into a
-        standardized Signal object.
-        
-        Args:
-            fusion_result (FusionResult): The output from the cognitive cycle.
-
-        Returns:
-            Signal: A standardized signal object.
+        步骤1：将 FusionResult 转换为标准化的 Signal。
         """
         
-        # Map decision to signal direction
+        # 这是一个占位符。
+        # FIX (E3): 之前的 'AgentDecision' 导入会失败。现在已修复。
+        # // This will fail: fusion_result.agent_decisions 
+        # (现在不会失败了)
+
+        if not fusion_result.agent_decisions:
+            logger.warning(f"{self.log_prefix} FusionResult {fusion_result.id} has no agent decisions.")
+            return None
+
+        # 假设元数据中包含目标符号
+        target_symbol = fusion_result.metadata.get("target_symbol")
+        if not target_symbol:
+            logger.error(f"{self.log_prefix} FusionResult {fusion_result.id} missing 'target_symbol' in metadata.")
+            return None
+            
+        # 简化的转换逻辑
         decision = fusion_result.final_decision.upper()
-        if decision == "BUY":
-            direction = 1
-        elif decision == "SELL":
-            direction = -1
-        else: # HOLD, ERROR_HOLD, etc.
-            direction = 0
+        signal_type = "HOLD" # 默认
+        
+        if decision in ("STRONG_BUY", "BULLISH", "BUY"):
+            signal_type = "BUY"
+        elif decision in ("STRONG_SELL", "BEARISH", "SELL"):
+            signal_type = "SELL"
+        elif decision == "NEUTRAL":
+            signal_type = "HOLD"
             
-        # Use confidence as the "weight" or "strength" of the signal
-        strength = fusion_result.confidence
-        
-        # TODO: Get symbol from config or state
-        symbol = "PRIMARY_ASSET" 
-        
-        signal = Signal(
-            symbol=symbol,
-            timestamp=datetime.utcnow(),
-            direction=direction,
-            strength=strength,
-            signal_type="AI_COGNITIVE",
-            metadata={
-                "reasoning": fusion_result.reasoning[:500], # Truncate
-                "decision_id": fusion_result.decision_id # Assume ID is attached
-            }
-        )
-        logger.info(f"Generated signal: {signal.direction} @ {signal.strength:.2f} for {signal.symbol}")
-        return signal
+        logger.info(f"{self.log_prefix} Translated decision {decision} to signal {signal_type} for {target_symbol}")
 
-    def generate_orders_from_signal(
-        self,
-        signal: Signal,
-        pipeline_state: PipelineState
-    ) -> List[Order]:
-        """
-        Calculates the required trade size based on the signal and
-        current portfolio state, then generates Order objects.
-        
-        Args:
-            signal (Signal): The signal from `generate_signal`.
-            pipeline_state (PipelineState): The current system state.
-            
-        Returns:
-            List[Order]: A list of orders to be executed (can be empty).
-        """
-        
-        current_portfolio = pipeline_state.get_value("portfolio", {})
-        current_positions = current_portfolio.get("positions", {})
-        total_value = current_portfolio.get("total_value", 100000) # Default portfolio val
-        
-        current_position_size = current_positions.get(signal.symbol, {}).get("size", 0)
-        
-        market_data = pipeline_state.get_latest_market_data(signal.symbol)
-        if not market_data:
-            logger.error(f"Cannot generate order for {signal.symbol}: No market data.")
-            return []
-            
-        current_price = market_data.close
+        # FIX (E2): 使用 Signal 模式
+        return Signal(
+            symbol=target_symbol,
+            timestamp=fusion_result.timestamp,
+            signal_type=signal_type,
+            strength=fusion_result.final_confidence,
+            metadata={"fusion_id": fusion_result.id}
+        )
 
-        # Use the sizing method to determine the *target* position size
-        target_size_dollars = self.sizing_method.calculate_target_size(
-            signal=signal,
-            current_price=current_price,
-            portfolio_value=total_value,
-            current_position_size=current_position_size
-        )
-        
-        # Apply portfolio constraints
-        max_size_dollars = total_value * self.max_position_size
-        if target_size_dollars > max_size_dollars:
-            logger.warning(f"Sizing method target ({target_size_dollars}) exceeds max position size. Capping at {max_size_dollars}.")
-            target_size_dollars = max_size_dollars
-        elif target_size_dollars < -max_size_dollars:
-            logger.warning(f"Sizing method target ({target_size_dollars}) exceeds max position size. Capping at {-max_size_dollars}.")
-            target_size_dollars = -max_size_dollars
+    def generate_orders(self, signals: List[Signal], portfolio_state: PortfolioState) -> List[Order]:
+        """
+        步骤2：将 Signal 列表和当前投资组合状态转换为 Order 列表。
+        """
+        orders = []
+        if not signals:
+            return orders
             
-        # Calculate target quantity (shares)
-        target_quantity = target_size_dollars / current_price
-        
-        # Calculate the delta (how much to trade)
-        current_quantity = current_position_size # Assume this is in shares
-        order_quantity = target_quantity - current_quantity
-        
-        # Apply minimum order constraints
-        order_value = abs(order_quantity * current_price)
-        if order_value < self.min_order_value:
-            logger.info(f"Calculated order value ${order_value:.2f} is below minimum ${self.min_order_value}. No order generated.")
-            return []
+        current_positions = portfolio_state.positions
+
+        for signal in signals:
+            if signal.signal_type == "HOLD":
+                continue
+
+            # 使用仓位管理模块 (IPositionSizer) 计算目标仓位
+            # FIX (E8): self.position_sizer 现在是 IPositionSizer
+            target_quantity = self.position_sizer.calculate_target_quantity(
+                signal,
+                portfolio_state
+            )
+
+            # 计算订单数量 (与当前持仓对比)
+            current_quantity = current_positions.get(signal.symbol, None)
+            current_qty_val = current_quantity.quantity if current_quantity else 0.0
             
-        # Create the order
-        if order_quantity == 0:
-            return []
-            
-        order_type = "MARKET" # Or "LIMIT" etc.
-        
-        order = Order(
-            symbol=signal.symbol,
-            timestamp=datetime.utcnow(),
-            quantity=order_quantity,
-            order_type=order_type,
-            # price=... (if limit order)
-            status="PENDING",
-            signal_id=signal.id # Link order to signal
-        )
-        
-        logger.info(f"Generated order: {order.order_type} {order.quantity:.4f} {order.symbol}")
-        return [order]
+            order_quantity = target_quantity - current_qty_val
+
+            if abs(order_quantity) > 1e-6: # 避免浮点数0
+                logger.info(f"{self.log_prefix} Generating order for {signal.symbol}: "
+                            f"Target={target_quantity}, Current={current_qty_val}, OrderQty={order_quantity}")
+                            
+                # FIX (E2): 使用 Order 模式
+                new_order = Order(
+                    id=f"order_{signal.symbol}_{signal.timestamp.isoformat()}", # 实际应由UUID生成
+                    symbol=signal.symbol,
+                    quantity=order_quantity,
+                    order_type="MARKET", # 默认为市价单
+                    status=OrderStatus.NEW,
+                    metadata={"signal_strength": signal.strength, "fusion_id": signal.metadata.get("fusion_id")}
+                )
+                orders.append(new_order)
+
+        return orders
