@@ -1,98 +1,151 @@
 """
-Pydantic schemas for data validation and standardization across the pipeline.
+凤凰计划的核心数据模式 (Authoritative Data Schemas)。
+此文件是系统中所有数据结构（Pydantic模型）的唯一真实来源。
+所有模块必须从此文件导入其所需的数据模型。
+
+FIX (E1, E2, E4):
+1.  重命名 TickerData -> MarketData
+2.  重命名 MarketEvent -> NewsData
+3.  重命名 EconomicEvent -> EconomicIndicator
+4.  从 execution/interfaces.py 移入 Order, Fill, OrderStatus, Position 的定义。
+5.  添加了 Signal, PortfolioState 的定义。
 """
+
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import Optional, Dict, Any, List
 from datetime import datetime
-import pandas as pd
+from enum import Enum
 
-class MarketEvent(BaseModel):
-    """
-    Schema for a market-related event (e.g., news, press release).
-    """
-    event_id: str = Field(..., description="Unique identifier for the event")
-    timestamp: datetime = Field(..., description="Timestamp of when the event occurred or was published")
-    source: str = Field(..., description="Source of the event (e.g., 'Reuters', 'Bloomberg')")
-    headline: str = Field(..., description="Event headline or title")
-    content: str = Field(..., description="Full content of the event")
-    symbols: List[str] = Field(default_factory=list, description="List of ticker symbols mentioned or related")
-    event_type: str = Field(default="news", description="Type of market event (e.g., 'news', 'earnings', 'sec_filing')")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary metadata (e.g., sentiment scores, entity tags)")
+# --- 市场与事件数据 (Market & Event Data) ---
 
-    class Config:
-        arbitrary_types_allowed = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
-
-class EconomicEvent(BaseModel):
+class MarketData(BaseModel):
     """
-    Schema for a macroeconomic event (e.g.,
+    统一的市场行情数据（原 TickerData）。
+    代表特定时间戳的OHLCV数据。
     """
-    event_id: str = Field(..., description="Unique identifier for the event")
-    timestamp: datetime = Field(..., description="Timestamp of the event (e.g., release time)")
-    event_name: str = Field(..., description="Name of the economic indicator (e.g., 'CPI', 'Non-Farm Payrolls')")
-    region: str = Field(..., description="Geographical region (e.g., 'USA', 'Eurozone')")
-    actual: Optional[float] = Field(None, description="Actual reported value")
-    forecast: Optional[float] = Field(None, description="Forecasted value")
-    previous: Optional[float] = Field(None, description="Previous value")
+    symbol: str = Field(..., description="资产代码")
+    timestamp: datetime = Field(..., description="数据点的时间戳 (UTC)")
+    open: float = Field(..., description="开盘价")
+    high: float = Field(..., description="最高价")
+    low: float = Field(..., description="最低价")
+    close: float = Field(..., description="收盘价")
+    volume: float = Field(..., description="成交量")
     
     class Config:
-        arbitrary_types_allowed = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
+        frozen = True
 
-# --- 新增的 TickerData Schema ---
-class TickerData(BaseModel):
+class NewsData(BaseModel):
     """
-    Schema for standardized OHLCV market data (ticker data).
+    统一的非结构化事件数据（原 MarketEvent）。
+    代表新闻、SEC文件、社交媒体帖子等。
     """
-    symbol: str = Field(..., description="Ticker symbol")
-    timestamp: datetime = Field(..., description="Timestamp of the data point (e.g., bar start time)")
-    open: float = Field(..., description="Open price")
-    high: float = Field(..., description="High price")
-    low: float = Field(..., description="Low price")
-    close: float = Field(..., description="Close price")
-    volume: float = Field(..., description="Volume")
+    id: str = Field(..., description="事件的唯一ID")
+    source: str = Field(..., description="数据来源 (e.g., 'Reuters', 'SEC')")
+    timestamp: datetime = Field(..., description="事件发布时间 (UTC)")
+    symbols: List[str] = Field(default_factory=list, description="与此事件相关的资产代码")
+    content: str = Field(..., description="事件的文本内容")
+    headline: Optional[str] = Field(None, description="事件标题")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="其他元数据")
 
     class Config:
-        arbitrary_types_allowed = True
-        json_encoders = {
-            # pandas Timestamps are common, ensure they are converted
-            pd.Timestamp: lambda v: v.to_pydatetime().isoformat(),
-            datetime: lambda v: v.isoformat()
-        }
+        frozen = True
 
-# --- 知识图谱 (Knowledge Graph) Schemas ---
+class EconomicIndicator(BaseModel):
+    """
+    统一的经济指标数据（原 EconomicEvent）。
+    代表如CPI, 非农就业人数等宏观经济数据。
+    """
+    id: str = Field(..., description="指标的唯一ID (e.g., 'CPI_YOY')")
+    name: str = Field(..., description="指标名称 (e.g., 'Consumer Price Index YOY')")
+    timestamp: datetime = Field(..., description="指标发布时间 (UTC)")
+    value: float = Field(..., description="指标的实际值")
+    expected: Optional[float] = Field(None, description="市场预期值")
+    previous: Optional[float] = Field(None, description="前值")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="其他元数据 (e.g., 'country')")
+
+    class Config:
+        frozen = True
+
+# --- 知识图谱 (Knowledge Graph) ---
 
 class KGNode(BaseModel):
     """
-    Represents a node in the Knowledge Graph.
+    知识图谱节点。
     """
-    node_id: str = Field(..., description="Unique identifier for the node (e.g., 'AAPL', 'Tim Cook')")
-    node_type: str = Field(..., description="Type of the node (e.g., 'COMPANY', 'PERSON', 'PRODUCT')")
-    attributes: Dict[str, Any] = Field(default_factory=dict, description="Properties of the node")
+    id: str = Field(..., description="节点ID")
+    type: str = Field(..., description="节点类型 (e.g., 'Company', 'Sector')")
+    properties: Dict[str, Any] = Field(default_factory=dict, description="节点属性")
 
-class KGRelation(BaseModel):
-    """
-    Represents a directed edge (relationship) in the Knowledge Graph.
-    """
-    relation_id: str = Field(..., description="Unique identifier for the relationship")
-    source_node_id: str = Field(..., description="ID of the source node")
-    target_node_id: str = Field(..., description="ID of the target node")
-    relation_type: str = Field(..., description="Type of relationship (e.g., 'IS_CEO_OF', 'MANUFACTURES')")
-    attributes: Dict[str, Any] = Field(default_factory=dict, description="Properties of the relationship (e.g., 'start_date', 'confidence')")
+# --- 交易执行 (Trading & Execution) ---
+# FIX (E2, E4): 从 execution/interfaces.py 移入并标准化
 
-class KnowledgeGraph(BaseModel):
+class Signal(BaseModel):
     """
-    Represents a subgraph or a complete Knowledge Graph.
+    交易信号。由认知层生成，由投资组合构造器消费。
     """
-    nodes: List[KGNode] = Field(default_factory=list)
-    relations: List[KGRelation] = Field(default_factory=list)
+    symbol: str = Field(..., description="资产代码")
+    timestamp: datetime = Field(..., description="信号生成时间 (UTC)")
+    signal_type: str = Field(..., description="信号类型 (e.g., 'BUY', 'SELL', 'HOLD')")
+    strength: float = Field(..., description="信号强度 (e.g., 0.0 to 1.0)", ge=0.0, le=1.0)
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="信号来源、原因等元数据")
 
-    def add_node(self, node: KGNode):
-        self.nodes.append(node)
+class OrderStatus(str, Enum):
+    """
+    订单状态枚举。
+    """
+    NEW = "NEW"                 # 订单已创建，等待发送
+    PENDING = "PENDING"         # 订单已发送至券商，等待确认
+    ACCEPTED = "ACCEPTED"       # 订单已被券商接受
+    PARTIALLY_FILLED = "PARTIALLY_FILLED" # 订单部分成交
+    FILLED = "FILLED"           # 订单完全成交
+    CANCELLED = "CANCELLED"     # 订单已取消
+    REJECTED = "REJECTED"       # 订单被拒绝
 
-    def add_relation(self, relation: KGRelation):
-        self.relations.append(relation)
+class Order(BaseModel):
+    """
+    交易订单。
+    """
+    id: str = Field(..., description="唯一的订单ID")
+    client_order_id: Optional[str] = Field(None, description="客户端自定义订单ID")
+    symbol: str = Field(..., description="资产代码")
+    quantity: float = Field(..., description="订单数量 (正数为买入, 负数为卖出)")
+    order_type: str = Field(..., description="订单类型 (e.g., 'MARKET', 'LIMIT')")
+    limit_price: Optional[float] = Field(None, description="限价单价格")
+    time_in_force: str = Field("GTC", description="订单时效 (e.g., 'GTC', 'IOC', 'FOK')")
+    status: OrderStatus = Field(OrderStatus.NEW, description="订单当前状态")
+    created_at: datetime = Field(default_factory=datetime.utcnow, description="订单创建时间 (UTC)")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="其他元数据")
+
+class Fill(BaseModel):
+    """
+    成交回报 (原 Execution)。
+    """
+    id: str = Field(..., description="唯一的成交ID")
+    order_id: str = Field(..., description="关联的订单ID")
+    symbol: str = Field(..., description="资产代码")
+    timestamp: datetime = Field(..., description="成交时间 (UTC)")
+    quantity: float = Field(..., description="成交数量 (正数为买入, 负数为卖出)")
+    price: float = Field(..., description="成交价格")
+    commission: float = Field(0.0, description="手续费")
+
+# --- 投资组合状态 (Portfolio State) ---
+
+class Position(BaseModel):
+    """
+    单个资产的持仓。
+    """
+    symbol: str = Field(..., description="资产代码")
+    quantity: float = Field(..., description="持仓数量 (正数为多头, 负数为实现空头)")
+    average_price: float = Field(..., description="平均持仓成本")
+    market_value: float = Field(..., description="当前市值")
+    unrealized_pnl: float = Field(..., description="未实现盈亏")
+
+class PortfolioState(BaseModel):
+    """
+    整个投资组合在特定时间点的快照。
+    """
+    timestamp: datetime = Field(..., description="快照时间 (UTC)")
+    cash: float = Field(..., description="可用现金")
+    total_value: float = Field(..., description="投资组合总价值 (cash + positions market_value)")
+    positions: Dict[str, Position] = Field(default_factory=dict, description="当前持仓")
+    realized_pnl: float = Field(0.0, description="已实现盈亏")
