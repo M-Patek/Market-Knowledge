@@ -8,7 +8,7 @@ from typing import List, Dict, Optional
 from core.schemas.data_schema import Signal, Order, PortfolioState, OrderStatus
 from core.schemas.fusion_result import FusionResult, AgentDecision
 
-# FIX (E8): 导入 IPositionSizer 接口
+# FIX (E8): 导入 IPositionSizer 接口 (原为 SizingMethod)
 from sizing.base import IPositionSizer
 
 from monitor.logging import get_logger
@@ -110,3 +110,4 @@ class PortfolioConstructor:
                 orders.append(new_order)
 
         return orders
+
