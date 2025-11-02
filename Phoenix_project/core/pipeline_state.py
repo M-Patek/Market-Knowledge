@@ -1,6 +1,6 @@
 import pandas as pd
 from typing import Dict, Any, Optional, List
-# 修正：'Deque' 应该从 'collections' 导入，而不是 'typing'
+# 修正：[FIX-ImportError/TypeError] 'Deque' 应该从 'collections' 导入，而不是 'typing'
 from collections import Deque 
 import threading
 
