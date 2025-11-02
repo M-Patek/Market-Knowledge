@@ -1,37 +1,55 @@
-"""
-Execution Signal Protocol
-Defines the data structure for signals sent from strategies to the execution layer.
-"""
-from pydantic import BaseModel, Field
-from typing import Dict, Optional
-import datetime
+from typing import Dict, Any, List
+from core.schemas.data_schema import Signal
+from monitor.logging import get_logger
 
-class StrategySignal(BaseModel):
+logger = get_logger(__name__)
+
+class SignalProtocol:
     """
-    关键修正 (Error 2 & 11): 
-    将信号协议从 "单标的" 更改为 "完整投资组合目标"。
-    OrderManager 期望收到一个包含所有目标权重的字典。
-    """
+    Defines and validates the structure of signals used within
+    the system.
     
-    strategy_id: str
-    timestamp: datetime.datetime = Field(default_factory=datetime.datetime.now)
+    This class is mostly a validator and standardizer. The main
+    schema is defined in `core.schemas.data_schema.Signal`.
+    """
 
-    # 修正: 使用 "target_weights" (复数) 字典
-    # 替代原有的 'ticker', 'action', 'target_weight'
-    target_weights: Dict[str, float] = Field(
-        ...,
-        description="完整的投资组合目标权重, e.g., {'AAPL': 0.5, 'GOOG': 0.3, 'CASH': 0.2}"
-    )
+    def __init__(self, config: Dict[str, Any] = None):
+        self.config = config or {}
+        self.known_signal_types = self.config.get("known_signal_types", [
+            "AI_COGNITIVE",
+            "TECHNICAL_ANALYSIS",
+            "MANUAL_OVERRIDE"
+        ])
+        logger.info("SignalProtocol initialized.")
 
-    # (可选) 增加一个元数据字段，说明信号的来源或类型
-    metadata: Optional[Dict] = Field(default_factory=dict)
-
-    class Config:
-        validate_assignment = True
-
-# 原始的(不正确的)定义已被移除:
-# class StrategySignal(BaseModel):
-#     ticker: str
-#     action: str  # e.g., "BUY", "SELL", "HOLD"
-#     target_weight: float # Desired portfolio weight
-#     metadata: Optional[Dict] = None
+    def validate_signal(self, signal_data: Dict[str, Any]) -> (bool, str, Signal):
+        """
+        Validates raw signal data and attempts to parse it into
+        a standardized Signal object.
+        
+        Returns:
+            (bool, str, Signal): (is_valid, error_message, parsed_signal)
+        """
+        try:
+            signal = Signal(**signal_data)
+            
+            # Additional semantic validation
+            if signal.signal_type not in self.known_signal_types:
+                return (False, f"Unknown signal_type: {signal.signal_type}", None)
+                
+            if not (-1 <= signal.direction <= 1):
+                return (False, f"Invalid direction: {signal.direction}", None)
+                
+            if not (0.0 <= signal.strength <= 1.0):
+                 return (False, f"Invalid strength: {signal.strength}", None)
+                 
+            return (True, "", signal)
+            
+        except Exception as e: # e.g., Pydantic ValidationError
+            logger.warning(f"Failed to validate signal: {e}")
+            return (False, f"Validation error: {e}", None)
+            
+    def create_signal(self, *args, **kwargs) -> Signal:
+        """Helper method to create a valid Signal object."""
+        # This just passes through to the Pydantic model
+        return Signal(*args, **kwargs)
