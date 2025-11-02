@@ -2,15 +2,13 @@
 from typing import Dict, Any
 
 # --- [修复] ---
-# 原: from .base_agent import BaseAgent
-# 新: from .base_agent import BaseAgent (依然正确)
-#
-# 原: from ...core.schemas.data_schema import MarketEvent
-# 新: from ....core.schemas.data_schema import MarketEvent (training/drl/agents/ -> ... -> core/)
+# 修复：将相对导入 'from .base_agent...' 更改为绝对导入
+from training.drl.agents.base_agent import BaseAgent
+# 修复：将相对导入 'from ....core.schemas.data_schema...' 更改为绝对导入
+from core.schemas.data_schema import MarketEvent
+# 修复：将相对导入 'from ....monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
 # --- [修复结束] ---
-from .base_agent import BaseAgent
-from ....core.schemas.data_schema import MarketEvent
-from ....monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
