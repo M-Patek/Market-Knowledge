@@ -1,147 +1,69 @@
-from typing import Dict, Any, List
+"""
+知识图谱服务 (Knowledge Graph Service)
+负责构建、更新和查询知识图谱 (KG)。
+KG 结合了来自不同来源（结构化、非结构化、时序）的信息。
+"""
+from typing import List, Dict, Any
 
-from ai.tabular_db_client import TabularDatabaseClient
-from ai.temporal_db_client import TemporalDatabaseClient
-from monitor.logging import ESLogger
-
+# FIX (E8): 导入正确的客户端名称 (TabularDBClient, TemporalDBClient)
+from ai.tabular_db_client import TabularDBClient
+from ai.temporal_db_client import TemporalDBClient
+from ai.retriever import Retriever # (用于非结构化)
+from ai.relation_extractor import RelationExtractor
+from core.schemas.data_schema import KGNode, NewsData
 
 class KnowledgeGraphService:
     """
-    Service responsible for interacting with and managing the knowledge graph.
-
-    This service abstracts the complexities of querying and updating the
-    temporal (e.g., KGraph) and tabular (e.g., BigQuery) databases that
-    together form the knowledge graph.
+    管理知识图谱的生命周期。
     """
-
+    
     def __init__(
         self,
-        config: Dict[str, Any],
-        temporal_db: TemporalDatabaseClient,
-        tabular_db: TabularDatabaseClient,
-        logger: ESLogger,
+        tabular_client: TabularDBClient,
+        temporal_client: TemporalDBClient,
+        retriever: Retriever,
+        relation_extractor: RelationExtractor
     ):
+        # FIX (E8): 使用正确的类型
+        self.tabular_client: TabularDBClient = tabular_client
+        self.temporal_client: TemporalDBClient = temporal_client
+        self.retriever: Retriever = retriever
+        self.relation_extractor: RelationExtractor = relation_extractor
+        
+        # (在真实系统中，KG 可能存储在 Neo4j 或类似的图数据库中)
+        self.graph_db_stub: Dict[str, KGNode] = {} # 占位符
+        self.log_prefix = "KnowledgeGraphService:"
+        print(f"{self.log_prefix} Initialized.")
+
+    def update_from_news(self, news_item: NewsData):
         """
-        Initializes the KnowledgeGraphService.
-
-        Args:
-            config: Configuration dictionary for the service.
-            temporal_db: Client for the temporal database (e.g., KGraph).
-            tabular_db: Client for the tabular database (e.g., BigQuery).
-            logger: An instance of ESLogger for logging.
+        从一篇新闻中提取关系并更新图谱。
         """
-        self.config = config
-        self.temporal_db = temporal_db
-        self.tabular_db = tabular_db
-        self.logger = logger
-        self.logger.log_info("KnowledgeGraphService initialized.")
-
-    async def query_knowledge_graph(self, query: str, state: Any) -> Dict[str, Any]:
-        """
-        Queries the knowledge graph based on the current state and a specific query.
-
-        This might involve:
-        1. Decomposing the query.
-        2. Querying the temporal DB for recent/fast-changing data.
-        3. Querying the tabular DB for historical/structured data.
-        4. Fusing the results.
-
-        Args:
-            query: The natural language or structured query.
-            state: The current pipeline state, providing context (e.g., timestamps).
-
-        Returns:
-            A dictionary containing the fused results from the KG.
-        """
-        self.logger.log_debug(f"Querying Knowledge Graph with: {query}")
-        try:
-            # In a real implementation, query decomposition would happen here.
-            # For this example, we'll query both and fuse naively.
+        print(f"{self.log_prefix} Updating KG from news item {news_item.id}")
+        
+        # 1. 提取关系
+        relations = self.relation_extractor.extract(news_item.content)
+        
+        # 2. (占位符) 更新图数据库
+        for rel in relations:
+            # rel 可能是 (subject, predicate, object)
+            # (在此处实现更新 self.graph_db_stub 的逻辑)
+            pass
             
-            temporal_query = self._build_temporal_query(query, state)
-            tabular_query = self._build_tabular_query(query, state)
-
-            temporal_results = await self.temporal_db.query(temporal_query)
-            tabular_results = await self.tabular_db.query(tabular_query)
-
-            fused_results = self._fuse_results(temporal_results, tabular_results)
-            
-            self.logger.log_info(f"Knowledge Graph query successful for: {query}")
-            return fused_results
-
-        except Exception as e:
-            self.logger.log_error(
-                f"Error querying Knowledge Graph: {e}", exc_info=True
-            )
-            return {"error": str(e), "temporal_results": [], "tabular_results": []}
-
-    async def update_knowledge_graph(self, data: Dict[str, Any]) -> bool:
+    def query(self, query_text: str) -> List[Dict[str, Any]]:
         """
-        Updates the knowledge graph with new information.
-
-        This could involve writing to either the temporal or tabular DB,
-        or both, depending on the nature of the data.
-
-        Args:
-            data: The data to be inserted or updated in the KG.
-                  This data should be structured to indicate its destination
-                  (e.g., {"temporal_updates": [...], "tabular_inserts": [...]}).
-
-        Returns:
-            True if all updates were successful, False otherwise.
+        (占位符) 查询知识图谱。
+        这可能涉及将自然语言转换为图查询 (如 Cypher)。
         """
-        self.logger.log_debug(f"Updating Knowledge Graph with data: {data}")
-        success = True
-        try:
-            if "temporal_updates" in data:
-                temporal_success = await self.temporal_db.update(
-                    data["temporal_updates"]
-                )
-                if not temporal_success:
-                    success = False
-                    self.logger.log_warning("Temporal DB update failed.")
-
-            if "tabular_inserts" in data:
-                tabular_success = await self.tabular_db.insert(
-                    data["tabular_inserts"]
-                )
-                if not tabular_success:
-                    success = False
-                    self.logger.log_warning("Tabular DB insert failed.")
-            
-            if success:
-                self.logger.log_info("Knowledge Graph update successful.")
-            else:
-                self.logger.log_warning("Knowledge Graph update partially failed.")
-                
-            return success
-
-        except Exception as e:
-            self.logger.log_error(
-                f"Error updating Knowledge Graph: {e}", exc_info=True
-            )
-            return False
-
-    def _build_temporal_query(self, query: str, state: Any) -> str:
-        """Builds a specific query for the temporal database."""
-        # Example: Add time constraints from the state
-        timestamp = state.get_timestamp()
-        return f"FIND {query} AROUND {timestamp}"
-
-    def _build_tabular_query(self, query: str, state: Any) -> str:
-        """Builds a specific SQL query for the tabular database."""
-        # Example: Use state to determine relevant tables
-        market = state.get_market_context()
-        return f"SELECT * FROM `{market}_data` WHERE CONTAINS(description, '{query}')"
-
-    def _fuse_results(
-        self, temporal_results: List[Any], tabular_results: List[Any]
-    ) -> Dict[str, Any]:
-        """Fuses results from both databases."""
-        # This is a naive fusion. A real implementation would be more complex,
-        # resolving entities and prioritizing recent data.
-        return {
-            "temporal_data": temporal_results,
-            "historical_data": tabular_results,
-            "fused_summary": f"Found {len(temporal_results)} recent items and {len(tabular_results)} historical items.",
-        }
+        print(f"{self.log_prefix} Querying KG: {query_text}")
+        
+        # 1. (占位符) 从 RAG 检索
+        rag_results = self.retriever.search_vector_db(query_text, top_k=1)
+        
+        # 2. (占位符) 从表格数据库查询
+        # tabular_results = self.tabular_client.query(...)
+        
+        # 3. (占位符) 从时序数据库查询
+        # temporal_results = self.temporal_client.search(...)
+        
+        return rag_results # 仅返回 RAG 结果作为示例
