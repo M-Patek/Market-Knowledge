@@ -1,147 +1,88 @@
-import asyncio
-from typing import Dict, Any, List
+"""
+Arbitrator Module.
 
-from ..monitor.logging import get_logger
-from ..api.gemini_pool_manager import GeminiPoolManager
-from ..ai.prompt_manager import PromptManager
-from ..core.schemas.fusion_result import AgentDecision
+This component is responsible for resolving conflicts when the Synthesizer
+reports high cognitive uncertainty. It can trigger a secondary, more
+focused cognitive loop.
+"""
+import logging
+from typing import List, Optional
 
-logger = get_logger(__name__)
+# 修复：使用正确的相对导入
+from ..core.schemas.fusion_result import FusionResult, AgentDecision
+from ..ai.metacognitive_agent import MetacognitiveAgent
+from ..ai.ensemble_client import EnsembleClient
+
+logger = logging.getLogger(__name__)
 
 class Arbitrator:
     """
-    An advanced LLM agent ("meta-agent") that is invoked when
-    the primary agent ensemble shows significant disagreement or
-    low confidence.
-    
-    Its job is to review the conflicting decisions and justifications
-    and provide a final, arbitrated judgment.
+    Handles high-uncertainty scenarios by invoking a meta-cognitive agent
+    or a specialized "Arbitrator" agent to make a final decision.
     """
 
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        gemini_pool: GeminiPoolManager,
-        prompt_manager: PromptManager
-    ):
+    def __init__(self, 
+                 uncertainty_threshold: float,
+                 meta_agent: MetacognitiveAgent):
         """
         Initializes the Arbitrator.
-        
-        Args:
-            config: Main configuration object.
-            gemini_pool: Pool for accessing Gemini models.
-            prompt_manager: To get the 'arbitrator' prompt.
-        """
-        self.config = config.get('arbitrator', {})
-        self.gemini_pool = gemini_pool
-        self.prompt_manager = prompt_manager
-        
-        # Use a powerful model for arbitration
-        self.model_id = self.config.get('model_id', 'gemini-1.5-pro')
-        
-        logger.info(f"Arbitrator initialized with model: {self.model_id}")
 
-    async def arbitrate(
-        self,
-        event_headline: str,
-        conflicting_decisions: List[AgentDecision],
-        context_summary: str,
-        event_id: str
-    ) -> AgentDecision:
-        """
-        Runs the arbitration process.
-        
         Args:
-            event_headline (str): The original event headline for context.
-            conflicting_decisions (List[AgentDecision]): The list of decisions to arbitrate.
-            context_summary (str): A compressed summary of the RAG context.
-            event_id (str): The unique event ID for tracing.
+            uncertainty_threshold: The cognitive uncertainty level (0.0 to 1.0)
+                                   above which arbitration is triggered.
+            meta_agent: A strong "Arbitrator" LLM agent, passed as a
+                        MetacognitiveAgent instance, to resolve the conflict.
+        """
+        self.uncertainty_threshold = uncertainty_threshold
+        self.meta_agent = meta_agent
+        if not self.meta_agent:
+            raise ValueError("Arbitrator requires a MetacognitiveAgent to function.")
             
+        logger.info(f"Arbitrator initialized with threshold: {self.uncertainty_threshold}")
+
+    async def needs_arbitration(self, fusion_result: FusionResult) -> bool:
+        """
+        Checks if the given fusion result exceeds the uncertainty threshold.
+        """
+        needs_arbitration = fusion_result.cognitive_uncertainty > self.uncertainty_threshold
+        if needs_arbitration:
+            logger.warning(f"Arbitration needed: Uncertainty {fusion_result.cognitive_uncertainty:.3f} "
+                           f"> threshold {self.uncertainty_threshold:.3f}")
+        return needs_arbitration
+
+    async def resolve_conflict(self, 
+                               event_context: dict, 
+                               conflicting_decisions: List[AgentDecision]) -> Optional[dict]:
+        """
+        Invokes the MetacognitiveAgent to analyze the conflicting decisions
+        and produce a final, overriding judgment.
+
+        Args:
+            event_context: The original event and RAG context.
+            conflicting_decisions: The list of decisions that caused the conflict.
+
         Returns:
-            AgentDecision: The final, arbitrated decision.
+            A dictionary containing the arbitrator's final decision, or None.
         """
+        logger.info(f"Resolving conflict for {len(conflicting_decisions)} decisions...")
         
-        # 1. Format the conflicting evidence for the prompt
-        formatted_conflicts = self._format_conflicts(conflicting_decisions)
-        
-        # 2. Get prompts
-        system_prompt = self.prompt_manager.get_system_prompt('arbitrator')
-        # The 'arbitrator' user prompt template is assumed to take
-        # 'headline', 'context_summary', and 'conflicts'.
-        user_prompt_template = self.prompt_manager.get_user_prompt_template('arbitrator') 
-        
-        user_prompt = user_prompt_template.format(
-            headline=event_headline,
-            context_summary=context_summary,
-            conflicts=formatted_conflicts
-        )
-
-        # 3. Call the LLM
         try:
-            async with self.gemini_pool.get_client(self.model_id) as gemini_client:
-                response = await gemini_client.generate_content_async(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    request_id=f"{event_id}_arbitrator",
-                    generation_config={"response_mime_type": "application/json"}
-                )
+            # The MetacognitiveAgent's "synthesize" method is used here
+            # with a prompt designed for arbitration (e.g., "arbitrator.json").
+            arbitrated_result = await self.meta_agent.synthesize(
+                event_context=event_context,
+                agent_decisions=conflicting_decisions
+            )
             
-            # 4. Parse the response
-            # The response is expected to match the AgentDecision schema
-            return self._parse_arbitrator_response(response)
-
+            if arbitrated_result:
+                logger.info("Conflict resolved by Arbitrator.")
+                # This result is expected to contain the fields
+                # 'fused_rationale', 'fused_sentiment', etc.
+                return arbitrated_result
+            else:
+                logger.error("Arbitrator meta-agent failed to produce a result.")
+                return None
+                
         except Exception as e:
-            logger.error(f"Arbitrator failed to run for event {event_id}: {e}", exc_info=True)
-            return AgentDecision(
-                agent_id="arbitrator",
-                decision="ERROR",
-                confidence=0.0,
-                justification=f"Arbitration LLM call failed: {str(e)}",
-                metadata={"error": str(e)}
-            )
-
-    def _format_conflicts(self, decisions: List[AgentDecision]) -> str:
-        """Helper to format the list of decisions into a string for the prompt."""
-        formatted = ""
-        for i, d in enumerate(decisions):
-            if d.decision in ["ERROR", "INVALID_RESPONSE"]:
-                continue
-            
-            formatted += f"--- Agent {i+1} ({d.agent_id}) ---\n"
-            formatted += f"Decision: {d.decision}\n"
-            formatted += f"Confidence: {d.confidence:.0%}\n"
-            formatted += f"Justification: {d.justification}\n\n"
-        
-        return formatted
-
-    def _parse_arbitrator_response(self, response: Dict[str, Any]) -> AgentDecision:
-        """
-D.
-        """
-        try:
-            # Validate required keys
-            if not all(k in response for k in ["decision", "confidence", "justification"]):
-                raise KeyError(f"Arbitrator response missing one or more required keys.")
-
-            confidence = float(response["confidence"])
-            if not (0 <= confidence <= 1):
-                raise ValueError(f"Confidence score {confidence} out of range [0, 1]")
-
-            decision = AgentDecision(
-                agent_id="arbitrator",
-                decision=str(response["decision"]).upper(),
-                confidence=confidence,
-                justification=str(response["justification"]),
-                metadata=response.get("metadata", {"arbitrated": True})
-            )
-            return decision
-
-        except (KeyError, ValueError, TypeError) as e:
-            logger.error(f"Failed to parse arbitrator response: {e}. Raw: {response}")
-            return AgentDecision(
-                agent_id="arbitrator",
-                decision="INVALID_RESPONSE",
-                confidence=0.0,
-                justification=f"Failed to parse arbitration response: {str(e)}",
-                metadata={"error": str(e), "raw_response": str(response)}
-            )
+            logger.error(f"Error during conflict resolution: {e}", exc_info=True)
+            return None
