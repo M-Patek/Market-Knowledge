@@ -37,7 +37,7 @@ services:
     # 1. 移除了不必要的 "api." 前缀 (因为工作目录已是 /app)
     # 2. 将目标从 :create_app() (工厂模式) 更改为 :app (实例模式)
     #    以匹配 api/gateway.py 中的定义
-    command: gunicorn --bind 0.0.0.0:8000 api.gateway:app
+    command: gunicorn --bind 0.0.0.0:8000 interfaces.api_server:app
     volumes:
       - .:/app
     environment:
@@ -54,8 +54,9 @@ services:
     depends_on:
       - redis
       - db
-    # 修复：确保 worker 也能找到根目录
-    command: celery -A worker.celery_app worker --loglevel=info
+    # 修复：[FIX-4] Celery app 实例在 'worker.py' 中名为 'app'，
+    # 而不是 'worker.celery_app'
+    command: celery -A worker:app worker --loglevel=info
     volumes:
       - .:/app
     environment:
@@ -89,4 +90,3 @@ services:
 volumes:
   phoenix_db_data:
   phoenix_redis_data:
-
