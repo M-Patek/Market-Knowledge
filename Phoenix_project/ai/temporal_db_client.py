@@ -3,7 +3,8 @@ from elasticsearch import AsyncElasticsearch
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-from ..monitor.logging import get_logger
+# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
