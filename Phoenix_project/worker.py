@@ -1,218 +1,163 @@
 """
 Celery Worker
-This module defines the Celery application and the tasks that run
-on the worker processes.
-
-The primary task is `run_cognitive_workflow`, which performs the
-heavy AI/cognitive lifting off the main event loop.
+- 定义和注册 Celery 任务
+- 构建核心服务 (Orchestrator)
+- 运行认知工作流
 """
 import os
-import logging
 import asyncio
 from celery import Celery
-from celery.signals import worker_process_init
-from typing import Optional, Dict, Any
+from kombu import Queue
 
+from monitor.logging import get_logger, setup_logging
+from config.loader import ConfigLoader
+from core.pipeline_state import PipelineState
+from data_manager import DataManager
+from strategy_handler import StrategyHandler
+from execution.order_manager import OrderManager
+from execution.adapters import AlpacaAdapter # (假设使用 Alpaca)
+from events.event_distributor import EventDistributor
 from controller.orchestrator import Orchestrator
-# 修复：[FIX-16] 移除了这个错误的导入，
-# build_orchestrator 是在这个文件中定义的。
-# from ..core.pipeline_service_builder import build_orchestrator
+from api.gemini_pool_manager import GeminiPoolManager
+from ai.metacognitive_agent import MetacognitiveAgent
+from cognitive.portfolio_constructor import PortfolioConstructor
 
 # --- Celery App Setup ---
-# Load Redis URL from environment variables
-REDIS_BROKER_URL = os.environ.get('REDIS_BROKER_URL', 'redis://localhost:6379/0')
-REDIS_BACKEND_URL = os.environ.get('REDIS_BACKEND_URL', 'redis://localhost:6379/1')
+setup_logging()
+logger = get_logger(__name__)
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672//")
 
 app = Celery(
-    'phoenix_worker',
-    broker=REDIS_BROKER_URL,
-    backend=REDIS_BACKEND_URL,
-    include=['worker'] # Tells Celery to look for tasks in this module
+    "phoenix_worker",
+    broker=RABBITMQ_URL,
+    backend=REDIS_URL,
 )
-
 app.conf.update(
-    task_serializer='json',
-    accept_content=['json'],
-    result_serializer='json',
-    timezone='UTC',
+    task_queues=(Queue("cognitive_workflow"),),
+    task_default_queue="cognitive_workflow",
+    task_serializer="json",
+    result_serializer="json",
+    accept_content=["json"],
+    timezone="UTC",
     enable_utc=True,
-    task_track_started=True,
 )
 
-# --- Global Orchestrator (per-worker) ---
-# We initialize this to None. It will be built *once* per
-# worker process when the worker first starts.
-_orchestrator: Optional[Orchestrator] = None
+# --- 全局 Orchestrator 实例 ---
+# (在 Celery worker 中，在任务执行前构建)
+orchestrator_instance = None
 
-def build_orchestrator() -> Orchestrator:
+def build_orchestrator():
     """
-    Builds a *complete* Orchestrator instance with all its
-    dependencies (CognitiveEngine, DataManager, etc.).
-    
-    This is a heavy operation and should only be done once
-    per worker process.
-    
-    修复：[FIX-16] 此函数已完全重写，
-    以镜像 'phoenix_project.py' (主入口点) 中的依赖注入 (DI) 树。
-    这确保了 worker 拥有与主应用程序相同的组件配置。
+    关键修正 (Error 4):
+    重构此函数以正确构建 Orchestrator 及其所有依赖项。
+    这必须与 controller/orchestrator.py 的 __init__ 签名严格匹配。
     """
-    logging.info("Building a new Orchestrator instance for this worker process...")
+    logger.info("Building core components for Orchestrator...")
     
-    # --- 导入所有必要的组件 ---
-    from config.loader import load_config
-    from core.pipeline_state import PipelineState
-    from data_manager import DataManager
-    from strategy_handler import RomanLegionStrategy
-    from execution.order_manager import OrderManager
-    from api.gemini_pool_manager import GeminiPoolManager
-    # Worker 总是使用模拟执行器
-    from execution.adapters import SimulatedBrokerAdapter 
-    
-    # --- 加载配置 ---
-    config_path = os.getenv('CONFIG_PATH', 'config/system.yaml')
-    config = load_config(config_path)
-    if config is None:
-        raise RuntimeError(f"Worker failed to load config from {config_path}")
+    try:
+        # 1. 加载配置
+        config_loader = ConfigLoader()
+        config = config_loader.get_system_config()
 
-    # --- 1. 初始化 API 池 ---
-    gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    llm_config = config.get('llm', {})
-    llm_config['api_key'] = gemini_api_key
-    gemini_pool = GeminiPoolManager(config=llm_config)
+        # 2. 核心状态和管理器
+        pipeline_state = PipelineState()
+        data_manager = DataManager(config.get('data_manager', {}))
+        event_distributor = EventDistributor()
 
-    # --- 2. 初始化核心状态和数据 ---
-    pipeline_config = config.get('pipeline', {})
-    pipeline_state = PipelineState(
-        max_recent_events=pipeline_config.get('max_recent_events', 100)
-    )
-    cache_dir = config.get('data_manager', {}).get('cache_dir', 'data_cache')
-    data_manager = DataManager(config, pipeline_state, cache_dir=cache_dir)
+        # 3. AI 和 API Pool (这些是 MetacognitiveAgent 的依赖)
+        gemini_pool = GeminiPoolManager(config.get('gemini', {}))
+        
+        # 4. 认知组件 (这些是 StrategyHandler 的依赖)
+        metacognitive_agent = MetacognitiveAgent(
+            config=config.get('metacognitive_agent', {}),
+            gemini_pool=gemini_pool
+            # (可能还需要其他依赖, e.g., prompt_manager)
+        )
+        portfolio_constructor = PortfolioConstructor(
+            config=config.get('portfolio_constructor', {})
+            # (可能还需要其他依赖)
+        )
+        
+        # 5. 执行组件 (这些是 OrderManager 和 Orchestrator 的依赖)
+        # 修正: OrderManager 构造函数需要一个 adapter
+        broker_adapter = AlpacaAdapter(config.get('execution', {}).get('alpaca', {}))
+        order_manager = OrderManager(
+            config=config.get('execution', {}), 
+            adapter=broker_adapter
+        )
 
-    # --- 3. 初始化执行 (模拟) ---
-    order_manager = OrderManager(
-        config=config.get('execution', {}),
-        # Worker 使用模拟适配器进行离线处理
-        adapter=SimulatedBrokerAdapter(config.get('execution', {}), pipeline_state)
-    )
+        # 6. 策略处理器
+        strategy_handler = StrategyHandler(
+            config=config.get('strategy_handler', {}),
+            data_manager=data_manager,
+            metacognitive_agent=metacognitive_agent,
+            portfolio_constructor=portfolio_constructor
+        )
 
-    # --- 4. 初始化策略处理器 ---
-    strategy = RomanLegionStrategy(
-        config=config,
-        data_manager=data_manager
-        # 注意：RomanLegionStrategy 在 'phoenix_project.py' 中
-        # 看起来没有接收到完整的依赖，
-        # 这可能是一个单独的问题。我们在这里镜像它。
-    )
-    
-    # --- 5. 构建 Orchestrator ---
-    # Worker 不需要 EventDistributor，
-    # 并且它使用自己的 Celery 'app' 实例
-    orchestrator = Orchestrator(
-        config=config,
-        data_manager=data_manager,
-        pipeline_state=pipeline_state,
-        gemini_pool=gemini_pool,
-        strategy_handler=strategy,
-        order_manager=order_manager,
-        celery_app=app  # 传入 worker 的 celery 实例
-    )
-    
-    logging.info("Orchestrator instance built successfully for worker.")
-    return orchestrator
-
-def get_orchestrator() -> Orchestrator:
-    """
-    Singleton accessor for the orchestrator.
-    Builds it on the first call within the worker process.
-    """
-    global _orchestrator
-    if _orchestrator is None:
-        _orchestrator = build_orchestrator()
-    return _orchestrator
-
-@worker_process_init.connect
-def on_worker_init(**kwargs):
-    """
-    Called when a new worker process is forked.
-    We initialize logging here.
-    """
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logging.info(f"New worker process initialized (PID: {os.getpid()}).")
-    # 我们可以根据需要预热 orchestrator
-    # get_orchestrator()
-
+        # 7. 实例化 Orchestrator
+        # 修正: 使用 controller.orchestrator.py 中的正确签名
+        orchestrator = Orchestrator(
+            config_loader=config_loader,
+            pipeline_state=pipeline_state,
+            data_manager=data_manager,
+            strategy_handler=strategy_handler,
+            order_manager=order_manager,
+            event_distributor=event_distributor
+            # 注意: gemini_pool 和 celery_app 不直接注入 Orchestrator
+            # 它们被注入到 Orchestrator 的 *依赖项* 中
+        )
+        
+        logger.info("Orchestrator built successfully.")
+        return orchestrator
+        
+    except Exception as e:
+        logger.error(f"Failed to build Orchestrator: {e}", exc_info=True)
+        return None
 
 # --- Celery Tasks ---
 
-@app.task(name="worker.run_cognitive_workflow")
-def run_cognitive_workflow(event_dict: Optional[Dict[str, Any]], 
-                           task_name: Optional[str]):
+@app.on_after_configure.connect
+def setup_periodic_tasks(sender, **kwargs):
+    """设置定时任务"""
+    sender.add_periodic_task(
+        60.0,  # (e.g., 每60秒运行一次)
+        run_cognitive_workflow.s(),
+        name="Run Cognitive Workflow",
+    )
+
+@app.task(name="run_cognitive_workflow", bind=True)
+def run_cognitive_workflow(self, *args, **kwargs):
     """
-    The main Celery task to execute the cognitive workflow.
-    
-    This runs on a worker process.
+    Celery 任务，用于执行主认知工作流。
     """
-    logging.info(f"Worker received task: run_cognitive_workflow (Task: {task_name}, Event: {event_dict is not None})")
+    global orchestrator_instance
     
     try:
-        # 1. Get the worker's singleton Orchestrator instance
-        orchestrator = get_orchestrator()
-        
-        # 2. Deserialize event (if it exists)
-        event = None
-        if event_dict:
-            # We need to import the schemas to parse the dict
-            from core.schemas.data_schema import MarketEvent, EconomicEvent
-            # 简单的类型检查
-            if 'content' in event_dict:
-                event = MarketEvent(**event_dict)
-            else:
-                event = EconomicEvent(**event_dict)
+        if orchestrator_instance is None:
+            logger.info("Orchestrator not found. Building...")
+            orchestrator_instance = build_orchestrator()
+            if orchestrator_instance is None:
+                logger.error("Failed to build orchestrator. Task cannot run.")
+                return "BUILD_FAILURE"
 
-        # 3. Run the cognitive workflow
-        # 修复：[FIX-16] Orchestrator 上没有 'run_cognitive_workflow_sync'。
-        # 正确的方法是 'run_cognitive_workflow' (这是一个 async 方法)。
-        # 我们必须为这个任务创建一个新的 asyncio 事件循环来运行它。
+        logger.info("Running cognitive workflow task...")
         
-        async def run_async_workflow():
-            await orchestrator.run_cognitive_workflow(
-                event=event,
-                task_name=task_name
-            )
-
-        # Run the async workflow synchronously
-        asyncio.run(run_async_workflow())
+        # 关键修正 (Error 5):
+        # Orchestrator 中没有 'run_cognitive_workflow' 方法。
+        # 调用正确的主循环入口点 'run_main_loop_async'。
+        asyncio.run(orchestrator_instance.run_main_loop_async())
         
-        logging.info(f"Cognitive workflow task completed successfully.")
-        # 任务成功完成后，Celery 会自动处理 'link'
-        # (例如触发 'release_processing_lock')
-
+        logger.info("Cognitive workflow task finished.")
+        return "SUCCESS"
+        
     except Exception as e:
-        logging.error(f"Cognitive workflow task FAILED: {e}", exc_info=True)
-        # The task will be marked as FAILED in the backend
-        raise
+        logger.error(f"Error during cognitive workflow task: {e}", exc_info=True)
+        # (可以添加重试逻辑)
+        raise self.retry(exc=e, countdown=60)
 
-@app.task(name="worker.release_processing_lock")
-def release_processing_lock():
-    """
-    A simple task (linked as a callback) that tells the *main*
-    orchestrator (via Redis) to release its processing lock.
-    
-    注意：这假设主进程 (LoopManager) 正在 *轮询* 这个 Redis 键。
-    在 'controller/loop_manager.py' 中使用 'asyncio.Event'
-    的锁是*行不通的*，因为该锁在不同的进程中。
-    """
-    logging.debug("Task: Releasing processing lock via Redis...")
-    try:
-        import redis
-        r = redis.from_url(REDIS_BROKER_URL, decode_responses=True)
-        
-        # 锁键必须与 LoopManager 中检查的键匹配
-        lock_key = "phoenix_processing_lock"
-        r.delete(lock_key)
-        
-        logging.info("Redis processing lock released.")
-
-    except Exception as e:
-        logging.error(f"Failed to release processing lock: {e}", exc_info=True)
+if __name__ == "__main__":
+    # 此 worker 通过 celery CLI 启动:
+    # celery -A worker worker --loglevel=info -Q cognitive_workflow
+    logger.info("Starting Celery worker...")
