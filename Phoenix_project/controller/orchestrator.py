@@ -1,5 +1,6 @@
 import time
 import asyncio
+import datetime  # <--- 添加了缺失的导入
 from typing import Dict, Any, Optional
 from core.pipeline_state import PipelineState
 from config.loader import ConfigLoader
@@ -84,7 +85,7 @@ class Orchestrator:
         
         await self.pipeline_state.update_state({
             "current_decision_id": decision_id,
-            "cycle_start_time": datetime.utcnow()
+            "cycle_start_time": datetime.datetime.utcnow()  # <--- 修正了调用
         })
         
         logger.info(f"--- Starting Main Cycle: {decision_id} ---")
@@ -155,7 +156,7 @@ class Orchestrator:
             
             await self.pipeline_state.update_state({
                 "last_cycle_time_ms": cycle_time_ms,
-                "last_successful_cycle_time": datetime.utcnow()
+                "last_successful_cycle_time": datetime.datetime.utcnow() # <--- 修正了调用
             })
             
             self.metrics_collector.gauge("cycle.time_ms", cycle_time_ms)
