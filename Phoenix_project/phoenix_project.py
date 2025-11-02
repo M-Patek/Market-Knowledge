@@ -1,215 +1,230 @@
+"""
+凤凰计划 (Phoenix Project) 主应用程序入口点。
+负责初始化和协调所有核心组件。
+"""
+import json
 import os
-import sys
-import asyncio
-from dotenv import load_dotenv
+from typing import Dict, Any
 
-# 将项目根目录添加到 Python 路径
-project_root = os.path.abspath(os.path.dirname(__file__))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
-# 从 .env 文件加载环境变量
-load_dotenv()
-
-from config.loader import load_config
-from monitor.logging import get_logger
-from controller.orchestrator import Orchestrator
+from config.loader import ConfigLoader
 from data_manager import DataManager
 from core.pipeline_state import PipelineState
-from strategy_handler import RomanLegionStrategy
-from api.gemini_pool_manager import GeminiPoolManager
-from events.stream_processor import StreamProcessor
 from events.event_distributor import EventDistributor
+from events.risk_filter import EventRiskFilter
+from events.stream_processor import StreamProcessor
+from cognitive.engine import CognitiveEngine
+from cognitive.portfolio_constructor import PortfolioConstructor
+from cognitive.risk_manager import RiskManager
 from execution.order_manager import OrderManager
+from execution.trade_lifecycle_manager import TradeLifecycleManager
 
-# 修正：导入 celery app 实例，以传递给 Orchestrator
-from worker import app as celery_app
+# FIX (E6): 导入 AlpacaAdapter (我们将在 adapters.py 中添加它)
+from execution.adapters import SimulatedBrokerAdapter, AlpacaAdapter
+from controller.orchestrator import Orchestrator
+from controller.loop_manager import LoopManager
+from controller.error_handler import ErrorHandler
+from controller.scheduler import Scheduler
+from audit_manager import AuditManager
+from snapshot_manager import SnapshotManager
+from metrics_collector import MetricsCollector
+from monitor.logging import setup_logging, get_logger
 
-# --- 全局组件 ---
-logger = get_logger('PhoenixMain')
-config = None
-orchestrator = None
-gemini_pool = None
-stream_processor = None
-event_distributor = None
+# (AI/RAG components)
+from ai.retriever import Retriever
+from ai.ensemble_client import EnsembleClient
+from ai.metacognitive_agent import MetacognitiveAgent
+from ai.reasoning_ensemble import ReasoningEnsemble
+from evaluation.arbitrator import Arbitrator
+from evaluation.fact_checker import FactChecker
+from ai.prompt_manager import PromptManager
+from api.gateway import APIGateway
+from api.gemini_pool_manager import GeminiPoolManager
+from memory.vector_store import VectorStore
+from memory.cot_database import CoTDatabase
+from sizing.fixed_fraction import FixedFractionSizer # 示例仓位管理器
 
-async def initialize_system():
+class PhoenixProject:
     """
-    初始化 Phoenix 系统的所有核心组件。
+    主应用程序类。
     """
-    global config, orchestrator, gemini_pool, stream_processor, event_distributor, logger, celery_app
-    
-    logger.info("--- PHOENIX PROJECT V2.0 INITIALIZATION START ---")
-    
-    try:
-        # 1. 加载配置
-        config_path = os.getenv('CONFIG_PATH', 'config/system.yaml')
-        config = load_config(config_path) # 修正: 调用新加载器函数
-        if config is None:
-            logger.critical("加载 system.yaml 失败。正在退出。")
-            sys.exit(1)
-        logger.info(f"配置已从 {config_path} 加载")
-
-        # 2. 初始化 Gemini API 池
-        gemini_api_key = os.environ.get("GEMINI_API_KEY")
-        if not gemini_api_key:
-            logger.warning("未设置 GEMINI_API_KEY。LLM 功能将被禁用。")
+    def __init__(self, config_path: str = 'config'):
+        # 1. 配置与日志
+        setup_logging()
+        self.logger = get_logger(__name__)
+        self.logger.info("Phoenix Project V2.0 启动中...")
         
-        # 修复：[FIX-9] 'GeminiPoolManager' 的 __init__ 需要一个
-        # 'config' 字典，而不是 'api_key' 和 'pool_size'
-        llm_config = config.get('llm', {})
-        llm_config['api_key'] = gemini_api_key # 将 key 注入到配置中
-        llm_config['pool_size'] = llm_config.get('gemini_pool_size', 5)
+        self.config_loader = ConfigLoader(config_path)
+        
+        # 2. 加载数据
+        catalog_path = self.config_loader.get_system_config().get("data_catalog_path", "data_catalog.json")
+        self.data_catalog = self._load_data_catalog(catalog_path)
+        
+        # 3. 初始化核心组件
+        self.error_handler = ErrorHandler()
+        
+        # FIX (E5): DataManager 构造函数需要 ConfigLoader，而不是 dict
+        self.data_manager = DataManager(self.config_loader, self.data_catalog)
+        
+        # FIX (E5): PipelineState 构造函数需要 initial_state 和 max_history
+        max_history = self.config_loader.get_system_config().get("max_pipeline_history", 100)
+        self.pipeline_state = PipelineState(initial_state=None, max_history=max_history)
+        
+        self.audit_manager = AuditManager(self.config_loader)
+        self.snapshot_manager = SnapshotManager(self.config_loader)
+        
+        # 4. 初始化事件/数据流
+        self.event_distributor = EventDistributor()
+        self.event_filter = EventRiskFilter(self.config_loader)
+        self.stream_processor = StreamProcessor()
 
-        gemini_pool = GeminiPoolManager(config=llm_config)
-        logger.info(f"GeminiPoolManager 已初始化，大小为 {llm_config['pool_size']}")
+        # 5. 初始化券商 (Execution)
+        self.broker = self._setup_broker()
+        
+        # 6. 初始化交易生命周期
+        initial_cash = self.config_loader.get_system_config().get("trading", {}).get("initial_cash", 1000000)
+        self.trade_lifecycle_manager = TradeLifecycleManager(initial_cash=initial_cash)
+        self.order_manager = OrderManager(self.broker)
+        
+        # 7. 初始化AI/认知 (Cognitive)
+        self.cognitive_engine = self._setup_cognitive_engine()
+        
+        # 8. 初始化投资组合
+        # (使用一个示例仓位管理器)
+        sizer = FixedFractionSizer(fraction=0.05) # 示例：每次交易使用5%的资金
+        self.portfolio_constructor = PortfolioConstructor(position_sizer=sizer)
+        self.risk_manager = RiskManager(self.config_loader)
 
-        # 3. 初始化核心状态和数据管理
-        # 修复：[FIX-16] 匹配 PipelineState 的签名
-        pipeline_config = config.get('pipeline', {})
-        pipeline_state = PipelineState(
-            max_recent_events=pipeline_config.get('max_recent_events', 100)
+        # 9. 监控
+        self.metrics_collector = MetricsCollector(self.config_loader)
+
+        # 10. 核心协调器 (Orchestrator)
+        self.orchestrator = Orchestrator(
+            pipeline_state=self.pipeline_state,
+            data_manager=self.data_manager,
+            event_filter=self.event_filter,
+            stream_processor=self.stream_processor,
+            cognitive_engine=self.cognitive_engine,
+            portfolio_constructor=self.portfolio_constructor,
+            risk_manager=self.risk_manager,
+            order_manager=self.order_manager,
+            trade_lifecycle_manager=self.trade_lifecycle_manager,
+            snapshot_manager=self.snapshot_manager,
+            metrics_collector=self.metrics_collector,
+            audit_manager=self.audit_manager,
+            error_handler=self.error_handler
         )
-        cache_dir = config.get('data_manager', {}).get('cache_dir', 'data_cache')
-        
-        # 修正：[FIX-TypeError-DataManager]
-        # DataManager 的构造函数已在 data_manager.py 中被修正
-        # 以接受 config, pipeline_state, 和 cache_dir。
-        data_manager = DataManager(
-            config=config, 
-            pipeline_state=pipeline_state, 
-            cache_dir=cache_dir
-        )
-        logger.info("PipelineState 和 DataManager 已初始化。")
 
-        # 4. 初始化订单管理器 (执行层)
-        order_manager = OrderManager(config.get('execution', {}))
-        logger.info("OrderManager 已初始化。")
+        # 11. 循环与调度
+        self.loop_manager = LoopManager(self.orchestrator, self.data_manager)
+        self.scheduler = Scheduler(self.orchestrator, self.config_loader)
 
-        # 5. 初始化策略处理器 (RomanLegion)
-        logger.info("加载策略数据...")
-        
-        strategy = RomanLegionStrategy(
-            config=config,
-            data_manager=data_manager
-        )
-        logger.info("RomanLegionStrategy 已初始化。")
+        self.logger.info("Phoenix Project 初始化完成。")
 
-        # 6. 初始化协调器 (大脑)
-        
-        # 修正：[FIX-TypeError-Orchestrator]
-        # Orchestrator 的构造函数不接受 'celery_app' (它自我导入)。
-        # 已从此处的调用中移除该参数。
-        orchestrator = Orchestrator(
-            config=config,
-            data_manager=data_manager,
-            pipeline_state=pipeline_state,
-            gemini_pool=gemini_pool,
-            strategy_handler=strategy,
-            order_manager=order_manager
-            # celery_app=celery_app  <- 已移除此错误参数
-        )
-        logger.info("主协调器已初始化。")
-        
-        # 7. 初始化事件流和分发器
-        stream_processor = StreamProcessor(config.get('event_stream', {}))
-        event_distributor = EventDistributor(
-            stream_processor=stream_processor,
-            orchestrator=orchestrator, # 传入已包含 celery_app 的 orchestrator
-            config=config.get('event_distributor', {})
-        )
-        logger.info("EventStreamProcessor 和 EventDistributor 已初始化。")
-
-        logger.info("--- PHOENIX 系统初始化完成 ---")
-        return True
-
-    except Exception as e:
-        logger.critical(f"系统初始化期间发生致命错误: {e}", exc_info=True)
-        return False
-
-async def run_system():
-    """
-    启动系统的主要异步循环。
-    """
-    global orchestrator, event_distributor, logger
-    
-    if not orchestrator or not event_distributor:
-        logger.critical("系统未初始化。无法运行。")
-        return
-
-    logger.info("--- PHOENIX 系统正在启动主循环 ---")
-    
-    try:
-        # 1. 启动协调器的主决策循环 (例如，每 5 分钟运行一次)
-        orchestrator_task = asyncio.create_task(orchestrator.start_decision_loop())
-        
-        # 2. 启动事件分发器 (从流处理器消费)
-        event_distributor_task = asyncio.create_task(event_distributor.start_consuming())
-        
-        logger.info("协调器和事件分发器循环正在运行。")
-        
-        # 等待任务完成 (或永远运行)
-        await asyncio.gather(
-            orchestrator_task,
-            event_distributor_task
-        )
-        
-    except asyncio.CancelledError:
-        logger.info("主系统循环已取消。")
-    except Exception as e:
-        logger.error(f"主系统运行循环中发生错误: {e}", exc_info=True)
-    finally:
-        logger.info("--- PHOENIX 系统正在关闭 ---")
-        await shutdown_system()
-
-async def shutdown_system():
-    """
-    优雅地关闭所有系统组件。
-    """
-    global orchestrator, event_distributor, gemini_pool, logger
-    
-    logger.info("开始优雅关闭...")
-    if event_distributor:
-        await event_distributor.stop_consuming()
-        logger.info("事件分发器已停止。")
-        
-    if orchestrator:
-        await orchestrator.stop_decision_loop()
-        logger.info("协调器循环已停止。")
-        
-    if gemini_pool:
-        await gemini_pool.close()
-        logger.info("Gemini API 池已关闭。")
-    
-    logger.info("--- PHOENIX 关闭完成 ---")
-
-async def main():
-    """
-    应用程序的主入口点。
-    """
-    if await initialize_system():
-        loop = asyncio.get_running_loop()
+    def _load_data_catalog(self, catalog_path: str) -> Dict[str, Any]:
+        if not os.path.exists(catalog_path):
+            self.logger.error(f"Data catalog not found at {catalog_path}")
+            return {}
         try:
-            await run_system()
-        except KeyboardInterrupt:
-            logger.info("收到 KeyboardInterrupt。正在关闭。")
-            await shutdown_system()
-    else:
-        sys.exit(1)
+            with open(catalog_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.error(f"Failed to load data catalog: {e}", exc_info=True)
+            return {}
+
+    def _setup_broker(self) -> SimulatedBrokerAdapter:
+        # (FIX (E6): 暂时只支持模拟券商)
+        # 
+        # broker_config = self.config_loader.get_system_config().get("broker", {})
+        # if broker_config.get("type") == "alpaca":
+        #     return AlpacaAdapter(
+        #         api_key=os.environ.get(broker_config.get("api_key_env")),
+        #         api_secret=os.environ.get(broker_config.get("api_secret_env")),
+        #         base_url=broker_config.get("base_url")
+        #     )
+        self.logger.warning("Broker type not specified or 'alpaca' not implemented, defaulting to SimulatedBrokerAdapter.")
+        return SimulatedBrokerAdapter()
+
+    def _setup_cognitive_engine(self) -> CognitiveEngine:
+        self.logger.info("Initializing Cognitive Stack...")
+        # (这部分逻辑在 worker.py 中更完整，这里只是一个示例)
+        try:
+            # 1. API & Prompts
+            gemini_pool = GeminiPoolManager() # 假设默认
+            api_gateway = APIGateway(gemini_pool)
+            prompt_manager = PromptManager(self.config_loader.config_path)
+            
+            # 2. Memory
+            vector_store = VectorStore()
+            cot_db = CoTDatabase()
+            
+            # 3. RAG
+            retriever = Retriever(vector_store, cot_db)
+            
+            # 4. Agents
+            agent_registry = self.config_loader.get_agent_registry()
+            ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry)
+            metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
+            arbitrator = Arbitrator(api_gateway, prompt_manager)
+            fact_checker = FactChecker(api_gateway, prompt_manager)
+            
+            # 5. Ensemble
+            reasoning_ensemble = ReasoningEnsemble(
+                retriever=retriever,
+                ensemble_client=ensemble_client,
+                metacognitive_agent=metacognitive_agent,
+                arbitrator=arbitrator,
+                fact_checker=fact_checker
+            )
+            
+            # 6. Cognitive Engine
+            cognitive_engine = CognitiveEngine(
+                reasoning_ensemble=reasoning_ensemble,
+                fact_checker=fact_checker
+            )
+            self.logger.info("Cognitive Stack Initialized.")
+            return cognitive_engine
+        except Exception as e:
+            self.logger.error(f"Failed to initialize cognitive stack: {e}", exc_info=True)
+            raise
+
+    def run_backtest(self, start_date: str, end_date: str, symbols: List[str]):
+        """
+        运行回测。
+        """
+        self.logger.info(f"Running backtest from {start_date} to {end_date} for {symbols}")
+        try:
+            self.loop_manager.run_backtest(start_date, end_date, symbols)
+            self.logger.info("Backtest complete.")
+            # TODO: 打印回测结果
+            
+        except Exception as e:
+            self.logger.error(f"Backtest failed: {e}", exc_info=True)
+            self.error_handler.handle_critical_error(e)
+
+    def run_live(self):
+        """
+        以实时模式运行 (使用调度器)。
+        """
+        self.logger.info("Starting Phoenix Project in LIVE mode...")
+        try:
+            self.scheduler.start()
+        except (KeyboardInterrupt, SystemExit):
+            self.logger.info("Shutting down live mode...")
+            self.scheduler.stop()
+        except Exception as e:
+            self.logger.error("Live mode failed:", exc_info=True)
+            self.error_handler.handle_critical_error(e)
+            self.scheduler.stop()
 
 if __name__ == "__main__":
-    # 检查 CLI 参数 (例如，运行回测、运行数据验证)
-    # 注意：'celery' 命令将通过它自己的入口点运行 'worker.py'
-    if len(sys.argv) > 1 and "celery" not in sys.argv[0]:
-        command = sys.argv[1]
-        logger.info(f"检测到 CLI 命令: {command}")
-        # TODO: 实现 CLI 参数处理
-        print(f"CLI 命令 '{command}' 尚未实现。启动主系统。")
-    elif "celery" not in sys.argv[0]:
-        try:
-            asyncio.run(main())
-        except Exception as e:
-            logger.critical(f"应用程序运行失败: {e}", exc_info=True)
-            sys.exit(1)
-    # 如果 'celery' 在 'sys.argv[0]' 中，则不执行 asyncio.run(main())
-    # Celery 会自己处理启动
+    # (示例运行)
+    # 在真实部署中，这将通过 CLI (scripts/run_cli.py) 或 worker (worker.py) 启动
+    
+    app = PhoenixProject()
+    
+    # 示例: 运行回测
+    app.run_backtest(
+        start_date="2023-01-01T00:00:00Z",
+        end_date="2023-03-01T00:00:00Z",
+        symbols=["AAPL", "MSFT"]
+    )
