@@ -5,7 +5,9 @@ from typing import List, Dict, Any, Optional
 from ..core.pipeline_state import PipelineState
 from ..core.schemas.fusion_result import FusionResult, AgentDecision
 from ..data_manager import DataManager
-from ..sizing.base import BaseSizer
+# 修复：[FIX-2] 'BaseSizer' 不存在于 'sizing/base.py' 中, 
+# 接口被定义为 'IPositionSizer'
+from ..sizing.base import IPositionSizer
 from .risk_manager import RiskManager
 
 class Portfolio:
@@ -27,7 +29,12 @@ class PortfolioConstructor:
     set of target weights.
     """
 
-    def __init__(self, config, data_manager: DataManager, sizer: BaseSizer, risk_manager: RiskManager):
+    def __init__(self, 
+                 config, 
+                 data_manager: DataManager, 
+                 # 修复：[FIX-2] 更新类型提示
+                 sizer: IPositionSizer, 
+                 risk_manager: RiskManager):
         """
         Initializes the PortfolioConstructor.
 
