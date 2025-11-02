@@ -1,7 +1,12 @@
 import pytest
 import yaml
-import os  # Ensure os is imported
-from datetime import datetime
+import os
+import sys # 修复：[FIX-10] 导入 sys
+from datetime import datetime, timedelta
+
+# 修复：[FIX-10] 添加日志记录器以查看 config 加载
+import logging
+logger = logging.getLogger(__name__)
 
 # Add project root to path to find 'core' module
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -41,39 +46,44 @@ def config():
 @pytest.fixture
 def state():
     """Provides a clean instance of PipelineState for each test."""
-    return PipelineState()
+    # 修复：[FIX-16] 传递 'max_recent_events'
+    return PipelineState(max_recent_events=10)
 
 # --- Test Cases ---
 
 def test_load_config(config):
     """Tests that the config fixture loads without errors."""
     assert config is not None
-    logger.info(f"Config loaded, keys: {config.keys()}")
+    logger.info(f"Config loaded, keys: {list(config.keys())}")
 
 def test_config_structure(config):
-    """Tests the basic structure of the loaded config."""
-    assert "services" in config
+    """
+    Tests the basic structure of the loaded config.
+    修复：[FIX-13] 将 'services' 更改为 'llm' 和 'event_stream'，
+    这些键存在于 config/system.yaml 中 (从 phoenix_project.py 推断)。
+    """
     assert "llm" in config
     assert "event_stream" in config
-    assert "data_management" in config
-    assert "api_server" in config
+    assert "data_manager" in config
+    assert "execution" in config
 
 def test_pipeline_state_initialization(state):
     """Tests the initial default values of the PipelineState."""
-    assert state.get_state('system_status') == 'initializing'
-    assert state.get_state('last_processed_event_id') is None
-    assert isinstance(state.get_state('last_decision_cycle_time'), datetime)
-    assert state.get_state('current_analysis_task') is None
-    assert state.get_state('active_circuit_breakers') == []
-    assert state.get_full_state()['metrics']['total_events_processed'] == 0
+    assert state.get_state('system_status') == 'IDLE'
+    assert state.get_state('last_event_id') is None
+    assert isinstance(state.get_state('last_event_timestamp'), datetime)
+    assert state.get_state('current_task_id') is None
+    # 修复：[FIX-10] 匹配 'core/pipeline_state.py' 中的新 metric 名称
+    assert state.get_metric('total_events_processed') == 0
+    assert state.get_recent_events() == []
 
 def test_set_and_get_state(state):
     """Tests basic set/get functionality."""
-    state.set_state('system_status', 'running')
-    assert state.get_state('system_status') == 'running'
+    state.set_state('system_status', 'RUNNING')
+    assert state.get_state('system_status') == 'RUNNING'
     
-    state.set_state('current_analysis_task', 'Analyze AAPL')
-    assert state.get_state('current_analysis_task') == 'Analyze AAPL'
+    state.set_state('current_task_id', 'task_123')
+    assert state.get_state('current_task_id') == 'task_123'
 
 def test_set_non_existent_key(state):
     """Tests that setting an unknown key raises a KeyError."""
@@ -86,61 +96,72 @@ def test_get_non_existent_key(state):
 
 def test_increment_metric(state):
     """Tests the metric incrementing utility."""
-    assert state.get_full_state()['metrics']['total_events_processed'] == 0
+    assert state.get_metric('total_events_processed') == 0
     state.increment_metric('total_events_processed')
-    assert state.get_full_state()['metrics']['total_events_processed'] == 1
+    assert state.get_metric('total_events_processed') == 1
     state.increment_metric('total_events_processed', 5)
-    assert state.get_full_state()['metrics']['total_events_processed'] == 6
+    assert state.get_metric('total_events_processed') == 6
 
 def test_increment_non_existent_metric(state):
     """Tests incrementing a metric that doesn't exist."""
     with pytest.raises(KeyError):
         state.increment_metric('non_existent_metric')
 
-def test_update_last_processed_event(state):
-    """Tests the specific helper for updating event ID and time."""
-    event_id = "evt_12345"
-    state.update_last_processed_event(event_id)
+def test_add_event_and_get_recent(state):
+    """Tests the event tracking and retrieval."""
+    event1 = {'id': 'evt_1', 'timestamp': datetime.now()}
+    event2 = {'id': 'evt_2', 'timestamp': datetime.now() + timedelta(seconds=1)}
     
-    assert state.get_state('last_processed_event_id') == event_id
-    assert state.get_full_state()['metrics']['total_events_processed'] == 1
-    # Check if the timestamp was updated (within a reasonable delta)
-    time_diff = datetime.now() - state.get_state('last_event_processed_time')
+    state.add_event(event1)
+    state.add_event(event2)
+    
+    assert state.get_state('last_event_id') == 'evt_2'
+    assert state.get_metric('total_events_processed') == 2
+    assert state.get_recent_events() == [event1, event2]
+    
+    time_diff = datetime.now() - state.get_state('last_event_timestamp')
     assert time_diff.total_seconds() < 1.0
 
-def test_start_and_end_decision_cycle(state):
-    """Tests the helpers for managing the decision cycle state."""
-    task = "Analyze GOOGL"
-    state.start_decision_cycle(task)
+def test_event_queue_capacity(state):
+    """Tests that the recent event queue respects max_recent_events."""
+    state_small = PipelineState(max_recent_events=2)
     
-    assert state.get_state('system_status') == 'processing'
-    assert state.get_state('current_analysis_task') == task
+    event1 = {'id': 'evt_1'}
+    event2 = {'id': 'evt_2'}
+    event3 = {'id': 'evt_3'}
     
-    state.end_decision_cycle()
+    state_small.add_event(event1)
+    state_small.add_event(event2)
+    state_small.add_event(event3)
     
-    assert state.get_state('system_status') == 'idle'
-    assert state.get_state('current_analysis_task') is None
-    assert state.get_full_state()['metrics']['total_decision_cycles'] == 1
-    time_diff = datetime.now() - state.get_state('last_decision_cycle_time')
+    # Should have evicted event1
+    assert state_small.get_recent_events() == [event2, event3]
+    assert len(state_small.get_recent_events()) == 2
+    assert state_small.get_metric('total_events_processed') == 3
+
+def test_start_and_end_task(state):
+    """Tests the helpers for managing the task state."""
+    task_id = "task_abc"
+    state.start_task(task_id)
+    
+    assert state.get_state('system_status') == 'PROCESSING'
+    assert state.get_state('current_task_id') == task_id
+    
+    state.end_task()
+    
+    assert state.get_state('system_status') == 'IDLE'
+    assert state.get_state('current_task_id') is None
+    assert state.get_metric('total_tasks_completed') == 1
+    time_diff = datetime.now() - state.get_state('last_task_timestamp')
     assert time_diff.total_seconds() < 1.0
 
-def test_circuit_breaker_tracking(state):
-    """Tests adding and removing circuit breaker states."""
-    breaker_name = "llm_api"
-    state.add_circuit_breaker(breaker_name)
-    assert state.get_state('active_circuit_breakers') == ["llm_api"]
+def test_get_full_state(state):
+    """Tests the full state snapshot."""
+    state.set_state('system_status', 'RUNNING')
+    state.increment_metric('total_events_processed')
     
-    # Test adding duplicates (should have no effect)
-    state.add_circuit_breaker(breaker_name)
-    assert state.get_state('active_circuit_breakers') == ["llm_api"]
+    full_state = state.get_full_state()
     
-    state.add_circuit_breaker("db_connection")
-    assert "llm_api" in state.get_state('active_circuit_breakers')
-    assert "db_connection" in state.get_state('active_circuit_breakers')
-    
-    state.remove_circuit_breaker(breaker_name)
-    assert state.get_state('active_circuit_breakers') == ["db_connection"]
-    
-    # Test removing non-existent (should not fail)
-    state.remove_circuit_breaker("non_existent")
-    assert state.get_state('active_circuit_breakers') == ["db_connection"]
+    assert full_state['state']['system_status'] == 'RUNNING'
+    assert full_state['metrics']['total_events_processed'] == 1
+    assert 'recent_events' in full_state
