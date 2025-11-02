@@ -1,135 +1,145 @@
-"""
-Adapts raw data streams (e.g., from websockets, APIs) into standardized
-Pydantic schemas defined in core.schemas.data_schema.
-
-This acts as an anti-corruption layer, ensuring that the rest of the
-system consumes clean, validated, and consistent data structures.
-"""
-import logging
-from typing import Union, Optional, Dict, Any
-from pydantic import ValidationError
-
-# 修复：添加 TickerData 并使用正确的相对导入
-from ..core.schemas.data_schema import MarketEvent, EconomicEvent, TickerData
-
-logger = logging.getLogger(__name__)
+from typing import List, Dict, Any, Union
+import pandas as pd
+from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
 
 class DataAdapter:
     """
-    Transforms raw data payloads (dicts, JSON strings) into standardized
-    Pydantic models.
+    Transforms and formats diverse data types (market, news, etc.)
+    into a unified string representation suitable for LLM prompts.
     """
 
-    def __init__(self):
-        """
-        Initializes the DataAdapter.
-        """
-        self.schema_map = {
-            "market_event": MarketEvent,
-            "economic_event": EconomicEvent,
-            "ticker_data": TickerData,
-        }
-        logger.info("DataAdapter initialized.")
+    def __init__(self, config: Dict[str, Any] = None):
+        self.config = config or {}
+        # Max tokens per data type to avoid overly long prompts
+        self.max_market_tokens = self.config.get("max_market_tokens", 1024)
+        self.max_news_tokens = self.config.get("max_news_tokens", 1024)
+        self.max_economic_tokens = self.config.get("max_economic_tokens", 512)
 
-    def parse_data(self, raw_data: Dict[str, Any], data_type: str) -> Optional[Union[MarketEvent, EconomicEvent, TickerData]]:
-        """
-        Parses a raw data dictionary into a specified Pydantic schema.
+    def format_market_data(self, market_data: List[MarketData]) -> str:
+        """Converts a list of MarketData objects into a compact string."""
+        if not market_data:
+            return "No recent market data available."
 
-        Args:
-            raw_data: The raw data dictionary.
-            data_type: The key for the target schema (e.g., 'market_event').
-
-        Returns:
-            A Pydantic model instance if parsing is successful, None otherwise.
-        """
-        schema = self.schema_map.get(data_type)
-        
-        if not schema:
-            logger.warning(f"No schema found for data_type: {data_type}")
-            return None
-            
+        # Create a DataFrame for easy manipulation
         try:
-            # Attempt to parse and validate the raw data
-            # This is where Pydantic works its magic
-            validated_data = schema(**raw_data)
-            return validated_data
+            df = pd.DataFrame([md.model_dump() for md in market_data])
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.sort_values(by="timestamp", ascending=False)
             
-        except ValidationError as e:
-            logger.error(f"Data validation failed for data_type {data_type}. Error: {e}. Raw data: {str(raw_data)[:200]}...")
-            return None
+            # Summarize: Get latest, and maybe some aggregates
+            latest = df.iloc[0]
+            summary = (
+                f"Latest Market Data ({latest['symbol']} at {latest['timestamp']}):\n"
+                f"Open: {latest['open']:.2f}, High: {latest['high']:.2f}, "
+                f"Low: {latest['low']:.2f}, Close: {latest['close']:.2f}, "
+                f"Volume: {latest['volume']}\n"
+            )
+            
+            # Add simple trend info
+            if len(df) > 1:
+                prev_close = df.iloc[1]['close']
+                change = latest['close'] - prev_close
+                change_pct = (change / prev_close) * 100
+                summary += f"Change: {change:+.2f} ({change_pct:+.2f}%)\n"
+            
+            # Simple technical indicator (e.g., 5-period SMA)
+            if len(df) >= 5:
+                sma_5 = df['close'].head(5).mean()
+                summary += f"5-Period SMA: {sma_5:.2f}\n"
+
+            # Truncate if necessary (simplified token counting)
+            if len(summary) > self.max_market_tokens:
+                summary = summary[:self.max_market_tokens] + "... [Truncated]"
+                
+            return summary
         except Exception as e:
-            logger.error(f"An unexpected error occurred during data parsing for {data_type}. Error: {e}")
-            return None
+            return f"Error formatting market data: {e}"
 
-    def adapt_market_event(self, raw_event: Dict[str, Any]) -> Optional[MarketEvent]:
-        """
-        Helper method to specifically adapt a market event.
+    def format_news_data(self, news_data: List[NewsData]) -> str:
+        """Converts a list of NewsData objects into a compact string."""
+        if not news_data:
+            return "No recent news available."
+
+        # Sort by timestamp, most recent first
+        sorted_news = sorted(news_data, key=lambda x: x.timestamp, reverse=True)
         
-        This might include more complex logic, like field remapping,
-        before validation.
-        """
-        # Example: Simple remapping if fields didn't match
-        # if 'title' in raw_event and 'headline' not in raw_event:
-        #     raw_event['headline'] = raw_event.pop('title')
+        output = "Recent News:\n"
+        total_len = len(output)
+        
+        for item in sorted_news:
+            # Format: [Timestamp] (Source) Headline: Summary
+            headline = item.headline or "No Headline"
+            summary = item.summary or "No Summary"
+            source = item.source or "Unknown Source"
             
-        return self.parse_data(raw_event, "market_event")
+            entry = (
+                f"- [{item.timestamp.isoformat()}] ({source}) {headline}: {summary}\n"
+            )
+            
+            if total_len + len(entry) > self.max_news_tokens:
+                output += "... [Truncated]"
+                break
+                
+            output += entry
+            total_len += len(entry)
+            
+        return output
 
-    def adapt_ticker_data(self, raw_tick: Dict[str, Any]) -> Optional[TickerData]:
-        """
-        Helper method to specifically adapt a raw ticker data point.
-        """
-        # Business logic for adaptation can go here
-        # e.g., converting units, parsing non-standard timestamps
-        return self.parse_data(raw_tick, "ticker_data")
+    def format_economic_data(self, economic_data: List[EconomicIndicator]) -> str:
+        """Converts a list of EconomicIndicator objects into a compact string."""
+        if not economic_data:
+            return "No recent economic indicators available."
+            
+        # Sort by timestamp, most recent first
+        sorted_data = sorted(economic_data, key=lambda x: x.timestamp, reverse=True)
 
-# Example Usage (if run directly for testing)
-if __name__ == "__main__":
-    import datetime
-    
-    logging.basicConfig(level=logging.INFO)
-    
-    adapter = DataAdapter()
-    
-    # 1. Test MarketEvent
-    raw_news = {
-        "event_id": "news_12345",
-        "timestamp": datetime.datetime.now().isoformat(),
-        "source": "Test Source",
-        "headline": "This is a test headline",
-        "content": "Full content of the test news.",
-        "symbols": ["TEST", "TICKER"],
-        "metadata": {"sentiment": 0.8}
-    }
-    
-    market_event = adapter.adapt_market_event(raw_news)
-    if market_event:
-        logger.info(f"Successfully adapted MarketEvent: {market_event.headline}")
-        logger.info(market_event.json())
+        output = "Recent Economic Indicators:\n"
+        total_len = len(output)
+
+        for item in sorted_data:
+            # Format: [Timestamp] Indicator: Value (Previous: X, Consensus: Y)
+            entry = f"- [{item.timestamp.isoformat()}] {item.name}: {item.value}"
+            details = []
+            if item.previous:
+                details.append(f"Previous: {item.previous}")
+            if item.consensus:
+                details.append(f"Consensus: {item.consensus}")
+            
+            if details:
+                entry += f" ({'; '.join(details)})\n"
+            else:
+                entry += "\n"
+
+            if total_len + len(entry) > self.max_economic_tokens:
+                output += "... [Truncated]"
+                break
+                
+            output += entry
+            total_len += len(entry)
+            
+        return output
+
+    def format_context(self, context: Dict[str, List[Any]]) -> str:
+        """
+        Takes a dictionary of context data (from PipelineState)
+        and formats it all into a single string.
+        """
+        formatted_strings = []
         
-    # 2. Test TickerData (NEW)
-    raw_tick = {
-        "symbol": "TEST",
-        "timestamp": datetime.datetime.now().isoformat(),
-        "open": 100.0,
-        "high": 101.0,
-        "low": 99.5,
-        "close": 100.5,
-        "volume": 10000
-    }
-    
-    ticker_data = adapter.adapt_ticker_data(raw_tick)
-    if ticker_data:
-        logger.info(f"Successfully adapted TickerData for: {ticker_data.symbol}")
-        logger.info(ticker_data.json())
+        if "market_data" in context:
+            formatted_strings.append(
+                self.format_market_data(context["market_data"])
+            )
+        if "news_data" in context:
+            formatted_strings.append(
+                self.format_news_data(context["news_data"])
+            )
+        if "economic_data" in context:
+            formatted_strings.append(
+                self.format_economic_data(context["economic_data"])
+            )
+        
+        # Add other data types as needed
+        # ...
 
-    # 3. Test Failed Validation
-    raw_bad_news = {
-        "event_id": "news_678",
-        "source": "Bad Source",
-        # 'timestamp' is missing (required)
-        "headline": "This will fail"
-    }
-    
-    bad_event = adapter.adapt_market_event(raw_bad_news)
-    if not bad_event:
-        logger.info("Successfully caught validation error for bad market event.")
+        return "\n\n".join(formatted_strings)
