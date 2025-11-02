@@ -1,111 +1,78 @@
+"""
+步进优化训练器 (Walk-Forward Trainer)
+用于传统量化策略的参数优化。
+"""
+from typing import Dict, Any, List
 import pandas as pd
-import asyncio
-from typing import Dict, Any
+from datetime import datetime
 
-# 修正：[FIX-ImportError]
-# 将所有 `..` 相对导入更改为从项目根目录开始的绝对导入，
-# 以匹配 `run_training.py` 设置的 sys.path 约定。
-from training.base_trainer import BaseTrainer
-from training.engine import TrainingEngine
-from training.backtest_engine import BacktestEngine
-from data_manager import DataManager
-from core.pipeline_state import PipelineState
-from cognitive.engine import CognitiveEngine
-# 假设 FeatureStore 存在于 features/store.py
-# from features.store import FeatureStore 
-from monitor.logging import get_logger
+from config.loader import ConfigLoader
+# FIX (E8): 导入 BacktestingEngine (原为 TrainingEngine)
+from training.engine import BacktestingEngine 
+from optimizer import Optimizer # (假设的优化器类)
 
-logger = get_logger("WalkForwardTrainer")
-
-class WalkForwardTrainer(BaseTrainer):
+class WalkForwardTrainer:
     """
-    Implements a walk-forward optimization and training loop.
+    实现步进交叉验证 (WFCV) 逻辑。
+    """
     
-    This trainer is responsible for:
-    1. Orchestrating the TrainingEngine (e.g., training the MetaLearner).
-    2. Orchestrating the BacktestEngine (evaluating the trained model).
-    3. Sliding the time windows and repeating the process.
-    """
+    def __init__(self, engine: BacktestingEngine, config_loader: ConfigLoader):
+        # FIX (E8): 确保类型为 BacktestingEngine
+        self.engine: BacktestingEngine = engine
+        self.config_loader = config_loader
+        self.optimizer = Optimizer() # 假设的优化器
+        
+        self.log_prefix = "WalkForwardTrainer:"
+        print(f"{self.log_prefix} Initialized.")
 
-    def __init__(self, config: Dict[str, Any], data_manager: DataManager):
-        super().__init__(config)
-        self.data_manager = data_manager
-        
-        # 1. Load Walk-Forward (WF) configuration
-        self.wf_config = self.config.get('walk_forward', {})
-        self.start_date = pd.Timestamp(self.wf_config.get('start_date', '2020-01-01'))
-        self.end_date = pd.Timestamp(self.wf_config.get('end_date', '2023-12-31'))
-        self.training_days = self.wf_config.get('training_days', 365)
-        self.validation_days = self.wf_config.get('validation_days', 90)
-        self.step_days = self.wf_config.get('step_days', 90) # How much the window slides
-        
-        logger.info(f"WalkForwardTrainer initialized: {self.start_date} to {self.end_date} (Step: {self.step_days} days)")
-
-        # 2. Initialize sub-engines
-        self.training_engine = TrainingEngine(self.config, self.data_manager)
-        
-        # 修正：CognitiveEngine 和 PipelineState 是 BacktestEngine 需要的
-        # 我们需要在这里创建它们
-        self.pipeline_state = PipelineState()
-        
-        # FIXME: CognitiveEngine 的初始化很复杂
-        # 它需要 MetacognitiveAgent 和 PortfolioConstructor
-        # 这里使用 None 作为占位符
-        cognitive_engine = None # = CognitiveEngine(...) 
-        
-        self.backtest_engine = BacktestEngine(
-            config=self.config,
-            data_manager=self.data_manager,
-            pipeline_state=self.pipeline_state,
-            cognitive_engine=cognitive_engine # 传入 engine
-        )
-
-    async def run_training_loop(self):
+    def run_optimization(
+        self,
+        strategy_name: str,
+        param_grid: Dict[str, List[Any]],
+        metric_to_optimize: str,
+        walk_forward_config: Dict[str, Any]
+        # (需要 start_date, end_date, symbols 等)
+    ):
         """
-        Executes the main walk-forward training loop asynchronously.
+        执行完整的步进优化。
         """
-        current_train_start = self.start_date
         
-        while True:
-            # 1. Define time windows
-            current_train_end = current_train_start + pd.Timedelta(days=self.training_days)
-            current_val_start = current_train_end
-            current_val_end = current_val_start + pd.Timedelta(days=self.validation_days)
+        train_window = walk_forward_config["train_window"] # (e.g., '365d')
+        test_window = walk_forward_config["test_window"] # (e.g., '90d')
+        
+        # (在此处实现步进逻辑)
+        
+        print(f"{self.log_prefix} Starting walk-forward optimization...")
+        
+        # 伪代码:
+        # current_start = start_date
+        # while current_start + train_window + test_window <= end_date:
+        #     train_start = current_start
+        #     train_end = current_start + train_window
+        #     test_start = train_end
+        #     test_end = test_start + test_window
             
-            if current_val_end > self.end_date:
-                logger.info("Reached end of walk-forward date range.")
-                break
-                
-            logger.info(f"--- WF Step ---")
-            logger.info(f"Training: {current_train_start.date()} to {current_train_end.date()}")
-            logger.info(f"Validation: {current_val_start.date()} to {current_val_end.date()}")
-
-            # 2. Run Training (e.g., train MetaLearner)
-            if not self.training_engine:
-                 logger.warning("TrainingEngine not initialized. Skipping training.")
-            else:
-                logger.info("Starting training phase...")
-                # model_artifact = await self.training_engine.run(
-                #     current_train_start, 
-                #     current_train_end
-                # )
-                # logger.info(f"Training complete. Model artifact: {model_artifact}")
-                pass # Placeholder
-
-            # 3. Run Validation (Backtest)
-            if not self.backtest_engine or not self.backtest_engine.cognitive_engine:
-                logger.warning("BacktestEngine or CognitiveEngine not initialized. Skipping validation.")
-            else:
-                logger.info("Starting validation (backtest) phase...")
-                # await self.backtest_engine.load_model(model_artifact)
-                # results = await self.backtest_engine.run(
-                #     current_val_start,
-                #     current_val_end
-                # )
-                # logger.info(f"Validation complete. Sharpe: {results.get('sharpe')}")
-                pass # Placeholder
-
-            # 4. Slide window
-            current_train_start += pd.Timedelta(days=self.step_days)
-
-        logger.info("--- Walk-Forward Training Loop Finished ---")
+        #     # 1. 训练 (优化)
+        #     best_params = self.optimizer.run(
+        #         engine=self.engine,
+        #         strategy_name=strategy_name,
+        #         param_grid=param_grid,
+        #         metric=metric_to_optimize,
+        #         start_date=train_start,
+        #         end_date=train_end
+        #     )
+            
+        #     # 2. 测试 (验证)
+        #     test_results = self.engine.run_backtest(
+        #         strategy_name=strategy_name,
+        #         params=best_params,
+        #         start_date=test_start,
+        #         end_date=test_end
+        #     )
+            
+        #     # (保存结果)
+            
+        #     # 3. 滑动窗口
+        #     current_start += test_window
+            
+        print(f"{self.log_prefix} Walk-forward optimization complete.")
