@@ -1,155 +1,115 @@
-from typing import Dict, Any, List
-import asyncio
-from core.schemas.data_schema import Order, Execution
-from core.pipeline_state import PipelineState
-from events.event_distributor import EventDistributor
-from execution.adapters import BrokerAdapter
+"""
+订单管理器 (Order Manager)
+负责处理订单的整个生命周期：发送、监控、取消。
+"""
+from typing import List, Dict, Optional
+from .interfaces import IBrokerAdapter
+import threading
+
+# FIX (E2, E4): 从核心模式导入 Order, Fill, OrderStatus
+from core.schemas.data_schema import Order, Fill, OrderStatus
+
 from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 class OrderManager:
     """
-    Manages the full lifecycle of orders:
-    - Receives pending orders from PortfolioConstructor.
-    - Submits them via the BrokerAdapter.
-    - Listens for execution fills.
-    - Updates the PipelineState (portfolio) based on fills.
+    作为订单和券商适配器之间的中介。
+    跟踪所有活动订单的状态。
     """
-
-    def __init__(
-        self,
-        pipeline_state: PipelineState,
-        event_distributor: EventDistributor,
-        broker_adapter: BrokerAdapter,
-        config: Dict[str, Any]
-    ):
-        self.pipeline_state = pipeline_state
-        self.event_distributor = event_distributor
-        self.broker_adapter = broker_adapter
-        self.config = config
+    
+    def __init__(self, broker: IBrokerAdapter):
+        self.broker = broker
+        self.active_orders: Dict[str, Order] = {} # key: order_id
+        self.lock = threading.Lock()
         
-        # In-memory tracking of orders
-        self._open_orders: Dict[str, Order] = {} # {order_id: Order}
+        # 订阅券商的回调
+        self.broker.subscribe_fills(self._on_fill)
+        self.broker.subscribe_order_status(self._on_order_status_update)
         
-        logger.info(f"OrderManager initialized with adapter: {broker_adapter.__class__.__name__}")
+        self.log_prefix = "OrderManager:"
+        logger.info(f"{self.log_prefix} Initialized.")
 
-    async def initialize(self):
-        """Initialize the broker adapter and subscribe to events."""
-        try:
-            await self.broker_adapter.initialize()
-            # Subscribe to execution events published by the adapter
-            await self.event_distributor.subscribe("order_execution", self.on_execution)
-            logger.info("OrderManager initialized and subscribed to executions.")
-        except Exception as e:
-            logger.error(f"Failed to initialize OrderManager: {e}", exc_info=True)
-            raise
+    def _on_fill(self, fill: Fill):
+        """
+        处理来自券商的成交回报 (Fill)。
+        """
+        with self.lock:
+            logger.info(f"{self.log_prefix} Received Fill: {fill.order_id} ({fill.quantity} @ {fill.price})")
+            
+            order = self.active_orders.get(fill.order_id)
+            if not order:
+                logger.warning(f"{self.log_prefix} Received fill for unknown order {fill.order_id}")
+                return
+                
+            # 这里的逻辑需要更复杂，以处理部分成交 (PARTIALLY_FILLED)
+            # 为简化起见，我们假设一个 Fill 意味着订单
+            # 状态将在 _on_order_status_update 中更新
 
-    async def submit_order(self, order: Order):
-        """Submits a new order to the broker."""
-        if order.id in self._open_orders:
-            logger.warning(f"Order {order.id} is already being tracked.")
+            # TODO: 将 Fill 事件转发给 TradeLifecycleManager
+
+    def _on_order_status_update(self, order: Order):
+        """
+        处理来自券商的订单状态更新。
+        """
+        with self.lock:
+            logger.info(f"{self.log_prefix} Status Update: Order {order.id} is now {order.status}")
+            
+            if order.status in [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED]:
+                # 订单生命周期结束，从活动列表中移除
+                if order.id in self.active_orders:
+                    del self.active_orders[order.id]
+                    logger.info(f"{self.log_prefix} Order {order.id} closed.")
+            else:
+                # 更新活动订单的状态
+                self.active_orders[order.id] = order
+
+    def submit_orders(self, orders: List[Order]):
+        """
+        向券商提交一批新订单。
+        """
+        if not orders:
             return
             
-        try:
-            logger.info(f"Submitting order {order.id} to broker...")
-            submitted_order = await self.broker_adapter.submit_order(order)
-            
-            if submitted_order.status == "REJECTED":
-                logger.error(f"Order {order.id} was REJECTED by broker: {submitted_order.reject_reason}")
-                await self.event_distributor.publish(
-                    "order_rejected", order=submitted_order
-                )
-            elif submitted_order.status == "FILLED":
-                logger.info(f"Order {order.id} was filled immediately (simulated).")
-                # The adapter should have already published this event
-                pass
-            else: # e.g., "PENDING", "ACCEPTED"
-                logger.info(f"Order {order.id} is open with status: {submitted_order.status}")
-                self._open_orders[submitted_order.id] = submitted_order
+        with self.lock:
+            for order in orders:
+                if order.id in self.active_orders:
+                    logger.warning(f"{self.log_prefix} Attempted to submit duplicate order {order.id}")
+                    continue
                 
-        except Exception as e:
-            logger.error(f"Error submitting order {order.id}: {e}", exc_info=True)
-            order.status = "REJECTED"
-            order.reject_reason = f"Submission error: {e}"
-            await self.event_distributor.publish("order_rejected", order=order)
+                try:
+                    broker_order_id = self.broker.place_order(order)
+                    # broker_order_id 可能与 order.id 不同
+                    # 真实系统中需要处理这种映射
+                    
+                    order.status = OrderStatus.PENDING # 假设 place_order 是异步的
+                    self.active_orders[order.id] = order
+                    logger.info(f"{self.log_prefix} Submitted order {order.id} (Broker ID: {broker_order_id})")
+                    
+                except Exception as e:
+                    logger.error(f"{self.log_prefix} Failed to place order {order.id}: {e}")
+                    order.status = OrderStatus.REJECTED # 标记为本地拒绝
 
-    async def on_execution(self, pipeline_state: PipelineState, execution: Execution):
+    def cancel_all_open_orders(self):
         """
-        Callback for 'order_execution' events.
-        This is the most critical part: updating the portfolio state.
+        取消所有活动的订单。
         """
-        logger.info(f"Received execution: {execution.quantity} {execution.symbol} @ {execution.fill_price}")
-        
-        try:
-            # 1. Update the order status
-            if execution.order_id in self._open_orders:
-                order = self._open_orders[execution.order_id]
-                # TODO: Handle partial fills
-                order.filled_quantity += execution.quantity
-                order.status = "FILLED" # Simplified
-                del self._open_orders[execution.order_id]
-            else:
-                logger.warning(f"Received execution for untracked/already-filled order: {execution.order_id}")
+        with self.lock:
+            logger.info(f"{self.log_prefix} Cancelling all {len(self.active_orders)} open orders...")
+            # 复制列表以避免在迭代时修改
+            order_ids = list(self.active_orders.keys())
             
-            # 2. Update trade history
-            await self.pipeline_state.update_state({"trade_history": [execution]})
-            
-            # 3. Update portfolio (the hard part)
-            portfolio = await self.pipeline_state.get_portfolio()
-            positions = portfolio.get("positions", {})
-            cash = portfolio.get("cash", 0.0)
-            
-            symbol = execution.symbol
-            quantity = execution.quantity
-            fill_price = execution.fill_price
-            commission = execution.commission
-            
-            # --- Update Cash ---
-            trade_cost = (quantity * fill_price) # Negative for buys, positive for sells
-            cash -= trade_cost
-            cash -= commission
-            
-            # --- Update Position ---
-            position = positions.get(symbol, {"size": 0, "avg_price": 0, "market_value": 0})
-            
-            current_size = position["size"]
-            current_avg_price = position["avg_price"]
-            
-            new_size = current_size + quantity
-            
-            if new_size == 0:
-                # Position closed
-                new_avg_price = 0
-            elif (current_size * quantity) >= 0: # Adding to position (or opening)
-                # Weighted average price
-                new_avg_price = ((current_avg_price * current_size) + (fill_price * quantity)) / new_size
-            else:
-                # Reducing position (realizing PnL)
-                # Average price does not change
-                new_avg_price = current_avg_price
+        for order_id in order_ids:
+            try:
+                self.broker.cancel_order(order_id)
+                logger.info(f"{self.log_prefix} Cancel request sent for {order_id}")
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Failed to cancel order {order_id}: {e}")
                 
-            position["size"] = new_size
-            position["avg_price"] = new_avg_price
-            
-            positions[symbol] = position
-            
-            # --- Recalculate Portfolio Value ---
-            # This requires getting *all* current market prices
-            # For simplicity, we'll just update cash and positions
-            # A separate "PortfolioManager" service should update market values.
-            
-            new_portfolio_state = {
-                "cash": cash,
-                "positions": positions
-                # "total_value" should be updated by another process
-            }
-            
-            await self.pipeline_state.update_portfolio(new_portfolio_state)
-            
-            logger.info(f"Portfolio updated for {symbol}: New Size {new_size}, New Cash {cash:.2f}")
-
-        except Exception as e:
-            logger.error(f"Failed to process execution {execution.execution_id}: {e}", exc_info=True)
-            # This is a critical error!
-            # await self.event_distributor.publish("CRITICAL_ERROR", ...)
+    def get_open_orders(self) -> List[Order]:
+        """
+        获取所有活动订单的当前状态。
+        """
+        with self.lock:
+            return list(self.active_orders.values())
