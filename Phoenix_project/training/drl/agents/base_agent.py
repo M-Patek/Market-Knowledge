@@ -1,33 +1,61 @@
-# (原: drl/agents/base_agent.py)
-# (无内部导入，无需修复)
-
+# (原: ai/base_trainer.py)
 from abc import ABC, abstractmethod
 from typing import Dict, Any
+# 修复：将相对导入 'from ..core.pipeline_state...' 更改为绝对导入
+from core.pipeline_state import PipelineState
+# 修复：将相对导入 'from ..data_manager...' 更改为绝对导入
+from data_manager import DataManager
+# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
 
-class BaseAgent(ABC):
+logger = get_logger(__name__)
+
+class BaseTrainer(ABC):
     """
-    (在线推理) DRL 智能体的基类。
-    定义了在“在线推理”阶段（在 CognitiveEngine 中）如何调用 DRL 智能体。
+    训练器的抽象基类。
+    定义了所有训练器（如滚动优化、DRL）必须实现的通用接口。
     """
-    def __init__(self, config: Dict[str, Any], model_path: str):
+
+    def __init__(self, config: Dict[str, Any], data_manager: DataManager):
+        """
+        初始化训练器。
+
+        Args:
+            config (Dict[str, Any]): 'training' 部分的配置。
+            data_manager (DataManager): 用于访问历史数据的数据管理器。
+        """
         self.config = config
-        self.model_path = model_path
-        self.model = self.load_model(model_path)
+        self.data_manager = data_manager
+        self.model = None # 训练产出的模型
+        logger.info(f"Trainer '{self.__class__.__name__}' 已初始化。")
 
     @abstractmethod
-    def load_model(self, path: str) -> Any:
+    async def run_training_loop(self):
         """
-        加载训练好的 DRL 模型 (例如 PPO.load)。
-        """
-        # 示例:
-        # from stable_baselines3 import PPO
-        # return PPO.load(path)
-        print(f"模拟：从 {path} 加载模型")
-        return "loaded_model_object"
-
-    @abstractmethod
-    def predict(self, observation: Any) -> Any:
-        """
-        执行模型推理。
+        执行主要的训练循环（例如，滚动窗口）。
         """
         pass
+
+    @abstractmethod
+    def evaluate_model(self, validation_data: Any) -> Dict[str, float]:
+        """
+        在验证集上评估当前模型。
+        """
+        pass
+
+    @abstractmethod
+    def save_model(self, path: str):
+        """
+        将训练好的模型保存到磁盘。
+        """
+        if self.model is None:
+            logger.warning("没有可保存的模型。")
+            return
+        logger.info(f"模型已保存到: {path}")
+
+    @abstractmethod
+    def load_model(self, path: str):
+        """
+        从磁盘加载模型。
+        """
+        logger.info(f"模型已从: {path} 加载。")
