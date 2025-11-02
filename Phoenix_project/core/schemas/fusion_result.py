@@ -1,60 +1,33 @@
 """
-Pydantic schemas for AI agent outputs (AgentDecision) and the final
-combined result (FusionResult).
+FusionResult Schema
+- 定义认知引擎中 "Fusion" (融合) 步骤的输出数据结构。
 """
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+from typing import List, Optional, Any
 
-# --- 新增的 AgentDecision Schema ---
-class AgentDecision(BaseModel):
-    """
-    Standardized output schema for a single AI agent's decision.
-    Each agent in the ensemble must return this structure.
-    """
-    agent_name: str = Field(..., description="Name of the agent that produced this decision")
-    timestamp: datetime = Field(default_factory=datetime.now, description="Timestamp of when the decision was made")
-    
-    # Core Decision Components
-    confidence: float = Field(..., description="Agent's confidence in its assessment (0.0 to 1.0)", ge=0, le=1)
-    sentiment: float = Field(..., description="Agent's sentiment assessment (-1.0 to 1.0)", ge=-1, le=1)
-    predicted_impact: float = Field(..., description="Agent's predicted impact score (-1.0 to 1.0)", ge=-1, le=1)
-    
-    # Rationale
-    rationale: str = Field(..., description="A brief, clear justification for the decision")
-    key_evidence_ids: List[str] = Field(default_factory=list, description="List of event_ids or doc_ids from the context that were most influential")
-    
-    # Optional metadata
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Any other relevant data (e.g., predicted timeframe, specific metrics)")
-
-    class Config:
-        arbitrary_types_allowed = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
-
-# --- 新增的 FusionResult Schema ---
 class FusionResult(BaseModel):
     """
-    Schema for the final, synthesized result after fusing multiple
-    AgentDecisions. This is the ultimate output of the cognitive layer.
+    保存来自 MetacognitiveAgent 融合步骤的结构化输出。
     """
-    fusion_timestamp: datetime = Field(default_factory=datetime.now, description="Timestamp of when the fusion was completed")
     
-    # Fused (Final) Decision
-    fused_confidence: float = Field(..., description="Combined confidence score (0.0 to 1.0)", ge=0, le=1)
-    fused_sentiment: float = Field(..., description="Combined sentiment score (-1.0 to 1.0)", ge=-1, le=1)
-    fused_predicted_impact: float = Field(..., description="Combined impact score (-1.0 to 1.0)", ge=-1, le=1)
+    # (假设的现有字段)
+    insights: List[Any] = Field(default_factory=list, description="融合后的见解列表")
+    confidence_scores: List[float] = Field(default_factory=list, description="每个见解的置信度")
     
-    # Uncertainty Metric
-    cognitive_uncertainty: float = Field(..., description="Calculated uncertainty or disagreement among agents (0.0 to 1.0)", ge=0, le=1)
+    # 关键修正 (Error 8):
+    # 添加 UncertaintyGuard (不确定性守卫) 所需的字段
     
-    # Rationale and Lineage
-    fused_rationale: str = Field(..., description="Synthesized rationale explaining the final decision and how agent opinions were weighed")
-    contributing_decisions: List[AgentDecision] = Field(..., description="The list of individual AgentDecisions that were used in this fusion")
+    status: str = Field(default="PENDING", description="融合结果的状态 (e.g., PENDING, SUCCESS, FAILED)")
     
+    final_decision: Optional[Any] = Field(None, description="融合后的最终决策或信号")
+    
+    error_message: Optional[str] = Field(None, description="如果 status 为 FAILED，记录错误信息")
+
+
     class Config:
+        """
+        Pydantic 配置
+        """
+        # (允许模型中存在任意类型，例如复杂的分析对象)
         arbitrary_types_allowed = True
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
+        validate_assignment = True
