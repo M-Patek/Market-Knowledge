@@ -1,55 +1,32 @@
-from typing import Dict, Any, List
+"""
+信号协议 (Signal Protocol)
+(这个文件在修复后变得很简单)
+
+负责定义信号的结构。
+"""
+
+# FIX (E2): 从 data_schema 导入 Signal
 from core.schemas.data_schema import Signal
-from monitor.logging import get_logger
 
-logger = get_logger(__name__)
+# FIX (E6): 移除了 StrategySignal 的导入，因为它不存在
+# from .interfaces import StrategySignal 
 
-class SignalProtocol:
+class SignalProcessor:
     """
-    Defines and validates the structure of signals used within
-    the system.
+    (占位符) 
+    在更复杂的系统中，这可能负责转换、验证或
+    充实来自不同策略的信号。
+    """
     
-    This class is mostly a validator and standardizer. The main
-    schema is defined in `core.schemas.data_schema.Signal`.
-    """
+    def __init__(self):
+        pass
 
-    def __init__(self, config: Dict[str, Any] = None):
-        self.config = config or {}
-        self.known_signal_types = self.config.get("known_signal_types", [
-            "AI_COGNITIVE",
-            "TECHNICAL_ANALYSIS",
-            "MANUAL_OVERRIDE"
-        ])
-        logger.info("SignalProtocol initialized.")
-
-    def validate_signal(self, signal_data: Dict[str, Any]) -> (bool, str, Signal):
+    def validate_signal(self, signal: Signal) -> bool:
         """
-        Validates raw signal data and attempts to parse it into
-        a standardized Signal object.
-        
-        Returns:
-            (bool, str, Signal): (is_valid, error_message, parsed_signal)
+        验证信号是否有效。
         """
-        try:
-            signal = Signal(**signal_data)
-            
-            # Additional semantic validation
-            if signal.signal_type not in self.known_signal_types:
-                return (False, f"Unknown signal_type: {signal.signal_type}", None)
-                
-            if not (-1 <= signal.direction <= 1):
-                return (False, f"Invalid direction: {signal.direction}", None)
-                
-            if not (0.0 <= signal.strength <= 1.0):
-                 return (False, f"Invalid strength: {signal.strength}", None)
-                 
-            return (True, "", signal)
-            
-        except Exception as e: # e.g., Pydantic ValidationError
-            logger.warning(f"Failed to validate signal: {e}")
-            return (False, f"Validation error: {e}", None)
-            
-    def create_signal(self, *args, **kwargs) -> Signal:
-        """Helper method to create a valid Signal object."""
-        # This just passes through to the Pydantic model
-        return Signal(*args, **kwargs)
+        if signal.strength < 0 or signal.strength > 1:
+            return False
+        if signal.signal_type not in ("BUY", "SELL", "HOLD"):
+            return False
+        return True
