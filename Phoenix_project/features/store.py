@@ -1,114 +1,67 @@
-from typing import Dict, Any, Optional, List
+"""
+特征存储 (Feature Store)
+用于存储、检索和管理用于模型训练和推理的特征。
+"""
+from typing import List, Dict, Any, Optional
 import pandas as pd
-from core.schemas.feature_schema import Feature
-from features.base import FeatureBase
-from monitor.logging import get_logger
+from datetime import datetime
 
-logger = get_logger(__name__)
+# FIX (E8): 导入 IFeatureStore 接口 (原为 FeatureBase)
+from .base import IFeatureStore
 
-class FeatureStore:
+class FeatureStore(IFeatureStore):
     """
-    Manages the lifecycle of features:
-    - Registration of feature calculation logic.
-    - Calculation/computation of features.
-    - Storage and retrieval of feature values.
+    特征存储的实现。
+    (目前是一个占位符，可以基于 Parquet 文件或数据库实现)
+    """
     
-    This is simplified. A real feature store (e.g., Feast, Tecton)
-    is a major piece of infrastructure.
-    """
+    def __init__(self, base_path: str):
+        self.base_path = base_path
+        self.cache: Dict[str, pd.DataFrame] = {}
+        print(f"FeatureStore initialized at {base_path}")
 
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self._feature_registry: Dict[str, FeatureBase] = {}
-        
-        # In-memory storage for feature values (e.g., {feature_name: DataFrame})
-        self.feature_storage: Dict[str, pd.DataFrame] = {} 
-        logger.info("FeatureStore initialized.")
-
-    def register_feature(self, feature_instance: FeatureBase):
-        """Registers a feature calculation class."""
-        name = feature_instance.name
-        if name in self._feature_registry:
-            logger.warning(f"Feature '{name}' is already registered. Overwriting.")
-        self._feature_registry[name] = feature_instance
-        logger.info(f"Feature registered: {name}")
-
-    def load_features_from_config(self, feature_configs: List[Dict[str, Any]]):
-        """
-        Loads and registers features from a config list.
-        Requires dynamic import.
-        """
-        # Placeholder for dynamic import
-        # Example:
-        # for config in feature_configs:
-        #   module = importlib.import_module(config['module'])
-        #   class_ = getattr(module, config['class'])
-        #   instance = class_(**config.get('params', {}))
-        #   self.register_feature(instance)
-        logger.warning("FeatureStore.load_features_from_config is not implemented.")
-
-    async def calculate_features(
+    def get_features(
         self,
-        data_context: Dict[str, pd.DataFrame],
-        features_to_run: Optional[List[str]] = None
-    ) -> Dict[str, pd.Series]:
+        feature_set_name: str,
+        entity_ids: List[str],
+        start_time: datetime,
+        end_time: datetime
+    ) -> Optional[pd.DataFrame]:
         """
-        Calculates one or more features based on the provided data.
-        
-        Args:
-            data_context (Dict[str, pd.DataFrame]): All available raw data,
-                                                  e.g., {"market_data_AAPL": df, ...}
-            features_to_run (Optional[List[str]]): List of feature names to run.
-                                                   If None, runs all registered.
-                                                   
-        Returns:
-            A dictionary of {feature_name: pd.Series}
+        检索一个特征集。
         """
-        if features_to_run is None:
-            features_to_run = list(self._feature_registry.keys())
-            
-        logger.info(f"Calculating {len(features_to_run)} features...")
+        # 这是一个占位符实现
+        print(f"Retrieving features for {feature_set_name} from {start_time} to {end_time}")
         
-        results: Dict[str, pd.Series] = {}
-        
-        for name in features_to_run:
-            if name not in self._feature_registry:
-                logger.warning(f"Cannot calculate feature '{name}': Not registered.")
-                continue
-                
-            feature_obj = self._feature_registry[name]
+        # 示例：尝试从缓存或文件加载
+        if feature_set_name in self.cache:
+            df = self.cache[feature_set_name]
+        else:
+            # (在此处实现从 Parquet 加载的逻辑)
+            # df = pd.read_parquet(f"{self.base_path}/{feature_set_name}.parquet")
+            # self.cache[feature_set_name] = df
+            print(f"Warning: Feature set {feature_set_name} not found in cache.")
+            return None
             
-            try:
-                # Check if dependencies are met
-                required_data_key = feature_obj.dependencies[0] # Simplified
-                if required_data_key not in data_context:
-                    logger.error(f"Cannot calculate feature '{name}': Missing dependency '{required_data_key}'.")
-                    continue
-                    
-                input_df = data_context[required_data_key]
-                
-                # Run calculation
-                feature_series = await feature_obj.calculate(input_df)
-                results[name] = feature_series
-                
-                # Store/cache the result
-                # This simple cache just stores the latest calculation
-                self.feature_storage[name] = feature_series.to_frame(name)
-                
-                logger.debug(f"Feature '{name}' calculated successfully.")
-                
-            except Exception as e:
-                logger.error(f"Failed to calculate feature '{name}': {e}", exc_info=True)
-                
-        return results
+        # (在此处实现基于 entity_ids 和时间的过滤)
+        # filtered_df = df[...]
+        # return filtered_df
+        
+        return pd.DataFrame() # 返回空
+        
 
-    def get_feature(self, feature_name: str) -> Optional[pd.DataFrame]:
-        """Retrieves the last calculated values for a feature."""
-        return self.feature_storage.get(feature_name)
+    def register_feature_set(self, feature_set_name: str, schema: Dict[str, Any]):
+        """
+        注册一个新的特征集（例如，创建表或目录）。
+        """
+        print(f"Registering feature set: {feature_set_name} with schema {schema}")
+        pass
 
-    def get_latest_feature_value(self, feature_name: str) -> Any:
-        """Gets the most recent value of a feature."""
-        df = self.get_feature(feature_name)
-        if df is not None and not df.empty:
-            return df.iloc[-1][feature_name]
-        return None
+    def ingest_features(self, feature_set_name: str, data: pd.DataFrame):
+        """
+        将新的特征数据写入存储。
+        """
+        print(f"Ingesting {len(data)} rows into {feature_set_name}")
+        
+        # (在此处实现写入 Parquet 或数据库的逻辑)
+        pass
