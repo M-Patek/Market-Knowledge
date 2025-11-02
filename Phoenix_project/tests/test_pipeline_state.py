@@ -1,122 +1,127 @@
+"""
+测试 PipelineState (已更新)
+"""
 import pytest
-import pandas as pd
-from datetime import timedelta
+from datetime import datetime
 
-# 修正：[FIX-ImportError]
-# 将所有 `..` 相对导入更改为从项目根目录开始的绝对导入，
-# 以匹配 `conftest.py` 设置的 sys.path 约定。
 from core.pipeline_state import PipelineState
+from core.schemas.data_schema import MarketData, PortfolioState, Position, NewsData
+
+# FIX (E10): 重写测试以匹配新的构造函数和 API
 
 @pytest.fixture
-def state():
-    """Returns a fresh PipelineState instance for each test."""
-    return PipelineState(max_recent_events=5)
+def empty_state():
+    """
+    返回一个具有默认配置的新 PipelineState。
+    """
+    # (E5 Fix) 使用新的构造函数
+    return PipelineState(initial_state=None, max_history=10)
 
-def test_pipeline_state_init(state):
-    """Tests the initial default values of the state."""
-    assert state.get_current_time() is not None
-    assert isinstance(state.get_current_time(), pd.Timestamp)
-    
-    market_state = state.get_market_state()
-    assert market_state["regime"] == "Unknown"
-    assert market_state["volatility"] == 0.0
-    assert market_state["sentiment"] == 0.0
-    
-    portfolio_state = state.get_portfolio_state()
-    assert portfolio_state["total_value"] == 0.0
-    assert portfolio_state["cash"] == 0.0
-    assert portfolio_state["positions"] == {}
-    
-    system_health = state.get_system_health()
-    assert system_health["components"] == {"Orchestrator": "OK"}
-    assert system_health["last_error"] is None
-    
-    assert state.get_recent_events() == []
+@pytest.fixture
+def sample_portfolio_state():
+    """
+    返回一个示例投资组合状态。
+    """
+    return PortfolioState(
+        timestamp=datetime(2023, 1, 1, 10, 0, 0),
+        cash=100000.0,
+        total_value=105000.0,
+        positions={
+            "AAPL": Position(
+                symbol="AAPL",
+                quantity=100.0,
+                average_price=150.0,
+                market_value=15000.0, # (应为 100 * 150)
+                unrealized_pnl=0.0
+            )
+        }
+    )
 
-def test_time_update(state):
-    """Tests updating and retrieving the current time."""
-    new_time = pd.Timestamp.utcnow() - timedelta(days=1)
-    state.update_time(new_time)
-    assert state.get_current_time() == new_time
+@pytest.fixture
+def sample_market_data():
+    """
+    返回一个 MarketData 示例。
+    """
+    return MarketData(
+        symbol="AAPL",
+        timestamp=datetime(2023, 1, 1, 12, 0, 0),
+        open=151.0, high=152.0, low=150.0, close=151.5, volume=10000
+    )
 
-def test_market_state_update(state):
-    """Tests updating and retrieving the market state."""
-    state.update_market_state(regime="Bull", volatility=0.5, sentiment=0.8)
-    market_state = state.get_market_state()
-    assert market_state["regime"] == "Bull"
-    assert market_state["volatility"] == 0.5
-    assert market_state["sentiment"] == 0.8
+def test_pipeline_state_initialization(empty_state: PipelineState):
+    """
+    测试 PipelineState 是否正确初始化。
+    """
+    assert empty_state.current_time == datetime.min
+    assert empty_state.get_latest_portfolio_state() is None
+    assert empty_state.max_history == 10
 
-def test_portfolio_state_update(state):
-    """Tests updating and retrieving the portfolio state."""
-    new_positions = {"AAPL": 10.0, "MSFT": 5.0}
-    state.update_portfolio(total_value=1500.0, cash=500.0, positions=new_positions)
-    
-    portfolio_state = state.get_portfolio_state()
-    assert portfolio_state["total_value"] == 1500.0
-    assert portfolio_state["cash"] == 500.0
-    assert portfolio_state["positions"] == new_positions
-    
-    # Test that a copy is returned
-    new_positions["GOOG"] = 1.0
-    assert state.get_portfolio_state()["positions"] == {"AAPL": 10.0, "MSFT": 5.0}
+def test_update_time(empty_state: PipelineState):
+    """
+    测试时间更新。
+    """
+    new_time = datetime(2023, 1, 1, 12, 0, 0)
+    empty_state.update_time(new_time)
+    assert empty_state.current_time == new_time
 
-def test_event_queue(state):
-    """Tests the FIFO queue functionality for recent events."""
-    assert state._recent_events.maxlen == 5
+def test_update_portfolio_state(empty_state: PipelineState, sample_portfolio_state: PortfolioState):
+    """
+    测试投资组合状态的更新和检索。
+    """
+    empty_state.update_portfolio_state(sample_portfolio_state)
     
-    ev1 = {"id": 1}
-    ev2 = {"id": 2}
-    ev3 = {"id": 3}
-    ev4 = {"id": 4}
-    ev5 = {"id": 5}
-    ev6 = {"id": 6}
-    
-    state.add_event(ev1)
-    state.add_event(ev2)
-    state.add_event(ev3)
-    
-    assert state.get_recent_events() == [ev3, ev2, ev1]
-    
-    state.add_event(ev4)
-    state.add_event(ev5)
-    
-    assert state.get_recent_events() == [ev5, ev4, ev3, ev2, ev1]
-    
-    # Add one more, ev1 should be pushed out
-    state.add_event(ev6)
-    assert state.get_recent_events() == [ev6, ev5, ev4, ev3, ev2]
+    latest_state = empty_state.get_latest_portfolio_state()
+    assert latest_state is not None
+    assert latest_state.cash == 100000.0
+    assert latest_state.positions["AAPL"].quantity == 100.0
 
-def test_system_health_update(state):
-    """Tests updating component health and errors."""
-    state.update_component_health("DataManager", "Warning", "API key missing")
+def test_update_data_batch_and_history(empty_state: PipelineState, sample_market_data: MarketData):
+    """
+    测试数据批次更新和历史记录（deque）。
+    """
+    sample_news = NewsData(
+        id="news1",
+        source="Reuters",
+        timestamp=datetime(2023, 1, 1, 11, 0, 0),
+        symbols=["AAPL"],
+        content="Test news."
+    )
     
-    health = state.get_system_health()
-    assert health["components"] == {
-        "Orchestrator": "OK",
-        "DataManager": "Warning"
+    data_batch = {
+        "market_data": [sample_market_data],
+        "news_data": [sample_news],
+        "economic_indicators": []
     }
-    assert health["last_error"] == "[DataManager] API key missing"
     
-    state.update_component_health("DataManager", "OK")
-    health = state.get_system_health()
-    assert health["components"]["DataManager"] == "OK"
-    # Last error should persist until cleared (or overwritten)
-    assert health["last_error"] == "[DataManager] API key missing"
+    empty_state.update_data_batch(data_batch)
     
-    state.update_component_health("Worker", "Error", "Redis connection failed")
-    assert state.get_system_health()["last_error"] == "[Worker] Redis connection failed"
+    assert len(empty_state.market_data_history) == 1
+    assert len(empty_state.news_history) == 1
+    assert empty_state.market_data_history[0].symbol == "AAPL"
+    
+    # 测试历史记录的 maxlen
+    for i in range(15):
+        empty_state.update_data_batch(data_batch)
+        
+    assert len(empty_state.market_data_history) == empty_state.max_history
+    assert len(empty_state.market_data_history) == 10
 
-def test_full_state_snapshot(state):
-    """Tests the combined snapshot method."""
-    time = pd.Timestamp.utcnow()
-    state.update_time(time)
-    state.update_market_state("Bear", 0.9, -0.5)
+def test_get_latest_market_data(empty_state: PipelineState):
+    """
+    测试 get_latest_market_data 辅助函数。
+    """
+    md1 = MarketData(symbol="AAPL", timestamp=datetime(2023, 1, 1), open=1, high=1, low=1, close=1, volume=1)
+    md2 = MarketData(symbol="MSFT", timestamp=datetime(2023, 1, 2), open=1, high=1, low=1, close=1, volume=1)
+    md3 = MarketData(symbol="AAPL", timestamp=datetime(2023, 1, 3), open=2, high=2, low=2, close=2, volume=2)
     
-    snapshot = state.get_full_state_snapshot()
+    batch = {"market_data": [md1, md2, md3], "news_data": [], "economic_indicators": []}
+    empty_state.update_data_batch(batch)
     
-    assert snapshot["current_time"] == time
-    assert snapshot["market_state"]["regime"] == "Bear"
-    assert snapshot["portfolio_state"]["cash"] == 0.0
-    assert snapshot["system_health"]["components"]["Orchestrator"] == "OK"
-    assert snapshot["recent_events_count"] == 0
+    latest_aapl = empty_state.get_latest_market_data("AAPL")
+    latest_msft = empty_state.get_latest_market_data("MSFT")
+    
+    assert latest_aapl is not None
+    assert latest_aapl.close == 2.0 # 确保拿到的是最新的
+    
+    assert latest_msft is not None
+    assert latest_msft.close == 1.0
