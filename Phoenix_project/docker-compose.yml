@@ -1,79 +1,81 @@
-# Docker Compose for Phoenix Project
 version: '3.8'
 
 services:
   
-  rabbitmq:
-    image: "rabbitmq:3.10-management"
-    ports:
-      - "5672:5672"   # AMQP
-      - "15672:15672" # Management UI
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq/
-    networks:
-      - phoenix_net
-
   redis:
-    image: "redis:7.0-alpine"
+    image: redis:7.0-alpine
+    container_name: phoenix_redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    networks:
-      - phoenix_net
+
+  # (可选: PostgreSQL - 用于表格 RAG)
+  # postgres_db:
+  #   image: postgres:15-alpine
+  #   container_name: phoenix_postgres
+  #   environment:
+  #     POSTGRES_USER: phoenix
+  #     POSTGRES_PASSWORD: password
+  #     POSTGRES_DB: phoenix_db
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+
+  # (可选: Elasticsearch - 用于时序 RAG)
+  # elasticsearch:
+  #   image: elasticsearch:8.6.2
+  #   container_name: phoenix_elastic
+  #   environment:
+  #     - discovery.type=single-node
+  #     - xpack.security.enabled=false
+  #     - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+  #   ports:
+  #     - "9200:9200"
+  #   volumes:
+  #     - elastic_data:/usr/share/elasticsearch/data
 
   worker:
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
-      celery
-        -A worker worker
-        --loglevel=INFO
-        -Q cognitive_workflow
-        -c 1 # (并发数 1)
+    container_name: phoenix_worker
     depends_on:
-      - rabbitmq
       - redis
-    env_file:
-      - .env # (确保 .env 文件存在)
-    networks:
-      - phoenix_net
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - PHOENIX_CONFIG_PATH=/app/config
+      # (需要在此处或 env.example 中设置所有 API 密钥)
+      # - GEMINI_API_KEY=...
+      # - PINECONE_API_KEY=...
     volumes:
-      - .:/app # (将当前目录挂载到 /app)
+      - .:/app
+    # (如果需要实时券商，取消注释)
+    # deploy:
+    #   restart: always
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    
-    # 关键修正 (Error 10):
-    # Gunicorn 的入口点必须是定义了全局 'app' 实例的文件。
-    # 'interfaces.api_server:app' 是错误的，因为 'app' 在类内部。
-    # 'api.gateway:app' 是正确的 FastAPI 入口点。
-    command: >
-      gunicorn
-        -k uvicorn.workers.UvicornWorker
-        -w 4
-        -b 0.0.0.0:8000
-        api.gateway:app
-        
-    ports:
-      - "8000:8000"
+    container_name: phoenix_api
     depends_on:
       - redis
-      - rabbitmq
-    env_file:
-      - .env
-    networks:
-      - phoenix_net
+    ports:
+      - "8000:8000"
+    environment:
+      - PHOENIX_CONFIG_PATH=/app/config
+      # (需要 API 密钥)
     volumes:
       - .:/app
-
-networks:
-  phoenix_net:
-    driver: bridge
+    
+    # FIX (E9): 修复 API 入口点
+    # command: gunicorn -w 4 -b 0.0.0.0:8000 api.gateway:app
+    command: gunicorn -w 4 -b 0.0.0.0:8000 interfaces.api_server:app
 
 volumes:
-  rabbitmq_data:
   redis_data:
+  postgres_data:
+  elastic_data:
