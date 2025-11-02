@@ -1,85 +1,96 @@
-"""
-Relation Extractor for Knowledge Graph.
+from typing import Dict, Any, List
+import json
+from api.gateway import APIGateway
+from ai.prompt_manager import PromptManager
+from monitor.logging import get_logger
 
-Uses an LLM to extract entities (nodes) and relationships (edges)
-from unstructured text (e.g., MarketEvent content) to build or
-update a Knowledge Graph.
-"""
-import logging
-from typing import List, Dict, Any, Optional
-
-# 修复：使用正确的相对导入
-from ..api.gemini_pool_manager import GeminiPoolManager
-from ..core.schemas.data_schema import KnowledgeGraph, KGNode, KGRelation, MarketEvent
-from .prompt_manager import PromptManager
-from .prompt_renderer import PromptRenderer
-
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class RelationExtractor:
     """
-    Extracts entities and relations from text to build a Knowledge Graph.
+    Identical to GraphEncoder. Uses an LLM to extract entities and relationships
+    from text to build a Knowledge Graph.
+    
+    This class is aliased for semantic clarity in different parts of the system.
     """
 
-    def __init__(self,
-                 prompt_manager: PromptManager,
-                 prompt_renderer: PromptRenderer,
-                 gemini_pool: GeminiPoolManager,
-                 prompt_name: str = "relation_extractor"): # Example prompt name
-        
+    def __init__(self, api_gateway: APIGateway, prompt_manager: PromptManager):
+        self.api_gateway = api_gateway
         self.prompt_manager = prompt_manager
-        self.prompt_renderer = prompt_renderer
-        self.gemini_pool = gemini_pool
-        self.prompt_template = self.prompt_manager.get_prompt(prompt_name)
-        
-        if not self.prompt_template:
-            # Fallback or error if prompt is missing
-            logger.warning(f"Prompt '{prompt_name}' not found. Using a basic fallback.")
-            self.prompt_template = """
-            Extract entities and relations from the text.
-            Text: {{ event.content }}
-            Respond in JSON format: {"nodes": [...], "relations": [...]}
-            """
-        
+        self.prompt_name = "extract_relations" # Prompt optimized for (Subject, Predicate, Object)
         logger.info("RelationExtractor initialized.")
 
-    async def extract(self, event: MarketEvent) -> Optional[KnowledgeGraph]:
+    async def extract_relations(self, text_content: str, metadata: Dict[str, Any] = None) -> Dict[str, List[Dict]]:
         """
-        Extracts a KnowledgeGraph from a given MarketEvent.
-
+        Takes a block of text and converts it into a list of structured
+        graph relations (nodes and edges).
+        
         Args:
-            event: The MarketEvent to process.
-
+            text_content (str): The input text (e.g., news article, agent reasoning).
+            metadata (Dict[str, Any]): Optional metadata about the text (source, timestamp).
+            
         Returns:
-            A KnowledgeGraph object, or None if extraction fails.
+            Dict[str, List[Dict]]: A dictionary with "nodes" and "edges" keys.
+                                  e.g., {"nodes": [...], "edges": [...]}
+        """
+        if not text_content:
+            logger.warning("RelationExtractor received empty text content.")
+            return {"nodes": [], "edges": []}
+            
+        prompt = self.prompt_manager.get_prompt(
+            self.prompt_name,
+            text_content=text_content,
+            metadata=metadata or {}
+        )
+        
+        if not prompt:
+            logger.error(f"Could not get prompt '{self.prompt_name}'.")
+            return {"nodes": [], "edges": []}
+
+        try:
+            # We explicitly ask the LLM to return JSON
+            raw_response = await self.api_gateway.send_request(
+                model_name="gemini-pro", # Use a model good at JSON output
+                prompt=prompt,
+                temperature=0.1, # Low temperature for structured output
+                max_tokens=2048,
+            )
+            
+            return self._parse_graph_response(raw_response)
+            
+        except Exception as e:
+            logger.error(f"Error extracting relations: {e}", exc_info=True)
+            return {"nodes": [], "edges": []}
+
+    def _parse_graph_response(self, response: str) -> Dict[str, List[Dict]]:
+        """
+        Robustly parses the LLM's string response, expecting JSON.
+        (This is identical to GraphEncoder's parser)
         """
         try:
-            # 1. Render the prompt
-            full_prompt = self.prompt_renderer.render(
-                template_content=self.prompt_template,
-                event=event.dict() # Pass event as a dict
-            )
+            # The LLM response might be wrapped in ```json ... ```
+            if "```json" in response:
+                json_str = response.split("```json")[1].split("```")[0].strip()
+            elif "```" in response:
+                json_str = response.split("```")[1].split("```")[0].strip()
+            else:
+                json_str = response.strip()
+                
+            graph_data = json.loads(json_str)
             
-            # 2. Execute the LLM call
-            response_json = await self.gemini_pool.generate_json(
-                model_name="gemini-1.5-flash", # Use a fast model for extraction
-                prompt=full_prompt,
-                system_prompt="You are a data extraction expert. Respond ONLY with the requested JSON schema for a knowledge graph."
-            )
-            
-            if not response_json or 'nodes' not in response_json or 'relations' not in response_json:
-                logger.warning(f"Invalid JSON response from RelationExtractor for event {event.event_id}")
-                return None
-
-            # 3. Validate and build the KnowledgeGraph
-            kg = KnowledgeGraph(
-                nodes=[KGNode(**node) for node in response_json.get('nodes', [])],
-                relations=[KGRelation(**rel) for rel in response_json.get('relations', [])]
-            )
-            
-            logger.info(f"Successfully extracted {len(kg.nodes)} nodes and {len(kg.relations)} relations from event {event.event_id}.")
-            return kg
-
+            # Validate basic structure
+            if "nodes" in graph_data and "edges" in graph_data and \
+               isinstance(graph_data["nodes"], list) and \
+               isinstance(graph_data["edges"], list):
+                logger.info(f"Successfully parsed relations: {len(graph_data['nodes'])} nodes, {len(graph_data['edges'])} edges.")
+                return graph_data
+            else:
+                logger.warning(f"Parsed JSON lacks required 'nodes'/'edges' keys or valid types: {json_str}")
+                return {"nodes": [], "edges": []}
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode JSON from relation response: {e}. Response: {response[:200]}...")
+            return {"nodes": [], "edges": []}
         except Exception as e:
-            logger.error(f"Error during relation extraction for event {event.event_id}: {e}", exc_info=True)
-            return None
+            logger.error(f"Error parsing relation response: {e}", exc_info=True)
+            return {"nodes": [], "edges": []}
