@@ -1,33 +1,59 @@
+# (原: ai/base_trainer.py)
+# 导入路径 '..' 依然正确，因为 'training' 和 'ai' 都是 'Phoenix_project' 的子目录
+from abc import ABC, abstractmethod
 from typing import Dict, Any
+from ..core.pipeline_state import PipelineState
+from ..data_manager import DataManager
+from ..monitor.logging import get_logger
 
-class BaseTrainer:
+logger = get_logger(__name__)
+
+class BaseTrainer(ABC):
     """
-    (新文件)
-    所有训练器 (例如 WalkForwardTrainer) 的抽象基类。
-    
-    这是为了修复 ai/walk_forward_trainer.py 中
-    试图导入一个不存在的 .base_trainer 的问题。
+    训练器的抽象基类。
+    定义了所有训练器（如滚动优化、DRL）必须实现的通用接口。
     """
-    
-    def __init__(self, config: Dict[str, Any]):
+
+    def __init__(self, config: Dict[str, Any], data_manager: DataManager):
         """
-        初始化基础训练器。
-        
+        初始化训练器。
+
         Args:
-            config (Dict[str, Any]): 该训练器的特定配置块。
+            config (Dict[str, Any]): 'training' 部分的配置。
+            data_manager (DataManager): 用于访问历史数据的数据管理器。
         """
         self.config = config
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.logger.info(f"{self.__class__.__name__} initialized.")
+        self.data_manager = data_manager
+        self.model = None # 训练产出的模型
+        logger.info(f"Trainer '{self.__class__.__name__}' 已初始化。")
 
-    def train(self, data: Any) -> Any:
+    @abstractmethod
+    async def run_training_loop(self):
         """
-        在给定的数据上训练模型。
+        执行主要的训练循环（例如，滚动窗口）。
         """
-        raise NotImplementedError("Trainer 必须实现 train() 方法")
+        pass
 
-    def evaluate(self, model_artifacts: Any, validation_data: Any) -> Dict[str, float]:
+    @abstractmethod
+    def evaluate_model(self, validation_data: Any) -> Dict[str, float]:
         """
-        在验证数据上评估一个已训练的模型。
+        在验证集上评估当前模型。
         """
-        raise NotImplementedError("Trainer 必须实现 evaluate() 方法")
+        pass
+
+    @abstractmethod
+    def save_model(self, path: str):
+        """
+        将训练好的模型保存到磁盘。
+        """
+        if self.model is None:
+            logger.warning("没有可保存的模型。")
+            return
+        logger.info(f"模型已保存到: {path}")
+
+    @abstractmethod
+    def load_model(self, path: str):
+        """
+        从磁盘加载模型。
+        """
+        logger.info(f"模型已从: {path} 加载。")
