@@ -1,123 +1,119 @@
-from typing import Dict, Any
-import pandas as pd
 import json
+import aiofiles
+from datetime import datetime
+from typing import Dict, Any, Optional
+from config.loader import ConfigLoader
+from monitor.logging import get_logger as get_system_logger
 
-from ..monitor.logging import get_logger
-
-# Use the central logging setup
-base_logger = get_logger(__name__)
+system_logger = get_system_logger(__name__)
 
 class AuditLogger:
     """
-    A specialized logger for writing structured audit trail data.
-    This is distinct from application/debug logging.
-    
-    It outputs structured logs (e.g., JSON) to a dedicated file or stream,
-    which can be consumed by analysis or compliance tools.
+    Handles logging of critical decisions and system states for auditing
+    and traceability. Logs are typically written to a persistent,
+    append-only file or database.
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initializes the AuditLogger.
+    def __init__(self, config_loader: ConfigLoader):
+        self.config = config_loader.get_config("system")
+        self.log_path = self.config.get("audit_log_path", "logs/audit_trail.jsonl")
         
-        Args:
-            config (Dict[str, Any]): Expects an 'audit_logger' config block.
-        """
-        audit_config = config.get('audit_logger', {})
-        self.log_path = audit_config.get('log_path', 'logs/phoenix_audit.jsonl')
-        
-        # TODO: Set up a dedicated file handler for this logger
-        # For simplicity in this example, we'll just log to a file manually,
-        # but a real implementation should use the 'logging' framework
-        # with a custom formatter and file handler.
-        
-        base_logger.info(f"AuditLogger initialized. Writing audit trail to: {self.log_path}")
-
-    def _write_audit_log(self, log_type: str, data: Dict[str, Any]):
-        """
-        Internal method to write a structured JSON line to the audit log.
-        
-        Args:
-            log_type (str): The type of event (e.g., "TRADE", "PIPELINE_IO").
-            data (Dict[str, Any]): The payload to log.
-        """
+        # Ensure log directory exists
         try:
-            # Ensure all data is JSON serializable
-            log_entry = {
-                "timestamp": pd.Timestamp.now().isoformat(),
-                "log_type": log_type,
-                "data": self._sanitize_for_json(data)
-            }
+            import os
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        except Exception as e:
+            system_logger.error(f"Failed to create audit log directory: {e}", exc_info=True)
             
-            with open(self.log_path, 'a') as f:
-                f.write(json.dumps(log_entry) + '\n')
+        system_logger.info(f"AuditLogger initialized. Logging to: {self.log_path}")
+
+    async def log_event(
+        self,
+        event_type: str,
+        details: Dict[str, Any],
+        pipeline_state: Optional[Any] = None, # Avoid circular import, type as Any
+        decision_id: Optional[str] = None
+    ):
+        """
+        Asynchronously logs a structured audit event.
+        
+        Args:
+            event_type (str): The type of event (e.g., "DECISION", "ERROR", "STATE_CHANGE").
+            details (Dict[str, Any]): A JSON-serializable dictionary of event details.
+            pipeline_state (Optional[PipelineState]): The state at the time of the event.
+            decision_id (Optional[str]): A unique ID to correlate events.
+        """
+        
+        timestamp = datetime.utcnow().isoformat()
+        
+        log_entry = {
+            "timestamp": timestamp,
+            "decision_id": decision_id or "N/A",
+            "event_type": event_type,
+            "details": details,
+        }
+        
+        # Optionally snapshot key parts of the state
+        if pipeline_state:
+            try:
+                # Be selective to avoid logging huge amounts of data
+                log_entry["state_snapshot"] = {
+                    "current_time": pipeline_state.get_value("current_time"),
+                    "last_decision": pipeline_state.get_value("last_decision"),
+                    # Add other key fields, but avoid full context data
+                }
+            except Exception as e:
+                system_logger.warning(f"Failed to create state snapshot for audit log: {e}")
+                log_entry["state_snapshot"] = {"error": "Failed to serialize state"}
+
+        try:
+            async with aiofiles.open(self.log_path, mode='a') as f:
+                # Convert to JSON string and add a newline
+                await f.write(json.dumps(log_entry) + "\n")
                 
         except Exception as e:
-            base_logger.error(f"Failed to write to audit log! Type: {log_type}. Error: {e}")
+            system_logger.error(f"FATAL: Failed to write to audit log file: {e}", exc_info=True)
+            # In a production system, this might trigger a circuit breaker
 
-    def _sanitize_for_json(self, data: Any) -> Any:
-        """
-        Recursively sanitizes data to ensure it's JSON serializable.
-        Converts pandas Timestamps, numpy objects, etc.
-        """
-        if isinstance(data, dict):
-            return {k: self._sanitize_for_json(v) for k, v in data.items()}
-        if isinstance(data, list):
-            return [self._sanitize_for_json(v) for v in data]
-        if isinstance(data, (pd.Timestamp, pd.Period)):
-            return data.isoformat()
-        if hasattr(data, 'to_dict'): # e.g., Pydantic models (if .model_dump() exists)
-            try:
-                return data.model_dump()
-            except:
-                pass # Fallback
-        if hasattr(data, 'isoformat'): # e.g., datetime
-             return data.isoformat()
-        # Add more types as needed (numpy, etc.)
+    async def log_decision(
+        self,
+        decision_id: str,
+        fusion_result: Any, # FusionResult
+        pipeline_state: Any  # PipelineState
+    ):
+        """Helper method to specifically log a final decision."""
+        details = {
+            "message": "Final decision synthesized.",
+            "decision": fusion_result.final_decision,
+            "confidence": fusion_result.confidence,
+            "reasoning": fusion_result.reasoning,
+            "contributing_agents": [
+                agent.model_dump() for agent in fusion_result.contributing_agents
+            ]
+        }
+        await self.log_event(
+            event_type="DECISION_SYNTHESIS",
+            details=details,
+            pipeline_state=pipeline_state,
+            decision_id=decision_id
+        )
 
-        # If simple type, return as is
-        return data
-
-
-    # --- Public Logging Methods ---
-
-    def log_event_in(self, event: Dict[str, Any]):
-        """Logs a raw event received by the system."""
-        self._write_audit_log("EVENT_IN", {"event": event})
-
-    def log_pipeline_io(self, event_id: str, pipeline_io: Dict[str, Any]):
-        """Logs the full I/O bundle (RAG, Agent I/O) for a cognitive pipeline run."""
-        self._write_audit_log("PIPELINE_IO", {"event_id": event_id, "io_bundle": pipeline_io})
-
-    def log_fusion_result(self, fusion_result: Dict[str, Any]):
-        """Logs the final decision and uncertainty from the cognitive engine."""
-        self._write_audit_log("FUSION_RESULT", {"result": fusion_result})
-
-    def log_signal(self, signal: Dict[str, Any]):
-        """Logs the generated strategy signal (target weights)."""
-        self._write_audit_log("STRATEGY_SIGNAL", {"signal": signal})
-
-    def log_trade(self, fill_record: Dict[str, Any]):
-        """Logs an executed (simulated) trade."""
-        self._write_audit_log("TRADE", {"fill": fill_record})
-
-    def log_costs(self, costs: Dict[str, Any], timestamp: pd.Timestamp):
-        """Logs simulated execution costs."""
-        log_data = costs.copy()
-        log_data["log_timestamp"] = timestamp
-        self._write_audit_log("EXECUTION_COSTS", log_data)
-
-    def log_portfolio_snapshot(self, portfolio: Dict[str, float], pnl_record: Dict[str, Any]):
-        """Logs a snapshot of the portfolio and PnL."""
-        self._write_audit_log("PORTFOLIO_SNAPSHOT", {
-            "positions": portfolio,
-            "pnl": pnl_record
-        })
-
-    def log_system_error(self, error: Exception, context: str = "general"):
-        """Logs a critical system error."""
-        self._write_audit_log("SYSTEM_ERROR", {
-            "context": context,
-            "error_type": type(error).__name__,
-            "message": str(error)
-        })
+    async def log_error(
+        self,
+        error_message: str,
+        component: str,
+        pipeline_state: Optional[Any] = None,
+        decision_id: Optional[str] = None
+    ):
+        """Helper method to log a critical error."""
+        details = {
+            "message": "A critical error occurred.",
+            "component": component,
+            "error": error_message
+        }
+        await self.log_event(
+            event_type="CRITICAL_ERROR",
+            details=details,
+            pipeline_state=pipeline_state,
+            decision_id=decision_id
+        )
