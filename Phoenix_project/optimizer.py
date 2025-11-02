@@ -6,15 +6,18 @@ best set of parameters for a given strategy or model.
 """
 import logging
 from typing import List, Dict, Any, Callable
+# 修复：[FIX-8] 导入 skopt
 from skopt import gp_minimize
 from skopt.space import Real, Integer, Categorical
 from skopt.utils import use_named_args
 
-# 修复：添加 pandas 导入
+# 修复：[FIX-8] 添加 pandas 导入
 import pandas as pd
 
-from .backtesting.engine import BacktestingEngine
-from .config.loader import ConfigLoader
+# 修复：[FIX-8] 导入路径从 '.backtesting.engine' 更改
+from training.backtest_engine import BacktestingEngine
+# 修复：[FIX-10] 导入 'load_config'
+from config.loader import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +30,8 @@ class Optimizer:
     def __init__(self, 
                  param_space_config: List[Dict[str, Any]],
                  objective_function: Callable,
-                 config_loader: ConfigLoader):
+                 # 修复：[FIX-10] config 是一个 dict，而不是 loader
+                 base_config: Dict[str, Any]):
         """
         Initializes the Optimizer.
 
@@ -36,14 +40,15 @@ class Optimizer:
                                 search space, e.g.,
                                 [{'type': 'Real', 'name': 'rsi_window', 'low': 5, 'high': 30}]
             objective_function: The function to minimize (e.g., -Sharpe Ratio).
-                                It must accept (config_loader, **params).
-            config_loader: The main ConfigLoader, which will be *copied*
-                           and *mutated* with new params for each run.
+                                It must accept (config, **params).
+            base_config: The main config dict, which will be *copied*
+                         and *mutated* with new params for each run.
         """
         self.param_space = self._build_param_space(param_space_config)
         self.param_names = [p.name for p in self.param_space]
         self.objective_function = objective_function
-        self.config_loader = config_loader
+        # 修复：[FIX-10] 存储 base_config
+        self.base_config = base_config
         
         logger.info(f"Optimizer initialized with parameter space: {self.param_names}")
 
@@ -75,24 +80,24 @@ class Optimizer:
         
         try:
             # 1. Create a deep copy of the config to mutate
-            temp_config_loader = self.config_loader.deep_copy()
+            # 修复：[FIX-10] 复制 base_config 字典
+            import copy
+            temp_config = copy.deepcopy(self.base_config)
             
             # 2. Update the config with the new parameters
-            # This assumes parameters are in a flat structure or
-            # we use a helper to update nested keys.
-            # Example: temp_config_loader.update_param('strategy.rsi_window', params['rsi_window'])
+            # Example: temp_config['strategy']['rsi_window'] = params['rsi_window']
             
             # For this example, let's assume we update a 'strategy' block
-            strategy_config = temp_config_loader.get_config('strategy', {})
+            strategy_config = temp_config.get('strategy', {})
             strategy_config.update(params)
-            temp_config_loader.set_config('strategy', strategy_config)
+            temp_config['strategy'] = strategy_config
             
             # 3. Run the user-provided objective function
-            # The user's function is responsible for running the backtest
-            result = self.objective_function(config_loader=temp_config_loader, **params)
+            # 修复：[FIX-10] 传入 temp_config
+            result = self.objective_function(config=temp_config, **params)
             
             # 4. Handle NaN/Inf results (common in backtesting)
-            # 修复：使用 pd.isna
+            # 修复：[FIX-8] 使用 pd.isna 并检查无穷大
             if pd.isna(result) or not pd.Series(result).is_finite().all():
                 logger.warning(f"Objective function returned invalid value (NaN/Inf) for params: {params}. Returning +inf.")
                 # We are minimizing, so return a very bad score
@@ -147,25 +152,25 @@ class Optimizer:
 
 # --- Example Objective Function (to be defined by the user) ---
 
-def example_sharpe_objective(config_loader: ConfigLoader, **params) -> float:
+def example_sharpe_objective(config: Dict[str, Any], **params) -> float:
     """
     An example objective function that runs a backtest and returns
     the negative Sharpe ratio (since we want to minimize).
     
     Args:
-        config_loader: The *mutated* ConfigLoader with new params.
+        config: The *mutated* config dict with new params.
         **params: The parameters being tested.
         
     Returns:
         The score to be minimized (e.g., -Sharpe Ratio).
     """
     
-    # 1. Initialize components using the *temp_config_loader*
+    # 1. Initialize components using the *temp_config*
     # (This is a simplified example)
     
-    # data_iterator = DataIterator(config_loader.get_config('data'))
-    # pipeline_state = PipelineState(config_loader.get_config('portfolio'))
-    # strategy_handler = MyStrategy(config_loader=config_loader, pipeline_state=pipeline_state)
+    # data_iterator = DataIterator(config.get('data'))
+    # pipeline_state = PipelineState(config.get('portfolio'))
+    # strategy_handler = MyStrategy(config=config, pipeline_state=pipeline_state)
     # ... (build other components)
     
     # engine = BacktestingEngine(
