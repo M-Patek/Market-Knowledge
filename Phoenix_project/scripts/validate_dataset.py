@@ -1,97 +1,137 @@
-import jsonschema
-import json
+"""
+Dataset Validation Script
+
+This script is used to load a sample dataset (e.g., from a CSV or JSONL file)
+and validate each entry against the Pydantic schemas.
+
+This is crucial for ensuring data quality before ingesting a large
+dataset into the vector or temporal databases.
+"""
 import sys
-from pathlib import Path
+import os
+import argparse
+import logging
+import json
+import pandas as pd
+from pydantic import ValidationError
 
-# 修正：添加项目根目录到 sys.path，以便导入根目录下的模块
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-sys.path.append(str(PROJECT_ROOT))
+# 修复：将项目根目录 (Phoenix_project) 添加到 sys.path
+# 这允许脚本以 'python scripts/validate_dataset.py' 的方式运行
+# 并正确解析 'from ai...' 或 'from core...'
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-# --------------------------------------------------
-# 原始脚本内容现在可以正常导入了
-# --------------------------------------------------
+# 修复：现在使用绝对导入
+from ai.data_adapter import DataAdapter
+from core.schemas.data_schema import MarketEvent, TickerData
 
-from data_manager import DataManager
-from monitor.logging import get_logger
+# --- 日志设置 ---
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - [DatasetValidator] - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-logger = get_logger(__name__)
-
-def validate_data_contract():
+def validate_dataset_file(file_path: str, data_type: str):
     """
-    Ensures that the AI cache data strictly adheres to the schema defined in data_catalog.json.
-    This is the Data Contract Enforcement gate for MLOps.
-    """
-    logger.info("Starting Data Contract Enforcement...")
+    Validates all entries in a given dataset file.
 
+    Args:
+        file_path (str): Path to the .jsonl or .csv file.
+        data_type (str): The type of data to validate ('market_event' or 'ticker_data').
+    """
+    if not os.path.exists(file_path):
+        logger.error(f"File not found: {file_path}")
+        return
+
+    logger.info(f"Starting validation for file: {file_path}")
+    logger.info(f"Expected data type: {data_type}")
+
+    # 确定 Pydantic schema
+    if data_type == 'market_event':
+        schema_class = MarketEvent
+    elif data_type == 'ticker_data':
+        schema_class = TickerData
+    else:
+        logger.error(f"Unknown data type: {data_type}. Must be 'market_event' or 'ticker_data'.")
+        return
+
+    # DataAdapter 用于将原始字典转换为标准化的 schema
+    # 注意：DataAdapter 内部可能有更复杂的逻辑
+    # 为简单起见，我们这里直接使用 Pydantic 验证
+    # adapter = DataAdapter() 
+
+    valid_entries = 0
+    invalid_entries = 0
+    
     try:
-        # 1. Load the DataManager to get access to the schema
-        # 修正：使用基于 PROJECT_ROOT 的路径
-        data_catalog_path = PROJECT_ROOT / "data_catalog.json"
-        dm = DataManager(data_catalog_path=data_catalog_path)
+        # 我们假设是 .jsonl (JSON Lines) 格式
+        if file_path.endswith('.jsonl'):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    try:
+                        raw_data = json.loads(line)
+                        # 验证
+                        schema_class(**raw_data)
+                        valid_entries += 1
+                    except ValidationError as e:
+                        logger.warning(f"Validation FAILED for line {i+1}: {e.errors()}")
+                        invalid_entries += 1
+                    except json.JSONDecodeError:
+                        logger.error(f"JSON decode FAILED for line {i+1}.")
+                        invalid_entries += 1
         
-        schema = dm.get_schema("fused_ai_analysis_schema")
-        if not schema:
-            logger.error("Failed to load 'fused_ai_analysis_schema' from data catalog.")
-            return False
-        
-        logger.info("Successfully loaded 'fused_ai_analysis_schema' data contract.")
-
-        # 2. Load the actual data cache
-        # 修正：使用基于 PROJECT_ROOT 的路径
-        # (假设 'asset_analysis_cache.json' 位于 'cache/' 目录)
-        cache_path = PROJECT_ROOT / "cache" / "asset_analysis_cache.json"
-        
-        if not cache_path.exists():
-            logger.warning(f"Cache file not found at {cache_path}. Skipping validation.")
-            # 在 CI/CD 中，这可能是一个通过（pass）或失败（fail）的状态，取决于策略
-            return True # 暂定为通过
-
-        with open(cache_path, 'r') as f:
-            data_cache = json.load(f)
-
-        logger.info(f"Loaded data cache from {cache_path}.")
-
-        # 3. Validate the data against the schema
-        # 假设缓存是一个字典，其键是 Ticker，值是符合 schema 的分析对象
-        if not isinstance(data_cache, dict):
-            logger.error("Data cache is not a dictionary (key-value store). Validation failed.")
-            return False
-
-        all_valid = True
-        for ticker, record in data_cache.items():
-            try:
-                jsonschema.validate(instance=record, schema=schema)
-                logger.debug(f"Record for {ticker} PASSED validation.")
-            except jsonschema.ValidationError as e:
-                logger.error(f"Data Contract VIOLATION for ticker {ticker}: {e.message}")
-                all_valid = False
-
-        if all_valid:
-            logger.info("Data Contract Enforcement PASSED. All records are valid.")
+        # 也可以添加对 CSV 的支持
+        elif file_path.endswith('.csv'):
+            df = pd.read_csv(file_path)
+            # 必须处理 NaNs，它们在转为 dict 时会变成 float 'nan'
+            df = df.where(pd.notnull(df), None)
+            for i, row in enumerate(df.to_dict('records')):
+                try:
+                    # CSV 数据可能需要更多的数据类型转换
+                    # 例如，时间戳和 JSON 字符串
+                    if 'timestamp' in row and isinstance(row['timestamp'], str):
+                        row['timestamp'] = pd.Timestamp(row['timestamp']).to_pydatetime()
+                    
+                    schema_class(**row)
+                    valid_entries += 1
+                except ValidationError as e:
+                    logger.warning(f"Validation FAILED for CSV row {i+1}: {e.errors()}")
+                    invalid_entries += 1
         else:
-            logger.error("Data Contract Enforcement FAILED. Invalid records found.")
-            
-        return all_valid
+            logger.error(f"Unsupported file format: {file_path}. Please use .jsonl or .csv")
+            return
 
-    except FileNotFoundError:
-        logger.error(f"Failed to load required file (data_catalog.json or cache).")
-        return False
-    except json.JSONDecodeError:
-        logger.error(f"Failed to parse JSON from data catalog or cache.")
-        return False
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-        return False
+        logger.critical(f"A critical error occurred while processing the file: {e}", exc_info=True)
+        return
+
+    # --- 总结 ---
+    logger.info("\n--- Dataset Validation Summary ---")
+    logger.info(f"File processed: {file_path}")
+    logger.info(f"Total entries valid: {valid_entries}")
+    logger.info(f"Total entries invalid: {invalid_entries}")
+    
+    if invalid_entries == 0 and valid_entries > 0:
+        logger.info("All entries are valid. Dataset is clean!")
+    elif valid_entries == 0 and invalid_entries == 0:
+        logger.warning("No data entries were found or processed.")
+    else:
+        logger.error(f"{invalid_entries} invalid entries found. Please review the warnings above.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Phoenix Dataset Validator")
+    parser.add_argument("file_path", 
+                        type=str, 
+                        help="Path to the dataset file (e.g., data/my_events.jsonl)")
+    parser.add_argument("-t", "--type", 
+                        type=str, 
+                        required=True, 
+                        choices=['market_event', 'ticker_data'],
+                        help="The type of data in the file.")
+
+    args = parser.parse_args()
+    
+    validate_dataset_file(args.file_path, args.type)
 
 if __name__ == "__main__":
-    """
-    This script is intended to be run as a CI/CD quality gate.
-    If validation fails, it will exit with a non-zero status code,
-    which should fail the CI pipeline.
-    """
-    if not validate_data_contract():
-        logger.error("CI Quality Gate: FAILED")
-        sys.exit(1)
-    else:
-        logger.info("CI Quality Gate: PASSED")
-        sys.exit(0)
+    main()
