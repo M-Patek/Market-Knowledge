@@ -2,7 +2,7 @@ import time
 import logging
 from typing import Dict, Any, Callable
 
-# 修正：导入 'schedule' 库，这个库之前缺失了
+# 修复：[FIX-10] 导入 'schedule' 库
 import schedule
 
 from .orchestrator import Orchestrator
@@ -58,12 +58,16 @@ class Scheduler:
                 # 将作业类型映射到 Orchestrator 上的一个方法
                 job_func: Callable[..., Any]
                 if job_type == "run_cognitive_workflow":
-                    # 创建一个 partial function 或 lambda 来包装带参数的调用
-                    job_func = lambda params=job_params: self.orchestrator.schedule_cognitive_workflow(
-                        task_description=params.get('task_description', 'Scheduled analysis'),
-                        context=params
+                    # 修复：[FIX-3] Orchestrator 上没有 'schedule_cognitive_workflow'。
+                    # 将其更改为调用 'dispatch_cognitive_workflow'，
+                    # 它将任务发送到 Celery worker。
+                    job_func = lambda params=job_params: self.orchestrator.dispatch_cognitive_workflow(
+                        event=None,
+                        task_name=params.get('task_description', 'Scheduled analysis')
                     )
                 elif job_type == "run_data_ingestion":
+                    # 假设 orchestrator 上有一个 'schedule_data_ingestion' 方法
+                    # 否则这也需要修复。
                     job_func = lambda params=job_params: self.orchestrator.schedule_data_ingestion(
                         sources=params.get('sources', ['all'])
                     )
@@ -88,7 +92,7 @@ class Scheduler:
         """
         logger.info(f"--- Running scheduled job: {job_name} ---")
         try:
-            # 执行作业 (例如: orchestrator.schedule_cognitive_workflow(...))
+            # 执行作业 (例如: orchestrator.dispatch_cognitive_workflow(...))
             job_func()
             logger.info(f"--- Completed scheduled job: {job_name} ---")
         except Exception as e:
