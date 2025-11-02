@@ -1,108 +1,145 @@
-import pandas as pd
-from typing import Dict, Any, Optional, List
-# 修正：[FIX-ImportError/TypeError] 'Deque' 应该从 'collections' 导入，而不是 'typing'
-from collections import Deque 
-import threading
+import asyncio
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+from collections import deque
+from copy import deepcopy
+from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
+from core.schemas.fusion_result import FusionResult, AgentDecision
+from monitor.logging import get_logger
+
+logger = get_logger(__name__)
 
 class PipelineState:
     """
-    一个线程安全的数据类，用于保存 Phoenix 系统的当前状态。
+    A thread-safe, asynchronous state manager for the application.
+    It holds all data, decisions, and portfolio information for
+    a single processing cycle.
     
-    这包括当前时间、市场状况、投资组合持仓、
-    情绪指标以及最近事件的队列。
-    
-    它被设计为在所有组件之间共享。
+    Uses asyncio.Lock to ensure safe concurrent access, although
+    in the current design, it's mostly accessed serially within
+    the main cycle. The lock is good practice.
     """
 
-    def __init__(self, max_recent_events: int = 100):
-        self.lock = threading.RLock() # 可重入锁，用于保护状态
-        
-        # --- 时间状态 ---
-        self._current_time: pd.Timestamp = pd.Timestamp.utcnow()
-        
-        # --- 市场内部状态 (由 CognitiveEngine 更新) ---
-        self._market_regime: str = "Unknown"
-        self._volatility_index: float = 0.0
-        self._sentiment_score: float = 0.0
-        
-        # --- 投资组合状态 (由 OrderManager/TLC 更新) ---
-        self._portfolio_value: float = 0.0
-        self._cash: float = 0.0
-        self._positions: Dict[str, float] = {} # e.g., {"AAPL": 100.0}
-        
-        # --- 事件状态 ---
-        self._recent_events: Deque[Dict[str, Any]] = Deque(maxlen=max_recent_events)
-        
-        # --- 系统健康状态 ---
-        self._component_health: Dict[str, str] = {"Orchestrator": "OK"}
-        self._last_error: Optional[str] = None
+    def __init__(self, initial_state: Optional[Dict[str, Any]] = None):
+        self._state: Dict[str, Any] = {
+            # --- Core Timestamps ---
+            "current_time": datetime.utcnow(),
+            "cycle_start_time": None,
+            "last_successful_cycle_time": None,
+            "last_data_ingest_time": None,
+            
+            # --- Cycle-specific IDs ---
+            "current_decision_id": None,
+            
+            # --- Raw Data Buffers (Time-Windowed) ---
+            "market_data": deque(maxlen=200), # Store last N ticks
+            "news_data": deque(maxlen=50),   # Store last N articles
+            "economic_data": deque(maxlen=50),
+            
+            # --- Cognitive Artifacts (from last cycle) ---
+            "last_formatted_context": None,
+            "last_agent_decisions": [], # List[AgentDecision]
+            "last_arbitration": None,
+            "last_fusion_result": None, # FusionResult
+            "last_fact_check": None,
+            "last_guarded_decision": None, # FusionResult
+            
+            # --- Execution & Portfolio State ---
+            "portfolio": {
+                "cash": 100000.0,
+                "total_value": 100000.0,
+                "positions": {} # e.g., {"AAPL": {"size": 10, "avg_price": 150.0, "market_value": ...}}
+            },
+            "open_orders": [], # List[Order]
+            "trade_history": deque(maxlen=1000), # List[Execution]
+            
+            # --- System Health ---
+            "last_cycle_time_ms": 0.0,
+            "system_status": "RUNNING", # RUNNING, DEGRADED, CIRCUIT_BREAKER
+            
+            **(initial_state or {})
+        }
+        self._lock = asyncio.Lock()
+        logger.info("PipelineState initialized.")
 
-    def update_time(self, new_time: pd.Timestamp):
-        with self.lock:
-            self._current_time = new_time
-            
-    def get_current_time(self) -> pd.Timestamp:
-        with self.lock:
-            return self._current_time
-            
-    def update_market_state(self, regime: str, volatility: float, sentiment: float):
-        with self.lock:
-            self._market_regime = regime
-            self._volatility_index = volatility
-            self._sentiment_score = sentiment
-            
-    def get_market_state(self) -> Dict[str, Any]:
-        with self.lock:
-            return {
-                "regime": self._market_regime,
-                "volatility": self._volatility_index,
-                "sentiment": self._sentiment_score
-            }
+    async def get_value(self, key: str, default: Any = None) -> Any:
+        """Safely get a value from the state."""
+        async with self._lock:
+            return deepcopy(self._state.get(key, default))
 
-    def update_portfolio(self, total_value: float, cash: float, positions: Dict[str, float]):
-        with self.lock:
-            self._portfolio_value = total_value
-            self._cash = cash
-            self._positions = positions.copy() # 创建一个副本
-            
-    def get_portfolio_state(self) -> Dict[str, Any]:
-        with self.lock:
-            return {
-                "total_value": self._portfolio_value,
-                "cash": self._cash,
-                "positions": self._positions.copy()
-            }
-            
-    def add_event(self, event: Dict[str, Any]):
-        with self.lock:
-            self._recent_events.appendleft(event) # 添加到队列前面
-            
-    def get_recent_events(self) -> List[Dict[str, Any]]:
-        with self.lock:
-            return list(self._recent_events)
+    async def update_value(self, key: str, value: Any):
+        """Safely update a single key in the state."""
+        async with self._lock:
+            self._state[key] = value
+            # logger.debug(f"State updated: {key} = {value}")
 
-    def update_component_health(self, component_name: str, status: str, error: Optional[str] = None):
-        with self.lock:
-            self._component_health[component_name] = status
-            if error:
-                self._last_error = f"[{component_name}] {error}"
-                
-    def get_system_health(self) -> Dict[str, Any]:
-        with self.lock:
-            return {
-                "components": self._component_health.copy(),
-                "last_error": self._last_error
-            }
-            
-    def get_full_state_snapshot(self) -> Dict[str, Any]:
+    async def update_state(self, updates: Dict[str, Any]):
+        """Safely update multiple keys in the state."""
+        async with self._lock:
+            for key, value in updates.items():
+                # Handle special deque appends
+                if key in ("market_data", "news_data", "economic_data") and isinstance(value, list):
+                    self._state[key].extend(value)
+                elif key in ("market_data", "news_data", "economic_data") and not isinstance(value, (list, deque)):
+                     self._state[key].append(value)
+                elif key == "trade_history" and isinstance(value, list):
+                    self._state[key].extend(value)
+                elif key == "trade_history" and not isinstance(value, (list, deque)):
+                    self._state[key].append(value)
+                else:
+                    self._state[key] = value
+            # logger.debug(f"Batch state update applied: {updates.keys()}")
+
+    async def get_full_state_copy(self) -> Dict[str, Any]:
+        """Return a deep copy of the entire state dictionary."""
+        async with self._lock:
+            return deepcopy(self._state)
+
+    # --- Convenience Accessors for Context Building ---
+
+    async def get_full_context(self) -> Dict[str, List[Any]]:
         """
-E        返回整个状态的一个深层复制快照。
+        Get all data needed to build a context snapshot for the AI.
+        Returns copies to prevent mutation.
         """
-        with self.lock:
+        async with self._lock:
             return {
-                "current_time": self._current_time,
-                "market_state": self.get_market_state(),
-                "portfolio_state": self.get_portfolio_state(),
-                "system_health": self.get_system_health(),
-                "recent_events_count": len(self._recent_events)
+                "market_data": list(self._state["market_data"]),
+                "news_data": list(self._state["news_data"]),
+                "economic_data": list(self._state["economic_data"]),
+                # Add other context-relevant data here
             }
+
+    async def get_full_context_formatted(self) -> str:
+        """
+        Get the last formatted context string.
+        Assumes DataAdapter has run and stored this.
+        """
+        async with self._lock:
+            return self._state.get("last_formatted_context", "No context available.")
+
+    async def get_latest_market_data(self, symbol: str) -> Optional[MarketData]:
+        """Get the most recent market data for a specific symbol."""
+        async with self._lock:
+            for data in reversed(self._state["market_data"]):
+                if data.symbol == symbol:
+                    return deepcopy(data)
+            return None
+    
+    async def get_portfolio(self) -> Dict[str, Any]:
+        """Safely get a copy of the portfolio."""
+        async with self._lock:
+            return deepcopy(self._state["portfolio"])
+
+    async def update_portfolio(self, portfolio_update: Dict[str, Any]):
+        """
+        Safely update the portfolio state.
+        This is typically called by the OrderManager or a portfolio
+        update service.
+        """
+        async with self._lock:
+            # Perform a deep merge
+            # This is simplified. A real update would be more careful,
+            # especially with nested dicts like 'positions'.
+            self._state["portfolio"].update(portfolio_update)
+            logger.info("Portfolio state updated.")
