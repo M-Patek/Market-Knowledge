@@ -1,56 +1,33 @@
-# drl/agents/base_agent.py
+# (原: drl/agents/base_agent.py)
+# (无内部导入，无需修复)
 
 from abc import ABC, abstractmethod
-from gymnasium import spaces
-import numpy as np
 from typing import Dict, Any
 
 class BaseAgent(ABC):
     """
-    An abstract base class for all DRL agents in the multi-agent framework.
-    It defines the common interface required for interaction with the 
-    training environment and the centralized critic.
+    (在线推理) DRL 智能体的基类。
+    定义了在“在线推理”阶段（在 CognitiveEngine 中）如何调用 DRL 智能体。
     """
-
-    def __init__(self, agent_id: str, config: Dict[str, Any]):
-        """
-        Initializes the base agent.
-
-        Args:
-            agent_id (str): A unique identifier for the agent (e.g., 'alpha_agent').
-            config (Dict[str, Any]): Agent-specific configuration parameters.
-        """
-        self.agent_id = agent_id
+    def __init__(self, config: Dict[str, Any], model_path: str):
         self.config = config
-        super().__init__()
+        self.model_path = model_path
+        self.model = self.load_model(model_path)
 
     @abstractmethod
-    def get_observation_space(self) -> spaces.Space:
+    def load_model(self, path: str) -> Any:
         """
-        Returns the observation space specific to this agent.
-        This defines what the agent "sees" from the global state.
+        加载训练好的 DRL 模型 (例如 PPO.load)。
         """
-        pass
+        # 示例:
+        # from stable_baselines3 import PPO
+        # return PPO.load(path)
+        print(f"模拟：从 {path} 加载模型")
+        return "loaded_model_object"
 
     @abstractmethod
-    def get_action_space(self) -> spaces.Space:
+    def predict(self, observation: Any) -> Any:
         """
-        Returns the action space specific to this agent.
-        This defines what the agent "does".
-        """
-        pass
-
-    @abstractmethod
-    def act(self, observation: np.ndarray) -> np.ndarray:
-        """
-        Takes an agent-specific observation and returns an action.
-        Note: This is for decentralized execution. The policy itself
-        will be trained by the centralized trainer.
-
-        Args:
-            observation (np.ndarray): The agent's view of the current state.
-
-        Returns:
-            np.ndarray: The action taken by the agent.
+        执行模型推理。
         """
         pass
