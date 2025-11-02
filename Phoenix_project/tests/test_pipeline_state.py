@@ -1,167 +1,122 @@
 import pytest
-import yaml
-import os
-import sys # 修复：[FIX-10] 导入 sys
-from datetime import datetime, timedelta
+import pandas as pd
+from datetime import timedelta
 
-# 修复：[FIX-10] 添加日志记录器以查看 config 加载
-import logging
-logger = logging.getLogger(__name__)
-
-# Add project root to path to find 'core' module
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
+# 修正：[FIX-ImportError]
+# 将所有 `..` 相对导入更改为从项目根目录开始的绝对导入，
+# 以匹配 `conftest.py` 设置的 sys.path 约定。
 from core.pipeline_state import PipelineState
-
-# --- Helper Function ---
-
-def load_config(config_path: str):
-    """Loads a YAML config file."""
-    absolute_path = os.path.abspath(config_path)
-    if not os.path.exists(absolute_path):
-        pytest.fail(f"Config file not found at absolute path: {absolute_path}")
-    with open(absolute_path, 'r') as f:
-        return yaml.safe_load(f)
-
-# --- Fixtures ---
-
-@pytest.fixture
-def config():
-    """
-    Provides the main system configuration, loaded from the correct path.
-    """
-    # FIX: Make path relative to this file, then go up to project root
-    # __file__ -> tests/test_pipeline_state.py
-    # os.path.dirname(__file__) -> tests/
-    # os.path.dirname(os.path.dirname(__file__)) -> Phoenix_project/
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
-    # FIX: Corrected path from 'Phoenix_project/config.yaml' to 'config/system.yaml'
-    config_path = os.path.join(base_dir, 'config', 'system.yaml')
-    
-    return load_config(config_path)
 
 @pytest.fixture
 def state():
-    """Provides a clean instance of PipelineState for each test."""
-    # 修复：[FIX-16] 传递 'max_recent_events'
-    return PipelineState(max_recent_events=10)
+    """Returns a fresh PipelineState instance for each test."""
+    return PipelineState(max_recent_events=5)
 
-# --- Test Cases ---
-
-def test_load_config(config):
-    """Tests that the config fixture loads without errors."""
-    assert config is not None
-    logger.info(f"Config loaded, keys: {list(config.keys())}")
-
-def test_config_structure(config):
-    """
-    Tests the basic structure of the loaded config.
-    修复：[FIX-13] 将 'services' 更改为 'llm' 和 'event_stream'，
-    这些键存在于 config/system.yaml 中 (从 phoenix_project.py 推断)。
-    """
-    assert "llm" in config
-    assert "event_stream" in config
-    assert "data_manager" in config
-    assert "execution" in config
-
-def test_pipeline_state_initialization(state):
-    """Tests the initial default values of the PipelineState."""
-    assert state.get_state('system_status') == 'IDLE'
-    assert state.get_state('last_event_id') is None
-    assert isinstance(state.get_state('last_event_timestamp'), datetime)
-    assert state.get_state('current_task_id') is None
-    # 修复：[FIX-10] 匹配 'core/pipeline_state.py' 中的新 metric 名称
-    assert state.get_metric('total_events_processed') == 0
+def test_pipeline_state_init(state):
+    """Tests the initial default values of the state."""
+    assert state.get_current_time() is not None
+    assert isinstance(state.get_current_time(), pd.Timestamp)
+    
+    market_state = state.get_market_state()
+    assert market_state["regime"] == "Unknown"
+    assert market_state["volatility"] == 0.0
+    assert market_state["sentiment"] == 0.0
+    
+    portfolio_state = state.get_portfolio_state()
+    assert portfolio_state["total_value"] == 0.0
+    assert portfolio_state["cash"] == 0.0
+    assert portfolio_state["positions"] == {}
+    
+    system_health = state.get_system_health()
+    assert system_health["components"] == {"Orchestrator": "OK"}
+    assert system_health["last_error"] is None
+    
     assert state.get_recent_events() == []
 
-def test_set_and_get_state(state):
-    """Tests basic set/get functionality."""
-    state.set_state('system_status', 'RUNNING')
-    assert state.get_state('system_status') == 'RUNNING'
-    
-    state.set_state('current_task_id', 'task_123')
-    assert state.get_state('current_task_id') == 'task_123'
+def test_time_update(state):
+    """Tests updating and retrieving the current time."""
+    new_time = pd.Timestamp.utcnow() - timedelta(days=1)
+    state.update_time(new_time)
+    assert state.get_current_time() == new_time
 
-def test_set_non_existent_key(state):
-    """Tests that setting an unknown key raises a KeyError."""
-    with pytest.raises(KeyError):
-        state.set_state('non_existent_key', 'some_value')
+def test_market_state_update(state):
+    """Tests updating and retrieving the market state."""
+    state.update_market_state(regime="Bull", volatility=0.5, sentiment=0.8)
+    market_state = state.get_market_state()
+    assert market_state["regime"] == "Bull"
+    assert market_state["volatility"] == 0.5
+    assert market_state["sentiment"] == 0.8
 
-def test_get_non_existent_key(state):
-    """Tests that getting an unknown key returns None."""
-    assert state.get_state('another_non_existent_key') is None
+def test_portfolio_state_update(state):
+    """Tests updating and retrieving the portfolio state."""
+    new_positions = {"AAPL": 10.0, "MSFT": 5.0}
+    state.update_portfolio(total_value=1500.0, cash=500.0, positions=new_positions)
+    
+    portfolio_state = state.get_portfolio_state()
+    assert portfolio_state["total_value"] == 1500.0
+    assert portfolio_state["cash"] == 500.0
+    assert portfolio_state["positions"] == new_positions
+    
+    # Test that a copy is returned
+    new_positions["GOOG"] = 1.0
+    assert state.get_portfolio_state()["positions"] == {"AAPL": 10.0, "MSFT": 5.0}
 
-def test_increment_metric(state):
-    """Tests the metric incrementing utility."""
-    assert state.get_metric('total_events_processed') == 0
-    state.increment_metric('total_events_processed')
-    assert state.get_metric('total_events_processed') == 1
-    state.increment_metric('total_events_processed', 5)
-    assert state.get_metric('total_events_processed') == 6
+def test_event_queue(state):
+    """Tests the FIFO queue functionality for recent events."""
+    assert state._recent_events.maxlen == 5
+    
+    ev1 = {"id": 1}
+    ev2 = {"id": 2}
+    ev3 = {"id": 3}
+    ev4 = {"id": 4}
+    ev5 = {"id": 5}
+    ev6 = {"id": 6}
+    
+    state.add_event(ev1)
+    state.add_event(ev2)
+    state.add_event(ev3)
+    
+    assert state.get_recent_events() == [ev3, ev2, ev1]
+    
+    state.add_event(ev4)
+    state.add_event(ev5)
+    
+    assert state.get_recent_events() == [ev5, ev4, ev3, ev2, ev1]
+    
+    # Add one more, ev1 should be pushed out
+    state.add_event(ev6)
+    assert state.get_recent_events() == [ev6, ev5, ev4, ev3, ev2]
 
-def test_increment_non_existent_metric(state):
-    """Tests incrementing a metric that doesn't exist."""
-    with pytest.raises(KeyError):
-        state.increment_metric('non_existent_metric')
+def test_system_health_update(state):
+    """Tests updating component health and errors."""
+    state.update_component_health("DataManager", "Warning", "API key missing")
+    
+    health = state.get_system_health()
+    assert health["components"] == {
+        "Orchestrator": "OK",
+        "DataManager": "Warning"
+    }
+    assert health["last_error"] == "[DataManager] API key missing"
+    
+    state.update_component_health("DataManager", "OK")
+    health = state.get_system_health()
+    assert health["components"]["DataManager"] == "OK"
+    # Last error should persist until cleared (or overwritten)
+    assert health["last_error"] == "[DataManager] API key missing"
+    
+    state.update_component_health("Worker", "Error", "Redis connection failed")
+    assert state.get_system_health()["last_error"] == "[Worker] Redis connection failed"
 
-def test_add_event_and_get_recent(state):
-    """Tests the event tracking and retrieval."""
-    event1 = {'id': 'evt_1', 'timestamp': datetime.now()}
-    event2 = {'id': 'evt_2', 'timestamp': datetime.now() + timedelta(seconds=1)}
+def test_full_state_snapshot(state):
+    """Tests the combined snapshot method."""
+    time = pd.Timestamp.utcnow()
+    state.update_time(time)
+    state.update_market_state("Bear", 0.9, -0.5)
     
-    state.add_event(event1)
-    state.add_event(event2)
+    snapshot = state.get_full_state_snapshot()
     
-    assert state.get_state('last_event_id') == 'evt_2'
-    assert state.get_metric('total_events_processed') == 2
-    assert state.get_recent_events() == [event1, event2]
-    
-    time_diff = datetime.now() - state.get_state('last_event_timestamp')
-    assert time_diff.total_seconds() < 1.0
-
-def test_event_queue_capacity(state):
-    """Tests that the recent event queue respects max_recent_events."""
-    state_small = PipelineState(max_recent_events=2)
-    
-    event1 = {'id': 'evt_1'}
-    event2 = {'id': 'evt_2'}
-    event3 = {'id': 'evt_3'}
-    
-    state_small.add_event(event1)
-    state_small.add_event(event2)
-    state_small.add_event(event3)
-    
-    # Should have evicted event1
-    assert state_small.get_recent_events() == [event2, event3]
-    assert len(state_small.get_recent_events()) == 2
-    assert state_small.get_metric('total_events_processed') == 3
-
-def test_start_and_end_task(state):
-    """Tests the helpers for managing the task state."""
-    task_id = "task_abc"
-    state.start_task(task_id)
-    
-    assert state.get_state('system_status') == 'PROCESSING'
-    assert state.get_state('current_task_id') == task_id
-    
-    state.end_task()
-    
-    assert state.get_state('system_status') == 'IDLE'
-    assert state.get_state('current_task_id') is None
-    assert state.get_metric('total_tasks_completed') == 1
-    time_diff = datetime.now() - state.get_state('last_task_timestamp')
-    assert time_diff.total_seconds() < 1.0
-
-def test_get_full_state(state):
-    """Tests the full state snapshot."""
-    state.set_state('system_status', 'RUNNING')
-    state.increment_metric('total_events_processed')
-    
-    full_state = state.get_full_state()
-    
-    assert full_state['state']['system_status'] == 'RUNNING'
-    assert full_state['metrics']['total_events_processed'] == 1
-    assert 'recent_events' in full_state
+    assert snapshot["current_time"] == time
+    assert snapshot["market_state"]["regime"] == "Bear"
+    assert snapshot["portfolio_state"]["cash"] == 0.0
+    assert snapshot["system_health"]["components"]["Orchestrator"] == "OK"
+    assert snapshot["recent_events_count"] == 0
