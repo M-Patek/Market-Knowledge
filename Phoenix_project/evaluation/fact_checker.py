@@ -1,149 +1,115 @@
-from typing import Dict, Any, List, Optional
-import asyncio
+from typing import Dict, Any, Optional
+import json
+from ai.prompt_manager import PromptManager
+from api.gateway import APIGateway
+from monitor.logging import get_logger
 
-from ..memory.vector_store import VectorStore
-from ..api.gemini_pool_manager import GeminiPoolManager
-from ..ai.prompt_manager import PromptManager
+logger = get_logger(__name__)
 
 class FactChecker:
     """
-    Responsible for verifying factual claims made by other agents.
-    It uses a separate vector store (or could use Google Search) to
-    find supporting or contradictory evidence for a given claim.
+    Uses an LLM with search capabilities (e.g., Gemini with Google Search tool)
+    to verify factual claims made in a piece of reasoning.
+    
+    NOTE: This requires the APIGateway to support enabling tools
+    like Google Search, which is not explicitly implemented in the
+    provided `APIGateway` or `GeminiPoolManager`. This implementation
+    *assumes* it can be enabled via `send_request`.
     """
 
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        gemini_pool: GeminiPoolManager,
-        prompt_manager: PromptManager,
-        vector_store: VectorStore
-    ):
-        """
-        Initializes the FactChecker.
-        
-        Args:
-            config: Main configuration object.
-            gemini_pool: Pool for accessing Gemini models.
-            prompt_manager: To get the 'fact_checker' prompt.
-            vector_store: Vector store client (e.g., Pinecone) to search for evidence.
-        """
-        self.config = config.get('fact_checker', {})
-        self.gemini_pool = gemini_pool
+    def __init__(self, api_gateway: APIGateway, prompt_manager: PromptManager):
+        self.api_gateway = api_gateway
         self.prompt_manager = prompt_manager
-        self.vector_store = vector_store
-        
-        self.model_id = self.config.get('model_id', 'gemini-1.5-pro')
-        self.top_k_evidence = self.config.get('top_k_evidence', 3)
-        
-    async def check_claim(self, claim: str, event_id: str) -> Dict[str, Any]:
+        self.prompt_name = "fact_check_reasoning"
+        logger.info("FactChecker initialized.")
+
+    async def check_facts(self, reasoning_text: str) -> Dict[str, Any]:
         """
-        Checks a single factual claim (e.g., "AAPL EPS beat estimates").
+        Checks the factual claims in the provided reasoning.
         
         Args:
-            claim (str): The statement to verify.
-            event_id (str): The ID of the event for logging/tracing.
+            reasoning_text (str): The AI's reasoning to be checked.
             
         Returns:
-            Dict[str, Any]: A structured response, e.g.,
+            A structured report, e.g.:
             {
-                "claim": claim,
-                "status": "VERIFIED" | "CONTRADICTED" | "NOT_FOUND",
-                "confidence": 0.9,
-                "evidence": [...]
+                "overall_support": "Supported" | "Refuted" | "No Information",
+                "checked_claims": [
+                    {"claim": "...", "support": "...", "evidence": "..."}
+                ]
             }
         """
         
-        # 1. Retrieve evidence
-        try:
-            # Use the vector store to find relevant documents
-            evidence_chunks = await self.vector_store.search(
-                query_text=claim,
-                top_k=self.top_k_evidence
-                # TODO: Add metadata filters (e.g., time range)
-            )
-        except Exception as e:
-            return {
-                "claim": claim,
-                "status": "ERROR",
-                "confidence": 0.0,
-                "justification": f"Failed to retrieve evidence: {e}",
-                "evidence": []
-            }
-            
-        if not evidence_chunks:
-            return {
-                "claim": claim,
-                "status": "NOT_FOUND",
-                "confidence": 0.0,
-                "justification": "No supporting evidence found in vector store.",
-                "evidence": []
-            }
-
-        # 2. Format context for the LLM
-        context_str = "\n\n---\n\n".join(
-            [f"Source: {chunk.get('metadata', {}).get('url', 'Unknown')}\n{chunk.get('text')}" 
-             for chunk in evidence_chunks]
+        prompt = self.prompt_manager.get_prompt(
+            self.prompt_name,
+            reasoning_text=reasoning_text
         )
         
-        # 3. Get prompts
-        system_prompt = self.prompt_manager.get_system_prompt('fact_checker')
-        # The 'fact_checker' user prompt template is assumed to take 'claim' and 'evidence'
-        user_prompt_template = self.prompt_manager.get_user_prompt_template('fact_checker') 
-        user_prompt = user_prompt_template.format(claim=claim, evidence=context_str)
-        
-        # 4. Call LLM to verify
+        if not prompt:
+            logger.error(f"Could not get prompt '{self.prompt_name}'.")
+            return self._error_response("Prompt missing")
+
         try:
-            async with self.gemini_pool.get_client(self.model_id) as gemini_client:
-                response = await gemini_client.generate_content_async(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    request_id=f"{event_id}_fact_check",
-                    generation_config={"response_mime_type": "application/json"}
-                )
+            # This is the critical part. We need to tell the gateway
+            # to enable Google Search. This is a hypothetical extension
+            # of the send_request method.
+            # A more realistic `send_request` would take `tools` as an arg.
             
-            # The response is expected to be a JSON object like the return dict
-            # Add the original claim back in
-            response['claim'] = claim
+            # --- HACK: Prepend prompt to instruct model to use search ---
+            # This is less reliable than the API `tools` parameter.
+            search_prompt = (
+                "You MUST use Google Search to verify the factual claims in the following text. "
+                "Do not use your internal knowledge. Provide sources for your checks.\n\n"
+                + prompt
+            )
             
-            # TODO: Add validation on the response schema
-            
-            return response
+            logger.warning("FactChecker is using a prompt-based search instruction. "
+                           "This is less reliable than enabling the API `tools` parameter.")
 
+            raw_response = await self.api_gateway.send_request(
+                model_name="gemini-1.5-pro", # Model that supports search
+                prompt=search_prompt,
+                temperature=0.0, # Be factual
+                max_tokens=2048
+            )
+            
+            return self._parse_fact_check_response(raw_response)
+            
         except Exception as e:
-            return {
-                "claim": claim,
-                "status": "ERROR",
-                "confidence": 0.0,
-                "justification": f"LLM verification failed: {e}",
-                "evidence": [chunk.get('metadata', {}) for chunk in evidence_chunks]
-            }
+            logger.error(f"Error during fact check: {e}", exc_info=True)
+            return self._error_response(f"LLM API failed: {e}")
 
-    async def batch_check_claims(self, claims: List[str], event_id: str) -> List[Dict[str, Any]]:
+    def _parse_fact_check_response(self, response: str) -> Dict[str, Any]:
         """
-        Checks a list of factual claims in parallel.
-        
-        Args:
-            claims (List[str]): List of claims to verify.
-            event_id (str): The base event ID.
-            
-        Returns:
-            List[Dict[str, Any]]: A list of verification results.
+        Parses the LLM response, which should be structured (JSON).
         """
-        tasks = [self.check_claim(claim, f"{event_id}_claim_{i}") for i, claim in enumerate(claims)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        final_results = []
-        for i, res in enumerate(results):
-            if isinstance(res, Exception):
-                final_results.append({
-                    "claim": claims[i],
-                    "status": "ERROR",
-                    "confidence": 0.0,
-                    "justification": f"Batch check task failed: {res}",
-                    "evidence": []
-                })
+        try:
+            import json
+            if "```json" in response:
+                json_str = response.split("```json")[1].split("```")[0].strip()
             else:
-                final_results.append(res)
+                json_str = response.strip()
                 
-        return final_results
+            parsed_data = json.loads(json_str)
+            
+            if "overall_support" not in parsed_data or "checked_claims" not in parsed_data:
+                logger.warning(f"Fact check response missing required keys: {response[:100]}...")
+                return self._error_response("Parsed JSON missing required keys.")
+                
+            logger.info(f"Fact check complete. Overall support: {parsed_data['overall_support']}")
+            return parsed_data
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON fact check: {e}. Response: {response[:200]}...")
+            return self._error_response(f"JSON parse failed: {e}")
+        except Exception as e:
+            logger.error(f"Error parsing fact check response: {e}", exc_info=True)
+            return self._error_response(f"Parsing failed: {e}")
+
+    def _error_response(self, error_msg: str) -> Dict[str, Any]:
+        """Returns a standardized error dictionary."""
+        return {
+            "overall_support": "Unknown",
+            "checked_claims": [],
+            "error": error_msg
+        }
