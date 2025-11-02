@@ -1,149 +1,136 @@
-import json
+"""
+Data Validation Script
+
+This script provides utilities to validate the integrity and format
+of data schemas (MarketEvent, TickerData, etc.) before ingestion
+or in unit tests.
+"""
 import sys
 import os
-import argparse
-import pydantic # Required for schema validation
+import json
+import logging
+from pydantic import ValidationError
 
-# Add project root to the Python path
+# 修复：将项目根目录 (Phoenix_project) 添加到 sys.path
+# 这允许脚本以 'python scripts/validate_data.py' 的方式运行
+# 并正确解析 'from core...'
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
-    sys.path.append(project_root)
+    sys.path.insert(0, project_root)
 
-# FIX: Import the entire data_schema module
-import core.schemas.data_schema as data_schemas
-from monitor.logging import get_logger
+# 修复：现在使用绝对导入
+from core.schemas.data_schema import TickerData, MarketEvent, EconomicEvent
 
-logger = get_logger('DataValidator')
+# --- 日志设置 ---
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - [Validator] - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Define the mapping from schema type argument to the class name in data_schema.py
-SCHEMA_NAME_MAP = {
-    'market_event': 'MarketEvent',
-    'economic_indicator': 'EconomicIndicator',
-    'corporate_action': 'CorporateAction',
-    'analyst_rating': 'AnalystRating',
-    'social_media': 'SocialMediaPost',
-    'news_article': 'NewsArticle',
-    'market_data': 'MarketData',
-    'fused_analysis': 'FusedAnalysis',
-    'portfolio_decision': 'PortfolioDecision'
+# --- 示例数据 ---
+
+EXAMPLE_TICKER_DATA = {
+    "symbol": "AAPL",
+    "timestamp": "2023-10-27T14:30:00Z",
+    "open": 170.3,
+    "high": 170.9,
+    "low": 170.1,
+    "close": 170.5,
+    "volume": 1000000
 }
 
-def load_data(file_path: str):
-    """Loads data from a JSON file."""
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON from {file_path}: {e}")
-        return None
-    except IOError as e:
-        logger.error(f"Error reading file {file_path}: {e}")
-        return None
+EXAMPLE_MARKET_EVENT = {
+    "id": "news_12345",
+    "source": "bloomberg",
+    "timestamp": "2023-10-27T14:32:00Z",
+    "content": "Federal Reserve minutes show division on rate hikes.",
+    "symbols": ["AAPL", "MSFT", "GOOG"],
+    "metadata": {"sentiment": 0.2, "source_reliability": "high"}
+}
 
-# FIX: Updated function to use Pydantic model for validation
-def validate_with_schema(data: dict, schema: pydantic.BaseModel) -> bool:
+EXAMPLE_ECONOMIC_EVENT = {
+    "id": "econ_cpi_202310",
+    "event_name": "US CPI (MoM)",
+    "timestamp": "2023-10-27T12:30:00Z",
+    "actual": 0.4,
+    "forecast": 0.3,
+    "previous": 0.6,
+    "country": "USA",
+    "impact": "high"
+}
+
+def validate_schema(data: dict, schema_class) -> bool:
     """
-    Validates a single data item against the provided Pydantic schema class.
+    Validates a dictionary against a given Pydantic schema class.
+
+    Args:
+        data (dict): The raw data dictionary.
+        schema_class: The Pydantic BaseModel class (e.g., TickerData).
+
+    Returns:
+        bool: True if valid, False otherwise.
     """
-    if not isinstance(data, dict):
-        logger.warning(f"Data item is not a dictionary, skipping: {type(data)}")
-        return False
-        
+    schema_name = schema_class.__name__
+    logger.info(f"--- Validating schema: {schema_name} ---")
     try:
-        # Attempt to instantiate the model. This triggers validation.
-        schema(**data)
+        # 尝试创建和验证 schema 实例
+        schema_instance = schema_class(**data)
+        
+        logger.info(f"Validation SUCCESSFUL for {schema_name}.")
+        logger.debug(f"Validated data: {schema_instance.model_dump_json(indent=2)}")
         return True
-    except pydantic.ValidationError as e:
-        item_id = data.get('id', data.get('article_id', 'N/A'))
-        logger.warning(f"Validation Error for item [ID: {item_id}]:\n{e}")
+        
+    except ValidationError as e:
+        logger.error(f"Validation FAILED for {schema_name}!")
+        logger.error("Details:")
+        # 打印易于阅读的错误
+        for error in e.errors():
+            field = " -> ".join(map(str, error['loc']))
+            msg = error['msg']
+            logger.error(f"  Field: {field}")
+            logger.error(f"  Error: {msg}")
         return False
     except Exception as e:
-        item_id = data.get('id', data.get('article_id', 'N/A'))
-        logger.error(f"An unexpected error occurred during validation for item [ID: {item_id}]: {e}")
+        logger.critical(f"An unexpected error occurred during validation: {e}", exc_info=True)
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate data files against core schemas.")
-    parser.add_argument("file_path", type=str, help="Path to the JSON data file to validate.")
-    parser.add_argument(
-        "--schema-type", 
-        type=str, 
-        default="market_event",
-        choices=SCHEMA_NAME_MAP.keys(),
-        help=f"The type of schema to validate against. Defaults to 'market_event'. Choices: {list(SCHEMA_NAME_MAP.keys())}"
-    )
+    """
+    Runs validation on all example data structures.
+    """
+    logger.info("Starting data schema validation...")
     
-    args = parser.parse_args()
+    results = []
     
-    file_path = args.file_path
-    schema_type = args.schema_type
-
-    if not os.path.exists(file_path):
-        logger.error(f"File not found: {file_path}")
-        sys.exit(1)
-
-    # FIX: Dynamically get the schema class from the imported module
-    schema_name = SCHEMA_NAME_MAP.get(schema_type)
-    if not schema_name:
-        # This should be caught by argparse choices, but as a safeguard:
-        logger.error(f"Error: Unknown schema type '{schema_type}'")
-        sys.exit(1)
-        
-    schema_class = getattr(data_schemas, schema_name, None)
-    if not schema_class:
-        logger.error(f"Error: Schema class '{schema_name}' not found in core.schemas.data_schema.py")
-        sys.exit(1)
-        
-    logger.info(f"Validating '{file_path}' against schema: {schema_name}")
-
-    data = load_data(file_path)
-    if data is None:
-        logger.error("Failed to load data. Exiting.")
-        sys.exit(1)
-
-    total_items = 0
-    valid_items = 0
+    # 1. 验证 TickerData
+    results.append(validate_schema(EXAMPLE_TICKER_DATA, TickerData))
     
-    # Data can be a single object or a list of objects
-    if isinstance(data, list):
-        total_items = len(data)
-        if total_items == 0:
-            logger.warning("Data file is an empty list.")
-            sys.exit(0)
-        
-        # Validate each item in the list
-        results = [validate_with_schema(item, schema_class) for item in data]
-        valid_items = sum(results)
-        
-    elif isinstance(data, dict):
-        total_items = 1
-        # Validate the single object
-        if validate_with_schema(data, schema_class):
-            valid_items = 1
+    # 2. 验证 MarketEvent
+    results.append(validate_schema(EXAMPLE_MARKET_EVENT, MarketEvent))
+    
+    # 3. 验证 EconomicEvent
+    results.append(validate_schema(EXAMPLE_ECONOMIC_EVENT, EconomicEvent))
+    
+    # 4. 验证一个无效的 TickerData (缺少字段)
+    invalid_ticker = EXAMPLE_TICKER_DATA.copy()
+    del invalid_ticker['close']
+    logger.info("\nIntentionally testing invalid TickerData (missing 'close'):")
+    results.append(not validate_schema(invalid_ticker, TickerData)) # 期望失败 (False)
+    
+    # 5. 验证一个无效的 MarketEvent (错误的数据类型)
+    invalid_event = EXAMPLE_MARKET_EVENT.copy()
+    invalid_event['symbols'] = "just a string" # 应该是 list
+    logger.info("\nIntentionally testing invalid MarketEvent (wrong 'symbols' type):")
+    results.append(not validate_schema(invalid_event, MarketEvent)) # 期望失败 (False)
+
+    # --- 总结 ---
+    logger.info("\n--- Validation Summary ---")
+    if all(results):
+        logger.info("All tests passed (including expected failures)!")
+        logger.info("Data schemas are correctly defined and enforced.")
+        sys.exit(0) # 成功退出
     else:
-        logger.error(f"Data file does not contain a JSON object or list of objects. Found: {type(data)}")
-        sys.exit(1)
-
-    # --- Report Results ---
-    if total_items > 0:
-        valid_percentage = (valid_items / total_items) * 100
-        logger.info("--- Validation Summary ---")
-        logger.info(f"Total items checked: {total_items}")
-        logger.info(f"Valid items: {valid_items}")
-        logger.info(f"Invalid items: {total_items - valid_items}")
-        logger.info(f"Pass Rate: {valid_percentage:.2f}%")
-        
-        if valid_items == total_items:
-            logger.info("Validation SUCCESS: All items conform to the schema.")
-            sys.exit(0) # Exit with success code
-        else:
-            logger.error("Validation FAILED: One or more items do not conform to the schema.")
-            sys.exit(1) # Exit with failure code
-    else:
-        logger.warning("No items were validated.")
-        sys.exit(0)
-
+        logger.error("One or more validation tests failed.")
+        sys.exit(1) # 失败退出
 
 if __name__ == "__main__":
     main()
