@@ -1,124 +1,98 @@
+"""
+Pydantic schemas for data validation and standardization across the pipeline.
+"""
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import pandas as pd
 
-class MarketData(BaseModel):
+class MarketEvent(BaseModel):
     """
-    Schema for market data (OHLCV, trades, quotes).
+    Schema for a market-related event (e.g., news, press release).
     """
-    symbol: str
-    timestamp: datetime
-    open: Optional[float] = None
-    high: Optional[float] = None
-    low: Optional[float] = None
-    close: Optional[float] = None
-    volume: Optional[float] = None
+    event_id: str = Field(..., description="Unique identifier for the event")
+    timestamp: datetime = Field(..., description="Timestamp of when the event occurred or was published")
+    source: str = Field(..., description="Source of the event (e.g., 'Reuters', 'Bloomberg')")
+    headline: str = Field(..., description="Event headline or title")
+    content: str = Field(..., description="Full content of the event")
+    symbols: List[str] = Field(default_factory=list, description="List of ticker symbols mentioned or related")
+    event_type: str = Field(default="news", description="Type of market event (e.g., 'news', 'earnings', 'sec_filing')")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary metadata (e.g., sentiment scores, entity tags)")
+
+    class Config:
+        arbitrary_types_allowed = True
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
+
+class EconomicEvent(BaseModel):
+    """
+    Schema for a macroeconomic event (e.g.,
+    """
+    event_id: str = Field(..., description="Unique identifier for the event")
+    timestamp: datetime = Field(..., description="Timestamp of the event (e.g., release time)")
+    event_name: str = Field(..., description="Name of the economic indicator (e.g., 'CPI', 'Non-Farm Payrolls')")
+    region: str = Field(..., description="Geographical region (e.g., 'USA', 'Eurozone')")
+    actual: Optional[float] = Field(None, description="Actual reported value")
+    forecast: Optional[float] = Field(None, description="Forecasted value")
+    previous: Optional[float] = Field(None, description="Previous value")
     
     class Config:
         arbitrary_types_allowed = True
         json_encoders = {
-            pd.Timestamp: lambda v: v.to_pydatetime()
+            datetime: lambda v: v.isoformat()
         }
 
-class NewsData(BaseModel):
+# --- 新增的 TickerData Schema ---
+class TickerData(BaseModel):
     """
-    Schema for news articles and social media posts.
+    Schema for standardized OHLCV market data (ticker data).
     """
-    source_id: str = Field(..., unique=True)
-    timestamp: datetime
-    source: str  # e.g., 'Reuters', 'Twitter'
-    headline: str
-    summary: Optional[str] = None
-    content: str
-    symbols: List[str] = Field(default_factory=list)
-    url: Optional[str] = None
-    
+    symbol: str = Field(..., description="Ticker symbol")
+    timestamp: datetime = Field(..., description="Timestamp of the data point (e.g., bar start time)")
+    open: float = Field(..., description="Open price")
+    high: float = Field(..., description="High price")
+    low: float = Field(..., description="Low price")
+    close: float = Field(..., description="Close price")
+    volume: float = Field(..., description="Volume")
+
     class Config:
         arbitrary_types_allowed = True
+        json_encoders = {
+            # pandas Timestamps are common, ensure they are converted
+            pd.Timestamp: lambda v: v.to_pydatetime().isoformat(),
+            datetime: lambda v: v.isoformat()
+        }
 
-class AlternativeData(BaseModel):
-    """
-    Schema for alternative datasets (e.g., satellite, credit card).
-    """
-    data_type: str
-    timestamp: datetime
-    source: str
-    data: Dict[str, Any]
-    
-    class Config:
-        arbitrary_types_allowed = True
+# --- 知识图谱 (Knowledge Graph) Schemas ---
 
-class DerivedData(BaseModel):
+class KGNode(BaseModel):
     """
-    Schema for features and derived insights.
+    Represents a node in the Knowledge Graph.
     """
-    feature_name: str
-    timestamp: datetime
-    value: Any
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    
-    class Config:
-        arbitrary_types_allowed = True
+    node_id: str = Field(..., description="Unique identifier for the node (e.g., 'AAPL', 'Tim Cook')")
+    node_type: str = Field(..., description="Type of the node (e.g., 'COMPANY', 'PERSON', 'PRODUCT')")
+    attributes: Dict[str, Any] = Field(default_factory=dict, description="Properties of the node")
 
-class Node(BaseModel):
+class KGRelation(BaseModel):
     """
-    Node in the knowledge graph.
+    Represents a directed edge (relationship) in the Knowledge Graph.
     """
-    id: str = Field(..., description="Unique identifier for the node")
-    label: str = Field(..., description="Node type (e.g., 'Company', 'Person', 'Event')")
-    properties: Dict[str, Any] = Field(default_factory=dict, description="Node attributes")
+    relation_id: str = Field(..., description="Unique identifier for the relationship")
+    source_node_id: str = Field(..., description="ID of the source node")
+    target_node_id: str = Field(..., description="ID of the target node")
+    relation_type: str = Field(..., description="Type of relationship (e.g., 'IS_CEO_OF', 'MANUFACTURES')")
+    attributes: Dict[str, Any] = Field(default_factory=dict, description="Properties of the relationship (e.g., 'start_date', 'confidence')")
 
-class Relation(BaseModel):
-    """
-    Relation (edge) in the knowledge graph.
-    """
-    id: str = Field(..., description="Unique identifier for the relation")
-    type: str = Field(..., description="Type of relationship (e.g., 'CEO_OF', 'COMPETES_WITH')")
-    start_node_id: str = Field(..., description="ID of the starting node")
-    end_node_id: str = Field(..., description="ID of the ending node")
-    properties: Dict[str, Any] = Field(default_factory=dict, description="Relation attributes (e.g., 'since', 'weight')")
-
-
-# --- 新增：补全 ai/graph_encoder.py 缺失的 KnoledgeGraph schema ---
 class KnowledgeGraph(BaseModel):
     """
-    Pydantic 模型，用于表示知识图谱的结构。
-    供 ai/graph_encoder.py 使用。
+    Represents a subgraph or a complete Knowledge Graph.
     """
-    nodes: List[Node] = Field(default_factory=list)
-    relations: List[Relation] = Field(default_factory=list)
+    nodes: List[KGNode] = Field(default_factory=list)
+    relations: List[KGRelation] = Field(default_factory=list)
 
-    class Config:
-        arbitrary_types_allowed = True
-        
-# --- 新增：补全 ai/retriever.py 缺失的 QueryResult schema ---
-class QueryResult(BaseModel):
-    """
-    Pydantic 模型，用于统一 RAG 检索器的返回格式。
-    供 ai/retriever.py 使用。
-    """
-    source: str = Field(..., description="数据来源 (e.g., 'vector', 'temporal', 'tabular')")
-    content: str = Field(..., description="检索到的文本内容或数据片段")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="相关的元数据 (e.g., source_id, timestamp)")
-    score: Optional[float] = Field(None, description="检索相关性得分")
+    def add_node(self, node: KGNode):
+        self.nodes.append(node)
 
-    class Config:
-        arbitrary_types_allowed = True
-
-
-class MarketEvent(BaseModel):
-    """
-    一个通用的市场事件 schema，用于事件流。
-    (从 strategy_handler.py 推断)
-    """
-    event_id: str = Field(..., description="事件的唯一 ID")
-    event_type: str = Field(..., description="事件类型 (e.g., 'PRICE', 'NEWS', 'URGENT_NEWS')")
-    timestamp: datetime = Field(..., description="事件发生时间")
-    symbols: List[str] = Field(default_factory=list, description="与此事件相关的 Tickers")
-    content: Optional[str] = Field(None, description="事件的文本内容 (例如新闻正文)")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="其他事件数据")
-
-    class Config:
-        arbitrary_types_allowed = True
-
+    def add_relation(self, relation: KGRelation):
+        self.relations.append(relation)
