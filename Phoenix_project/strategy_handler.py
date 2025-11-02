@@ -1,151 +1,138 @@
-import pandas as pd
-from typing import Dict, Any, Optional
-
-from monitor.logging import get_logger
-from data_manager import DataManager
-from core.pipeline_state import PipelineState
-from core.schemas.data_schema import MarketEvent
-
-# FIX: Renamed SimpleFeatureStore to FeatureStore
-from features.store import FeatureStore
+"""
+Strategy Handler
+- 加载和管理一个或多个交易策略
+- 将 Orchestrator 的事件分派给相关策略
+"""
 from cognitive.engine import CognitiveEngine
+from data_manager import DataManager
+from ai.metacognitive_agent import MetacognitiveAgent
+from cognitive.portfolio_constructor import PortfolioConstructor
+from monitor.logging import get_logger
+from typing import Dict, Any
 
 class BaseStrategy:
-    """
-    Abstract base class for all trading strategies.
-    Defines the interface for event handling and signal generation.
-    """
-    def __init__(self, config: Dict[str, Any], data_manager: DataManager):
+    """策略的基类"""
+    def __init__(self, config):
         self.config = config
-        self.data_manager = data_manager
         self.logger = get_logger(self.__class__.__name__)
-        self.logger.info(f"Strategy '{self.__class__.__name__}' initialized.")
+        self.logger.info(f"Strategy {self.__class__.__name__} initialized.")
 
-    async def on_event(self, event: MarketEvent, state: PipelineState) -> Optional[Dict[str, Any]]:
-        """
-        Asynchronously process an incoming market event.
-        
-        Args:
-            event: The MarketEvent object (e.g., news, price update).
-            state: The current PipelineState object.
-            
-        Returns:
-            A dictionary representing a trading signal, or None if no action.
-            Example signal: {"action": "BUY", "symbol": "AAPL", "weight": 0.1}
-        """
-        raise NotImplementedError("Strategy must implement on_event")
+    async def on_data(self, data_event):
+        """处理传入的市场数据"""
+        raise NotImplementedError
 
-    async def on_decision_cycle(self, current_time: pd.Timestamp, state: PipelineState) -> Optional[Dict[str, Any]]:
-        """
-        Asynchronously triggered on a regular cycle (e.g., daily, hourly) 
-        for portfolio rebalancing decisions.
-        
-        Args:
-            current_time: The timestamp of the current decision cycle.
-            state: The current PipelineState object.
-            
-        Returns:
-            A dictionary representing a desired portfolio state or list of signals.
-        """
-        self.logger.debug(f"Decision cycle triggered at {current_time}")
-        # Default implementation does nothing
-        return None
-
+    async def run_cognitive_cycle(self):
+        """执行策略的认知循环"""
+        raise NotImplementedError
 
 class RomanLegionStrategy(BaseStrategy):
     """
-    A sophisticated strategy handler that uses a "Cognitive Engine" to make
-    decisions. It represents one "Legion" of the trading system.
+    一个具体的策略实现示例。
     """
     
-    # FIX: Removed redundant data arguments (asset_analysis_data, sentiment_data)
-    # The CognitiveEngine will now get this data via the DataManager.
-    def __init__(self, config: Dict[str, Any], data_manager: DataManager):
+    # 关键修正 (Error 3): 
+    # 构造函数现在接受由外部(Orchestrator/StrategyHandler)注入的依赖
+    def __init__(
+        self, 
+        config: Dict[str, Any], 
+        data_manager: DataManager,
+        metacognitive_agent: MetacognitiveAgent,
+        portfolio_constructor: PortfolioConstructor
+    ):
         """
-        Initializes the strategy, its feature store, and the core cognitive engine.
-        
-        Args:
-            config: The main system configuration dictionary.
-            data_manager: The shared DataManager instance.
+        使用依赖注入初始化策略。
         """
-        super().__init__(config, data_manager)
+        super().__init__(config)
+        self.data_manager = data_manager 
         
-        # FIX: Renamed SimpleFeatureStore to FeatureStore
-        self.feature_store = FeatureStore()
-        self.logger.info("FeatureStore initialized.")
-
-        # FIX: Passed config and data_manager to CognitiveEngine.
-        # The CognitiveEngine is now self-sufficient and will load its own data
-        # via the DataManager as needed.
+        # 关键修正: 使用注入的依赖项来构建 CognitiveEngine
+        # 而不是错误地传递 data_manager
         self.cognitive_engine = CognitiveEngine(
-            config=self.config, 
-            data_manager=self.data_manager
+            config=self.config.get('cognitive_engine', {}),
+            metacognitive_agent=metacognitive_agent,
+            portfolio_constructor=portfolio_constructor
         )
         
-        # Get references to the engine's components for convenience
-        self.portfolio_constructor = self.cognitive_engine.portfolio_constructor
-        self.risk_manager = self.cognitive_engine.risk_manager
-        
-        self.logger.info("RomanLegionStrategy initialized with CognitiveEngine.")
+        self.logger.info("RomanLegionStrategy components initialized.")
 
-    async def on_event(self, event: MarketEvent, state: PipelineState) -> Optional[Dict[str, Any]]:
-        """
-        Processes high-priority, real-time events (e.g., breaking news).
-        This path is for rapid, tactical decisions.
-        """
-        self.logger.debug(f"Processing event: {event.event_id} ({event.event_type})")
-        
-        # 1. Update features based on the event
-        new_features = self.feature_store.update_features(event)
-        
-        # 2. (Optional) Quick check for immediate action
-        # This bypasses the full cognitive loop for speed
-        if event.event_type == 'URGENT_NEWS' and 'AAPL' in event.symbols:
-             # Example: A simple heuristic rule
-             if "positive guidance" in event.content.lower():
-                 self.logger.info("Tactical BUY signal triggered by urgent news.")
-                 return {"action": "TACTICAL_BUY", "symbol": "AAPL", "weight": 0.02}
+    async def on_data(self, data_event):
+        """处理传入的市场数据"""
+        self.logger.debug(f"Received data event: {data_event.get('type')}")
+        # (策略的数据处理逻辑)
+        pass
 
-        # 3. For most events, we just log and wait for the main decision cycle
-        self.logger.debug(f"Event {event.event_id} logged. Awaiting decision cycle.")
-        return None
-
-    async def on_decision_cycle(self, current_time: pd.Timestamp, state: PipelineState) -> Optional[Dict[str, Any]]:
+    async def run_cognitive_cycle(self):
         """
-        This is the main entry point for the full cognitive workflow.
-        It runs the entire RAG, reasoning, and portfolio construction process.
+        执行策略的认知循环并返回信号。
         """
-        self.logger.info(f"--- RomanLegionDecisionCycle START: {current_time} ---")
+        self.logger.info("Running cognitive cycle...")
+        # 1. (获取策略所需的数据)
+        # market_data = self.data_manager.get_latest_data(...)
         
-        try:
-            # 1. Define the primary analysis task for this cycle
-            # In a real system, this would be more dynamic (e.g., top 50 assets)
-            task_description = "Analyze the market outlook for AAPL and GOOGL for the next 5 trading days."
-            
-            # 2. Run the full cognitive engine workflow
-            # This is an async call that performs RAG, multi-agent reasoning,
-            # synthesis, risk assessment, and portfolio construction.
-            portfolio_decision = await self.cognitive_engine.run_cycle(
-                task_description=task_description,
-                current_time=current_time,
-                current_state=state
+        # 2. (运行认知引擎)
+        # fusion_result = await self.cognitive_engine.run_cycle(market_data)
+        
+        # 3. (生成信号)
+        # signal = self.portfolio_constructor.generate_signal(fusion_result)
+        # return signal
+        
+        # (模拟返回一个信号)
+        from execution.signal_protocol import StrategySignal
+        return StrategySignal(
+            strategy_id="RomanLegion_v1",
+            target_weights={"AAPL": 0.5, "MSFT": 0.5}
+        )
+
+class StrategyHandler:
+    """
+    加载、保存和协调所有活动策略。
+    """
+    def __init__(self, config, data_manager, metacognitive_agent, portfolio_constructor):
+        self.config = config
+        self.data_manager = data_manager
+        self.metacognitive_agent = metacognitive_agent
+        self.portfolio_constructor = portfolio_constructor
+        self.strategies: Dict[str, BaseStrategy] = {}
+        self.logger = get_logger(self.__class__.__name__)
+        self.load_strategies()
+
+    def load_strategies(self):
+        """
+        根据配置加载策略。
+        """
+        self.logger.info("Loading strategies...")
+        # (此处应有逻辑根据 config 加载策略)
+        # 示例:
+        strategy_config = self.config.get('strategy_handler', {}).get('strategies', [])
+        
+        if not strategy_config:
+            self.logger.warning("No strategies defined in config. Loading default RomanLegionStrategy.")
+            # 修正: 确保在创建时注入所有依赖项
+            self.strategies['RomanLegion_v1'] = RomanLegionStrategy(
+                config=self.config, # (传递相关配置)
+                data_manager=self.data_manager,
+                metacognitive_agent=self.metacognitive_agent,
+                portfolio_constructor=self.portfolio_constructor
             )
-            
-            if portfolio_decision is None:
-                self.logger.warning("Cognitive engine returned no decision.")
-                return None
 
-            # 3. Log and return the final decision
-            # The decision object (e.g., PortfolioDecision) contains the
-            # target weights, the reasoning, and any generated orders.
-            self.logger.info(f"Cognitive engine produced decision: {portfolio_decision.decision_id}")
-            
-            # The orchestrator will receive this and pass it to the OrderManager
-            return portfolio_decision.to_dict() 
-            
-        except Exception as e:
-            self.logger.error(f"Error during decision cycle: {e}", exc_info=True)
-            # Propagate error to orchestrator's error handler
-            raise
-        finally:
-            self.logger.info(f"--- RomanLegionDecisionCycle END: {current_time} ---")
+    async def run_all_cognitive_cycles(self):
+        """
+        触发所有策略的认知循环。
+        """
+        signals = []
+        for name, strategy in self.strategies.items():
+            try:
+                signal = await strategy.run_cognitive_cycle()
+                if signal:
+                    signals.append(signal)
+            except Exception as e:
+                self.logger.error(f"Error running cognitive cycle for strategy {name}: {e}")
+        return signals
+
+    async def on_event(self, event):
+        """
+        将事件分派给所有策略。
+        """
+        for strategy in self.strategies.values():
+            if hasattr(strategy, 'on_event'):
+                await strategy.on_event(event)
