@@ -1,138 +1,163 @@
-from neo4j import AsyncGraphDatabase
-from typing import Dict, Any, List, Optional
-from .monitor.logging import get_logger
+"""
+Knowledge Graph Service
 
-logger = get_logger(__name__)
+A high-level service that manages the Knowledge Graph (KG).
+It provides an interface for:
+1. Injecting new information (from RelationExtractor).
+2. Querying the graph.
+3. Potentially persisting the graph to a database (e.g., Neo4j, or
+   simplified in PostgreSQL JSONB).
+
+This service acts as an abstraction layer over the chosen KG backend.
+"""
+import logging
+from typing import Optional, List
+
+# 修复：从根目录开始使用绝对导入，移除 `.`
+from ai.tabular_db_client import TabularDBClient # Example: Using PG for storage
+from core.schemas.data_schema import KnowledgeGraph, KGNode, KGRelation
+
+logger = logging.getLogger(__name__)
 
 class KnowledgeGraphService:
     """
-    Manages connections and queries to a Neo4j Knowledge Graph.
-    Used for storing and retrieving complex relationships between
-    entities (e.g., "Company A" -> "SUPPLIES" -> "Company B").
+    Manages the creation, updating, and querying of the knowledge graph.
+    
+    This is a simplified implementation assuming storage in the
+    existing TabularDB (PostgreSQL) using JSONB.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, db_client: TabularDBClient):
         """
         Initializes the KnowledgeGraphService.
 
-        Expected config keys:
-          - uri: Neo4j bolt/bolt+s URI
-          - user: Username for Neo4j
-          - password: Password for Neo4j
-          - database: Database name (optional; defaults to 'neo4j')
+        Args:
+            db_client: An initialized TabularDBClient (PostgreSQL).
         """
-        self.uri = config.get("uri")
-        self.user = config.get("user")
-        self.password = config.get("password")
-        self.database = config.get("database", "neo4j")
+        self.db = db_client
+        logger.info("KnowledgeGraphService initialized (PostgreSQL backend).")
 
-        if not self.uri or not self.user or not self.password:
-            raise ValueError("Neo4j config requires 'uri', 'user', and 'password'.")
+    async def setup_schema(self):
+        """
+        Ensures the tables for storing nodes and relations exist.
+        """
+        if not self.db.is_connected():
+            logger.info("DB not connected, connecting for KG schema setup...")
+            await self.db.connect()
+            
+        logger.info("Setting up Knowledge Graph schema...")
+        
+        # Table for Nodes (Entities)
+        # We use ON CONFLICT to allow idempotent updates
+        await self.db.execute("""
+        CREATE TABLE IF NOT EXISTS kg_nodes (
+            node_id VARCHAR(255) PRIMARY KEY,
+            node_type VARCHAR(100) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            metadata JSONB,
+            last_updated TIMESTAMPTZ NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kg_node_type ON kg_nodes(node_type);
+        CREATE INDEX IF NOT EXISTS idx_kg_node_name ON kg_nodes(name);
+        """)
+        
+        # Table for Relations (Edges)
+        await self.db.execute("""
+        CREATE TABLE IF NOT EXISTS kg_relations (
+            relation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            source_node_id VARCHAR(255) REFERENCES kg_nodes(node_id) ON DELETE CASCADE,
+            target_node_id VARCHAR(255) REFERENCES kg_nodes(node_id) ON DELETE CASCADE,
+            relation_type VARCHAR(100) NOT NULL,
+            context TEXT,
+            metadata JSONB,
+            last_updated TIMESTAMPTZ NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_kg_rel_source ON kg_relations(source_node_id);
+        CREATE INDEX IF NOT EXISTS idx_kg_rel_target ON kg_relations(target_node_id);
+        CREATE INDEX IF NOT EXISTS idx_kg_rel_type ON kg_relations(relation_type);
+        """)
+        
+        logger.info("Knowledge Graph schema setup complete.")
 
-        self._driver = AsyncGraphDatabase.driver(self.uri, auth=(self.user, self.password))
-        logger.info("KnowledgeGraphService initialized for %s", self.uri)
+    async def add_knowledge_graph(self, kg: KnowledgeGraph):
+        """
+        Adds or updates nodes and relations from a KnowledgeGraph object
+        into the database.
+        """
+        if not self.db.is_connected():
+            logger.error("Database not connected. Cannot add KnowledgeGraph.")
+            return
 
-    async def close(self):
-        """Closes the underlying driver."""
-        await self._driver.close()
-        logger.info("KnowledgeGraphService closed.")
+        now = "NOW()" # Use SQL NOW() for consistency
 
-    async def run_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """
-        Runs a read-only query against the Neo4j database.
-        """
-        params = params or {}
-        logger.debug("KG read query: %s | params=%s", query, params)
-        async with self._driver.session(database=self.database) as session:
-            result = await session.run(query, **params)
-            records = [r.data() for r in await result.to_list()]
-            logger.debug("KG read result: %s rows", len(records))
-            return records
+        async with self.db.pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # 1. Upsert Nodes
+                    for node in kg.nodes:
+                        await conn.execute(
+                            """
+                            INSERT INTO kg_nodes (node_id, node_type, name, metadata, last_updated)
+                            VALUES ($1, $2, $3, $4::jsonb, $5)
+                            ON CONFLICT (node_id) DO UPDATE SET
+                                name = EXCLUDED.name,
+                                metadata = EXCLUDED.metadata,
+                                last_updated = EXCLUDED.last_updated;
+                            """,
+                            node.id, node.type, node.name, node.metadata, now
+                        )
+                    
+                    # 2. Insert Relations
+                    # We assume relations are new and don't check for conflicts
+                    # A more robust system would hash relations to prevent duplicates
+                    for rel in kg.relations:
+                        await conn.execute(
+                            """
+                            INSERT INTO kg_relations (source_node_id, target_node_id, relation_type, context, metadata, last_updated)
+                            VALUES ($1, $2, $3, $4, $5::jsonb, $6);
+                            """,
+                            rel.source_id, rel.target_id, rel.type, rel.context, rel.metadata, now
+                        )
+                    
+                    logger.info(f"Successfully upserted {len(kg.nodes)} nodes and added {len(kg.relations)} relations.")
 
-    async def run_write_tx(self, query: str, params: Optional[Dict[str, Any]] = None) -> None:
-        """
-        Runs a write transaction with the given query/params.
-        """
-        params = params or {}
-        logger.debug("KG write query: %s | params=%s", query, params)
-        async with self._driver.session(database=self.database) as session:
-            await session.execute_write(lambda tx: tx.run(query, **params))
-        logger.debug("KG write commit ok.")
+                except Exception as e:
+                    logger.error(f"Failed to add KnowledgeGraph (transaction rolled back): {e}", exc_info=True)
+                    raise
 
-    async def upsert_entity(self, entity_id: str, entity_type: str, properties: Dict[str, Any]):
+    async def find_related_nodes(self, node_id: str, hops: int = 1) -> Optional[List[Dict[str, Any]]]:
         """
-        Creates or updates an entity node.
+        Finds nodes connected to a given node_id within N hops.
+        
+        Args:
+            node_id: The starting node ID (e.g., "AAPL").
+            hops: The number of hops (1 = direct neighbors).
+
+        Returns:
+            A list of node and relation data, or None on failure.
         """
+        if hops != 1:
+            # Multi-hop queries are complex (require CTEs)
+            logger.warning("Only 1-hop queries are supported in this simplified service.")
+        
         query = """
-        MERGE (e:Entity {name: $entity_id})
-        ON CREATE SET e.type = $entity_type
-        SET e += $properties
+        SELECT 
+            'outbound' as direction, r.relation_type, t.*
+        FROM kg_relations r
+        JOIN kg_nodes t ON r.target_node_id = t.node_id
+        WHERE r.source_node_id = $1
+        
+        UNION
+        
+        SELECT 
+            'inbound' as direction, r.relation_type, s.*
+        FROM kg_relations r
+        JOIN kg_nodes s ON r.source_node_id = s.node_id
+        WHERE r.target_node_id = $1;
         """
-        await self.run_write_tx(
-            query,
-            {"entity_id": entity_id, "entity_type": entity_type, "properties": properties},
-        )
-
-    async def upsert_relation(self, entity_a_id: str, relation: str, entity_b_id: str, weight: float = 1.0):
-        """
-        Creates or updates a relation between two entities.
-        """
-        query = """
-        MERGE (a:Entity {name: $entity_a})
-        MERGE (b:Entity {name: $entity_b})
-        MERGE (a)-[r:%s]->(b)
-        ON CREATE SET r.weight = $weight
-        SET r.weight = $weight
-        """ % relation
-        await self.run_write_tx(query, {"entity_a": entity_a_id, "entity_b": entity_b_id, "weight": weight})
-
-    async def delete_entity(self, entity_id: str):
-        """
-        Deletes an entity and all relationships.
-        """
-        query = """
-        MATCH (e:Entity {name: $entity_id})
-        DETACH DELETE e
-        """
-        await self.run_write_tx(query, {"entity_id": entity_id})
-
-    async def get_neighbors(self, entity_id: str, relation: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Returns neighbors connected with optional relation filter.
-        """
-        if relation:
-            query = f"""
-            MATCH (:Entity {{name: $entity_id}})-[r:{relation}]->(n:Entity)
-            RETURN n.name AS neighbor, n.type AS type, r.weight AS weight
-            """
-        else:
-            query = """
-            MATCH (:Entity {name: $entity_id})-[r]->(n:Entity)
-            RETURN n.name AS neighbor, n.type AS type, r.weight AS weight, type(r) AS relation
-            """
-        return await self.run_query(query, {"entity_id": entity_id})
-
-    async def connect_entities(self, entity_a_id: str, entity_b_id: str):
-        """
-        Example helper to connect two entities with a generic relation.
-        """
-        query = """
-        MATCH (a:Entity {name: $entity_a})
-        MATCH (b:Entity {name: $entity_b})
-        MERGE (a)-[:RELATED_TO]->(b)
-        """
-        await self.run_write_tx(query, {"entity_a": entity_a_id, "entity_b": entity_b_id})
-
-    async def get_related_entities(self, entity_id: str, hops: int = 1) -> List[Dict]:
-        """
-        Example: Finds entities related to a given entity within N hops.
-        """
-        if hops < 1:
-            hops = 1
-
-        query = f"""
-        MATCH (a:Entity {{name: $entity_id}})-[*1..{hops}]-(b:Entity)
-        WHERE a <> b
-        RETURN DISTINCT b.name AS related_entity, b.type AS entity_type
-        """
-        return await self.run_query(query, {"entity_id": entity_id})
+        try:
+            results = await self.db.fetch(query, node_id)
+            return [dict(row) for row in results]
+        except Exception as e:
+            logger.error(f"Error querying related nodes for {node_id}: {e}", exc_info=True)
+            return None
