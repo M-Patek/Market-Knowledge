@@ -1,71 +1,95 @@
-# Phoenix_project/ai/graph_encoder.py
-import tensorflow as tf
-import tensorflow_gnn as tfgnn
-from typing import List
-import asyncio
-from ..api.gemini_pool_manager import GeminiPoolManager
-from ..ai.prompt_manager import PromptManager
-from ..core.schemas.data_schema import KnowledgeGraph 
+from typing import Dict, Any, List
+import json
+from api.gateway import APIGateway
+from ai.prompt_manager import PromptManager
+from monitor.logging import get_logger
 
-class GNNEncoder(tf.keras.Model):
+logger = get_logger(__name__)
+
+class GraphEncoder:
     """
-    使用GNN将KnowledgeGraph编码为单个密集嵌入向量。
+    Uses an LLM to encode textual information (like news or reasoning)
+    into a structured graph format (nodes and edges) for use in a
+    Knowledge Graph.
     """
-    def __init__(self, embedding_dim: int = 32, num_node_features: int = 16):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.num_node_features = num_node_features
-        # 用于节点类型的简单嵌入层
-        self.node_type_embedding = tf.keras.layers.Embedding(input_dim=10, output_dim=self.num_node_features) # 假设最多10种实体类型
 
-        # [NEW] RGCN层，用于处理异构关系
-        # 假设最多有20种不同的关系类型
-        self.graph_conv = tfgnn.keras.layers.RGCNConv(self.embedding_dim, num_relation_types=20, activation='relu')
-        # 将节点状态池化为单个图嵌入的层
-        self.pool = tfgnn.keras.layers.Pool(tfgnn.CONTEXT, "mean")
+    def __init__(self, api_gateway: APIGateway, prompt_manager: PromptManager):
+        self.api_gateway = api_gateway
+        self.prompt_manager = prompt_manager
+        self.prompt_name = "encode_to_graph" # The prompt template name
+        logger.info("GraphEncoder initialized.")
 
-    def call(self, graph_tensor: tfgnn.GraphTensor) -> tf.Tensor:
-        """GNN编码器的前向传播。"""
-        # 嵌入节点类型以创建初始特征
-        node_features = self.node_type_embedding(graph_tensor.node_sets["entities"]["type"])
-        graph_tensor = graph_tensor.replace_features(node_sets={"entities": {"features": node_features}})
-
-        # 应用RGCN图卷积，现在传入关系类型
-        graph = self.graph_conv(graph_tensor, edge_set_name="relations", relation_type_feature='relation_type')
-        # 池化节点状态以获得图级别的嵌入
-        embedding = self.pool(graph)
-        return embedding
-
-    def encode_graph(self, kg: KnowledgeGraph) -> tf.Tensor:
+    async def encode_text_to_graph(self, text_content: str, metadata: Dict[str, Any] = None) -> Dict[str, List[Dict]]:
         """
-        将Pydantic的KnowledgeGraph转换为GraphTensor并进行编码。
+        Takes a block of text and converts it into a graph structure
+        containing nodes and relationships.
+        
+        Args:
+            text_content (str): The input text (e.g., news article, agent reasoning).
+            metadata (Dict[str, Any]): Optional metadata about the text (source, timestamp).
+            
+        Returns:
+            Dict[str, List[Dict]]: A dictionary with "nodes" and "edges" keys.
+                                  e.g., {"nodes": [...], "edges": [...]}
         """
-        if not kg.entities or not kg.relations:
-            return tf.zeros((1, self.embedding_dim))
+        if not text_content:
+            logger.warning("GraphEncoder received empty text content.")
+            return {"nodes": [], "edges": []}
+            
+        prompt = self.prompt_manager.get_prompt(
+            self.prompt_name,
+            text_content=text_content,
+            metadata=metadata or {}
+        )
+        
+        if not prompt:
+            logger.error(f"Could not get prompt '{self.prompt_name}'.")
+            return {"nodes": [], "edges": []}
 
-        # 将实体类型简单映射为整数
-        entity_type_map = {t: i for i, t in enumerate(set(e.type for e in kg.entities))}
-        # [NEW] 将关系标签映射为整数
-        relation_type_map = {r: i for i, r in enumerate(set(rel.label for rel in kg.relations))}
+        try:
+            # We explicitly ask the LLM to return JSON
+            raw_response = await self.api_gateway.send_request(
+                model_name="gemini-pro", # Use a model good at JSON output
+                prompt=prompt,
+                temperature=0.1, # Low temperature for structured output
+                max_tokens=2048,
+                # Ensure the prompt guides the model to produce JSON
+            )
+            
+            return self._parse_graph_response(raw_response)
+            
+        except Exception as e:
+            logger.error(f"Error encoding text to graph: {e}", exc_info=True)
+            return {"nodes": [], "edges": []}
 
-        graph_tensor = tfgnn.GraphTensor.from_pieces(
-            node_sets={
-                "entities": tfgnn.NodeSet.from_fields(
-                    sizes=tf.constant([len(kg.entities)]),
-                    features={
-                        "type": tf.constant([[entity_type_map.get(e.type, 0) for e in kg.entities]], dtype=tf.int32),
-                    })
-            },
-            edge_sets={
-                "relations": tfgnn.EdgeSet.from_fields(
-                    sizes=tf.constant([len(kg.relations)]),
-                    features={
-                        # [NEW] 添加关系类型作为边的特征
-                        'relation_type': tf.constant([[relation_type_map.get(r.label, 0) for r in kg.relations]], dtype=tf.int32)
-                    },
-                    adjacency=tfgnn.Adjacency.from_indices(
-                        source=("entities", tf.constant([r.source_id for r in kg.relations], dtype=tf.int32)),
-                        target=("entities", tf.constant([r.target_id for r in kg.relations], dtype=tf.int32)),
-                    ))
-            })
-        return self(graph_tensor)
+    def _parse_graph_response(self, response: str) -> Dict[str, List[Dict]]:
+        """
+        Robustly parses the LLM's string response, expecting JSON.
+        """
+        try:
+            # The LLM response might be wrapped in ```json ... ```
+            if "```json" in response:
+                json_str = response.split("```json")[1].split("```")[0].strip()
+            elif "```" in response:
+                json_str = response.split("```")[1].split("```")[0].strip()
+            else:
+                json_str = response.strip()
+                
+            graph_data = json.loads(json_str)
+            
+            # Validate basic structure
+            if "nodes" in graph_data and "edges" in graph_data and \
+               isinstance(graph_data["nodes"], list) and \
+               isinstance(graph_data["edges"], list):
+                logger.info(f"Successfully parsed graph with {len(graph_data['nodes'])} nodes and {len(graph_data['edges'])} edges.")
+                return graph_data
+            else:
+                logger.warning(f"Parsed JSON lacks required 'nodes'/'edges' keys or valid types: {json_str}")
+                return {"nodes": [], "edges": []}
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode JSON from graph response: {e}. Response: {response[:200]}...")
+            return {"nodes": [], "edges": []}
+        except Exception as e:
+            logger.error(f"Error parsing graph response: {e}", exc_info=True)
+            return {"nodes": [], "edges": []}
