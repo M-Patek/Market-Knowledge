@@ -2,13 +2,19 @@ import pandas as pd
 # 修复：[FIX-15] 添加 'Callable' 用于类型提示
 from typing import Dict, Any, Optional, Callable
 
-from ..core.pipeline_state import PipelineState
-from ..data.data_iterator import DataIterator
-from ..controller.orchestrator import Orchestrator
-from ..execution.trade_lifecycle_manager import TradeLifecycleManager
-from ..monitor.logging import get_logger
+# 修复：将相对导入 'from ..core.pipeline_state...' 更改为绝对导入
+from core.pipeline_state import PipelineState
+# 修复：将相对导入 'from ..data.data_iterator...' 更改为绝对导入
+from data.data_iterator import DataIterator
+# 修复：将相对导入 'from ..controller.orchestrator...' 更改为绝对导入
+from controller.orchestrator import Orchestrator
+# 修复：将相对导入 'from ..execution.trade_lifecycle_manager...' 更改为绝对导入
+from execution.trade_lifecycle_manager import TradeLifecycleManager
+# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
 # 修复：[FIX-15] 导入 'render_report' (函数)，而不是 'ReportRenderer' (类)
-from ..output.renderer import render_report
+# 修复：将相对导入 'from ..output.renderer...' 更改为绝对导入
+from output.renderer import render_report
 
 logger = get_logger(__name__)
 
