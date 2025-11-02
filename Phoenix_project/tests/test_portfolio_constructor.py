@@ -1,97 +1,139 @@
 """
-Tests for the PortfolioConstructor
+测试 PortfolioConstructor (已更新)
 """
 import pytest
-import pandas as pd
+from unittest.mock import MagicMock
+from datetime import datetime
+
 from cognitive.portfolio_constructor import PortfolioConstructor
-
-# 关键修正 (Error 9):
-# 从 sizing.base 导入正确的接口 'IPositionSizer'
-# 而不是不存在的 'BaseSizer'
 from sizing.base import IPositionSizer
-from sizing.fixed_fraction import FixedFractionSizer # (导入一个具体的实现用于测试)
+from core.schemas.data_schema import Signal, PortfolioState, Position
+from core.schemas.fusion_result import FusionResult
 
-# --- Mocks ---
-
-class MockPositionSizer(IPositionSizer):
-    """
-    IPositionSizer 接口的模拟实现
-    """
-    def calculate_size(self, signal, current_portfolio, market_data) -> Dict[str, float]:
-        # (模拟返回一个固定的仓位大小)
-        if signal.get('action') == 'BUY':
-            return {signal.get('ticker'): 0.5} # (分配 50% 仓位)
-        else:
-            return {signal.get('ticker'): 0.0} # (清仓)
-
-# (假设的 FusionResult 模拟)
-class MockFusionResult:
-    def __init__(self, decision):
-        self.final_decision = decision
-
-# --- Tests ---
+# FIX (E10): 重写测试以正确模拟依赖项
 
 @pytest.fixture
-def constructor_config():
-    """Fixture for portfolio constructor config"""
-    return {
-        "sizer": "fixed_fraction", # (假设配置指定了sizer)
-        "risk_manager": {} # (假设)
-    }
+def mock_position_sizer() -> IPositionSizer:
+    """
+    模拟一个 IPositionSizer。
+    """
+    sizer = MagicMock(spec=IPositionSizer)
+    # 模拟计算：返回 100 股
+    sizer.calculate_target_quantity.return_value = 100.0
+    return sizer
 
 @pytest.fixture
-def portfolio_constructor(constructor_config):
-    """Fixture for PortfolioConstructor"""
-    # (在实际应用中，sizer 和 risk_manager 可能是被注入的)
-    # (为了测试，我们可以在这里实例化它们)
-    
-    # 修正: 确保 sizers 字典中包含一个 'IPositionSizer' 的实例
-    sizers = {
-        "fixed_fraction": FixedFractionSizer(),
-        "mock_sizer": MockPositionSizer()
-    }
-    # (risk_manager_mock = ...)
-    
-    return PortfolioConstructor(
-        config=constructor_config,
-        # sizers=sizers, 
-        # risk_manager=risk_manager_mock
+def portfolio_constructor(mock_position_sizer: IPositionSizer) -> PortfolioConstructor:
+    """
+    返回一个带有模拟 Sizer 的 PortfolioConstructor 实例。
+    """
+    return PortfolioConstructor(position_sizer=mock_position_sizer)
+
+@pytest.fixture
+def bullish_fusion_result() -> FusionResult:
+    """
+    返回一个看涨的 FusionResult。
+    """
+    return FusionResult(
+        id="fusion1",
+        timestamp=datetime(2023, 1, 1, 10, 0, 0),
+        agent_decisions=[], # 在 translate 中不重要
+        final_decision="STRONG_BUY",
+        final_confidence=0.9,
+        summary="Test",
+        uncertainty_score=0.1,
+        metadata={"target_symbol": "AAPL"}
     )
 
-def test_constructor_initialization(portfolio_constructor):
-    """测试构造函数是否正确初始化"""
-    assert portfolio_constructor is not None
-    # 修正: 检查它是否正确加载了 sizer
-    # (这取决于 PortfolioConstructor 的内部实现)
-    # assert isinstance(portfolio_constructor.sizer, FixedFractionSizer)
-
-def test_generate_signal(portfolio_constructor):
-    """测试信号生成逻辑"""
-    
-    # 1. 模拟一个 "BUY" 决策的融合结果
-    buy_decision = {
-        "ticker": "AAPL",
-        "action": "BUY",
-        "confidence": 0.85,
-        "price_target": 200.0
-    }
-    fusion_result = MockFusionResult(decision=buy_decision)
-
-    # 2. 模拟当前市场和投资组合
-    market_data = {"AAPL": {"price": 180.0}}
-    current_portfolio = {"cash": 10000} # (e.g., $10k cash)
-
-    # 3. 运行信号生成
-    signal = portfolio_constructor.generate_signal(
-        fusion_result, 
-        current_portfolio, 
-        market_data
+@pytest.fixture
+def empty_portfolio_state() -> PortfolioState:
+    """
+    返回一个空的投资组合状态。
+    """
+    return PortfolioState(
+        timestamp=datetime(2023, 1, 1, 9, 0, 0),
+        cash=100000.0,
+        total_value=100000.0,
+        positions={}
     )
 
-    # 4. 验证信号
+@pytest.fixture
+def existing_portfolio_state() -> PortfolioState:
+    """
+    返回一个已有 AAPL 仓位的投资组合状态。
+    """
+    return PortfolioState(
+        timestamp=datetime(2023, 1, 1, 9, 0, 0),
+        cash=85000.0,
+        total_value=100000.0,
+        positions={
+            "AAPL": Position(
+                symbol="AAPL",
+                quantity=50.0, # 已有 50 股
+                average_price=150.0,
+                market_value=7500.0,
+                unrealized_pnl=0.0
+            )
+        }
+    )
+
+def test_translate_decision_to_signal(portfolio_constructor: PortfolioConstructor, bullish_fusion_result: FusionResult):
+    """
+    测试从 FusionResult 到 Signal 的转换。
+    """
+    signal = portfolio_constructor.translate_decision_to_signal(bullish_fusion_result)
+    
     assert signal is not None
-    # 验证 (Error 2) 修复: 信号应该是 StrategySignal 格式 (target_weights)
-    assert signal.strategy_id == "PortfolioConstructor"
-    assert "AAPL" in signal.target_weights
-    # (这里的具体权重取决于 FixedFractionSizer 的逻辑)
-    # assert signal.target_weights["AAPL"] > 0 
+    assert signal.symbol == "AAPL"
+    assert signal.signal_type == "BUY"
+    assert signal.strength == 0.9
+
+def test_generate_orders_new_position(
+    portfolio_constructor: PortfolioConstructor,
+    mock_position_sizer: IPositionSizer,
+    bullish_fusion_result: FusionResult,
+    empty_portfolio_state: PortfolioState
+):
+    """
+    测试在没有仓位时生成订单。
+    """
+    # 1. 转换
+    signal = portfolio_constructor.translate_decision_to_signal(bullish_fusion_result)
+    
+    # 2. 生成订单
+    orders = portfolio_constructor.generate_orders([signal], empty_portfolio_state)
+    
+    # 3. 验证
+    # 检查 sizer 被正确调用
+    mock_position_sizer.calculate_target_quantity.assert_called_with(signal, empty_portfolio_state)
+    
+    assert len(orders) == 1
+    order = orders[0]
+    assert order.symbol == "AAPL"
+    # 目标 = 100, 当前 = 0 -> 订单 = 100
+    assert order.quantity == 100.0
+
+def test_generate_orders_adjust_position(
+    portfolio_constructor: PortfolioConstructor,
+    mock_position_sizer: IPositionSizer,
+    bullish_fusion_result: FusionResult,
+    existing_portfolio_state: PortfolioState
+):
+    """
+    测试在已有仓位时调整订单。
+    """
+    # 1. 转换
+    signal = portfolio_constructor.translate_decision_to_signal(bullish_fusion_result)
+    
+    # 2. 生成订单
+    orders = portfolio_constructor.generate_orders([signal], existing_portfolio_state)
+    
+    # 3. 验证
+    # Sizer 仍然返回 100 (这是我们的 mock)
+    mock_position_sizer.calculate_target_quantity.assert_called_with(signal, existing_portfolio_state)
+    
+    assert len(orders) == 1
+    order = orders[0]
+    assert order.symbol == "AAPL"
+    # 目标 = 100, 当前 = 50 -> 订单 = 50
+    assert order.quantity == 50.0
