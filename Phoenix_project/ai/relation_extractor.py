@@ -1,87 +1,85 @@
-import logging
-from typing import Dict, Any, List
+"""
+Relation Extractor for Knowledge Graph.
 
-# 修正：不再导入 'APIGateway'，它不存在。
-# 改为导入 'GeminiPoolManager'，这是实际的 LLM 客户端。
-from api.gemini_pool_manager import GeminiPoolManager
-from core.schemas.data_schema import KnowledgeGraph
+Uses an LLM to extract entities (nodes) and relationships (edges)
+from unstructured text (e.g., MarketEvent content) to build or
+update a Knowledge Graph.
+"""
+import logging
+from typing import List, Dict, Any, Optional
+
+# 修复：使用正确的相对导入
+from ..api.gemini_pool_manager import GeminiPoolManager
+from ..core.schemas.data_schema import KnowledgeGraph, KGNode, KGRelation, MarketEvent
+from .prompt_manager import PromptManager
+from .prompt_renderer import PromptRenderer
 
 logger = logging.getLogger(__name__)
 
 class RelationExtractor:
     """
-    一个使用 LLM (通过 GeminiPoolManager) 从非结构化文本中
-    提取实体和关系的组件。
-    (Task 7 - 关系提取器)
+    Extracts entities and relations from text to build a Knowledge Graph.
     """
 
-    def __init__(self, gemini_pool: GeminiPoolManager):
-        """
-        初始化关系提取器。
+    def __init__(self,
+                 prompt_manager: PromptManager,
+                 prompt_renderer: PromptRenderer,
+                 gemini_pool: GeminiPoolManager,
+                 prompt_name: str = "relation_extractor"): # Example prompt name
         
-        Args:
-            gemini_pool (GeminiPoolManager): 用于调用 LLM API 的 API 池。
-        """
+        self.prompt_manager = prompt_manager
+        self.prompt_renderer = prompt_renderer
         self.gemini_pool = gemini_pool
-        self.prompt_template = self._load_prompt_template()
+        self.prompt_template = self.prompt_manager.get_prompt(prompt_name)
+        
+        if not self.prompt_template:
+            # Fallback or error if prompt is missing
+            logger.warning(f"Prompt '{prompt_name}' not found. Using a basic fallback.")
+            self.prompt_template = """
+            Extract entities and relations from the text.
+            Text: {{ event.content }}
+            Respond in JSON format: {"nodes": [...], "relations": [...]}
+            """
+        
         logger.info("RelationExtractor initialized.")
 
-    def _load_prompt_template(self) -> str:
+    async def extract(self, event: MarketEvent) -> Optional[KnowledgeGraph]:
         """
-        加载用于关系提取的提示模板。
-        
-        FIXME: 提示应该从 ai/prompt_manager.py 或
-               prompts/ 目录加载，而不是硬编码。
-        """
-        # 这是一个简化的示例提示
-        return """
-        You are a financial analyst. Extract all entities (Companies, People, Products) 
-        and relationships (e.g., 'CEO_OF', 'COMPETES_WITH', 'PARTNERS_WITH') 
-        from the text below.
-        
-        Return the answer ONLY as a JSON object with two keys: "nodes" and "relations".
-        
-        - "nodes" should be a list of objects, e.g.: 
-          [{"id": "NVDA", "label": "Company", "properties": {"name": "NVIDIA"}}]
-        - "relations" should be a list of objects, e.g.: 
-          [{"id": "r1", "type": "CEO_OF", "start_node_id": "JENSEN_HUANG", "end_node_id": "NVDA"}]
+        Extracts a KnowledgeGraph from a given MarketEvent.
 
-        Text to analyze:
-        ---
-        {text_content}
-        ---
-        """
-
-    async def extract_kg_from_text(self, text_content: str, source_id: str) -> KnowledgeGraph:
-        """
-        从单个文本块中提取知识图谱片段。
-        
         Args:
-            text_content (str): 要分析的（例如）新闻文章。
-            source_id (str): 文本来源的 ID，用于日志记录。
-            
+            event: The MarketEvent to process.
+
         Returns:
-            KnowledgeGraph: 一个包含提取的节点和关系的 Pydantic 对象。
+            A KnowledgeGraph object, or None if extraction fails.
         """
-        logger.debug(f"Extracting relations from source_id: {source_id}")
-        
-        prompt = self.prompt_template.format(text_content=text_content)
-        
         try:
-            # 修正：调用 gemini_pool 上的方法
-            result_json = await self.gemini_pool.generate_json_response(
-                prompt=prompt
+            # 1. Render the prompt
+            full_prompt = self.prompt_renderer.render(
+                template_content=self.prompt_template,
+                event=event.dict() # Pass event as a dict
             )
             
-            if result_json:
-                # 验证并解析为 Pydantic 模型
-                kg = KnowledgeGraph(**result_json)
-                logger.info(f"Extracted {len(kg.nodes)} nodes and {len(kg.relations)} relations from {source_id}.")
-                return kg
-            else:
-                logger.warning(f"Relation extraction returned empty JSON for {source_id}")
-                return KnowledgeGraph(nodes=[], relations=[])
+            # 2. Execute the LLM call
+            response_json = await self.gemini_pool.generate_json(
+                model_name="gemini-1.5-flash", # Use a fast model for extraction
+                prompt=full_prompt,
+                system_prompt="You are a data extraction expert. Respond ONLY with the requested JSON schema for a knowledge graph."
+            )
+            
+            if not response_json or 'nodes' not in response_json or 'relations' not in response_json:
+                logger.warning(f"Invalid JSON response from RelationExtractor for event {event.event_id}")
+                return None
+
+            # 3. Validate and build the KnowledgeGraph
+            kg = KnowledgeGraph(
+                nodes=[KGNode(**node) for node in response_json.get('nodes', [])],
+                relations=[KGRelation(**rel) for rel in response_json.get('relations', [])]
+            )
+            
+            logger.info(f"Successfully extracted {len(kg.nodes)} nodes and {len(kg.relations)} relations from event {event.event_id}.")
+            return kg
 
         except Exception as e:
-            logger.error(f"Failed to extract relations from {source_id}: {e}", exc_info=True)
-            return KnowledgeGraph(nodes=[], relations=[])
+            logger.error(f"Error during relation extraction for event {event.event_id}: {e}", exc_info=True)
+            return None
