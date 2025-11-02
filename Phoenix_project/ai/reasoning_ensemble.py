@@ -1,149 +1,103 @@
-from typing import Dict, Any, List
-import asyncio
-from api.gateway import APIGateway
-from ai.prompt_manager import PromptManager
-from ai.data_adapter import DataAdapter
-from ai.ensemble_client import AIEnsembleClient
+"""
+推理集成 (Reasoning Ensemble)
+协调 EnsembleClient, MetacognitiveAgent, 和 Arbitrator。
+这是认知引擎的核心协调器。
+"""
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+
+# FIX (E3): 导入 AgentDecision 和 FusionResult
+from core.schemas.fusion_result import AgentDecision, FusionResult
+from ai.ensemble_client import EnsembleClient
 from ai.metacognitive_agent import MetacognitiveAgent
-from fusion.synthesizer import Synthesizer
-from evaluation.critic import Critic
 from evaluation.arbitrator import Arbitrator
-from core.schemas.fusion_result import FusionResult, AgentDecision
-from core.pipeline_state import PipelineState
+from evaluation.fact_checker import FactChecker
+from ai.retriever import Retriever
 from monitor.logging import get_logger
+import uuid
 
 logger = get_logger(__name__)
 
 class ReasoningEnsemble:
     """
-    Coordinates the entire AI reasoning pipeline:
-    1. Data Adapting: Formats context data for LLMs.
-    2. Ensemble Run: Runs multiple AI agents in parallel.
-    3. Arbitration/Critique: (Optional) A metacognitive agent analyzes the results.
-    4. Synthesis: Fuses the agent decisions into a single, final result.
+    执行完整的 "RAG -> Multi-Agent -> Arbitrate" 流程。
     """
-
+    
     def __init__(
         self,
-        api_gateway: APIGateway,
-        prompt_manager: PromptManager,
-        config: Dict[str, Any]
+        retriever: Retriever,
+        ensemble_client: EnsembleClient,
+        metacognitive_agent: MetacognitiveAgent,
+        arbitrator: Arbitrator,
+        fact_checker: FactChecker
     ):
-        self.api_gateway = api_gateway
-        self.prompt_manager = prompt_manager
-        self.config = config
-        
-        # 1. Data Adapter
-        self.data_adapter = DataAdapter(config.get("data_adapter", {}))
-        
-        # 2. Ensemble Client
-        ensemble_agent_configs = config.get("ensemble_agents", {})
-        if not ensemble_agent_configs:
-            logger.warning("No ensemble agents configured. Reasoning will be limited.")
-        self.ensemble_client = AIEnsembleClient(
-            api_gateway, prompt_manager, ensemble_agent_configs
-        )
-        
-        # 3. Metacognitive / Evaluation Agents
-        self.metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
-        self.arbitrator = Arbitrator(
-            api_gateway, prompt_manager, self.metacognitive_agent
-        )
-        self.critic = Critic(api_gateway, prompt_manager) # General purpose critic
-        
-        # 4. Synthesizer
-        self.synthesizer = Synthesizer(
-            api_gateway, prompt_manager, config.get("synthesizer", {})
-        )
-        
-        self.use_arbitrator = config.get("use_arbitrator", True)
-        logger.info("ReasoningEnsemble initialized.")
+        self.retriever = retriever
+        self.ensemble_client = ensemble_client
+        self.metacognitive_agent = metacognitive_agent
+        self.arbitrator = arbitrator
+        self.fact_checker = fact_checker
+        self.log_prefix = "ReasoningEnsemble:"
 
-    async def reason(self, pipeline_state: PipelineState) -> FusionResult:
+    def reason(self, target_symbols: List[str], timestamp: datetime) -> Optional[FusionResult]:
         """
-        Executes the full reasoning pipeline.
-        
-        Args:
-            pipeline_state (PipelineState): The current state of the system.
-            
-        Returns:
-            FusionResult: The final, synthesized decision.
+        执行完整的推理链。
         """
-        logger.info("Starting reasoning pipeline...")
+        logger.info(f"{self.log_prefix} Starting reasoning for {target_symbols} at {timestamp}...")
         
-        # 1. Get and format context
-        context_data = pipeline_state.get_full_context()
         try:
-            formatted_context = self.data_adapter.format_context(context_data)
-            logger.debug(f"Formatted context: \n{formatted_context[:300]}...")
-        except Exception as e:
-            logger.error(f"Error formatting context: {e}", exc_info=True)
-            return FusionResult(
-                final_decision="ERROR",
-                confidence=0.0,
-                reasoning=f"Failed to format context: {e}",
-                contributing_agents=[]
+            # 1. RAG - 检索上下文
+            # (在真实系统中，时间窗口需要定义)
+            context = self.retriever.retrieve_context(
+                symbols=target_symbols,
+                end_time=timestamp,
+                window_days=7 # 假设7天窗口
             )
+            if not context:
+                logger.warning(f"{self.log_prefix} No context retrieved for {target_symbols}.")
+                return None
 
-        # 2. Run AI Ensemble
-        try:
-            agent_decisions = await self.ensemble_client.run_ensemble(
-                context=formatted_context,
-                base_prompt_name="analyst_persona", # Base prompt
-                context_data=context_data
+            # 2. Multi-Agent - 并行执行分析师
+            # FIX (E3): 期望返回 List[AgentDecision]
+            decisions: List[AgentDecision] = self.ensemble_client.execute_ensemble(
+                context=context,
+                target_symbols=target_symbols
             )
-        except Exception as e:
-            logger.error(f"Error running AI ensemble: {e}", exc_info=True)
-            return FusionResult(
-                final_decision="ERROR",
-                confidence=0.0,
-                reasoning=f"AI ensemble failed: {e}",
-                contributing_agents=[]
-            )
-            
-        if not agent_decisions:
-            logger.warning("AI ensemble returned no decisions.")
-            return FusionResult(
-                final_decision="HOLD",
-                confidence=0.5,
-                reasoning="AI ensemble provided no opinions. Defaulting to HOLD.",
-                contributing_agents=[]
-            )
-            
-        pipeline_state.update_value("last_agent_decisions", agent_decisions)
+            if not decisions:
+                logger.error(f"{self.log_prefix} No agent decisions were returned from ensemble.")
+                return None
 
-        # 3. Arbitration / Critique (Metacognition)
-        arbitration_result = None
-        if self.use_arbitrator:
-            try:
-                logger.info("Running Arbitrator...")
-                arbitration_result = await self.arbitrator.arbitrate(
-                    formatted_context, agent_decisions
-                )
-                pipeline_state.update_value("last_arbitration", arbitration_result)
-                logger.info(f"Arbitrator suggestion: {arbitration_result.get('suggested_decision')}")
-            except Exception as e:
-                logger.error(f"Error running Arbitrator: {e}", exc_info=True)
-                # Non-fatal, we can proceed to synthesis without it
-        
-        # 4. Synthesis
-        try:
-            logger.info("Running Synthesizer...")
-            final_result = await self.synthesizer.fuse_decisions(
-                context=formatted_context,
-                agent_decisions=agent_decisions,
-                arbitrator_critique=arbitration_result # Pass critique if available
-            )
-        except Exception as e:
-            logger.error(f"Error running Synthesizer: {e}", exc_info=True)
-            return FusionResult(
-                final_decision="ERROR",
-                confidence=0.0,
-                reasoning=f"Synthesizer failed: {e}",
-                contributing_agents=agent_decisions
+            # 3. Fact Checking - 事实检查 (可选但推荐)
+            verified_decisions = []
+            for dec in decisions:
+                is_valid, report = self.fact_checker.check(dec.reasoning, context)
+                if is_valid:
+                    verified_decisions.append(dec)
+                else:
+                    logger.warning(f"{self.log_prefix} Agent {dec.agent_name} decision failed fact check: {report}")
+            
+            if not verified_decisions:
+                logger.error(f"{self.log_prefix} All agent decisions failed fact-checking.")
+                return None
+
+            # 4. Arbitration - 仲裁
+            # (MetacognitiveAgent 可以在 Arbitrator 内部调用，或者在这里单独调用)
+            # meta_analysis = self.metacognitive_agent.analyze_decisions(verified_decisions, context)
+            
+            # FIX (E3):  arbitrator.arbitrate 期望 List[AgentDecision]
+            fusion_result: FusionResult = self.arbitrator.arbitrate(
+                decisions=verified_decisions,
+                context=context
             )
             
-        logger.info(f"Reasoning pipeline complete. Final decision: {final_result.final_decision}")
-        pipeline_state.update_value("last_fusion_result", final_result)
-        
-        return final_result
+            # 5. 补充元数据
+            fusion_result.metadata["target_symbol"] = target_symbols[0] if target_symbols else "N/A"
+            fusion_result.metadata["context_length"] = len(context)
+            fusion_result.id = f"fusion_{uuid.uuid4()}"
+
+            logger.info(f"{self.log_prefix} Reasoning complete. Final Decision: {fusion_result.final_decision}")
+            
+            return fusion_result
+
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Reasoning chain failed: {e}", exc_info=True)
+            return None
