@@ -1,297 +1,178 @@
+"""
+Walk-Forward Trainer for AI/DRL Models.
+
+Orchestrates a walk-forward optimization (WFO) process, which involves:
+1. Training a model on a historical data window (e.g., 2 years).
+2. Validating/testing the model on the subsequent unseen window (e.g., 6 months).
+3. Sliding the window forward and repeating the process.
+
+This simulates a realistic trading scenario where the model must adapt
+to new data over time.
+"""
 import logging
-import numpy as np
-import pandas as pd
-from .reasoning_ensemble import ReasoningEnsemble
-# 修正: 导入新创建的 .base_trainer
-from .base_trainer import BaseTrainer
-from datetime import date, timedelta
-import mlflow
-from typing import Dict, Any, List
+from datetime import datetime
+from typing import List, Dict, Any
 
-# --- DRL (Task 1.2) Imports ---
-from execution.order_manager import OrderManager
-from drl.trading_env import TradingEnv
-from data.data_iterator import DataIterator
-from stable_baselines3 import PPO
+from ..config.loader import ConfigLoader
+# 修复：使用正确的相对导入
+from ..execution.order_manager import OrderManager
+from ..execution.trade_lifecycle_manager import TradeLifecycleManager
+from ..data.data_iterator import DataIterator
+from ..backtesting.engine import BacktestingEngine
+from ..core.pipeline_state import PipelineState
+from .base_trainer import BaseTrainer # Assumes a BaseTrainer class exists
 
-class WalkForwardTrainer(BaseTrainer):
+logger = logging.getLogger(__name__)
+
+# Placeholder for the DRL model/agent trainer
+# from ..drl.multi_agent_trainer import MultiAgentTrainer
+
+class WalkForwardTrainer:
     """
-    实现了一个步进式训练和验证方法。
-    
-    这种方法模拟了一个真实的交易场景，其中模型在
-    新数据可用时进行重新训练，并其性能在
-    紧邻训练期后的样本外数据上进行评估。
+    Manages the walk-forward training and validation process.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: ConfigLoader, model_trainer: BaseTrainer):
         """
-        初始化 WalkForwardTrainer。
+        Initializes the WalkForwardTrainer.
 
         Args:
-            config (Dict[str, Any]): 配置字典，包含像
-                                     'training_window_size', 'validation_window_size',
-                                     'retraining_frequency', 和 'ensemble_config' 这样的参数。
+            config: The system configuration object.
+            model_trainer: An instance of a model trainer (e.g., DRLTrainer)
+                           that adheres to the BaseTrainer interface.
         """
-        super().__init__(config)
-        # 修正: super().__init__() 已经设置了 self.logger
-        self.training_window_size = config.get('training_window_size', 365)
-        self.validation_window_size = config.get('validation_window_size', 90)
-        self.retraining_frequency = config.get('retraining_frequency', 30) # 使用配置中的30天
-        self.training_mode = config.get('training_mode', 'ensemble') # 'ensemble' or 'drl'
-        # 存储上次成功再训练的日期
-        self.last_retraining_date = config.get('last_retraining_date', date.min)
+        self.config = config
+        self.model_trainer = model_trainer
+        self.wfo_config = config.get_config('walk_forward_optimization')
         
-        # 初始化 ReasoningEnsemble，这是我们正在训练的模型
-        self.ensemble_config = config.get('ensemble_config', {})
-        self.drl_config = config.get('drl_config', {})
+        if not self.wfo_config:
+            raise ValueError("Walk-forward optimization config not found in system config.")
+            
+        logger.info("WalkForwardTrainer initialized.")
+        self._parse_wfo_config()
+
+    def _parse_wfo_config(self):
+        """Parses and validates the WFO configuration."""
+        try:
+            self.start_date = datetime.fromisoformat(self.wfo_config['start_date'])
+            self.end_date = datetime.fromisoformat(self.wfo_config['end_date'])
+            self.train_window_days = self.wfo_config['train_window_days']
+            self.validation_window_days = self.wfo_config['validation_window_days']
+            self.step_days = self.wfo_config['step_days']
+            
+            logger.info(f"WFO Config: Train={self.train_window_days}d, "
+                        f"Validate={self.validation_window_days}d, Step={self.step_days}d")
+        except KeyError as e:
+            logger.error(f"Missing key in WFO config: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error parsing WFO config: {e}")
+            raise
+
+    def run_walk_forward(self):
+        """
+        Executes the entire walk-forward training process.
+        """
+        logger.info(f"Starting walk-forward training from {self.start_date} to {self.end_date}.")
         
-        if self.training_mode == 'ensemble':
-            self.model = ReasoningEnsemble(self.ensemble_config)
-        else:
-            self.model = None # DRL agent will be instantiated per-fold
+        current_start = self.start_date
+        fold = 0
         
-        self.logger.info(
-            f"WalkForwardTrainer initialized: "
-            f"Train window={self.training_window_size} days, "
-            f"Validate window={self.validation_window_size} days, "
-            f"Retrain every={self.retraining_frequency} days."
+        while True:
+            fold += 1
+            
+            # 1. Define time windows
+            train_start = current_start
+            train_end = train_start + pd.Timedelta(days=self.train_window_days)
+            val_start = train_end
+            val_end = val_start + pd.Timedelta(days=self.validation_window_days)
+            
+            if val_end > self.end_date:
+                logger.info("Reached end of data. Walk-forward complete.")
+                break
+
+            logger.info(f"--- WFO Fold {fold} ---")
+            logger.info(f"Train Window: {train_start.date()} to {train_end.date()}")
+            logger.info(f"Validation Window: {val_start.date()} to {val_end.date()}")
+            
+            # 2. Train the model
+            logger.info(f"Starting training for Fold {fold}...")
+            model, train_metrics = self.model_trainer.train(
+                start_date=train_start,
+                end_date=train_end
+            )
+            
+            if model is None:
+                logger.error(f"Training failed for Fold {fold}. Stopping.")
+                break
+                
+            logger.info(f"Training complete for Fold {fold}. Metrics: {train_metrics}")
+
+            # 3. Validate the model (run backtest)
+            logger.info(f"Starting validation for Fold {fold}...")
+            
+            # Set up a new backtesting engine for this validation fold
+            backtest_engine = self._setup_backtest_engine(
+                model=model,
+                start_date=val_start,
+                end_date=val_end
+            )
+            
+            val_results = backtest_engine.run()
+            
+            logger.info(f"Validation complete for Fold {fold}. Sharpe: {val_results.get('sharpe_ratio')}")
+            # Here, you would save the model, results, and metrics
+            self._save_fold_results(fold, model, val_results)
+
+            # 4. Slide the window
+            current_start += pd.Timedelta(days=self.step_days)
+
+        logger.info("Walk-forward training process finished.")
+
+    def _setup_backtest_engine(self, model: Any, start_date: datetime, end_date: datetime) -> BacktestingEngine:
+        """
+        Helper to initialize a BacktestingEngine for a validation fold.
+        """
+        # This is highly dependent on your BacktestingEngine's needs
+        
+        # 1. Create DataIterator for the validation window
+        data_paths_config = self.config.get_config('data_paths') # Assumes config
+        val_iterator = DataIterator(
+            file_paths=[data_paths_config['ticker_data_csv']], # Example
+            data_types=['ticker'],
+            start_date=start_date,
+            end_date=end_date
         )
-
-    def check_retraining_status(self, current_date: date) -> Dict[str, Any]:
-        """
-        根据性能衰减或周期检查是否需要再训练。
-        如果需要，生成一个带成本的 "再训练建议"。
-        (Task 3.1 - Adaptive Retraining Approval Workflow)
-        """
-        self.logger.info(f"Checking retraining status for {current_date}...")
         
-        days_since_last_train = (current_date - self.last_retraining_date).days
-        cycle_trigger = days_since_last_train >= self.retraining_frequency
-
-        if cycle_trigger: 
-            self.logger.info(f"Retraining cycle trigger met ({days_since_last_train} days >= {self.retraining_frequency}).")
-            
-            train_start_date = current_date
-            train_end_date = current_date + timedelta(days=self.training_window_size)
-            
-            cost_data = self.estimate_api_cost(train_start_date, train_end_date)
-            
-            return {
-                "recommendation_pending": True,
-                "reason": f"Retraining cycle met ({self.retraining_frequency} days).",
-                "cost_estimate": cost_data
-            }
-
-        return {"recommendation_pending": False}
-
-    def train(self, data: np.ndarray) -> Any:
-        """
-        在给定的数据窗口上训练模型。
-        """
-        self.logger.info(f"Starting training on data with shape {data.shape}...")
+        # 2. Create a PipelineState
+        initial_capital = self.config.get_config('backtesting')['initial_capital']
+        pipeline_state = PipelineState(initial_capital=initial_capital)
         
-        # 模拟 ReasoningEnsemble 的训练
-        simulated_training_artifacts = self.model.calibrate(data)
+        # 3. Create execution components
+        order_manager = OrderManager(pipeline_state=pipeline_state)
+        trade_manager = TradeLifecycleManager(pipeline_state=pipeline_state)
         
-        self.logger.info("Training complete.")
-        self.last_retraining_date = date.today() 
-        return simulated_training_artifacts 
-
-    def evaluate(self, model_artifacts: Any, validation_data: np.ndarray) -> Dict[str, float]:
-        """
-        在样本外验证数据上评估训练好的模型。
-        """
-        self.logger.info(f"Starting evaluation on data with shape {validation_data.shape}...")
+        # 4. Create the strategy handler, injecting the *trained model*
+        # This assumes your strategy handler can accept a trained model
+        strategy_handler = None # Placeholder
+        # strategy_handler = MyDRLStrategyHandler(model=model, state=pipeline_state)
         
-        simulated_returns = []
-        
-        for i in range(len(validation_data)):
-            current_day_data = validation_data[max(0, i-30):i+1] 
-            decision = self.model.make_decision(current_day_data) # 简化
-            
-            actual_return = validation_data[i, -1] # 假设最后一列是目标回报
-            daily_pnl = decision * actual_return
-            simulated_returns.append(daily_pnl)
+        if strategy_handler is None:
+            raise NotImplementedError("StrategyHandler initialization with a trained model is not implemented.")
 
-        metrics = self._calculate_performance_metrics(simulated_returns)
-        self.logger.info(f"Evaluation complete: {metrics}")
-        return metrics
+        engine = BacktestingEngine(
+            data_iterator=val_iterator,
+            strategy_handler=strategy_handler,
+            order_manager=order_manager,
+            trade_lifecycle_manager=trade_manager,
+            pipeline_state=pipeline_state
+        )
+        return engine
 
-    def run_walk_forward_validation(self, full_dataset: np.ndarray) -> Dict[str, Any]:
-        """
-        在整个数据集上执行完整的步进式验证过程。
-        """
-        self.logger.info(f"Starting full walk-forward validation on dataset with {len(full_dataset)} days.")
-        
-        if self.training_mode == 'drl':
-            return self.run_drl_walk_forward(full_dataset)
-
-        total_data_days = len(full_dataset)
-        days_per_step = self.retraining_frequency
-        num_steps = (total_data_days - self.training_window_size) // days_per_step
-        
-        all_fold_metrics = []
-        
-        for i in range(num_steps):
-            train_start = i * days_per_step
-            train_end = train_start + self.training_window_size
-            val_start = train_end
-            val_end = val_start + self.validation_window_size
-
-            if val_end > total_data_days:
-                break
-
-            self.logger.info(f"--- Fold {i+1}/{num_steps} ---")
-            self.logger.info(f"Training window: Days {train_start} to {train_end-1}")
-            self.logger.info(f"Validation window: Days {val_start} to {val_end-1}")
-
-            train_data = full_dataset[train_start:train_end]
-            validation_data = full_dataset[val_start:val_end]
-
-            trained_model_artifacts = self.train(train_data)
-            fold_metrics = self.evaluate(trained_model_artifacts, validation_data)
-            all_fold_metrics.append(fold_metrics)
-            
-            if mlflow.active_run():
-                mlflow.log_metrics(fold_metrics, step=i)
-
-        final_metrics = self._aggregate_metrics(all_fold_metrics)
-        self.logger.info(f"--- Walk-forward validation complete ---")
-        self.logger.info(f"Aggregated Metrics: {final_metrics}")
-        
-        if mlflow.active_run():
-            mlflow.log_metrics({f"agg_{k}": v for k, v in final_metrics.items()})
-        
-        return final_metrics
-
-    def run_drl_walk_forward(self, full_dataset: np.ndarray) -> Dict[str, Any]:
-        """
-        (Task 1.2) 在整个数据集上为DRL代理执行完整的步进式验证过程。
-        """
-        self.logger.info(f"Starting DRL walk-forward validation on dataset with {len(full_dataset)} days.")
-
-        total_data_days = len(full_dataset)
-        days_per_step = self.retraining_frequency
-        num_steps = (total_data_days - self.training_window_size) // days_per_step
-        all_fold_metrics = []
-
-        env_params = self.drl_config.get('env_params', {})
-        agent_params = self.drl_config.get('agent_params', {})
-        column_map = self.drl_config.get('column_map', {}) 
-        train_timesteps = self.drl_config.get('train_timesteps', 10000)
-        order_manager = OrderManager(**self.drl_config.get('order_manager_config', {}))
-
-        for i in range(num_steps):
-            train_start = i * days_per_step
-            train_end = train_start + self.training_window_size
-            val_start = train_end
-            val_end = val_start + self.validation_window_size
-
-            if val_end > total_data_days:
-                break
-
-            self.logger.info(f"--- DRL Fold {i+1}/{num_steps} ---")
-            self.logger.info(f"Training window: Days {train_start} to {train_end-1}")
-            self.logger.info(f"Validation window: Days {val_start} to {val_end-1}")
-
-            train_data = full_dataset[train_start:train_end]
-            validation_data = full_dataset[val_start:val_end]
-
-            train_iterator = DataIterator(train_data, column_map, ticker=env_params.get("trading_ticker"))
-            train_env = TradingEnv(data_iterator=train_iterator, order_manager=order_manager, **env_params)
-            agent = PPO("MlpPolicy", train_env, **agent_params)
-
-            self.logger.info(f"Training DRL agent for {train_timesteps} timesteps...")
-            agent.learn(total_timesteps=train_timesteps)
-
-            val_iterator = DataIterator(validation_data, column_map, ticker=env_params.get("trading_ticker"))
-            val_env = TradingEnv(data_iterator=val_iterator, order_manager=order_manager, **env_params)
-
-            fold_metrics = self._evaluate_drl_agent(agent, val_env)
-            all_fold_metrics.append(fold_metrics)
-            if mlflow.active_run():
-                mlflow.log_metrics(fold_metrics, step=i)
-
-        final_metrics = self._aggregate_metrics(all_fold_metrics)
-        self.logger.info(f"--- DRL Walk-forward validation complete ---")
-        self.logger.info(f"Aggregated Metrics: {final_metrics}")
-        if mlflow.active_run():
-            mlflow.log_metrics({f"agg_{k}": v for k, v in final_metrics.items()})
-        return final_metrics
-
-    def _evaluate_drl_agent(self, agent, env: TradingEnv) -> Dict[str, float]:
-        """Helper to run a trained DRL agent on a validation environment."""
-        obs, _ = env.reset()
-        done = False
-        while not done:
-            action, _ = agent.predict(obs, deterministic=True)
-            obs, reward, done, _, info = env.step(action)
-        
-        metrics = self._calculate_performance_metrics(list(env.return_history))
-        metrics["total_return_val"] = env.portfolio_value - env.initial_capital
-        return metrics
-
-    def _calculate_performance_metrics(self, returns: list) -> Dict[str, float]:
-        """从回报列表中计算关键性能指标。"""
-        if not returns or len(returns) == 0:
-            return {"sharpe_ratio_dsr": 0, "max_drawdown": 0, "total_return_sum": 0, "volatility": 0}
-            
-        returns_array = np.array(returns)
-        total_return = np.sum(returns_array)
-        
-        mean_return = np.mean(returns_array)
-        std_dev = np.std(returns_array)
-        sharpe_ratio = (mean_return / std_dev) * np.sqrt(252) if std_dev > 0 else 0
-        
-        cumulative_returns = np.cumsum(returns_array)
-        peak = np.maximum.accumulate(cumulative_returns)
-        drawdown = (cumulative_returns - peak)
-        max_drawdown = np.min(drawdown) if len(drawdown) > 0 else 0
-        
-        return {
-            "sharpe_ratio_dsr": sharpe_ratio, 
-            "max_drawdown": max_drawdown,
-            "total_return_sum": total_return,
-            "volatility": std_dev
-        }
-
-    def _aggregate_metrics(self, all_metrics: List[Dict[str, float]]) -> Dict[str, float]:
-        """聚合所有折的指标 (例如, 通过平均)。"""
-        if not all_metrics:
-            return {}
-            
-        df = pd.DataFrame(all_metrics)
-        return df.mean().to_dict()
-
-    def _perform_bootstrap_test(self, validation_returns: list) -> Dict[str, float]:
-        """
-        在验证回报上执行平稳 bootstrap 测试。
-        """
-        self.logger.info("Performing stationary bootstrap test on returns...")
-        
-        lower_bound = 0.85
-        upper_bound = 1.25
-        
-        return {'sharpe_ci_lower': lower_bound, 'sharpe_ci_upper': upper_bound}
-
-    def estimate_api_cost(self, start_date: date, end_date: date) -> Dict[str, Any]:
-        """
-        [Sub-Task 1.2.3] 估算给定日期范围内的 AI 分析成本。
-        """
-        self.logger.info(f"Estimating API cost for retraining from {start_date} to {end_date}...")
-        
-        total_days = (end_date - start_date).days
-        business_days = np.busday_count(start_date.isoformat(), end_date.isoformat())
-
-        # 占位符逻辑
-        simulated_cache_hit_rate = 0.90 
-        cached_days = int(business_days * simulated_cache_hit_rate)
-        missing_days = business_days - cached_days
-
-        daily_cost = self.config.get('daily_average_analysis_cost', 0.50) # 默认 $0.50/天
-        estimated_cost = missing_days * daily_cost
-
-        self.logger.info(f"Cost estimation complete: {missing_days}/{business_days} business days require analysis. Estimated cost: ${estimated_cost:.2f}")
-        
-        return {"estimated_api_cost": estimated_cost, "business_days_total": business_days, "business_days_to_analyze": missing_days}
-
+    def _save_fold_results(self, fold: int, model: Any, results: Dict[str, Any]):
+        """Saves the model and metrics for a completed fold."""
+        # Placeholder: Implement saving to disk/S3/DB
+        logger.info(f"Saving results for fold {fold}...")
+        # model.save(f"models/wfo_fold_{fold}_model.zip")
+        # pd.DataFrame([results]).to_csv(f"models/wfo_fold_{fold}_metrics.csv")
+        pass
