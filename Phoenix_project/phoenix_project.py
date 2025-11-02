@@ -71,7 +71,15 @@ async def initialize_system():
             max_recent_events=pipeline_config.get('max_recent_events', 100)
         )
         cache_dir = config.get('data_manager', {}).get('cache_dir', 'data_cache')
-        data_manager = DataManager(config, pipeline_state, cache_dir=cache_dir)
+        
+        # 修正：[FIX-TypeError-DataManager]
+        # DataManager 的构造函数已在 data_manager.py 中被修正
+        # 以接受 config, pipeline_state, 和 cache_dir。
+        data_manager = DataManager(
+            config=config, 
+            pipeline_state=pipeline_state, 
+            cache_dir=cache_dir
+        )
         logger.info("PipelineState 和 DataManager 已初始化。")
 
         # 4. 初始化订单管理器 (执行层)
@@ -88,14 +96,18 @@ async def initialize_system():
         logger.info("RomanLegionStrategy 已初始化。")
 
         # 6. 初始化协调器 (大脑)
+        
+        # 修正：[FIX-TypeError-Orchestrator]
+        # Orchestrator 的构造函数不接受 'celery_app' (它自我导入)。
+        # 已从此处的调用中移除该参数。
         orchestrator = Orchestrator(
             config=config,
             data_manager=data_manager,
             pipeline_state=pipeline_state,
             gemini_pool=gemini_pool,
             strategy_handler=strategy,
-            order_manager=order_manager,
-            celery_app=celery_app  # 修正：传入 Celery app 实例
+            order_manager=order_manager
+            # celery_app=celery_app  <- 已移除此错误参数
         )
         logger.info("主协调器已初始化。")
         
