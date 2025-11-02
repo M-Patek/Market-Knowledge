@@ -1,103 +1,67 @@
-import torch
-import torch.nn as nn
+# (原: drl/agents/alpha_agent.py)
 from typing import Dict, Any
 
+# --- [修复] ---
+# 原: from .base_agent import BaseAgent
+# 新: from .base_agent import BaseAgent (依然正确)
+#
+# 原: from ...core.schemas.data_schema import MarketEvent
+# 新: from ....core.schemas.data_schema import MarketEvent (training/drl/agents/ -> ... -> core/)
+# --- [修复结束] ---
 from .base_agent import BaseAgent
+from ....core.schemas.data_schema import MarketEvent
+from ....monitor.logging import get_logger
+
+logger = get_logger(__name__)
 
 class AlphaAgent(BaseAgent):
     """
-    A DRL agent responsible for generating the primary alpha signal
-    (e.g., predicting market direction or relative strength).
-    
-    This agent's "action" is typically a continuous value (e.g., -1 to 1).
+    Alpha 智能体 (AlphaAgent) 专注于生成交易信号（Alpha）。
+    它可以是一个 DRL 模型，也可以是一个传统的量化模型。
     """
 
-    def __init__(self, observation_space, action_space, network: nn.Module, config: Dict[str, Any]):
-        """
-        Initializes the AlphaAgent.
-        
-        Args:
-            observation_space: The Gym observation space.
-            action_space: The Gym action space.
-            network (nn.Module): The policy/value network.
-            config: Configuration dictionary.
-        """
-        super().__init__(
-            agent_id="alpha_agent",
-            observation_space=observation_space,
-            action_space=action_space,
-            network=network,
-            config=config
-        )
-        self.agent_type = "alpha"
+    def __init__(self, config: Dict[str, Any], model_path: str):
+        super().__init__(config, model_path)
+        # 加载 DRL (PPO) 模型
+        # self.model = PPO.load(model_path)
+        logger.info(f"AlphaAgent (DRL) 已初始化，模型路径: {model_path}")
 
-    def compute_action(self, observation: torch.Tensor) -> torch.Tensor:
+    def generate_signal(self, event: MarketEvent, market_context: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Computes the action (e.g., signal) based on the observation.
+        (在线推理)
+        基于 DRL 模型，根据事件和市场上下文生成信号。
+        """
         
-        Args:
-            observation (torch.Tensor): The current state observation.
+        # 1. 将 event 和 market_context 转换为 DRL 模型的输入状态 (obs)
+        # obs = self._preprocess_observation(event, market_context)
+        obs = "dummy_observation" # 模拟
+        
+        # 2. DRL 模型预测动作
+        # action, _states = self.model.predict(obs, deterministic=True)
+        action = 2 # 模拟 (0=Sell, 1=Hold, 2=Buy)
+        
+        signal = "hold"
+        if action == 0:
+            signal = "sell"
+        elif action == 2:
+            signal = "buy"
             
-        Returns:
-            torch.Tensor: The action to take.
-        """
-        # Get the policy distribution from the network
-        dist = self.network(observation)
-        
-        # Sample from the distribution (stochastic policy)
-        # For a deterministic policy, you might take dist.mean
-        action = dist.sample()
-        
-        # Store the log probability for training
-        self.last_log_prob = dist.log_prob(action)
-        
-        # Clamp or clip the action to be within the valid action space bounds
-        # (e.g., -1 to 1)
-        action = torch.clamp(action, self.action_space.low[0], self.action_space.high[0])
-        
-        return action
+        logger.debug(f"AlphaAgent 决策: {signal} (基于 DRL action: {action})")
 
-    def compute_reward(self, state: Any, action: Any, next_state: Any) -> float:
+        return {
+            "decision": signal,
+            "confidence": 0.85, # DRL 模型的置信度 (例如，来自 predict_proba)
+            "metadata": {"agent": "AlphaAgent_DRL_v1"}
+        }
+
+    def _preprocess_observation(self, event: MarketEvent, context: Dict[str, Any]) -> Any:
         """
-        Defines the reward function for the AlphaAgent.
-        This is a critical part of the DRL design.
-        
-        Example: Reward based on subsequent price movement (Sharpe ratio, PnL).
-        
-        Args:
-            state: The state when the action was taken.
-            action: The action (signal) taken.
-            next_state: The resulting state.
-            
-        Returns:
-            float: The reward.
+        将在线推理数据转换为 DRL 环境 (TradingEnv) 所需的观测空间。
+        这必须与 'TradingEnv' 中的 '_get_observation' 方法严格匹配。
         """
-        
-        # This reward logic is highly strategy-dependent.
-        # Example: Simple reward based on PnL
-        # This assumes 'state' and 'next_state' are dicts with price info
-        
-        try:
-            price_t = state['price']
-            price_t_plus_1 = next_state['price']
-            
-            # Calculate return
-            market_return = (price_t_plus_1 - price_t) / price_t
-            
-            # Action is the signal (-1 to 1)
-            signal = action.item() 
-            
-            # Reward is the PnL from holding the position
-            # (This is a simplified "mark-to-market" reward)
-            reward = signal * market_return
-            
-            # Penalize for transaction costs (e.g., changing position)
-            # if 'last_signal' in state:
-            #     turnover = abs(signal - state['last_signal'])
-            #     reward -= turnover * self.config.get('turnover_penalty', 0.0001)
-                
-            return reward
-            
-        except Exception as e:
-            # Handle cases where state doesn't have price
-            return 0.0
+        # ... 
+        # 1. 从 context 中获取最近 N 天的 OHLCV 数据
+        # 2. 确保形状与 (lookback_window, 5) 匹配
+        # ...
+        # return observation_array
+        pass
