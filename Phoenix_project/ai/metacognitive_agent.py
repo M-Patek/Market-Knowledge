@@ -1,96 +1,109 @@
-"""
-Metacognitive Agent.
-
-This agent's role is not to analyze the primary event, but to analyze
-the *outputs* of other agents. It reflects on the ensemble's decisions
-to identify conflicts, assess overall confidence, and generate a
-synthesizing rationale.
-"""
-import logging
 from typing import List, Dict, Any, Optional
+from core.schemas.fusion_result import AgentDecision, FusionResult
+from ai.prompt_manager import PromptManager
+from api.gateway import APIGateway
+from monitor.logging import get_logger
 
-from ..api.gemini_pool_manager import GeminiPoolManager
-from .prompt_manager import PromptManager
-from .prompt_renderer import PromptRenderer
-# 修复：使用正确的相对导入
-from ..core.schemas.fusion_result import AgentDecision
-
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class MetacognitiveAgent:
     """
-    Analyzes a list of AgentDecisions to produce a summary and synthesis.
+    An agent that "thinks about thinking." It analyzes the reasoning
+    of other agents, identifies potential biases or flaws, and provides
+    a critique or a refined synthesis.
     
-    This agent is often used by the Synthesizer or Arbitrator.
+    This agent is a key part of the 'Arbitrator' or 'Critic' step.
     """
 
-    def __init__(self,
-                 prompt_manager: PromptManager,
-                 prompt_renderer: PromptRenderer,
-                 gemini_pool: GeminiPoolManager,
-                 prompt_name: str = "arbitrator"): # Default prompt
-        
+    def __init__(self, api_gateway: APIGateway, prompt_manager: PromptManager):
+        self.api_gateway = api_gateway
         self.prompt_manager = prompt_manager
-        self.prompt_renderer = prompt_renderer
-        self.gemini_pool = gemini_pool
-        self.prompt_template = self.prompt_manager.get_prompt(prompt_name)
-        
-        if not self.prompt_template:
-            raise ValueError(f"MetacognitiveAgent prompt '{prompt_name}' not found.")
-            
-        logger.info(f"MetacognitiveAgent initialized with prompt '{prompt_name}'.")
+        logger.info("MetacognitiveAgent initialized.")
 
-    async def synthesize(self, 
-                         event_context: Dict[str, Any], 
-                         agent_decisions: List[AgentDecision]) -> Dict[str, Any] | None:
+    async def critique_reasoning(
+        self,
+        context: str,
+        agent_decisions: List[AgentDecision],
+        prompt_name: str = "critique_reasoning"
+    ) -> Dict[str, Any]:
         """
-        Analyzes the decisions and generates a synthesized rationale.
-
+        Analyzes a list of agent decisions and provides a critique.
+        
         Args:
-            event_context: The original event and evidence context.
-            agent_decisions: The list of decisions from the first-layer agents.
-
+            context (str): The shared context provided to all agents.
+            agent_decisions (List[AgentDecision]): The outputs from the AI ensemble.
+            prompt_name (str): The prompt template to use (e.g., "critique", "arbitrate").
+            
         Returns:
-            A dictionary containing the synthesized rationale and fused scores,
-            or None if the analysis fails.
+            A dictionary containing the critique, identified biases, etc.
         """
-        if not agent_decisions:
-            logger.warning("MetacognitiveAgent: No agent decisions to synthesize.")
-            return None
-
-        # Convert Pydantic models to simple dicts for the prompt
-        decisions_list_of_dicts = [d.dict() for d in agent_decisions]
         
-        # Prepare the context for the renderer
-        render_context = {
-            "event": event_context.get("event", {}),
-            "context": event_context.get("context", {}),
-            "agent_decisions": decisions_list_of_dicts
-        }
+        # Format the agent decisions for the prompt
+        decisions_summary = ""
+        for i, decision in enumerate(agent_decisions):
+            decisions_summary += (
+                f"--- Agent {i+1}: {decision.agent_name} (Model: {decision.model_id}) ---\n"
+                f"Decision: {decision.decision} (Confidence: {decision.confidence:.2f})\n"
+                f"Reasoning: {decision.reasoning}\n\n"
+            )
+            
+        prompt = self.prompt_manager.get_prompt(
+            prompt_name,
+            context=context,
+            decisions_summary=decisions_summary
+        )
+        
+        if not prompt:
+            logger.error(f"Could not get prompt '{prompt_name}'.")
+            return {"error": f"Prompt '{prompt_name}' not found."}
 
         try:
-            # 1. Render the prompt
-            full_prompt = self.prompt_renderer.render_from_context(
-                template_content=self.prompt_template,
-                render_context=render_context
+            raw_response = await self.api_gateway.send_request(
+                model_name="gemini-1.5-pro", # Use a highly capable model
+                prompt=prompt,
+                temperature=0.2,
+                max_tokens=2048
             )
             
-            # 2. Execute the LLM call
-            # We expect the meta-agent to return a JSON object
-            # matching the structure defined in its prompt (e.g., FusionResult fields)
-            response_json = await self.gemini_pool.generate_json(
-                model_name="gemini-1.5-pro", # Meta-cognition needs a strong model
-                prompt=full_prompt,
-                system_prompt="You are a senior investment strategist. Your role is to synthesize conflicting reports. Respond ONLY with the requested JSON schema."
-            )
+            # The response should ideally be structured (JSON)
+            # For simplicity, we'll assume it's text, but JSON is better.
+            critique = self._parse_critique_response(raw_response)
+            logger.info("Metacognitive critique generated.")
+            return critique
             
-            if not response_json:
-                logger.warning("MetacognitiveAgent did not return a valid JSON response.")
-                return None
-
-            logger.debug(f"MetacognitiveAgent synthesis: {response_json}")
-            return response_json
-
         except Exception as e:
-            logger.error(f"Error during MetacognitiveAgent synthesis: {e}", exc_info=True)
-            return None
+            logger.error(f"Error during metacognitive critique: {e}", exc_info=True)
+            return {"error": f"LLM API failed: {e}"}
+
+    def _parse_critique_response(self, response: str) -> Dict[str, Any]:
+        """
+        Parses the raw response from the LLM.
+        
+        Assumes the prompt requested a JSON output like:
+        {
+            "summary_critique": "...",
+            "identified_biases": ["..."],
+            "conflicting_points": ["..."],
+            "suggested_decision": "BUY/SELL/HOLD",
+            "confidence": 0.0-1.0,
+            "reasoning": "..."
+        }
+        """
+        try:
+            import json
+            # Robust parsing (handles ```json ... ```)
+            if "```json" in response:
+                json_str = response.split("```json")[1].split("```")[0].strip()
+            else:
+                json_str = response.strip()
+                
+            parsed_data = json.loads(json_str)
+            return parsed_data
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON critique: {e}. Response: {response[:200]}...")
+            # Fallback to text
+            return {"summary_critique": response, "identified_biases": [], "error": "JSON parse failed"}
+        except Exception as e:
+            logger.error(f"Error parsing critique response: {e}", exc_info=True)
+            return {"error": f"Parsing failed: {e}"}
