@@ -1,160 +1,148 @@
-"""
-Data Iterator for Backtesting Engine.
-
-This module provides a flexible way to iterate over historical data,
-simulating the passage of time and yielding data points (e.g.,
-MarketEvents, TickerData) as they would have occurred.
-"""
-import logging
+from typing import List, Dict, Any, Iterator, Optional
 import pandas as pd
-from typing import Iterator, Union, List, Optional
 from datetime import datetime
-import json  # 修复：添加 json 导入
+from core.schemas.data_schema import MarketData, NewsData
+from monitor.logging import get_logger
 
-# 修复：添加 TickerData 并使用正确的相对导入
-from ..core.schemas.data_schema import TickerData, MarketEvent
-
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class DataIterator:
     """
-    Iterates over one or more time-indexed data sources (e.g., CSV, Parquet)
-    and yields data points in chronological order.
+    An iterator that yields data batches for backtesting.
+    It simulates a live data feed by stepping through multiple
+    time-aligned data sources (e.g., market data, news).
     """
-    
-    def __init__(self, file_paths: List[str], data_types: List[str], 
-                 start_date: datetime, end_date: datetime,
-                 timestamp_col: str = 'timestamp'):
-        """
-        Initializes the DataIterator.
 
+    def __init__(
+        self,
+        market_data_dfs: Dict[str, pd.DataFrame],
+        news_data_df: Optional[pd.DataFrame] = None,
+        # ... other data sources
+    ):
+        """
+        Initializes the iterator with all data sources.
+        DataFrames are expected to have a 'timestamp' column.
+        
         Args:
-            file_paths: List of paths to the data files.
-            data_types: List of data types corresponding to each file 
-                        (e.g., 'ticker', 'market_event').
-            start_date: The simulation start date.
-            end_date: The simulation end date.
-            timestamp_col: The name of the timestamp column in the files.
+            market_data_dfs (Dict[str, pd.DataFrame]): A dict of {symbol: DataFrame}.
+            news_data_df (Optional[pd.DataFrame]): A DataFrame of news.
         """
-        self.file_paths = file_paths
-        self.data_types = data_types
-        self.start_date = start_date
-        self.end_date = end_date
-        self.timestamp_col = timestamp_col
-        self.combined_data = None
         
-        if len(file_paths) != len(data_types):
-            raise ValueError("file_paths and data_types must have the same length.")
+        if not market_data_dfs:
+            logger.error("DataIterator requires at least one market data DataFrame.")
+            raise ValueError("No market data provided.")
             
-        logger.info(f"DataIterator initialized for {len(file_paths)} sources.")
-
-    def setup(self):
-        """
-        Loads all data sources, combines them, sorts by time, and filters by date.
-        This is a one-time setup operation.
-        """
-        all_dfs = []
+        self.market_data_dfs = market_data_dfs
+        self.news_data_df = news_data_df
         
-        for file_path, data_type in zip(self.file_paths, self.data_types):
-            try:
-                logger.info(f"Loading data from {file_path} as type '{data_type}'...")
-                # Simple loader, assumes CSV for this example
-                # In a real scenario, this would support parquet, feather, etc.
-                if file_path.endswith('.csv'):
-                    df = pd.read_csv(file_path)
-                elif file_path.endswith('.jsonl'):
-                    records = []
-                    with open(file_path, 'r') as f:
-                        for line in f:
-                            # 修复：使用 json.loads
-                            records.append(json.loads(line))
-                    df = pd.DataFrame(records)
-                else:
-                    logger.warning(f"Unsupported file type: {file_path}. Skipping.")
-                    continue
-                    
-                df[self.timestamp_col] = pd.to_datetime(df[self.timestamp_col])
-                df['data_type'] = data_type
-                df['source_file'] = file_path
-                all_dfs.append(df)
-                
-            except Exception as e:
-                logger.error(f"Failed to load data from {file_path}: {e}", exc_info=True)
-                
-        if not all_dfs:
-            logger.error("No data could be loaded. Cannot proceed.")
-            self.combined_data = pd.DataFrame()
-            return
-
-        # Combine, filter, and sort
-        logger.info("Combining and sorting all data sources...")
-        self.combined_data = pd.concat(all_dfs, ignore_index=True)
-        self.combined_data.sort_values(by=self.timestamp_col, inplace=True)
-        
-        # Filter by date range
-        self.combined_data = self.combined_data[
-            (self.combined_data[self.timestamp_col] >= self.start_date) &
-            (self.combined_data[self.timestamp_col] <= self.end_date)
-        ]
-        
-        logger.info(f"Setup complete. {len(self.combined_data)} total data points to iterate.")
-
-    def _parse_row(self, row: pd.Series) -> Optional[Union[TickerData, MarketEvent]]:
-        """
-        Parses a row from the combined DataFrame into a Pydantic schema.
-        """
-        data_type = row['data_type']
-        row_dict = row.to_dict()
-        
-        try:
-            if data_type == 'ticker':
-                # 修复：使用 TickerData schema
-                return TickerData(
-                    symbol=row_dict.get('symbol'),
-                    timestamp=row_dict.get(self.timestamp_col),
-                    open=row_dict.get('open'),
-                    high=row_dict.get('high'),
-                    low=row_dict.get('low'),
-                    close=row_dict.get('close'),
-                    volume=row_dict.get('volume')
-                )
-            elif data_type == 'market_event':
-                return MarketEvent(**row_dict)
-            else:
-                logger.warning(f"Unknown data_type in iterator: {data_type}")
-                return None
-        except Exception as e:
-            logger.error(f"Failed to parse row into schema {data_type}: {e}. Row: {row_dict}")
-            return None
-
-    def __iter__(self) -> Iterator[Union[TickerData, MarketEvent]]:
-        """
-        Returns the iterator object.
-        """
-        if self.combined_data is None:
-            logger.info("Running one-time setup...")
-            self.setup()
+        # Combine all timestamps to create a master index
+        all_timestamps = set()
+        for df in market_data_dfs.values():
+            all_timestamps.update(df['timestamp'])
             
-        self.current_index = 0
+        if news_data_df is not None:
+            all_timestamps.update(news_data_df['timestamp'])
+            
+        if not all_timestamps:
+            logger.error("No timestamps found in any data source.")
+            raise ValueError("Data sources are empty.")
+            
+        self.master_index = sorted(list(all_timestamps))
+        self.current_step = 0
+        self.total_steps = len(self.master_index)
+        
+        # Create iterators for each DataFrame for efficient lookup
+        self.market_iterators = {
+            symbol: df.set_index('timestamp').iterrows()
+            for symbol, df in market_data_dfs.items()
+        }
+        self.news_iterator = (
+            news_data_df.set_index('timestamp').iterrows()
+            if news_data_df is not None else None
+        )
+        
+        # Pre-load the first item to handle timestamp alignment
+        # This is a simplified approach. A real implementation would be
+        # more complex, handling `iterrows` exhaustion.
+        
+        # A simpler (but less memory-efficient for huge data) approach:
+        # Set index on all DFs
+        self.market_data_indexed = {
+            symbol: df.set_index('timestamp')
+            for symbol, df in market_data_dfs.items()
+        }
+        self.news_data_indexed = (
+            news_data_df.set_index('timestamp')
+            if news_data_df is not None else None
+        )
+        
+        logger.info(f"DataIterator initialized with {self.total_steps} unique timestamps.")
+
+    def __iter__(self) -> "DataIterator":
+        self.current_step = 0
         return self
 
-    def __next__(self) -> Union[TickerData, MarketEvent]:
+    def __next__(self) -> Dict[str, Any]:
         """
-        Yields the next data point in chronological order.
+        Yields the data batch for the next timestamp in the master index.
         """
-        if self.combined_data is None:
-            raise StopIteration("Data not loaded. Call setup() first or use in a for loop.")
-            
-        if self.current_index < len(self.combined_data):
-            row = self.combined_data.iloc[self.current_index]
-            self.current_index += 1
-            
-            parsed_item = self._parse_row(row)
-            if parsed_item:
-                return parsed_item
-            else:
-                # Skip bad rows and try to get the next one
-                return self.__next__()
-        else:
-            logger.info("DataIterator reached the end.")
+        if self.current_step >= self.total_steps:
             raise StopIteration
+            
+        current_timestamp = self.master_index[self.current_step]
+        
+        batch = {
+            "timestamp": current_timestamp,
+            "market_data": [],
+            "news_data": []
+        }
+        
+        # Get market data for this timestamp
+        for symbol, df_indexed in self.market_data_indexed.items():
+            if current_timestamp in df_indexed.index:
+                row = df_indexed.loc[current_timestamp]
+                # Handle multiple rows for same timestamp (unlikely in master index)
+                if isinstance(row, pd.Series):
+                    market_data = self._row_to_market_data(row, symbol, current_timestamp)
+                    batch["market_data"].append(market_data)
+                # else: Handle DataFrame rows
+                    
+        # Get news data for this timestamp
+        if self.news_data_indexed is not None:
+             if current_timestamp in self.news_data_indexed.index:
+                rows = self.news_data_indexed.loc[current_timestamp]
+                if isinstance(rows, pd.Series):
+                    # Single news item
+                    news_data = self._row_to_news_data(rows, current_timestamp)
+                    batch["news_data"].append(news_data)
+                elif isinstance(rows, pd.DataFrame):
+                    # Multiple news items at exact same timestamp
+                    for _, row in rows.iterrows():
+                        news_data = self._row_to_news_data(row, current_timestamp)
+                        batch["news_data"].append(news_data)
+
+        self.current_step += 1
+        return batch
+
+    def _row_to_market_data(self, row: pd.Series, symbol: str, timestamp: datetime) -> MarketData:
+        """Helper to convert a DataFrame row to a MarketData Pydantic model."""
+        return MarketData(
+            symbol=symbol,
+            timestamp=timestamp,
+            open=row.get("open", 0.0),
+            high=row.get("high", 0.0),
+            low=row.get("low", 0.0),
+            close=row.get("close", 0.0),
+            volume=row.get("volume", 0)
+        )
+        
+    def _row_to_news_data(self, row: pd.Series, timestamp: datetime) -> NewsData:
+        """Helper to convert a DataFrame row to a NewsData Pydantic model."""
+        return NewsData(
+            timestamp=timestamp,
+            headline=row.get("headline", ""),
+            source=row.get("source", "Unknown"),
+            summary=row.get("summary", ""),
+            url=row.get("url", ""),
+            content=row.get("content", "")
+        )
