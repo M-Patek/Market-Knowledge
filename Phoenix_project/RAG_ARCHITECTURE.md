@@ -17,7 +17,7 @@ Technology: Pinecone Serverless. This provides a scalable, managed vector databa
 
 Embedding Models:
 
-Unstructured Text (News, Filings): text-embedding-3-large (OpenAI), as defined in models/embedding_models/. Chosen for its state-of-the-art performance in capturing semantic meaning.
+Unstructured Text (News, Filings): text-embedding-004 (Google). [修正：根据主人的决定，从 text-embedding-3-large 更改] Chosen for its state-of-the-art performance in capturing semantic meaning.
 
 Query Enhancement (HyDE): To improve semantic retrieval, the system implements Hypothetical Document Embedding (HyDE). Before searching, a high-capability LLM (gemini-2.5-pro) generates a "hypothetical" document that perfectly answers the query. This document (not the query) is then embedded and used for the vector search, leading to more robust semantic matching.
 
