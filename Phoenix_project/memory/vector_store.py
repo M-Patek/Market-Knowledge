@@ -2,9 +2,12 @@ from pinecone import Pinecone, ServerlessSpec, PodSpec
 from typing import Dict, Any, List, Optional
 import os
 
-from ..monitor.logging import get_logger
-from ..ai.embedding_client import EmbeddingClient
-from ..core.schemas.data_schema import MarketEvent
+# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
+from monitor.logging import get_logger
+# 修复：将相对导入 'from ..ai.embedding_client...' 更改为绝对导入
+from ai.embedding_client import EmbeddingClient
+# 修复：将相对导入 'from ..core.schemas.data_schema...' 更改为绝对导入
+from core.schemas.data_schema import MarketEvent
 
 logger = get_logger(__name__)
 
