@@ -99,5 +99,7 @@ tabular_db:
   host: "postgres_db"
   port: 5432
   user: "phoenix_user"
-  password_env_var: "PG_PASSWORD"
+  # FIX: 修复了密码逻辑断裂
+  # 将 'PG_PASSWORD' 更改为 'POSTGRES_PASSWORD' 以匹配 docker-compose.yml
+  password_env_var: "POSTGRES_PASSWORD"
   database: "phoenix_tabular"
