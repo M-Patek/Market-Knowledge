@@ -14,16 +14,18 @@ import asyncio
 from datetime import datetime
 from typing import Optional, Dict, Any, Union
 
-# 修复：为所有本地模块添加 `..` 相对导入
-from ..data_manager import DataManager
-from ..core.pipeline_state import PipelineState
-from ..core.schemas.data_schema import MarketEvent, EconomicEvent
-from ..strategy_handler import RomanLegionStrategy # Assuming this is the main strategy
-from ..execution.order_manager import OrderManager
-from ..execution.signal_protocol import StrategySignal
-from ..events.event_distributor import EventDistributor
-from ..worker import app as celery_app
-from ..config.loader import ConfigLoader
+# 修正：[FIX-ImportError]
+# 将所有 `..` 相对导入更改为从项目根目录开始的绝对导入，
+# 以匹配项目的标准约定 (如 phoenix_project.py 中所设定的)。
+from data_manager import DataManager
+from core.pipeline_state import PipelineState
+from core.schemas.data_schema import MarketEvent, EconomicEvent
+from strategy_handler import RomanLegionStrategy # Assuming this is the main strategy
+from execution.order_manager import OrderManager
+from execution.signal_protocol import StrategySignal
+from events.event_distributor import EventDistributor
+from worker import app as celery_app
+from config.loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
 
