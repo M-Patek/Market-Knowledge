@@ -20,8 +20,10 @@ ai:
     google:
       api_key_env_var: "GEMINI_PRO_KEY"
       models:
-        - name: "gemini-1.5-flash-latest"
+        # 修正：根据主人的决定，将推理模型更新为 gemini-2.5-pro
+        - name: "gemini-2.5-pro"
           type: "generative"
+        # 修正：根据主人的决定，嵌入模型为 text-embedding-004 (已正确)
         - name: "text-embedding-004"
           type: "embedding"
   
@@ -97,4 +99,3 @@ tabular_db:
   user: "phoenix_user"
   password_env_var: "PG_PASSWORD"
   database: "phoenix_tabular"
-
