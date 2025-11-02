@@ -4,7 +4,8 @@
 """
 import json
 import os
-from typing import Dict, Any
+# FIX (E-PY-1): 从 'typing' 中导入 'List'，以修复 run_backtest 中的 NameError
+from typing import Dict, Any, List
 
 from config.loader import ConfigLoader
 from data_manager import DataManager
