@@ -1,146 +1,147 @@
+from typing import Dict, Any, List, Optional
 import pandas as pd
-import yfinance as yf
-from typing import Dict, Any, Optional, TYPE_CHECKING
-from datetime import datetime, timedelta
-
-from .monitor.logging import get_logger
-
-# 修正：为类型检查导入 PipelineState，以避免循环导入
-if TYPE_CHECKING:
-    from .core.pipeline_state import PipelineState
-    from .core.schemas.data_schema import MarketEvent, EconomicEvent
+from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
+from config.loader import ConfigLoader
+from data.data_iterator import DataIterator
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 class DataManager:
     """
-    提供一个标准化的接口，用于获取历史市场数据并处理实时事件。
-    
-    这个实现使用 `yfinance` 作为历史数据源，并包含处理
-    来自 Orchestrator 的实时事件更新所需的方法存根。
+    Handles loading, caching, and serving all data required by the system.
+    It abstracts the data sources (e.g., APIs, databases, local files).
     """
 
-    def __init__(
-        self, 
-        config: Dict[str, Any],
-        pipeline_state: "PipelineState",
-        cache_dir: str
-    ):
-        """
-        初始化 DataManager。
+    def __init__(self, config_loader: ConfigLoader):
+        self.config_loader = config_loader
+        self.data_catalog = self._load_data_catalog()
         
-        修正：[FIX-TypeError-DataManager]
-        构造函数现在接受 config, pipeline_state, 和 cache_dir,
-        以匹配调用方 (phoenix_project.py, run_training.py) 的意图。
+        # In-memory cache for loaded data (e.g., for backtesting)
+        self.data_cache: Dict[str, pd.DataFrame] = {}
+        
+        logger.info(f"DataManager initialized. Found {len(self.data_catalog)} entries in catalog.")
 
+    def _load_data_catalog(self) -> Dict[str, Any]:
+        """Loads the data catalog file."""
+        try:
+            # Assuming data_catalog.json is in the root
+            catalog = self.config_loader.load_json("data_catalog.json")
+            return catalog.get("datasets", {})
+        except Exception as e:
+            logger.error(f"Failed to load data_catalog.json: {e}", exc_info=True)
+            return {}
+
+    def _load_dataset(self, dataset_id: str) -> Optional[pd.DataFrame]:
+        """
+        Loads a single dataset from the path specified in the catalog.
+        Caches the result in memory.
+        """
+        if dataset_id in self.data_cache:
+            return self.data_cache[dataset_id]
+            
+        if dataset_id not in self.data_catalog:
+            logger.error(f"Dataset '{dataset_id}' not found in data catalog.")
+            return None
+            
+        dataset_info = self.data_catalog[dataset_id]
+        file_path = dataset_info.get("path")
+        file_type = dataset_info.get("type", "csv")
+        
+        if not file_path:
+            logger.error(f"No path specified for dataset '{dataset_id}'.")
+            return None
+            
+        try:
+            # TODO: Handle relative paths correctly from project root
+            # Assuming file_path is relative to project root
+            
+            if file_type == "csv":
+                df = pd.read_csv(file_path, parse_dates=["timestamp"])
+            elif file_type == "parquet":
+                df = pd.read_parquet(file_path)
+                if "timestamp" in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+            else:
+                logger.error(f"Unsupported file type '{file_type}' for dataset '{dataset_id}'.")
+                return None
+                
+            logger.info(f"Successfully loaded dataset '{dataset_id}' from {file_path}. Shape: {df.shape}")
+            self.data_cache[dataset_id] = df
+            return df
+            
+        except FileNotFoundError:
+            logger.error(f"Data file not found: {file_path}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to load dataset '{dataset_id}': {e}", exc_info=True)
+            return None
+
+    def get_backtest_iterator(self, market_data_ids: List[str], news_data_id: Optional[str] = None) -> DataIterator:
+        """
+        Pre-loads all necessary data for a backtest and returns
+        a DataIterator instance.
+        
         Args:
-            config (Dict, Any): The main system configuration.
-            pipeline_state (PipelineState): 对共享流水线状态的引用。
-            cache_dir (str): 用于数据缓存的目录路径。
-        """
-        self.config = config.get('data_manager', {})
-        self.pipeline_state = pipeline_state
-        self.cache_dir = cache_dir
-        
-        self.historical_cache: Dict[str, pd.DataFrame] = {}
-        self.cache_expiry_minutes = self.config.get('cache_expiry_minutes', 60)
-        
-        logger.info(f"DataManager initialized with yfinance source. Cache dir: {self.cache_dir}")
-
-    async def update_with_event(self, event: "Union[MarketEvent, EconomicEvent]"):
-        """
-        [存根] 处理来自 Orchestrator 的传入事件。
-        
-        FIXME: 需要实现此逻辑。
-        这可能涉及：
-        1. 将事件保存到时序数据库 (Elasticsearch)。
-        2. 如果事件是新闻/SEC 文件，触发嵌入和向量存储。
-        3. 更新此事件相关 Ticker 的特征。
-        """
-        logger.debug(f"Received event (stub): {event.event_id if hasattr(event, 'event_id') else 'Unknown ID'}")
-        # 将事件添加到 pipeline_state 的最近事件中
-        self.pipeline_state.add_event(event.dict())
-        # 实际的数据库/特征更新逻辑应在此处
-        await asyncio.sleep(0) # 模拟 async I/O
-
-    async def update_market_data(self, trigger_time: datetime):
-        """
-        [存根] 由 Orchestrator 的计划任务（例如日终）调用。
-        
-        FIXME: 需要实现此逻辑。
-        这可能涉及：
-        1. 获取自上次更新以来所有资产的最新 OHLCV 数据。
-        2. 更新特征存储 (feature store)。
-        3. 更新 pipeline_state 中的市场数据。
-        """
-        logger.debug(f"Updating market data for (stub): {trigger_time}")
-        # 实际的数据拉取和特征工程应在此处
-        await asyncio.sleep(0) # 模拟 async I/O
-
-    def get_historical_data(
-        self, 
-        symbol: str, 
-        start_date: pd.Timestamp, 
-        end_date: pd.Timestamp
-    ) -> pd.DataFrame:
-        """
-        获取给定 Ticker 和日期范围的历史 OHLCV 数据。
-        
-        Args:
-            symbol (str): The ticker symbol (e.g., "AAPL").
-            start_date (pd.Timestamp): The start of the date range.
-            end_date (pd.Timestamp): The end of the date range.
+            market_data_ids (List[str]): List of dataset IDs for market data.
+                                         The catalog entry *must* contain a 'symbol'.
+            news_data_id (Optional[str]): Dataset ID for news data.
             
         Returns:
-            pd.DataFrame: A DataFrame with OHLCV data, indexed by Timestamp.
-                          Returns an empty DataFrame on failure.
+            DataIterator
         """
+        logger.info("Preparing backtest data iterator...")
         
-        # 1. Check cache (simplified cache - does not check date range)
-        # A real cache would be more granular (e.g., symbol + date_range)
-        if symbol in self.historical_cache:
-            # TODO: Add expiry logic
-            logger.debug(f"Returning cached data for {symbol}")
-            cached_data = self.historical_cache[symbol]
-            return cached_data.loc[start_date:end_date]
+        market_data_dfs: Dict[str, pd.DataFrame] = {}
+        for dataset_id in market_data_ids:
+            symbol = self.data_catalog.get(dataset_id, {}).get("symbol")
+            if not symbol:
+                logger.error(f"Dataset '{dataset_id}' in catalog has no 'symbol' defined. Skipping.")
+                continue
+                
+            df = self._load_dataset(dataset_id)
+            if df is not None:
+                market_data_dfs[symbol] = df
+                
+        news_data_df = None
+        if news_data_id:
+            news_data_df = self._load_dataset(news_data_id)
+            
+        if not market_data_dfs:
+            raise ValueError("No valid market data could be loaded for the backtest.")
+            
+        return DataIterator(
+            market_data_dfs=market_data_dfs,
+            news_data_df=news_data_df
+        )
 
-        # 2. Fetch from source (yfinance)
-        try:
-            logger.info(f"Fetching yfinance data for {symbol} from {start_date} to {end_date}")
-            ticker = yf.Ticker(symbol)
-            
-            # yfinance start is inclusive, end is exclusive. Add 1 day to end_date.
-            data = ticker.history(
-                start=start_date.strftime('%Y-%m-%d'),
-                end=(end_date + timedelta(days=1)).strftime('%Y-%m-%d')
-            )
-            
-            if data.empty:
-                logger.warning(f"No data returned from yfinance for {symbol}")
-                return pd.DataFrame()
-
-            # 3. Clean and Standardize Data
-            data.rename(columns={
-                'Open': 'open',
-                'High': 'high',
-                'Low': 'low',
-                'Close': 'close',
-                'Volume': 'volume'
-            }, inplace=True)
-            
-            # Ensure index is timezone-naive (or standardize to UTC)
-            data.index = data.index.tz_localize(None)
-            
-            # Keep only standard columns
-            standard_cols = ['open', 'high', 'low', 'close', 'volume']
-            data = data[standard_cols]
-            
-            # 4. Store in cache
-            self.historical_cache[symbol] = data
-            
-            # 5. Return the requested slice
-            return data.loc[start_date:end_date]
-
-        except Exception as e:
-            logger.error(f"Failed to fetch yfinance data for {symbol}: {e}", exc_info=True)
-            return pd.DataFrame()
+    async def fetch_live_data(self) -> Dict[str, List[Any]]:
+        """
+        Fetches new data from live APIs.
+        This is a placeholder for a real implementation.
+        
+        Returns:
+            A dictionary of data lists, e.g.:
+            {"market_data": [MarketData(...)], "news_data": [NewsData(...)]}
+        """
+        logger.warning("fetch_live_data is a placeholder and not implemented.")
+        # --- Placeholder Implementation ---
+        # 1. Connect to live data provider (e.g., Alpaca, Polygon)
+        # 2. Get data since `last_data_ingest_time`
+        # 3. Parse data into Pydantic models
+        # 4. Return the batch
+        
+        await asyncio.sleep(0.1) # Simulate async I/O
+        
+        # Example dummy data
+        dummy_market_data = MarketData(
+            symbol="DUMMY",
+            timestamp=datetime.utcnow(),
+            open=100, high=101, low=99, close=100.5, volume=10000
+        )
+        
+        return {
+            "market_data": [dummy_market_data],
+            "news_data": [],
+            "economic_data": []
+        }
