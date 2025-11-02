@@ -1,93 +1,57 @@
-from typing import Dict, Any, List
-from core.schemas.data_schema import MarketData, NewsData
-from core.pipeline_state import PipelineState
-from events.event_distributor import EventDistributor
-from monitor.logging import get_logger
+"""
+事件流处理器
+(目前似乎是一个占位符或概念)
+在更复杂的系统中，这可能是一个 Kafka/Spark 流处理器。
+在当前架构中，Orchestrator 扮演了这个角色。
+"""
+from typing import Any, Dict, List
 
-logger = get_logger(__name__)
+# FIX (E1): 导入统一后的核心模式
+from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
 
 class StreamProcessor:
     """
-    Handles the initial ingestion of raw data streams (live or backtest).
-    It validates data against schemas, publishes raw events, and updates
-    the PipelineState buffers.
+    处理传入的数据流，可能进行聚合、转换或充实。
     """
-
-    def __init__(
-        self,
-        pipeline_state: PipelineState,
-        event_distributor: EventDistributor
-    ):
-        self.pipeline_state = pipeline_state
-        self.event_distributor = event_distributor
-        logger.info("StreamProcessor initialized.")
-
-    async def process_data_batch(self, data_batch: Dict[str, List[Any]]):
-        """
-        Processes a batch of data from the DataManager.
+    def __init__(self):
+        self.log_prefix = "StreamProcessor:"
+        print(f"{self.log_prefix} Initialized.")
         
-        Args:
-            data_batch (Dict[str, List[Any]]): A dict containing lists of
-                                              Pydantic data models.
-                                              e.g., {"market_data": [...], "news_data": [...]}
+    def process_batch(self, data_batch: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        """
+        处理来自 DataManager 的原始批次。
+        
+        示例：
+        - 充实市场数据（例如，添加技术指标）。
+        - 聚合新闻情绪。
         """
         
-        # 1. Process Market Data
-        market_data_list = data_batch.get("market_data", [])
-        validated_market_data = []
-        for data in market_data_list:
-            try:
-                # Data should already be validated by DataManager/API client
-                # but we can re-validate if needed.
-                if isinstance(data, MarketData):
-                    validated_market_data.append(data)
-                    # Publish the raw event for other listeners (e.g., RiskFilter)
-                    await self.event_distributor.publish(
-                        "market_data_raw", data=data
-                    )
-                else:
-                    logger.warning(f"Skipping invalid market data item: {type(data)}")
-            except Exception as e:
-                logger.error(f"Failed to validate market data: {e}", exc_info=True)
-                
-        # 2. Process News Data
-        news_data_list = data_batch.get("news_data", [])
-        validated_news_data = []
-        for data in news_data_list:
-            try:
-                if isinstance(data, NewsData):
-                    validated_news_data.append(data)
-                    await self.event_distributor.publish(
-                        "news_data_raw", data=data
-                    )
-                else:
-                    logger.warning(f"Skipping invalid news data item: {type(data)}")
-            except Exception as e:
-                logger.error(f"Failed to validate news data: {e}", exc_info=True)
-                
-        # ... Process other data types (economic, etc.)
+        # FIX (E1): 使用 MarketData
+        if "market_data" in data_batch:
+            for data_point in data_batch["market_data"]:
+                if isinstance(data_point, MarketData):
+                    # 示例：可以在这里添加一个TA指标
+                    # data_point.metadata["RSI_14"] = calculate_rsi(data_point) # 假设...
+                    pass
+
+        # FIX (E1): 使用 NewsData
+        if "news_data" in data_batch:
+             for data_point in data_batch["news_data"]:
+                if isinstance(data_point, NewsData):
+                    # 示例：可以在这里进行初步的情绪分析
+                    # data_point.metadata["sentiment"] = analyze_sentiment(data_point.content)
+                    pass
+
+        # FIX (E1): 使用 EconomicIndicator
+        if "economic_indicators" in data_batch:
+            for data_point in data_batch["economic_indicators"]:
+                 if isinstance(data_point, EconomicIndicator):
+                    # 示例：计算“意外” (Surprise)
+                    if data_point.expected is not None:
+                        data_point.metadata["surprise"] = data_point.value - data_point.expected
+                    pass
+
+        print(f"{self.log_prefix} Processed batch.")
         
-        # 3. Update PipelineState buffers
-        try:
-            update_dict = {}
-            if validated_market_data:
-                update_dict["market_data"] = validated_market_data
-            if validated_news_data:
-                update_dict["news_data"] = validated_news_data
-            
-            if update_dict:
-                await self.pipeline_state.update_state(update_dict)
-                logger.info(
-                    f"StreamProcessor updated state with "
-                    f"{len(validated_market_data)} market, "
-                    f"{len(validated_news_data)} news items."
-                )
-                
-            # 4. Publish a "processed" event to trigger the main cycle
-            await self.event_distributor.publish(
-                "data_batch_processed",
-                batch_size=len(market_data_list) + len(news_data_list)
-            )
-            
-        except Exception as e:
-            logger.error(f"Failed to update PipelineState with data batch: {e}", exc_info=True)
+        # 在这个简单的实现中，我们只返回原始批次（可能已充实）
+        return data_batch
