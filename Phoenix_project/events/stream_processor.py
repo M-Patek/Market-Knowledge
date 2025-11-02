@@ -66,7 +66,9 @@ class StreamProcessor:
                     return
 
                 # Check against the Risk Filter
-                if self.risk_filter.is_high_risk(event.headline) or self.risk_filter.is_high_risk(event.content):
+                # 修复：[FIX-5] 'RiskFilter' 上的方法是 'check_event'，
+                # 而不是 'is_high_risk'
+                if self.risk_filter.check_event(event.headline) or self.risk_filter.check_event(event.content):
                     event.metadata['risk_filter_triggered'] = True
                     logger.warning(f"High-risk event detected: {event.headline}")
                     # Optionally, route high-risk events to a different queue
@@ -161,7 +163,8 @@ if __name__ == "__main__":
             return
             
         adapter = DataAdapter()
-        risk_filter = RiskFilter(config_path="config/event_filter_config.yaml")
+        # 修复：[FIX-10] 提供 'config' 字典，而不仅仅是路径
+        risk_filter = RiskFilter(config={'config_path': "config/event_filter_config.yaml"})
         
         processor = StreamProcessor(
             stream_uri=STREAM_URI,
