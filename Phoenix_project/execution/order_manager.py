@@ -1,114 +1,155 @@
-"""
-Order Manager
-- 接收 StrategySignal (目标投资组合)
-- 计算与当前持仓的差异
-- 生成并发送订单到 Broker Adapter
-- 跟踪订单状态
-"""
-from typing import Dict, List
+from typing import Dict, Any, List
+import asyncio
+from core.schemas.data_schema import Order, Execution
+from core.pipeline_state import PipelineState
+from events.event_distributor import EventDistributor
+from execution.adapters import BrokerAdapter
 from monitor.logging import get_logger
-from .interfaces import IOrderManager, IBrokerAdapter, Order, Fill
-from .signal_protocol import StrategySignal
 
-class OrderManager(IOrderManager):
+logger = get_logger(__name__)
+
+class OrderManager:
     """
-    管理订单的生命周期，从信号生成到执行。
+    Manages the full lifecycle of orders:
+    - Receives pending orders from PortfolioConstructor.
+    - Submits them via the BrokerAdapter.
+    - Listens for execution fills.
+    - Updates the PipelineState (portfolio) based on fills.
     """
-    
-    # 关键修正 (Error 4):
-    # 构造函数现在接受一个 Broker Adapter (依赖注入)
-    # 而不是在内部硬编码或不接受 adapter
-    def __init__(self, config: Dict, adapter: IBrokerAdapter):
+
+    def __init__(
+        self,
+        pipeline_state: PipelineState,
+        event_distributor: EventDistributor,
+        broker_adapter: BrokerAdapter,
+        config: Dict[str, Any]
+    ):
+        self.pipeline_state = pipeline_state
+        self.event_distributor = event_distributor
+        self.broker_adapter = broker_adapter
         self.config = config
-        self.adapter = adapter  # 存储注入的 adapter
-        self.logger = get_logger(self.__class__.__name__)
-        self.current_positions: Dict[str, float] = {} # (应从 adapter 加载)
-        self.active_orders: Dict[str, Order] = {}
-        self.logger.info(f"OrderManager initialized with adapter: {adapter.__class__.__name__}")
+        
+        # In-memory tracking of orders
+        self._open_orders: Dict[str, Order] = {} # {order_id: Order}
+        
+        logger.info(f"OrderManager initialized with adapter: {broker_adapter.__class__.__name__}")
 
-    async def load_current_positions(self):
-        """从 Broker Adapter 加载当前持仓"""
+    async def initialize(self):
+        """Initialize the broker adapter and subscribe to events."""
         try:
-            # (假设 adapter 有一个 get_positions 方法)
-            self.current_positions = await self.adapter.get_positions()
-            self.logger.info(f"Loaded positions: {self.current_positions}")
+            await self.broker_adapter.initialize()
+            # Subscribe to execution events published by the adapter
+            await self.event_distributor.subscribe("order_execution", self.on_execution)
+            logger.info("OrderManager initialized and subscribed to executions.")
         except Exception as e:
-            self.logger.error(f"Failed to load positions: {e}")
+            logger.error(f"Failed to initialize OrderManager: {e}", exc_info=True)
+            raise
 
-    async def generate_orders_from_signal(self, signal: StrategySignal):
-        """
-        根据信号(目标权重)和当前持仓计算并生成订单。
-        """
-        self.logger.info(f"Received signal: {signal.strategy_id} | Targets: {signal.target_weights}")
-        
-        # (确保持仓是最新的)
-        await self.load_current_positions()
-
-        # (获取总资产净值 - 假设)
-        total_equity = await self.adapter.get_total_equity() 
-        
-        orders_to_place: List[Order] = []
-        target_weights = signal.target_weights
-        
-        # (这是一个简化的差分逻辑)
-        # 1. 计算所有标的的目标美元价值
-        all_tickers = set(target_weights.keys()) | set(self.current_positions.keys())
-
-        for ticker in all_tickers:
-            target_weight = target_weights.get(ticker, 0.0)
-            target_value = total_equity * target_weight
+    async def submit_order(self, order: Order):
+        """Submits a new order to the broker."""
+        if order.id in self._open_orders:
+            logger.warning(f"Order {order.id} is already being tracked.")
+            return
             
-            current_value = self.current_positions.get(ticker, {}).get('market_value', 0.0)
+        try:
+            logger.info(f"Submitting order {order.id} to broker...")
+            submitted_order = await self.broker_adapter.submit_order(order)
             
-            delta_value = target_value - current_value
-            
-            # (应用一个阈值，避免小额交易)
-            if abs(delta_value) > self.config.get('min_trade_value', 100): 
-                # (需要从 $ 转换到 数量 qty)
-                # (此处需要价格数据... 简化处理)
-                try:
-                    # (假设 adapter 有 get_last_price 方法)
-                    last_price = await self.adapter.get_last_price(ticker)
-                    if last_price <= 0:
-                        raise ValueError("Price is zero or negative")
-                        
-                    qty = delta_value / last_price
-                    
-                    order = Order(
-                        ticker=ticker,
-                        qty=abs(qty),
-                        side="buy" if delta_value > 0 else "sell",
-                        order_type="market", # (或 "limit")
-                        # (limit_price=...)
-                    )
-                    orders_to_place.append(order)
-                    
-                except Exception as e:
-                    self.logger.error(f"Could not create order for {ticker}: {e}")
+            if submitted_order.status == "REJECTED":
+                logger.error(f"Order {order.id} was REJECTED by broker: {submitted_order.reject_reason}")
+                await self.event_distributor.publish(
+                    "order_rejected", order=submitted_order
+                )
+            elif submitted_order.status == "FILLED":
+                logger.info(f"Order {order.id} was filled immediately (simulated).")
+                # The adapter should have already published this event
+                pass
+            else: # e.g., "PENDING", "ACCEPTED"
+                logger.info(f"Order {order.id} is open with status: {submitted_order.status}")
+                self._open_orders[submitted_order.id] = submitted_order
+                
+        except Exception as e:
+            logger.error(f"Error submitting order {order.id}: {e}", exc_info=True)
+            order.status = "REJECTED"
+            order.reject_reason = f"Submission error: {e}"
+            await self.event_distributor.publish("order_rejected", order=order)
 
-        # 2. 发送订单
-        await self.place_orders(orders_to_place)
-
-    async def place_orders(self, orders: List[Order]):
-        """将订单列表发送到 broker adapter"""
-        for order in orders:
-            try:
-                order_id = await self.adapter.place_order(order)
-                order.broker_order_id = order_id
-                self.active_orders[order_id] = order
-                self.logger.info(f"Placed order: {order.side} {order.qty} {order.ticker} | ID: {order_id}")
-            except Exception as e:
-                self.logger.error(f"Failed to place order for {order.ticker}: {e}")
-
-    async def on_fill(self, fill_event: Fill):
+    async def on_execution(self, pipeline_state: PipelineState, execution: Execution):
         """
-        处理来自 adapter 的订单成交事件。
+        Callback for 'order_execution' events.
+        This is the most critical part: updating the portfolio state.
         """
-        self.logger.info(f"Received fill: {fill_event.status} {fill_event.filled_qty} {fill_event.ticker} @ {fill_event.avg_fill_price}")
-        # (更新持仓和活动订单列表)
-        if fill_event.order_id in self.active_orders:
-            if fill_event.status == "filled" or fill_event.status == "cancelled":
-                del self.active_orders[fill_event.order_id]
+        logger.info(f"Received execution: {execution.quantity} {execution.symbol} @ {execution.fill_price}")
         
-        # (需要更新 self.current_positions)
-        await self.load_current_positions() 
+        try:
+            # 1. Update the order status
+            if execution.order_id in self._open_orders:
+                order = self._open_orders[execution.order_id]
+                # TODO: Handle partial fills
+                order.filled_quantity += execution.quantity
+                order.status = "FILLED" # Simplified
+                del self._open_orders[execution.order_id]
+            else:
+                logger.warning(f"Received execution for untracked/already-filled order: {execution.order_id}")
+            
+            # 2. Update trade history
+            await self.pipeline_state.update_state({"trade_history": [execution]})
+            
+            # 3. Update portfolio (the hard part)
+            portfolio = await self.pipeline_state.get_portfolio()
+            positions = portfolio.get("positions", {})
+            cash = portfolio.get("cash", 0.0)
+            
+            symbol = execution.symbol
+            quantity = execution.quantity
+            fill_price = execution.fill_price
+            commission = execution.commission
+            
+            # --- Update Cash ---
+            trade_cost = (quantity * fill_price) # Negative for buys, positive for sells
+            cash -= trade_cost
+            cash -= commission
+            
+            # --- Update Position ---
+            position = positions.get(symbol, {"size": 0, "avg_price": 0, "market_value": 0})
+            
+            current_size = position["size"]
+            current_avg_price = position["avg_price"]
+            
+            new_size = current_size + quantity
+            
+            if new_size == 0:
+                # Position closed
+                new_avg_price = 0
+            elif (current_size * quantity) >= 0: # Adding to position (or opening)
+                # Weighted average price
+                new_avg_price = ((current_avg_price * current_size) + (fill_price * quantity)) / new_size
+            else:
+                # Reducing position (realizing PnL)
+                # Average price does not change
+                new_avg_price = current_avg_price
+                
+            position["size"] = new_size
+            position["avg_price"] = new_avg_price
+            
+            positions[symbol] = position
+            
+            # --- Recalculate Portfolio Value ---
+            # This requires getting *all* current market prices
+            # For simplicity, we'll just update cash and positions
+            # A separate "PortfolioManager" service should update market values.
+            
+            new_portfolio_state = {
+                "cash": cash,
+                "positions": positions
+                # "total_value" should be updated by another process
+            }
+            
+            await self.pipeline_state.update_portfolio(new_portfolio_state)
+            
+            logger.info(f"Portfolio updated for {symbol}: New Size {new_size}, New Cash {cash:.2f}")
+
+        except Exception as e:
+            logger.error(f"Failed to process execution {execution.execution_id}: {e}", exc_info=True)
+            # This is a critical error!
+            # await self.event_distributor.publish("CRITICAL_ERROR", ...)
