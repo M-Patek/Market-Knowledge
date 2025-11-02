@@ -10,31 +10,36 @@ services:
     volumes:
       - redis_data:/data
 
+  # FIX 1: 取消注释数据库服务
   # (可选: PostgreSQL - 用于表格 RAG)
-  # postgres_db:
-  #   image: postgres:15-alpine
-  #   container_name: phoenix_postgres
-  #   environment:
-  #     POSTGRES_USER: phoenix
-  #     POSTGRES_PASSWORD: password
-  #     POSTGRES_DB: phoenix_db
-  #   ports:
-  #     - "5432:5432"
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
+  postgres_db:
+    image: postgres:15-alpine
+    container_name: phoenix_postgres
+    environment:
+      # FIX 2: 使配置与 system.yaml 匹配
+      POSTGRES_USER: phoenix_user
+      POSTGRES_DB: phoenix_tabular
+      # FIX 3: 为数据库设置密码。
+      # 这个密码将通过下面的 worker/api 环境变量传递给应用程序
+      POSTGRES_PASSWORD: "changeme_in_prod" 
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
+  # FIX 1: 取消注释数据库服务
   # (可选: Elasticsearch - 用于时序 RAG)
-  # elasticsearch:
-  #   image: elasticsearch:8.6.2
-  #   container_name: phoenix_elastic
-  #   environment:
-  #     - discovery.type=single-node
-  #     - xpack.security.enabled=false
-  #     - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-  #   ports:
-  #     - "9200:9200"
-  #   volumes:
-  #     - elastic_data:/usr/share/elasticsearch/data
+  elasticsearch:
+    image: elasticsearch:8.6.2
+    container_name: phoenix_elastic
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elastic_data:/usr/share/elasticsearch/data
 
   worker:
     build:
@@ -43,13 +48,19 @@ services:
     container_name: phoenix_worker
     depends_on:
       - redis
+      - postgres_db # 添加依赖
+      - elasticsearch # 添加依赖
+    # FIX 3: 注入环境变量
+    # env_file 用于加载 .env 中的 API 密钥 (例如 GEMINI_PRO_KEY)
+    env_file:
+      - ./.env
+    # environment 用于传递此 compose 文件中定义的服务凭证
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - PHOENIX_CONFIG_PATH=/app/config
-      # (需要在此处或 env.example 中设置所有 API 密钥)
-      # - GEMINI_API_KEY=...
-      # - PINECONE_API_KEY=...
+      # 注入与 postgres_db 服务匹配的密码
+      - POSTGRES_PASSWORD=changeme_in_prod 
     volumes:
       - .:/app
     # (如果需要实时券商，取消注释)
@@ -63,11 +74,17 @@ services:
     container_name: phoenix_api
     depends_on:
       - redis
+      - postgres_db # 添加依赖
+      - elasticsearch # 添加依赖
     ports:
       - "8000:8000"
+    # FIX 3: 注入环境变量
+    env_file:
+      - ./.env
     environment:
       - PHOENIX_CONFIG_PATH=/app/config
-      # (需要 API 密钥)
+      # 注入与 postgres_db 服务匹配的密码
+      - POSTGRES_PASSWORD=changeme_in_prod
     volumes:
       - .:/app
     
