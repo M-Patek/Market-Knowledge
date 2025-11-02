@@ -1,87 +1,66 @@
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
-# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
-from monitor.logging import get_logger
-# 修复：将相对导入 'from ..core.schemas.fusion_result...' 更改为绝对导入
-from core.schemas.fusion_result import FusionResult
+from monitor.logging import ESLogger
+from core.pipeline_state import PipelineState
 
-logger = get_logger(__name__)
 
 class UncertaintyGuard:
     """
-    A "circuit breaker" that sits *after* the cognitive pipeline.
-    
-    It inspects the final FusionResult. If the cognitive uncertainty
-    is too high, or if the AI's decision is "INVALID" or "ERROR",
-    this guard can halt the execution pipeline (e.g., prevent a
-    trade) and flag the event for human review.
+    A component that acts as a circuit breaker based on uncertainty metrics.
+
+    If the uncertainty from the FusionSynthesizer exceeds a predefined threshold,
+    this guard can halt the progression of the signal to the cognitive engine,
+    preventing high-uncertainty data from triggering automated actions.
     """
 
-    def __init__(self, config: Dict[str, Any], error_handler: Any):
+    def __init__(self, config: Dict[str, Any], logger: ESLogger):
         """
         Initializes the UncertaintyGuard.
-        
-        Args:
-            config: Main system configuration.
-            error_handler: The main ErrorHandler to notify admins.
-        """
-        self.config = config.get('uncertainty_guard', {})
-        self.error_handler = error_handler
-        
-        # The uncertainty score (0.0 to 1.0) above which we block execution
-        self.uncertainty_threshold = self.config.get('uncertainty_threshold', 0.75)
-        
-        logger.info(f"UncertaintyGuard initialized with threshold: {self.uncertainty_threshold:.0%}")
 
-    def validate_result(self, fusion_result: FusionResult) -> bool:
-        """
-        Validates the FusionResult.
-        
         Args:
-            fusion_result (FusionResult): The output from the Synthesizer.
-            
+            config: A dictionary containing configuration parameters,
+                    specifically `uncertainty_threshold`.
+            logger: An instance of ESLogger for logging.
+        """
+        self.uncertainty_threshold = config.get("uncertainty_threshold", 0.75)
+        self.logger = logger
+        self.logger.log_info(
+            f"UncertaintyGuard initialized with threshold: {self.uncertainty_threshold}"
+        )
+
+    def validate_uncertainty(self, state: PipelineState) -> Optional[str]:
+        """
+        Validates the uncertainty of the latest fusion result in the pipeline state.
+
+        Args:
+            state: The current PipelineState object.
+
         Returns:
-            bool: True if the result is "safe" to execute, False otherwise.
+            An error message if uncertainty exceeds the threshold, otherwise None.
         """
-        
-        # 1. Check for pipeline errors
-        if fusion_result.status == "ERROR":
-            logger.error(f"UncertaintyGuard BLOCKED (PIPELINE_ERROR) event: {fusion_result.event_id}. "
-                         f"Error: {fusion_result.error_message}")
-            self.error_handler.notify_admin(
-                f"Execution blocked for {fusion_result.event_id}: Pipeline Error - {fusion_result.error_message}"
-            )
-            return False
-            
-        # 2. Check for invalid final decisions
-        if fusion_result.final_decision.decision in ["ERROR", "INVALID_RESPONSE", "UNKNOWN"]:
-            logger.error(f"UncertaintyGuard BLOCKED (INVALID_DECISION) event: {fusion_result.event_id}. "
-                         f"Decision: {fusion_result.final_decision.decision}")
-            self.error_handler.notify_admin(
-                f"Execution blocked for {fusion_result.event_id}: Invalid AI Decision - {fusion_result.final_decision.justification}"
-            )
-            return False
+        if not state.fusion_result:
+            self.logger.log_warning("No fusion result in state, skipping uncertainty check.")
+            return None  # No result to check
 
-        # 3. Check uncertainty threshold
-        if fusion_result.cognitive_uncertainty > self.uncertainty_threshold:
-            logger.warning(f"UncertaintyGuard BLOCKED (HIGH_UNCERTAINTY) event: {fusion_result.event_id}. "
-                           f"Score: {fusion_result.cognitive_uncertainty:.2f} > {self.uncertainty_threshold:.2f}")
-            
-            # This is a *warning*, not a critical error, but we still notify
-            self.error_handler.notify_admin(
-                f"Execution blocked for {fusion_result.event_id}: High Cognitive Uncertainty ({fusion_result.cognitive_uncertainty:.0%})"
+        uncertainty_score = state.fusion_result.uncertainty_score
+        if uncertainty_score is None:
+            self.logger.log_warning(
+                f"Fusion result for event {state.fusion_result.event_id} has no uncertainty score. Allowing passage."
             )
-            return False
-            
-        # 4. Check for "HOLD"
-        # We don't block "HOLD", as "HOLD" is a valid signal (e.g., to close positions)
-        if fusion_result.final_decision.decision == "HOLD":
-            logger.info(f"UncertaintyGuard PASSED (HOLD) event: {fusion_result.event_id}.")
-            return True
-            
-        # If all checks pass, the signal is safe to execute
-        logger.info(f"UncertaintyGuard PASSED event: {fusion_result.event_id}. "
-                    f"Decision: {fusion_result.final_decision.decision}, "
-                    f"Uncertainty: {fusion_result.cognitive_uncertainty:.2f}")
+            return None  # Cannot check, allow passage
+
+        if uncertainty_score > self.uncertainty_threshold:
+            error_msg = (
+                f"CircuitBreaker: Uncertainty threshold exceeded. "
+                f"Score ({uncertainty_score}) > Threshold ({self.uncertainty_threshold}). "
+                f"Halting pipeline for event {state.fusion_result.event_id}."
+            )
+            self.logger.log_warning(error_msg)
+            # Here you could also emit a specific event, e.g., to a human-in-the-loop queue
+            return error_msg
         
-        return True
+        self.logger.log_info(
+            f"Uncertainty check passed for event {state.fusion_result.event_id}. "
+            f"Score ({uncertainty_score}) <= Threshold ({self.uncertainty_threshold})."
+        )
+        return None
