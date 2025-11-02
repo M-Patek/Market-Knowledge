@@ -1,189 +1,193 @@
+"""
+Real-time Event Stream Processor.
+
+Connects to live data streams (e.g., WebSocket), validates data,
+and pushes standardized events to the EventDistributor (Redis queue).
+"""
 import asyncio
+import websockets
 import json
-import redis.asyncio as redis
-from typing import Dict, Any, List, Optional
-import aiohttp
+import logging
+import os
+import pandas as pd
+from typing import Optional
 
-from ..monitor.logging import get_logger
 from .event_distributor import EventDistributor
-from .risk_filter import RiskFilter
-from ..ai.data_adapter import DataAdapter
+# 修复：添加 TickerData 并使用正确的相对导入
 from ..core.schemas.data_schema import MarketEvent, TickerData
+from ..ai.data_adapter import DataAdapter
+from .risk_filter import RiskFilter
 
-logger = get_logger(__name__)
-
-class RealTimeDQM:
-    """A simple real-time Data Quality Monitor."""
-    def __init__(self):
-        self.price_cache = {}
-        self.anomaly_threshold = 0.2 # 20% price jump
-
-    def check_price_anomaly(self, ticker_data: TickerData) -> bool:
-        """Checks for anomalous price jumps."""
-        symbol = ticker_data.symbol
-        new_price = ticker_data.close
-        
-        if symbol in self.price_cache:
-            last_price = self.price_cache[symbol]
-            if last_price > 0 and (abs(new_price - last_price) / last_price) > self.anomaly_threshold:
-                logger.warning(f"DQM ANOMALY: Price jump for {symbol} "
-                               f"({last_price} -> {new_price})")
-                self.price_cache[symbol] = new_price
-                return True # Anomaly detected
-        
-        self.price_cache[symbol] = new_price
-        return False # No anomaly
+logger = logging.getLogger(__name__)
 
 class StreamProcessor:
     """
-    Connects to real-time data streams (e.g., Benzinga, AlphaVantage)
-    and processes incoming data.
-    
-    It performs:
-    1. Adaptation (Raw JSON -> Pydantic Schema)
-    2. Deduplication (using Redis)
-    3. Data Quality Monitoring (DQM)
-    4. Risk Filtering (fast, synchronous check)
-    5. Distribution (hands off high-value events to EventDistributor)
+    Connects to a WebSocket stream, processes messages, and distributes them.
     """
+    
+    def __init__(self, 
+                 stream_uri: str, 
+                 distributor: EventDistributor, 
+                 adapter: DataAdapter,
+                 risk_filter: RiskFilter):
+        """
+        Initializes the StreamProcessor.
 
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        event_distributor: EventDistributor,
-        risk_filter: RiskFilter,
-        data_adapter: DataAdapter
-    ):
-        self.config = config.get('stream_processor', {})
-        self.event_distributor = event_distributor
+        Args:
+            stream_uri: The WebSocket URI to connect to.
+            distributor: The EventDistributor to push events to.
+            adapter: The DataAdapter to standardize data.
+            risk_filter: The RiskFilter to check events.
+        """
+        self.stream_uri = stream_uri
+        self.distributor = distributor
+        self.adapter = adapter
         self.risk_filter = risk_filter
-        self.data_adapter = data_adapter
-        
-        self.dqm = RealTimeDQM()
-        
-        # Redis client for deduplication
-        self.redis_client = redis.from_url(
-            self.config.get('redis_url', 'redis://localhost:6379'),
-            decode_responses=True
-        )
-        self.dedup_key_prefix = "stream_dedup:"
-        self.dedup_expiry_sec = self.config.get('dedup_expiry_sec', 3600) # 1 hour
-        
-        # Stream sources
-        self.benzinga_ws_url = self.config.get('benzinga_ws_url')
-        # ... other stream configs ...
-        
-        self._is_running = False
+        self.running = False
+        logger.info(f"StreamProcessor initialized for URI: {stream_uri}")
 
-    async def run(self):
-        """Starts all configured stream listeners."""
-        self._is_running = True
-        logger.info("Starting StreamProcessor...")
-        
-        tasks = []
-        if self.benzinga_ws_url:
-            tasks.append(asyncio.create_task(
-                self._listen_to_benzinga(self.benzinga_ws_url)
-            ))
+    async def _process_message(self, raw_message: str):
+        """
+        Processes a single raw message from the WebSocket.
+        """
+        try:
+            msg = json.loads(raw_message)
             
-        # TODO: Add tasks for other streams (AlphaVantage, etc.)
-        
-        if not tasks:
-            logger.warning("No data streams configured. StreamProcessor will be idle.")
-            return
+            # --- Example: Differentiating between stream types ---
+            
+            # 1. Market Event (News) Stream
+            # (Assuming a hypothetical news stream format)
+            if msg.get('stream_type') == 'news':
+                # Use adapter to standardize
+                event: Optional[MarketEvent] = self.adapter.adapt_market_event(msg.get('data', {}))
+                
+                if not event:
+                    logger.warning(f"Failed to adapt news message: {str(raw_message)[:100]}...")
+                    return
 
-        await asyncio.gather(*tasks)
+                # Check against the Risk Filter
+                if self.risk_filter.is_high_risk(event.headline) or self.risk_filter.is_high_risk(event.content):
+                    event.metadata['risk_filter_triggered'] = True
+                    logger.warning(f"High-risk event detected: {event.headline}")
+                    # Optionally, route high-risk events to a different queue
+                    # await self.distributor.push_event(event, queue_name="high_risk_queue")
+                
+                # Push to the standard event distributor
+                await self.distributor.push_event(event)
+                logger.debug(f"Distributed MarketEvent: {event.event_id}")
+
+            # 2. Ticker Data Stream
+            # (Assuming a format like Polygon.io or Binance)
+            elif msg.get('e') == 'k': # 'e' for event type, 'k' for kline/candlestick
+                kline = msg.get('k', {})
+                # Adapt raw kline data to our standardized TickerData schema
+                # 修复：使用 TickerData schema
+                data = TickerData(
+                    symbol=kline.get('s'),
+                    timestamp=pd.to_datetime(kline.get('T'), unit='ms'), # Kline start time
+                    open=float(kline.get('o')),
+                    high=float(kline.get('h')),
+                    low=float(kline.get('l')),
+                    close=float(kline.get('c')),
+                    volume=float(kline.get('v'))
+                )
+                
+                # Note: TickerData might not go to the main event queue.
+                # It might go to a different queue or be handled directly
+                # for real-time feature generation.
+                # For this example, we'll assume it's pushed for logging/monitoring.
+                await self.distributor.push_event(data, queue_name="ticker_queue")
+                logger.debug(f"Distributed TickerData: {data.symbol}")
+
+            else:
+                logger.debug(f"Received unhandled message type: {str(raw_message)[:100]}...")
+                
+        except json.JSONDecodeError:
+            logger.warning(f"Received non-JSON message: {raw_message}")
+        except Exception as e:
+            logger.error(f"Error processing message: {e}. Message: {raw_message}", exc_info=True)
+
+    async def start(self):
+        """
+        Starts the WebSocket client and message processing loop.
+        """
+        self.running = True
+        logger.info(f"Attempting to connect to WebSocket: {self.stream_uri}")
+        
+        while self.running:
+            try:
+                async with websockets.connect(self.stream_uri) as websocket:
+                    logger.info(f"Successfully connected to {self.stream_uri}")
+                    async for message in websocket:
+                        if not self.running:
+                            break
+                        await self._process_message(message)
+                        
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"WebSocket connection closed (code={e.code}, reason={e.reason}). Retrying in 5s...")
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}. Retrying in 5s...")
+                
+            if self.running:
+                await asyncio.sleep(5) # Wait before retrying
 
     def stop(self):
-        """Signals the processor to stop."""
-        logger.info("StreamProcessor received stop signal.")
-        self._is_running = False
-        # (The websocket tasks must handle this signal)
+        """
+        Stops the WebSocket client.
+        """
+        self.running = False
+        logger.info("Stopping StreamProcessor...")
 
-    async def _listen_to_benzinga(self, ws_url: str):
-        """Main connection loop for a Benzinga websocket."""
-        logger.info(f"Connecting to Benzinga stream: {ws_url}")
-        
-        while self._is_running:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(ws_url) as ws:
-                        
-                        # TODO: Add authentication logic (e.g., sending auth message)
-                        
-                        async for msg in ws:
-                            if not self._is_running:
-                                break
-                                
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self._process_raw_message(msg.data, "Benzinga")
-                            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                                logger.warning(f"Benzinga websocket closed/errored: {msg.data}")
-                                break
-            
-            except Exception as e:
-                logger.error(f"Benzinga stream connection failed: {e}. Reconnecting in 5s...")
-                await asyncio.sleep(5) # Reconnect delay
+# Example usage (requires a running Redis)
+if __name__ == "__main__":
+    
+    # This example won't connect to a real stream unless one is provided,
+    # but it demonstrates the setup.
+    
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Load a mock stream URI
+    STREAM_URI = os.environ.get("MOCK_STREAM_URI", "ws://echo.websocket.org")
+    REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost")
 
-    async def _process_raw_message(self, raw_data: str, source: str):
-        """Handles a single raw message from any stream."""
+    async def main():
+        # Setup dependencies
         try:
-            raw_event = json.loads(raw_data)
-            
-            # --- 1. Adaptation ---
-            # Standardize the data (e.g., Benzinga -> MarketEvent)
-            # We assume a 'type' field exists in the raw data
-            event_type = raw_event.get('type', 'unknown')
-            
-            event_object: Optional[Union[MarketEvent, TickerData]] = None
-            
-            if event_type == 'news':
-                event_object = self.data_adapter.adapt_news_event(raw_event)
-            elif event_type == 'price':
-                event_object = self.data_adapter.adapt_market_data(raw_event)
-            else:
-                logger.debug(f"Unknown event type received from {source}: {event_type}")
-                return
-
-            if not event_object:
-                # Adaptation failed or was a duplicate
-                return
-
-            # --- 2. Deduplication (using adapted event_id) ---
-            if isinstance(event_object, MarketEvent):
-                dedup_key = f"{self.dedup_key_prefix}{event_object.event_id}"
-                if await self.redis_client.set(dedup_key, "1", ex=self.dedup_expiry_sec, nx=True) is None:
-                    logger.debug(f"Discarding duplicate event: {event_object.event_id}")
-                    return
-            
-            # --- 3. Data Quality Monitoring (DQM) ---
-            if isinstance(event_object, TickerData):
-                if self.dqm.check_price_anomaly(event_object):
-                    # TODO: Log anomaly, but decide whether to discard
-                    pass
-                # Price data is usually not "published" to the orchestrator,
-                # but rather just updates the ContextBus state.
-                # (This logic is simplified)
-                # await self.context_bus.update_market_data(event_object)
-                return
-
-            # --- 4. High-Speed Risk Filtering ---
-            if isinstance(event_object, MarketEvent):
-                risk_match = self.risk_filter.check_event(event_object)
-                if risk_match:
-                    event_object.metadata['risk_filter_match'] = risk_match
-                    # (All risk events are high-value by default)
-                
-                # TODO: Add 'value' filter (e.g., based on symbols, tags)
-                is_high_value = True # For now, assume all news is high-value
-                
-                # --- 5. Distribution ---
-                if is_high_value:
-                    # Send the standardized, high-value event to the
-                    # processing queue.
-                    await self.event_distributor.publish(event_object)
-
-        except json.JSONDecodeError:
-            logger.warning(f"Received invalid JSON from {source}: {raw_data[:100]}...")
+            distributor = EventDistributor(redis_url=REDIS_URL)
+            await distributor.connect()
         except Exception as e:
-            logger.error(f"Error processing raw message: {e}", exc_info=True)
+            logger.error(f"Could not connect to Redis at {REDIS_URL}. Aborting. Error: {e}")
+            return
+            
+        adapter = DataAdapter()
+        risk_filter = RiskFilter(config_path="config/event_filter_config.yaml")
+        
+        processor = StreamProcessor(
+            stream_uri=STREAM_URI,
+            distributor=distributor,
+            adapter=adapter,
+            risk_filter=risk_filter
+        )
+        
+        try:
+            logger.info("Starting StreamProcessor...")
+            # For testing, just run for 10 seconds
+            # In production, this would be `await processor.start()`
+            await asyncio.wait_for(processor.start(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.info("Test run finished.")
+        except KeyboardInterrupt:
+            logger.info("Manual interruption.")
+        finally:
+            processor.stop()
+            await distributor.disconnect()
+            logger.info("StreamProcessor shut down.")
+
+    # To run this example:
+    # 1. Make sure you have a Redis server running on localhost.
+    # 2. You can use 'ws://echo.websocket.org' to test connectivity.
+    #    It will just echo back whatever you send (which won't parse, but tests the loop).
+    #
+    # asyncio.run(main())
+    logger.info("StreamProcessor example complete. Run `asyncio.run(main())` to test.")
