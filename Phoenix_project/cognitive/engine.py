@@ -1,11 +1,16 @@
 from typing import Dict, Any, Optional
 
-from ..core.pipeline_state import PipelineState
-from ..core.schemas.fusion_result import FusionResult
-from ..ai.metacognitive_agent import MetacognitiveAgent
-from .portfolio_constructor import PortfolioConstructor, Portfolio
-from ..execution.signal_protocol import StrategySignal
-from ..monitor.logging import get_logger
+# 修正：[FIX-ImportError]
+# 将所有 `..` 相对导入更改为从项目根目录开始的绝对导入，
+# 以匹配项目的标准约定 (如 phoenix_project.py 中所设定的)。
+from core.pipeline_state import PipelineState
+from core.schemas.fusion_result import FusionResult
+from ai.metacognitive_agent import MetacognitiveAgent
+# 'portfolio_constructor' 在同一目录 'cognitive/' 下，
+# 使用相对导入 `.` 是可以的，但为了统一，我们也使用绝对导入。
+from cognitive.portfolio_constructor import PortfolioConstructor, Portfolio
+from execution.signal_protocol import StrategySignal
+from monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -114,3 +119,5 @@ class CognitiveEngine:
                     f"Uncertainty: {signal.metadata['cognitive_uncertainty']:.2f}")
         
         return signal
+
+}
