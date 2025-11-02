@@ -11,7 +11,7 @@ It provides an interface for:
 This service acts as an abstraction layer over the chosen KG backend.
 """
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 # 修复：从根目录开始使用绝对导入，移除 `.`
 from ai.tabular_db_client import TabularDBClient # Example: Using PG for storage
@@ -41,7 +41,9 @@ class KnowledgeGraphService:
         """
         Ensures the tables for storing nodes and relations exist.
         """
-        if not self.db.is_connected():
+        # 修复：[FIX-7] 'TabularDBClient' 没有 'is_connected' 方法。
+        # 检查 'pool' 属性是否存在
+        if not self.db.pool:
             logger.info("DB not connected, connecting for KG schema setup...")
             await self.db.connect()
             
@@ -49,7 +51,9 @@ class KnowledgeGraphService:
         
         # Table for Nodes (Entities)
         # We use ON CONFLICT to allow idempotent updates
-        await self.db.execute("""
+        # 修复：[FIX-7] 'db.execute' 不存在。
+        # 使用 'db.pool.execute' 来访问 asyncpg pool 的方法。
+        await self.db.pool.execute("""
         CREATE TABLE IF NOT EXISTS kg_nodes (
             node_id VARCHAR(255) PRIMARY KEY,
             node_type VARCHAR(100) NOT NULL,
@@ -62,7 +66,7 @@ class KnowledgeGraphService:
         """)
         
         # Table for Relations (Edges)
-        await self.db.execute("""
+        await self.db.pool.execute("""
         CREATE TABLE IF NOT EXISTS kg_relations (
             relation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             source_node_id VARCHAR(255) REFERENCES kg_nodes(node_id) ON DELETE CASCADE,
@@ -84,40 +88,44 @@ class KnowledgeGraphService:
         Adds or updates nodes and relations from a KnowledgeGraph object
         into the database.
         """
-        if not self.db.is_connected():
+        if not self.db.pool:
             logger.error("Database not connected. Cannot add KnowledgeGraph.")
             return
 
-        now = "NOW()" # Use SQL NOW() for consistency
+        now_ts = "NOW()" # Use SQL NOW() for consistency
 
         async with self.db.pool.acquire() as conn:
             async with conn.transaction():
                 try:
                     # 1. Upsert Nodes
-                    for node in kg.nodes:
-                        await conn.execute(
-                            """
-                            INSERT INTO kg_nodes (node_id, node_type, name, metadata, last_updated)
-                            VALUES ($1, $2, $3, $4::jsonb, $5)
-                            ON CONFLICT (node_id) DO UPDATE SET
-                                name = EXCLUDED.name,
-                                metadata = EXCLUDED.metadata,
-                                last_updated = EXCLUDED.last_updated;
-                            """,
-                            node.id, node.type, node.name, node.metadata, now
-                        )
+                    nodes_data = [
+                        (node.id, node.type, node.name, node.metadata_json, now_ts)
+                        for node in kg.nodes
+                    ]
+                    await conn.executemany(
+                        """
+                        INSERT INTO kg_nodes (node_id, node_type, name, metadata, last_updated)
+                        VALUES ($1, $2, $3, $4::jsonb, $5)
+                        ON CONFLICT (node_id) DO UPDATE SET
+                            name = EXCLUDED.name,
+                            metadata = EXCLUDED.metadata,
+                            last_updated = EXCLUDED.last_updated;
+                        """,
+                        nodes_data
+                    )
                     
                     # 2. Insert Relations
-                    # We assume relations are new and don't check for conflicts
-                    # A more robust system would hash relations to prevent duplicates
-                    for rel in kg.relations:
-                        await conn.execute(
-                            """
-                            INSERT INTO kg_relations (source_node_id, target_node_id, relation_type, context, metadata, last_updated)
-                            VALUES ($1, $2, $3, $4, $5::jsonb, $6);
-                            """,
-                            rel.source_id, rel.target_id, rel.type, rel.context, rel.metadata, now
-                        )
+                    relations_data = [
+                        (rel.source_id, rel.target_id, rel.type, rel.context, rel.metadata_json, now_ts)
+                        for rel in kg.relations
+                    ]
+                    await conn.executemany(
+                        """
+                        INSERT INTO kg_relations (source_node_id, target_node_id, relation_type, context, metadata, last_updated)
+                        VALUES ($1, $2, $3, $4, $5::jsonb, $6);
+                        """,
+                        relations_data
+                    )
                     
                     logger.info(f"Successfully upserted {len(kg.nodes)} nodes and added {len(kg.relations)} relations.")
 
@@ -156,7 +164,8 @@ class KnowledgeGraphService:
         WHERE r.target_node_id = $1;
         """
         try:
-            results = await self.db.fetch(query, node_id)
+            # 修复：[FIX-7] 'db.fetch' 不存在。使用 'db.pool.fetch'
+            results = await self.db.pool.fetch(query, node_id)
             return [dict(row) for row in results]
         except Exception as e:
             logger.error(f"Error querying related nodes for {node_id}: {e}", exc_info=True)
