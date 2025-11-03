@@ -5,8 +5,8 @@ Base class for all L2 (Metacognition & Arbitration) Agents.
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
 
-from core.pipeline_state import PipelineState
-from core.schemas.evidence_schema import EvidenceItem
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 
 class BaseL2Agent(ABC):
     """
