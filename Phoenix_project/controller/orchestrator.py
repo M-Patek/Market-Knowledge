@@ -2,20 +2,21 @@ import time
 import asyncio
 import datetime  # <--- 添加了缺失的导入
 from typing import Dict, Any, Optional
-from core.pipeline_state import PipelineState
-from config.loader import ConfigLoader
-from monitor.logging import get_logger
-from controller.scheduler import Scheduler
-from controller.error_handler import ErrorHandler
-from data_manager import DataManager
-from events.event_distributor import EventDistributor
-from cognitive.engine import CognitiveEngine
-from cognitive.portfolio_constructor import PortfolioConstructor
-from cognitive.risk_manager import RiskManager
-from execution.order_manager import OrderManager
-from audit_manager import AuditManager
-from metrics_collector import MetricsCollector
-from snapshot_manager import SnapshotManager
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.config.loader import ConfigLoader
+from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.controller.scheduler import Scheduler
+from Phoenix_project.controller.error_handler import ErrorHandler
+from Phoenix_project.data_manager import DataManager
+from Phoenix_project.events.event_distributor import EventDistributor
+from Phoenix_project.cognitive.engine import CognitiveEngine
+from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
+from Phoenix_project.cognitive.risk_manager import RiskManager
+from Phoenix_project.execution.order_manager import OrderManager
+from Phoenix_project.audit_manager import AuditManager
+from Phoenix_project.metrics_collector import MetricsCollector
+from Phoenix_project.snapshot_manager import SnapshotManager
+from Phoenix_project.core.exceptions import CognitiveError, PhoenixError # Import our new exceptions
 
 logger = get_logger(__name__)
 
@@ -109,9 +110,6 @@ class Orchestrator:
             logger.debug(f"[{decision_id}] Running CognitiveEngine...")
             cognitive_output = await self.cognitive_engine.process_cognitive_cycle(self.pipeline_state)
             
-            if "error" in cognitive_output:
-                raise Exception(f"CognitiveEngine failed: {cognitive_output['error']}")
-
             fusion_result = cognitive_output["final_decision"]
             fusion_result.decision_id = decision_id # Stamp the ID
             
@@ -169,6 +167,18 @@ class Orchestrator:
             # Reset error count for the main cycle component
             self.error_handler.reset_failure_count("run_main_cycle")
 
+        except CognitiveError as e:
+            # Specific handling for known cognitive failures
+            end_time = time.perf_counter()
+            cycle_time_ms = (end_time - start_time) * 1000
+            
+            logger.error(f"--- Main Cycle {decision_id} FAILED ({cycle_time_ms:.2f} ms) due to CognitiveError: {e} ---", exc_info=False) # No need for full traceback
+            self.metrics_collector.increment("cycle.failure.cognitive")
+            
+            await self.error_handler.handle_error(e, "run_main_cycle.cognitive_engine", {"decision_id": decision_id})
+            await self.audit_manager.audit_error(e, "run_main_cycle.cognitive_engine", self.pipeline_state, decision_id)
+
+
         except Exception as e:
             end_time = time.perf_counter()
             cycle_time_ms = (end_time - start_time) * 1000
@@ -184,4 +194,3 @@ class Orchestrator:
 
         finally:
             self._is_running_cycle = False
-
