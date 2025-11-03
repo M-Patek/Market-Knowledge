@@ -1,116 +1,149 @@
 import asyncio
 from typing import Dict, Any, Callable
-from core.pipeline_state import PipelineState
-from monitor.logging import get_logger
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 class AgentExecutor:
     """
-    Executes registered agents (functions or callables) based on triggers
-    and updates the pipeline state.
+    Handles the execution of a DAG (Directed Acyclic Graph) of agents.
+    It resolves dependencies and executes agents in the correct order,
+    handling both synchronous and asynchronous agent 'run' methods.
     """
-
-    def __init__(self, pipeline_state: PipelineState):
-        self.pipeline_state = pipeline_state
-        self.agents: Dict[str, Callable] = {}
-        self.triggers: Dict[str, str] = {}  # Map agent name to trigger event
-        logger.info("AgentExecutor initialized.")
-
-    def register_agent(self, name: str, agent_callable: Callable, trigger_event: str):
+    
+    def __init__(self, agent_registry: Dict[str, Callable[[], Any]]):
         """
-        Register an agent function or method to be called on a specific trigger.
-
+        Initializes the executor.
+        
         Args:
-            name (str): A unique name for the agent.
-            agent_callable (Callable): The function/method to call.
-                                       Expected signature: agent(pipeline_state, **kwargs) -> update_dict
-            trigger_event (str): The event name that triggers this agent.
+            agent_registry (Dict[str, Callable[[], Any]]): 
+                A dictionary mapping agent IDs to factory functions that
+                create an instance of the agent.
         """
-        if name in self.agents:
-            logger.warning(f"Agent '{name}' is already registered. Overwriting.")
-        self.agents[name] = agent_callable
-        self.triggers[name] = trigger_event
-        logger.info(f"Agent '{name}' registered with trigger '{trigger_event}'.")
+        self.agent_registry = agent_registry
+        self.agent_instances = {} # Cache for instantiated agents
+        logger.info(f"AgentExecutor initialized with {len(agent_registry)} agents.")
 
-    async def on_event(self, event_name: str, **kwargs):
+    def _get_agent_instance(self, agent_id: str) -> Any:
         """
-        Called by the EventDistributor when a relevant event occurs.
-        This method finds and executes all agents registered for this event.
+        Retrieves or creates an agent instance.
         """
-        logger.debug(f"Event '{event_name}' received. Checking for triggered agents.")
-        agents_to_run = [
-            (name, agent)
-            for name, trigger in self.triggers.items()
-            if trigger == event_name
-        ]
-
-        if not agents_to_run:
-            logger.debug(f"No agents registered for event '{event_name}'.")
-            return
-
-        for name, agent_callable in agents_to_run:
-            logger.info(f"Executing agent '{name}' triggered by '{event_name}'.")
+        if agent_id not in self.agent_instances:
+            if agent_id not in self.agent_registry:
+                logger.error(f"Agent '{agent_id}' not found in registry.")
+                raise ValueError(f"Agent '{agent_id}' not found in registry.")
+            
+            # Call the factory function to create the agent
             try:
-                # Asynchronously execute the agent
-                if asyncio.iscoroutinefunction(agent_callable):
-                    update_data = await agent_callable(
-                        self.pipeline_state, **kwargs
-                    )
-                else:
-                    # Run synchronous agent in a thread pool to avoid blocking
-                    loop = asyncio.get_event_loop()
-                    update_data = await loop.run_in_executor(
-                        None, agent_callable, self.pipeline_state, **kwargs
-                    )
-
-                # Update the pipeline state with the results from the agent
-                if update_data and isinstance(update_data, dict):
-                    await self.pipeline_state.update_state(update_data)
-                    logger.info(
-                        f"Agent '{name}' executed successfully and updated state."
-                    )
-                elif update_data:
-                    logger.warning(
-                        f"Agent '{name}' executed but returned non-dict data. State not updated."
-                    )
-                else:
-                    logger.info(
-                        f"Agent '{name}' executed successfully. No state update returned."
-                    )
-
+                self.agent_instances[agent_id] = self.agent_registry[agent_id]()
+                logger.debug(f"Instantiated agent: {agent_id}")
             except Exception as e:
-                logger.error(
-                    f"Error executing agent '{name}': {e}", exc_info=True
-                )
-                # Optionally, emit a failure event
-                # await self.pipeline_state.event_distributor.publish("agent_error", agent_name=name, error=str(e))
+                logger.error(f"Failed to instantiate agent '{agent_id}': {e}", exc_info=True)
+                raise
+        
+        return self.agent_instances[agent_id]
 
-    def load_agents_from_config(self, agent_configs: Dict[str, Any]):
+    async def execute_dag(
+        self, 
+        dag: Dict[str, List[str]], 
+        state: PipelineState
+    ) -> Dict[str, Any]:
         """
-        Loads and registers agents based on a configuration dictionary.
-        This part would need a mechanism to import/resolve callables from strings.
-        Example config:
-        {
-            "alpha_agent_1": {
-                "module": "my_agents.alpha",
-                "callable": "generate_signals",
-                "trigger": "market_data_processed"
-            },
-            ...
-        }
+        Executes a cognitive DAG.
+        
+        Args:
+            dag (Dict[str, List[str]]): 
+                The dependency graph. 
+                Keys are agent IDs (tasks), values are lists of agent IDs 
+                they depend on.
+            state (PipelineState): The current pipeline state.
+            
+        Returns:
+            Dict[str, Any]: A dictionary mapping agent IDs to their results.
         """
-        # This implementation is simplified. A real implementation would
-        # need dynamic imports (importlib) to load callables.
-        logger.warning(
-            "load_agents_from_config is not fully implemented (requires dynamic import)."
-        )
-        # Example pseudo-code for dynamic loading:
-        # for name, config in agent_configs.items():
-        #     try:
-        #         module = importlib.import_module(config['module'])
-        #         callable_func = getattr(module, config['callable'])
-        #         self.register_agent(name, callable_func, config['trigger'])
-        #     except Exception as e:
-        #         logger.error(f"Failed to load agent '{name}': {e}")
-        pass
+        logger.info(f"Executing DAG with {len(dag)} tasks...")
+        
+        # Simple topological sort (assumes no circular dependencies)
+        # In a real system, we'd validate the DAG first.
+        
+        execution_order = self._resolve_execution_order(dag)
+        results: Dict[str, Any] = {}
+        
+        for agent_id in execution_order:
+            if agent_id not in dag:
+                logger.error(f"Task '{agent_id}' is in execution order but not in DAG definition.")
+                continue
+                
+            dependencies = dag[agent_id]
+            
+            # Gather dependency results
+            try:
+                dependency_outputs = {dep_id: results[dep_id] for dep_id in dependencies}
+            except KeyError as e:
+                logger.error(f"Missing dependency result for '{agent_id}': {e}", exc_info=True)
+                raise ValueError(f"Failed to execute '{agent_id}': Missing dependency {e}")
+            
+            try:
+                # Get the agent instance
+                agent = self._get_agent_instance(agent_id)
+                
+                logger.debug(f"Running agent: {agent_id}...")
+                
+                # Execute the agent's run method
+                if asyncio.iscoroutinefunction(agent.run):
+                    result = await agent.run(state, dependency_outputs)
+                else:
+                    result = agent.run(state, dependency_outputs)
+                    
+                results[agent_id] = result
+                logger.debug(f"Agent {agent_id} complete.")
+                
+            except Exception as e:
+                logger.error(f"Agent '{agent_id}' failed during execution: {e}", exc_info=True)
+                # Propagate the error. The Orchestrator will handle it.
+                raise
+        
+        logger.info("DAG execution complete.")
+        return results
+
+    def _resolve_execution_order(self, dag: Dict[str, List[str]]) -> List[str]:
+        """
+        Performs a topological sort on the DAG.
+        (Simple implementation)
+        """
+        # 1. Find in-degrees (how many nodes point to me)
+        in_degree = {agent_id: 0 for agent_id in dag}
+        adj = {agent_id: [] for agent_id in dag}
+        
+        for agent_id, dependencies in dag.items():
+            for dep_id in dependencies:
+                # dep_id -> agent_id
+                if dep_id in adj:
+                    adj[dep_id].append(agent_id)
+                if agent_id in in_degree:
+                    in_degree[agent_id] += 1
+                
+        # 2. Find nodes with 0 in-degree
+        queue = [agent_id for agent_id in dag if in_degree[agent_id] == 0]
+        
+        sorted_order = []
+        
+        # 3. Process the queue
+        while queue:
+            agent_id = queue.pop(0)
+            sorted_order.append(agent_id)
+            
+            # "Remove" this node by decrementing its neighbors' in-degrees
+            for neighbor in adj.get(agent_id, []):
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+                    
+        # 4. Check for cycles
+        if len(sorted_order) != len(dag):
+            cycle_nodes = {agent_id for agent_id, degree in in_degree.items() if degree > 0}
+            logger.error(f"Cycle detected in agent DAG. Nodes involved: {cycle_nodes}")
+            raiseValueError(f"Cycle detected in agent DAG. Nodes: {cycle_nodes}")
+            
+        return sorted_order
