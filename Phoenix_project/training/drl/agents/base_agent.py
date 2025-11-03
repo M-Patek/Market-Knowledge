@@ -2,11 +2,11 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 # 修复：将相对导入 'from ..core.pipeline_state...' 更改为绝对导入
-from core.pipeline_state import PipelineState
+from Phoenix_project.core.pipeline_state import PipelineState
 # 修复：将相对导入 'from ..data_manager...' 更改为绝对导入
-from data_manager import DataManager
+from Phoenix_project.data_manager import DataManager
 # 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
-from monitor.logging import get_logger
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
