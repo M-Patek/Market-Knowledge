@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 # We use a forward reference 'EvidenceItem' to avoid circular dependencies
 # or needing to import the schema file just for this base class definition.
 # The actual EvidenceItem schema will be defined in core/schemas/.
-from core.pipeline_state import PipelineState
+from Phoenix_project.core.pipeline_state import PipelineState
 
 class BaseL1Agent(ABC):
     """
