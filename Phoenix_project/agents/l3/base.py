@@ -5,8 +5,8 @@ Base class for all L3 (DRL/Control) Agents.
 from abc import ABC, abstractmethod
 from typing import Any, Dict
 
-from core.pipeline_state import PipelineState
-from core.schemas.fusion_result import FusionResult
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.fusion_result import FusionResult
 
 class BaseL3Agent(ABC):
     """
