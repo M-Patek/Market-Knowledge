@@ -1,10 +1,11 @@
 from typing import Dict, Any, Optional
-from core.pipeline_state import PipelineState
-from ai.reasoning_ensemble import ReasoningEnsemble
-from evaluation.voter import Voter
-from evaluation.fact_checker import FactChecker
-from fusion.uncertainty_guard import UncertaintyGuard
-from monitor.logging import get_logger
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
+from Phoenix_project.evaluation.voter import Voter
+from Phoenix_project.evaluation.fact_checker import FactChecker
+from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
+from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.core.exceptions import CognitiveError # Import our new custom exception
 
 logger = get_logger(__name__)
 
@@ -36,6 +37,10 @@ class CognitiveEngine:
         self.fact_check_threshold = self.config.get("fact_check_threshold", 0.7)
         self.uncertainty_threshold = self.config.get("uncertainty_threshold", 0.6)
         
+        # Fact-checker confidence adjustments
+        self.fc_confidence_boost = self.config.get("fc_confidence_boost", 0.1) # Boost for "Supported"
+        self.fc_confidence_penalty = self.config.get("fc_confidence_penalty", 0.2) # Penalty for "Partial"
+        
         logger.info("CognitiveEngine initialized.")
 
     async def process_cognitive_cycle(self, pipeline_state: PipelineState) -> Dict[str, Any]:
@@ -55,7 +60,8 @@ class CognitiveEngine:
             fusion_result = await self.reasoning_ensemble.reason(pipeline_state)
         except Exception as e:
             logger.error(f"Cognitive cycle failed: ReasoningEnsemble error: {e}", exc_info=True)
-            return {"error": f"ReasoningEnsemble failed: {e}"}
+            # Re-raise as a specific, catchable error instead of returning a dict
+            raise CognitiveError(f"ReasoningEnsemble failed: {e}") from e
             
         pipeline_state.update_value("last_fusion_result", fusion_result)
         
@@ -69,17 +75,30 @@ class CognitiveEngine:
                 )
                 pipeline_state.update_value("last_fact_check", fact_check_report)
                 
-                # TODO: Act on the fact-check report.
-                # If "support" is "Refuted", we should probably
-                # override the decision.
-                if fact_check_report.get("overall_support") == "Refuted":
+                # Act on the fact-check report to adjust confidence
+                support_status = fact_check_report.get("overall_support")
+                
+                if support_status == "Supported":
+                    logger.info("Fact-checker supported reasoning. Boosting confidence.")
+                    # Boost confidence, but cap at 1.0
+                    original_confidence = fusion_result.confidence
+                    fusion_result.confidence = min(original_confidence + self.fc_confidence_boost, 1.0)
+                    fusion_result.reasoning += f"\n\n[FACT-CHECK]: Supported. Confidence boosted from {original_confidence:.2f} to {fusion_result.confidence:.2f}."
+                
+                elif support_status == "Partial":
+                    logger.warning("Fact-checker partially refuted reasoning. Penalizing confidence.")
+                    # Penalize confidence, but floor at 0.0
+                    original_confidence = fusion_result.confidence
+                    fusion_result.confidence = max(original_confidence - self.fc_confidence_penalty, 0.0)
+                    fusion_result.reasoning += f"\n\n[FACT-CHECK]: Partially Refuted. Confidence penalized from {original_confidence:.2f} to {fusion_result.confidence:.2f}."
+
+                elif support_status == "Refuted":
                     logger.warning("Fact-checker refuted reasoning! Overriding decision.")
                     # This is a simple override. A better system might re-run
                     # reasoning with the new info.
                     fusion_result.final_decision = "HOLD"
                     fusion_result.reasoning += "\n\n[OVERRIDE]: Original reasoning was refuted by fact-checker."
                     fusion_result.confidence = 0.9 # High confidence in the HOLD
-                    
             except Exception as e:
                 logger.error(f"Fact-checker failed: {e}", exc_info=True)
                 # Non-fatal, proceed with original decision
