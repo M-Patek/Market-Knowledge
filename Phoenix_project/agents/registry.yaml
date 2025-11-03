@@ -1,27 +1,71 @@
 # Phoenix_project/agents/registry.yaml
-# Defines the fixed agent identities for the system as specified in Task 3.
+# Defines the 3-Layer Agent Architecture for the Phoenix Project.
 
-agents:
+# L1 Agent Layer: Three-Cluster Expert Model
+l1_agents:
+  # Cluster 1: Core Alpha Generation Cluster
+  - id: fundamental_analyst
+    role: Fundamental Analyst Agent
+    description: Evaluates intrinsic value, financial health, and earnings growth.
+    horizon: Medium to Long-Term (Quarterly/Annually)
+  - id: technical_analyst
+    role: Technical Analyst Agent
+    description: Analyzes price, volume, and momentum to identify market timing.
+    horizon: Short-Term/Ultra Short-Term (High-Frequency)
+  - id: catalyst_monitor
+    role: Catalyst & Event Monitor Agent
+    description: Monitors high-frequency, short-term events like product launches, contract announcements, and signal catalysts.
+    horizon: Ultra Short-Term (Event-Driven)
+
+  # Cluster 2: Macro & Contextual Cluster
+  - id: macro_strategist
+    role: Macro Strategist Agent
+    description: Analyzes macroeconomic indicators and central bank policies, assessing overall market liquidity.
+    horizon: Medium-Term (Monthly/Quarterly)
+  - id: geopolitical_analyst
+    role: Geopolitical & Regulatory Analyst Agent
+    description: Assesses geopolitical risks and changes in industry regulatory policy.
+    horizon: Long-Term (Trend-Based)
+
+  # Cluster 3: Alternative Data & Long-Term Signal Cluster
+  - id: supply_chain_intelligence
+    role: Supply Chain Intelligence Agent
+    description: Uses supply chain/alternative data to pre-emptively predict future revenue leading indicators.
+    horizon: Medium-Term Leading Indicators
+  - id: innovation_tracker
+    role: Innovation & IP Tracker Agent
+    description: Evaluates patents, academic papers, and talent migration to track the long-term technological moat.
+    horizon: Long-Term (1-3 Years)
+
+# L2 Agent Layer: Metacognition & Arbitration
+l2_agents:
   - id: planner
     role: Task Decomposition
-    description: Analyzes the main task and generates a multi-step execution graph (subgoals and dependencies).
-
-  - id: technical
-    role: Technical Analysis
-    description: Performs technical analysis on market data (e.g., price trends, indicators).
-
-  - id: fundamental
-    role: Fundamental Analysis
-    description: Performs fundamental analysis (e.g., financial statements, news, economic factors).
-
+    description: L1 Task Initialization: Decomposes the analysis objective and determines execution dependencies before L1 Agents start.
   - id: adversary
     role: Counter-Argument
-    description: Actively seeks to find flaws, risks, and counter-arguments to the primary analyses.
-
+    description: Pressure Testing: Actively seeks flaws and counter-arguments against the EvidenceItems provided by L1 Agents.
   - id: critic
     role: Criticism & Fact Check
-    description: Reviews all paths for logical consistency, factual accuracy, and adherence to constraints.
-
+    description: Data Quality Check: Reviews the L1 Agent outputs for logical consistency, factual accuracy, and constraint compliance.
   - id: fusion
     role: Fusion & Arbitration
-    description: Synthesizes diverse analyses, arbitrates conflicts, and forms a final, unified conclusion.
+    description: Signal Aggregation: Synthesizes all evidence provided by L1 and the criticisms from L2 to form a unified, high-confidence preliminary decision (FusionResult).
+  - id: metacognitive_agent
+    role: Review Reasoning Process
+    description: Supervision: Monitors the CoT (Chain of Thought) of L1 and L2 Agents behind the scenes, identifying divergence and potential LLM hallucinations.
+
+# L3 Agent Layer: DRL/Control Layer
+l3_agents:
+  - id: alpha_agent
+    role: Signal Generation
+    description: Converts the preliminary L2 decision into a refined trading signal (Buy/Sell/Hold).
+    model_type: DRL/Quantitative Model
+  - id: risk_agent
+    role: Capital Adjustment
+    description: Assesses trade risk and determines the capital allocation ratio (capital_modifier) for the signal.
+    model_type: DRL/Risk Model
+  - id: execution_agent
+    role: Order Execution
+    description: Splits large orders and optimizes the execution path to minimize market impact.
+    model_type: DRL/Execution Optimization Model
