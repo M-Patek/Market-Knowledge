@@ -7,42 +7,45 @@ import os
 # FIX (E-PY-1): 从 'typing' 中导入 'List'，以修复 run_backtest 中的 NameError
 from typing import Dict, Any, List
 
-from config.loader import ConfigLoader
-from data_manager import DataManager
-from core.pipeline_state import PipelineState
-from events.event_distributor import EventDistributor
-from events.risk_filter import EventRiskFilter
-from events.stream_processor import StreamProcessor
-from cognitive.engine import CognitiveEngine
-from cognitive.portfolio_constructor import PortfolioConstructor
-from cognitive.risk_manager import RiskManager
-from execution.order_manager import OrderManager
-from execution.trade_lifecycle_manager import TradeLifecycleManager
+from Phoenix_project.config.loader import ConfigLoader
+from Phoenix_project.data_manager import DataManager
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.events.event_distributor import EventDistributor
+from Phoenix_project.events.risk_filter import EventRiskFilter
+from Phoenix_project.events.stream_processor import StreamProcessor
+from Phoenix_project.cognitive.engine import CognitiveEngine
+from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
+from Phoenix_project.cognitive.risk_manager import RiskManager
+from Phoenix_project.execution.order_manager import OrderManager
+from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
 
 # FIX (E6): 导入 AlpacaAdapter (我们将在 adapters.py 中添加它)
-from execution.adapters import SimulatedBrokerAdapter, AlpacaAdapter
-from controller.orchestrator import Orchestrator
-from controller.loop_manager import LoopManager
-from controller.error_handler import ErrorHandler
-from controller.scheduler import Scheduler
-from audit_manager import AuditManager
-from snapshot_manager import SnapshotManager
-from metrics_collector import MetricsCollector
-from monitor.logging import setup_logging, get_logger
+from Phoenix_project.execution.adapters import SimulatedBrokerAdapter, AlpacaAdapter
+from Phoenix_project.controller.orchestrator import Orchestrator
+from Phoenix_project.controller.loop_manager import LoopManager
+from Phoenix_project.controller.error_handler import ErrorHandler
+from Phoenix_project.controller.scheduler import Scheduler
+from Phoenix_project.audit_manager import AuditManager
+from Phoenix_project.snapshot_manager import SnapshotManager
+from Phoenix_project.metrics_collector import MetricsCollector
+from Phoenix_project.monitor.logging import setup_logging, get_logger
 
 # (AI/RAG components)
-from ai.retriever import Retriever
-from ai.ensemble_client import EnsembleClient
-from ai.metacognitive_agent import MetacognitiveAgent
-from ai.reasoning_ensemble import ReasoningEnsemble
-from evaluation.arbitrator import Arbitrator
-from evaluation.fact_checker import FactChecker
-from ai.prompt_manager import PromptManager
-from api.gateway import APIGateway
-from api.gemini_pool_manager import GeminiPoolManager
-from memory.vector_store import VectorStore
-from memory.cot_database import CoTDatabase
-from sizing.fixed_fraction import FixedFractionSizer # 示例仓位管理器
+from Phoenix_project.ai.retriever import Retriever
+from Phoenix_project.ai.ensemble_client import EnsembleClient
+from Phoenix_project.ai.metacognitive_agent import MetacognitiveAgent
+from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
+from Phoenix_project.evaluation.arbitrator import Arbitrator
+from Phoenix_project.evaluation.fact_checker import FactChecker
+# FIX: Add missing imports for CognitiveEngine dependencies
+from Phoenix_project.evaluation.voter import Voter
+from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
+from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.api.gateway import APIGateway
+from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
+from Phoenix_project.memory.vector_store import VectorStore
+from Phoenix_project.memory.cot_database import CoTDatabase
+from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # 示例仓位管理器
 
 class PhoenixProject:
     """
@@ -100,15 +103,15 @@ class PhoenixProject:
 
         # 10. 核心协调器 (Orchestrator)
         self.orchestrator = Orchestrator(
+            config_loader=self.config_loader, # FIX: Added missing config_loader
             pipeline_state=self.pipeline_state,
             data_manager=self.data_manager,
-            event_filter=self.event_filter,
-            stream_processor=self.stream_processor,
+            event_distributor=self.event_distributor, # FIX: Pass event_distributor
             cognitive_engine=self.cognitive_engine,
             portfolio_constructor=self.portfolio_constructor,
             risk_manager=self.risk_manager,
             order_manager=self.order_manager,
-            trade_lifecycle_manager=self.trade_lifecycle_manager,
+            # FIX: Removed extraneous args (event_filter, stream_processor, trade_lifecycle_manager)
             snapshot_manager=self.snapshot_manager,
             metrics_collector=self.metrics_collector,
             audit_manager=self.audit_manager,
@@ -168,6 +171,10 @@ class PhoenixProject:
             arbitrator = Arbitrator(api_gateway, prompt_manager)
             fact_checker = FactChecker(api_gateway, prompt_manager)
             
+            # FIX: Instantiate missing dependencies for CognitiveEngine
+            uncertainty_guard = UncertaintyGuard()
+            voter = Voter() # Assuming no-arg constructor
+
             # 5. Ensemble
             reasoning_ensemble = ReasoningEnsemble(
                 retriever=retriever,
@@ -178,9 +185,14 @@ class PhoenixProject:
             )
             
             # 6. Cognitive Engine
+            # FIX: Pass all required arguments to CognitiveEngine constructor
             cognitive_engine = CognitiveEngine(
                 reasoning_ensemble=reasoning_ensemble,
-                fact_checker=fact_checker
+                fact_checker=fact_checker,
+                uncertainty_guard=uncertainty_guard,
+                voter=voter,
+                # Pass the relevant config section
+                config=self.config_loader.get_config("cognitive_engine", {}) 
             )
             self.logger.info("Cognitive Stack Initialized.")
             return cognitive_engine
