@@ -1,0 +1,75 @@
+"""
+L3 Agent: Execution Agent
+Refactored from training/drl/agents/execution_agent.py.
+Responsible for "Order Execution."
+"""
+from typing import Any, List, Optional
+import uuid
+
+from agents.l3.base import BaseL3Agent
+from core.pipeline_state import PipelineState
+from core.schemas.fusion_result import FusionResult
+from core.schemas.data_schema import Signal, Order, OrderStatus
+from core.schemas.risk_schema import RiskAdjustment
+
+class ExecutionAgent(BaseL3Agent):
+    """
+    Implements the L3 Execution agent.
+    Inherits from BaseL3Agent and implements the run method
+    to convert a Signal and RiskAdjustment into Orders.
+    """
+    
+    def run(self, state: PipelineState, fusion_result: Optional[FusionResult] = None) -> List[Order]:
+        """
+        Splits large orders and optimizes the execution path.
+        This agent consumes the outputs of its L3 peers (Alpha and Risk)
+        by retrieving them from the PipelineState.
+        
+        Args:
+            state (PipelineState): The current state, used to retrieve L3 results.
+            fusion_result (FusionResult, optional): Not used by this agent.
+            
+        Returns:
+            List[Order]: A list of Order objects to be executed.
+        """
+        
+        # Retrieve the outputs from the other L3 agents from the state
+        signals: List[Signal] = state.get_results_by_type(Signal)
+        adjustments: List[RiskAdjustment] = state.get_results_by_type(RiskAdjustment)
+
+        orders = []
+        
+        # TODO: Implement actual DRL/Quant model logic for execution.
+        # This logic would use self.model_client to split orders (TWAP, VWAP, etc.)
+        
+        # This is a mock execution logic.
+        # It just converts each signal into a single MARKET order,
+        # applying the risk adjustment.
+        
+        for signal in signals:
+            # Find the matching risk adjustment
+            adjustment = next((adj for adj in adjustments if adj.target_symbol == signal.symbol), None)
+            capital_modifier = adjustment.capital_modifier if adjustment else 1.0
+            
+            # Mock total capital per trade = 100,000
+            total_capital = 100000.0
+            trade_value = total_capital * signal.strength * capital_modifier
+            
+            # We can't know price, so we'll create a simple Market Order
+            # In a real system, we'd need a price oracle to get quantity.
+            # For this mock, we'll assume a placeholder quantity.
+            mock_quantity = 100.0 * (1.0 if signal.signal_type == "BUY" else -1.0)
+
+            orders.append(Order(
+                id=str(uuid.uuid4()),
+                symbol=signal.symbol,
+                quantity=mock_quantity, # Placeholder quantity
+                order_type="MARKET",
+                status=OrderStatus.NEW,
+                metadata={"source_agent": self.agent_id, "signal_id": signal.id}
+            ))
+            
+        return orders
+
+    def __repr__(self) -> str:
+        return f"<ExecutionAgent(id='{self.agent_id}')>"
