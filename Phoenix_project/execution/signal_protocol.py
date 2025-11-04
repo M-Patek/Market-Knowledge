@@ -6,7 +6,8 @@
 """
 
 # FIX (E2): 从 data_schema 导入 Signal
-from core.schemas.data_schema import Signal
+# 修正：将 'core.schemas...' 转换为 'Phoenix_project.core.schemas...'
+from Phoenix_project.core.schemas.data_schema import Signal
 
 # FIX (E6): 移除了 StrategySignal 的导入，因为它不存在
 # from .interfaces import StrategySignal 
