@@ -7,7 +7,7 @@
 from typing import Any, Dict, List
 
 # FIX (E1): 导入统一后的核心模式
-from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
+from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
 
 class StreamProcessor:
     """
