@@ -1,6 +1,6 @@
 # Phoenix_project/evaluation/voter.py
 from typing import List
-from monitor.metrics import UNCERTAINTY # 来自 Task 25 的更正后导入
+from Phoenix_project.monitor.metrics import UNCERTAINTY # 来自 Task 25 的更正后导入
 
 def vote(paths: list[dict]) -> dict:
     """
