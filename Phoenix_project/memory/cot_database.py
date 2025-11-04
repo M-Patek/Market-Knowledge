@@ -5,8 +5,10 @@ import aiofiles
 import json
 import os
 
-from core.schemas.fusion_result import FusionResult
-from monitor.logging import ESLogger
+# 修正：将 'core.schemas...' 转换为 'Phoenix_project.core.schemas...'
+from Phoenix_project.core.schemas.fusion_result import FusionResult
+# 修正：将 'monitor.logging...' 转换为 'Phoenix_project.monitor.logging...'
+from Phoenix_project.monitor.logging import ESLogger
 
 
 class CoTDatabase:
