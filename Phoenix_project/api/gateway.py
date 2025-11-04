@@ -1,9 +1,9 @@
 import asyncio
 import google.generativeai as genai
 from typing import List, Dict, Any, Optional, Union
-from api.gemini_pool_manager import GeminiPoolManager
-from monitor.logging import get_logger
-from config.loader import ConfigLoader
+from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
+from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.config.loader import ConfigLoader
 
 logger = get_logger(__name__)
 
