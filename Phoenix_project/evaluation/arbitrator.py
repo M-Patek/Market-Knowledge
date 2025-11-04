@@ -11,10 +11,10 @@ from pydantic import ValidationError
 
 
 # FIX (E3): 导入 AgentDecision 和 FusionResult (这个保留)
-from core.schemas.fusion_result import AgentDecision, FusionResult
-from ai.prompt_manager import PromptManager
-from api.gateway import IAPIGateway
-from monitor.logging import get_logger
+from Phoenix_project.core.schemas.fusion_result import AgentDecision, FusionResult
+from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.api.gateway import IAPIGateway
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -127,4 +127,3 @@ class Arbitrator:
             uncertainty_score=1.0, # 最高不确定性
             uncertainty_dimensions={"arbitration_failure": 1.0}
         )
-
