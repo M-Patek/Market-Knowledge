@@ -4,9 +4,9 @@ L1 Agent: Macro Strategist
 from typing import Any, Dict
 from decimal import Decimal
 
-from agents.l1.base import BaseL1Agent
-from core.pipeline_state import PipelineState
-from core.schemas.evidence_schema import EvidenceItem, EvidenceType
+from Phoenix_project.agents.l1.base import BaseL1Agent
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceType
 
 class MacroStrategistAgent(BaseL1Agent):
     """
