@@ -1,127 +1,132 @@
-"""
-测试 PipelineState (已更新)
-"""
+# tests/test_pipeline_state.py
 import pytest
 from datetime import datetime
 
-from core.pipeline_state import PipelineState
-from core.schemas.data_schema import MarketData, PortfolioState, Position, NewsData
+# --- [修复] ---
+# 修复：将 'core.pipeline_state' 转换为 'Phoenix_project.core.pipeline_state'
+from Phoenix_project.core.pipeline_state import PipelineState
+# 修复：将 'core.schemas.data_schema' 转换为 'Phoenix_project.core.schemas.data_schema'
+from Phoenix_project.core.schemas.data_schema import MarketEvent, Signal
+# 修复：将 'core.schemas.evidence_schema' 转换为 'Phoenix_project.core.schemas.evidence_schema'
+from Phoenix_project.core.schemas.evidence_schema import Evidence
+# 修复：将 'core.schemas.fusion_result' 转换为 'Phoenix_project.core.schemas.fusion_result'
+from Phoenix_project.core.schemas.fusion_result import FusionResult
+# 修复：将 'core.schemas.risk_schema' 转换为 'Phoenix_project.core.schemas.risk_schema'
+from Phoenix_project.core.schemas.risk_schema import RiskAssessment
+# --- [修复结束] ---
 
-# FIX (E10): 重写测试以匹配新的构造函数和 API
 
 @pytest.fixture
-def empty_state():
-    """
-    返回一个具有默认配置的新 PipelineState。
-    """
-    # (E5 Fix) 使用新的构造函数
-    return PipelineState(initial_state=None, max_history=10)
+def state():
+    """Provides a clean PipelineState for each test."""
+    return PipelineState(event_id="evt_001")
 
-@pytest.fixture
-def sample_portfolio_state():
-    """
-    返回一个示例投资组合状态。
-    """
-    return PortfolioState(
-        timestamp=datetime(2023, 1, 1, 10, 0, 0),
-        cash=100000.0,
-        total_value=105000.0,
-        positions={
-            "AAPL": Position(
-                symbol="AAPL",
-                quantity=100.0,
-                average_price=150.0,
-                market_value=15000.0, # (应为 100 * 150)
-                unrealized_pnl=0.0
-            )
-        }
+def test_pipeline_state_initialization(state):
+    """Tests the default values upon initialization."""
+    assert state.event_id == "evt_001"
+    assert state.start_time is not None
+    assert state.current_step == "INITIALIZED"
+    assert state.is_successful is False
+    assert state.error_message is None
+    
+    # Check that all data fields are empty
+    assert state.raw_event is None
+    assert state.context_data == {}
+    assert state.analysis_results == []
+    assert state.fusion_result is None
+    assert state.risk_assessment is None
+    assert state.signals == []
+
+def test_add_step_and_timing(state):
+    """Tests the logging of pipeline steps and their timings."""
+    state.add_step("DATA_INGESTION", 10.5)
+    state.add_step("ANALYSIS", 150.2)
+    
+    assert state.current_step == "ANALYSIS"
+    assert "DATA_INGESTION" in state.timings
+    assert state.timings["DATA_INGESTION"] == 10.5
+    assert "ANALYSIS" in state.timings
+    assert state.timings["ANALYSIS"] == 150.2
+
+def test_set_raw_event(state):
+    """Tests attaching the raw event."""
+    event = MarketEvent(
+        id="evt_001",
+        source="test",
+        timestamp=datetime.now(),
+        content="Test event"
     )
+    state.set_raw_event(event)
+    assert state.raw_event == event
 
-@pytest.fixture
-def sample_market_data():
-    """
-    返回一个 MarketData 示例。
-    """
-    return MarketData(
+def test_add_analysis_result(state):
+    """Tests appending analysis results (Evidence)."""
+    evidence1 = Evidence(
+        source="agent_1",
+        content="Evidence 1",
+        timestamp=datetime.now(),
+        confidence=0.8
+    )
+    evidence2 = Evidence(
+        source="agent_2",
+        content="Evidence 2",
+        timestamp=datetime.now(),
+        confidence=0.9
+    )
+    
+    state.add_analysis_result(evidence1)
+    state.add_analysis_result(evidence2)
+    
+    assert len(state.analysis_results) == 2
+    assert state.analysis_results[0] == evidence1
+    assert state.analysis_results[1] == evidence2
+
+def test_set_fusion_result(state):
+    """Tests setting the final FusionResult."""
+    fusion = FusionResult(
+        event_id="evt_001",
+        timestamp=datetime.now(),
+        assessment="Fused assessment",
+        trade_candidates=[{"ticker": "AAPL"}]
+    )
+    state.set_fusion_result(fusion)
+    assert state.fusion_result == fusion
+
+def test_set_risk_assessment(state):
+    """Tests setting the RiskAssessment."""
+    risk = RiskAssessment(
+        allows_execution=False,
+        reason="Market volatility too high",
+        confidence=0.95
+    )
+    state.set_risk_assessment(risk)
+    assert state.risk_assessment == risk
+    
+def test_set_signals(state):
+    """Tests setting the final list of Signals."""
+    signal1 = Signal(
         symbol="AAPL",
-        timestamp=datetime(2023, 1, 1, 12, 0, 0),
-        open=151.0, high=152.0, low=150.0, close=151.5, volume=10000
+        signal_type="BUY",
+        strength=0.5
     )
+    state.set_signals([signal1])
+    assert len(state.signals) == 1
+    assert state.signals[0] == signal1
 
-def test_pipeline_state_initialization(empty_state: PipelineState):
-    """
-    测试 PipelineState 是否正确初始化。
-    """
-    assert empty_state.current_time == datetime.min
-    assert empty_state.get_latest_portfolio_state() is None
-    assert empty_state.max_history == 10
+def test_mark_failure(state):
+    """Tests marking the pipeline as failed."""
+    state.mark_failure("ANALYSIS", "Something went wrong")
+    
+    assert state.is_successful is False
+    assert state.current_step == "ANALYSIS"
+    assert state.error_message == "Something went wrong"
 
-def test_update_time(empty_state: PipelineState):
-    """
-    测试时间更新。
-    """
-    new_time = datetime(2023, 1, 1, 12, 0, 0)
-    empty_state.update_time(new_time)
-    assert empty_state.current_time == new_time
-
-def test_update_portfolio_state(empty_state: PipelineState, sample_portfolio_state: PortfolioState):
-    """
-    测试投资组合状态的更新和检索。
-    """
-    empty_state.update_portfolio_state(sample_portfolio_state)
+def test_mark_success(state):
+    """Tests marking the pipeline as successful."""
+    state.mark_success("SIGNAL_GENERATION")
     
-    latest_state = empty_state.get_latest_portfolio_state()
-    assert latest_state is not None
-    assert latest_state.cash == 100000.0
-    assert latest_state.positions["AAPL"].quantity == 100.0
-
-def test_update_data_batch_and_history(empty_state: PipelineState, sample_market_data: MarketData):
-    """
-    测试数据批次更新和历史记录（deque）。
-    """
-    sample_news = NewsData(
-        id="news1",
-        source="Reuters",
-        timestamp=datetime(2023, 1, 1, 11, 0, 0),
-        symbols=["AAPL"],
-        content="Test news."
-    )
-    
-    data_batch = {
-        "market_data": [sample_market_data],
-        "news_data": [sample_news],
-        "economic_indicators": []
-    }
-    
-    empty_state.update_data_batch(data_batch)
-    
-    assert len(empty_state.market_data_history) == 1
-    assert len(empty_state.news_history) == 1
-    assert empty_state.market_data_history[0].symbol == "AAPL"
-    
-    # 测试历史记录的 maxlen
-    for i in range(15):
-        empty_state.update_data_batch(data_batch)
-        
-    assert len(empty_state.market_data_history) == empty_state.max_history
-    assert len(empty_state.market_data_history) == 10
-
-def test_get_latest_market_data(empty_state: PipelineState):
-    """
-    测试 get_latest_market_data 辅助函数。
-    """
-    md1 = MarketData(symbol="AAPL", timestamp=datetime(2023, 1, 1), open=1, high=1, low=1, close=1, volume=1)
-    md2 = MarketData(symbol="MSFT", timestamp=datetime(2023, 1, 2), open=1, high=1, low=1, close=1, volume=1)
-    md3 = MarketData(symbol="AAPL", timestamp=datetime(2023, 1, 3), open=2, high=2, low=2, close=2, volume=2)
-    
-    batch = {"market_data": [md1, md2, md3], "news_data": [], "economic_indicators": []}
-    empty_state.update_data_batch(batch)
-    
-    latest_aapl = empty_state.get_latest_market_data("AAPL")
-    latest_msft = empty_state.get_latest_market_data("MSFT")
-    
-    assert latest_aapl is not None
-    assert latest_aapl.close == 2.0 # 确保拿到的是最新的
-    
-    assert latest_msft is not None
-    assert latest_msft.close == 1.0
+    assert state.is_successful is True
+    assert state.current_step == "SIGNAL_GENERATION"
+    assert state.error_message is None
+    assert state.end_time is not None
+    assert state.total_duration_ms > 0
