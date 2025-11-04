@@ -7,10 +7,10 @@ from collections import deque
 from datetime import datetime
 
 # FIX (E1, E2, E3): 导入统一的模式
-from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator, PortfolioState
-from core.schemas.fusion_result import AgentDecision, FusionResult
+from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, EconomicIndicator, PortfolioState
+from Phoenix_project.core.schemas.fusion_result import AgentDecision, FusionResult
 
-from monitor.logging import get_logger
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
