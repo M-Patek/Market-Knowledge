@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Generator
 
 # FIX (E1): 导入统一后的核心模式
-from core.schemas.data_schema import MarketData, NewsData
+# 修正：将 'core.schemas...' 转换为 'Phoenix_project.core.schemas...'
+from Phoenix_project.core.schemas.data_schema import MarketData, NewsData
 
 class DataIterator:
     """
