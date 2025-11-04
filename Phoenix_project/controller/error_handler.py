@@ -1,5 +1,5 @@
 import asyncio
-from monitor.logging import get_logger
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
