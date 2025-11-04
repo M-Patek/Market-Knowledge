@@ -5,10 +5,10 @@ Responsible for "Counter-Argument" and "Pressure Testing" L1 Evidence.
 """
 from typing import Any, List
 
-from agents.l2.base import BaseL2Agent
-from core.pipeline_state import PipelineState
-from core.schemas.evidence_schema import EvidenceItem, EvidenceType
-from core.schemas.adversary_result import AdversaryResult
+from Phoenix_project.agents.l2.base import BaseL2Agent
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceType
+from Phoenix_project.core.schemas.adversary_result import AdversaryResult
 
 class AdversaryAgent(BaseL2Agent):
     """
