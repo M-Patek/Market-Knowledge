@@ -53,7 +53,7 @@ class BaseTrainer(ABC):
             return
         logger.info(f"模型已保存到: {path}")
 
-    @abstractmethod
+    @abstractmodel
     def load_model(self, path: str):
         """
         从磁盘加载模型。
