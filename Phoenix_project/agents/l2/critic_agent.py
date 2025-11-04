@@ -5,10 +5,10 @@ Responsible for "Criticism & Fact Check" on L1 EvidenceItems.
 """
 from typing import Any, List
 
-from agents.l2.base import BaseL2Agent
-from core.pipeline_state import PipelineState
-from core.schemas.evidence_schema import EvidenceItem
-from core.schemas.critic_result import CriticResult
+from Phoenix_project.agents.l2.base import BaseL2Agent
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
+from Phoenix_project.core.schemas.critic_result import CriticResult
 
 class CriticAgent(BaseL2Agent):
     """
