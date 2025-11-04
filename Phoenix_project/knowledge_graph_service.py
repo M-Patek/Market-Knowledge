@@ -6,11 +6,11 @@ KG 结合了来自不同来源（结构化、非结构化、时序）的信息�
 from typing import List, Dict, Any
 
 # FIX (E8): 导入正确的客户端名称 (TabularDBClient, TemporalDBClient)
-from ai.tabular_db_client import TabularDBClient
-from ai.temporal_db_client import TemporalDBClient
-from ai.retriever import Retriever # (用于非结构化)
-from ai.relation_extractor import RelationExtractor
-from core.schemas.data_schema import KGNode, NewsData
+from Phoenix_project.ai.tabular_db_client import TabularDBClient
+from Phoenix_project.ai.temporal_db_client import TemporalDBClient
+from Phoenix_project.ai.retriever import Retriever # (用于非结构化)
+from Phoenix_project.ai.relation_extractor import RelationExtractor
+from Phoenix_project.core.schemas.data_schema import KGNode, NewsData
 
 class KnowledgeGraphService:
     """
