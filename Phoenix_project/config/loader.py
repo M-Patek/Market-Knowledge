@@ -28,4 +28,3 @@ def load_config(config_path: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.critical(f"读取配置文件 {config_path} 失败: {e}", exc_info=True)
         return None
-
