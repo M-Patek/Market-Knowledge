@@ -15,9 +15,9 @@ from skopt.utils import use_named_args
 import pandas as pd
 
 # 修复：[FIX-8] 导入路径从 '.backtesting.engine' 更改
-from training.backtest_engine import BacktestingEngine
+from Phoenix_project.training.backtest_engine import BacktestingEngine
 # 修复：[FIX-10] 导入 'load_config'
-from config.loader import load_config
+from Phoenix_project.config.loader import load_config
 
 logger = logging.getLogger(__name__)
 
