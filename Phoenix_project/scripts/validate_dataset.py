@@ -23,8 +23,8 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # 修复：现在使用绝对导入
-from ai.data_adapter import DataAdapter
-from core.schemas.data_schema import MarketEvent, TickerData
+from Phoenix_project.ai.data_adapter import DataAdapter
+from Phoenix_project.core.schemas.data_schema import MarketEvent, TickerData
 
 # --- 日志设置 ---
 logging.basicConfig(level=logging.INFO,
