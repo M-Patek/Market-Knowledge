@@ -1,9 +1,9 @@
 import asyncio
 import time
 from typing import Callable, Coroutine
-from core.pipeline_state import PipelineState
-from controller.orchestrator import Orchestrator
-from monitor.logging import get_logger
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.controller.orchestrator import Orchestrator
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
