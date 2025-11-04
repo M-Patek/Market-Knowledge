@@ -1,8 +1,8 @@
 from typing import Dict, Any, Optional
 import json
-from ai.prompt_manager import PromptManager
-from api.gateway import APIGateway
-from monitor.logging import get_logger
+from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.api.gateway import APIGateway
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
