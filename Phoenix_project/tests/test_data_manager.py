@@ -1,126 +1,128 @@
-"""
-测试 DataManager (已更新)
-"""
+# tests/test_data_manager.py
 import pytest
 from unittest.mock import MagicMock, patch
+from datetime import datetime, timedelta
 import pandas as pd
-from datetime import datetime
 
-from data_manager import DataManager
-from config.loader import ConfigLoader
+# --- [修复] ---
+# 修复：将 'data_manager' 转换为 'Phoenix_project.data_manager'
+from Phoenix_project.data_manager import DataManager
+# 修复：将 'core.schemas.data_schema' 转换为 'Phoenix_project.core.schemas.data_schema'
+from Phoenix_project.core.schemas.data_schema import MarketEvent, TickerData
+# 修复：将 'ai.data_adapter' 转换为 'Phoenix_project.ai.data_adapter'
+from Phoenix_project.ai.data_adapter import DataAdapter
+# --- [修复结束] ---
 
-# FIX (E10): 重写测试以使用模拟的 ConfigLoader
 
 @pytest.fixture
-def mock_config_loader() -> ConfigLoader:
-    """
-    模拟一个 ConfigLoader。
-    """
-    loader = MagicMock(spec=ConfigLoader)
-    # (E5 Fix) 模拟 DataManager 所需的配置
-    loader.get_system_config.return_value = {
-        "data_store": {
-            "local_base_path": "/test/data"
+def mock_dependencies():
+    """Mocks all dependencies for DataManager."""
+    mock_config = {
+        "data_manager": {
+            "temporal_db_url": "mock_db_url",
+            "feature_store_path": "mock_fs_path",
+            "cold_storage_config": {"type": "s3", "bucket": "mock-bucket"}
         }
     }
-    return loader
-
-@pytest.fixture
-def sample_data_catalog() -> dict:
-    """
-    返回一个示例数据目录。
-    """
+    mock_logger = MagicMock()
+    mock_adapter = MagicMock(spec=DataAdapter)
+    mock_temporal_db = MagicMock()
+    mock_feature_store = MagicMock()
+    mock_cold_storage = MagicMock()
+    
     return {
-        "market_data_AAPL": {
-            "path": "market/aapl.parquet",
-            "format": "parquet",
-            "timestamp_col": "timestamp"
-        },
-        "news_events": {
-            "path": "news/events.csv",
-            "format": "csv",
-            "timestamp_col": "date"
-        }
+        "config": mock_config,
+        "logger": mock_logger,
+        "adapter": mock_adapter,
+        "temporal_db": mock_temporal_db,
+        "feature_store": mock_feature_store,
+        "cold_storage": mock_cold_storage
     }
 
 @pytest.fixture
-def data_manager(mock_config_loader: ConfigLoader, sample_data_catalog: dict) -> DataManager:
-    """
-    返回一个使用模拟依赖项的 DataManager 实例。
-    """
-    # (E5 Fix) 使用正确的构造函数
-    return DataManager(config_loader=mock_config_loader, data_catalog=sample_data_catalog)
+def data_manager(mock_dependencies):
+    """Fixture to create a DataManager with mocked dependencies."""
+    
+    # We patch the internals that DataManager tries to create
+    with patch("Phoenix_project.data_manager.TemporalDBClient", return_value=mock_dependencies["temporal_db"]), \
+         patch("Phoenix_project.data_manager.FeatureStore", return_value=mock_dependencies["feature_store"]), \
+         patch("Phoenix_project.data_manager.S3Client", return_value=mock_dependencies["cold_storage"]):
+        
+        dm = DataManager(
+            config=mock_dependencies["config"],
+            logger=mock_dependencies["logger"],
+            adapter=mock_dependencies["adapter"]
+        )
+    return dm
 
-# --- 模拟 Pandas 读取 ---
-@pytest.fixture
-def mock_parquet_data() -> pd.DataFrame:
-    """
-    模拟从 Parquet 文件读取的 DataFrame。
-    """
-    return pd.DataFrame({
-        'open': [150], 'high': [151], 'low': [149], 'close': [150.5], 'volume': [1000]
-    }, index=[pd.to_datetime("2023-01-01 10:00:00", utc=True)])
+# Sample data
+NOW = datetime.utcnow()
+SAMPLE_MARKET_EVENT_RAW = {
+    "source": "manual_test",
+    "timestamp": NOW.isoformat(),
+    "content": "This is a test event.",
+    "metadata": {}
+}
+SAMPLE_MARKET_EVENT_ADAPTED = MarketEvent(
+    id="event_123",
+    source="manual_test",
+    timestamp=NOW,
+    content="This is a test event."
+)
+SAMPLE_TICKER_DATA = TickerData(
+    symbol="AAPL",
+    timestamp=NOW,
+    open=150.0, high=151.0, low=149.0, close=150.5, volume=1000
+)
 
-@pytest.fixture
-def mock_csv_data() -> pd.DataFrame:
-    """
-    模拟从 CSV 文件读取的 DataFrame。
-    """
-    return pd.DataFrame({
-        'id': ['news1'], 'source': ['Reuters'], 'content': ['Test'], 'date': [pd.to_datetime("2023-01-01 09:00:00", utc=True)]
-    })
 
-# 使用 patch 来模拟 os.path.exists 和 pandas I/O
-@patch('os.path.exists', return_value=True)
-@patch('pandas.read_parquet')
-def test_load_market_data(mock_read_parquet, mock_exists, data_manager: DataManager, mock_parquet_data: pd.DataFrame):
+def test_data_manager_process_event(data_manager, mock_dependencies):
     """
-    测试 get_market_data 是否正确加载、缓存和过滤数据。
+    Tests the `process_event` workflow.
     """
-    mock_read_parquet.return_value = mock_parquet_data
+    mock_adapter = mock_dependencies["adapter"]
+    mock_temporal_db = mock_dependencies["temporal_db"]
     
-    start_date = datetime(2023, 1, 1, 0, 0, 0)
-    end_date = datetime(2023, 1, 2, 0, 0, 0)
+    # 1. Mock the adapter's output
+    mock_adapter.standardize_event.return_value = SAMPLE_MARKET_EVENT_ADAPTED
     
-    # 1. 第一次调用（加载）
-    dfs = data_manager.get_market_data(["AAPL"], start_date, end_date)
+    # 2. Call the method
+    result_event = data_manager.process_event(SAMPLE_MARKET_EVENT_RAW)
     
-    assert "AAPL" in dfs
-    assert len(dfs["AAPL"]) == 1
-    assert dfs["AAPL"].iloc[0]['close'] == 150.5
+    # 3. Verify adapter was called
+    mock_adapter.standardize_event.assert_called_once_with(SAMPLE_MARKET_EVENT_RAW)
     
-    # 验证 pd.read_parquet 被调用
-    mock_read_parquet.assert_called_once_with("/test/data/market/aapl.parquet")
+    # 4. Verify temporal DB was called
+    mock_temporal_db.insert_market_event.assert_called_once_with(SAMPLE_MARKET_EVENT_ADAPTED)
     
-    # 2. 第二次调用（从缓存）
-    mock_read_parquet.reset_mock()
-    dfs_cached = data_manager.get_market_data(["AAPL"], start_date, end_date)
-    
-    # 验证 pd.read_parquet *没有* 被再次调用
-    mock_read_parquet.assert_not_called()
-    assert len(dfs_cached["AAPL"]) == 1
+    # 5. Verify the correct event is returned
+    assert result_event == SAMPLE_MARKET_EVENT_ADAPTED
 
-@patch('os.path.exists', return_value=True)
-@patch('pandas.read_csv')
-def test_fetch_data_for_batch(mock_read_csv, mock_exists, data_manager: DataManager, mock_csv_data: pd.DataFrame):
+def test_data_manager_get_context_data(data_manager, mock_dependencies):
     """
-    测试 fetch_data_for_batch 是否正确转换数据为 Pydantic 模式。
-    (我们只测试 NewsData，因为 MarketData 在上一个测试中已覆盖)
+    Tests the `get_context_data` workflow.
     """
-    mock_read_csv.return_value = mock_csv_data
+    mock_temporal_db = mock_dependencies["temporal_db"]
+    mock_feature_store = mock_dependencies["feature_store"]
     
-    start_date = datetime(2023, 1, 1, 0, 0, 0)
-    end_date = datetime(2023, 1, 2, 0, 0, 0)
+    # 1. Mock the DB/Store outputs
+    mock_temporal_db.query_ticker_data.return_value = [SAMPLE_TICKER_DATA]
+    mock_temporal_db.query_market_events.return_value = [SAMPLE_MARKET_EVENT_ADAPTED]
+    mock_feature_store.get_features.return_value = pd.DataFrame({"rsi": [50]}) # Mock
     
-    # (模拟 DataManager，使其不加载 MarketData)
-    data_manager.data_catalog = {"news_events": data_manager.data_catalog["news_events"]}
+    # 2. Call the method
+    symbols = ["AAPL"]
+    time_window = timedelta(days=1)
+    context_data = data_manager.get_context_data(symbols, time_window)
     
-    batch = data_manager.fetch_data_for_batch(start_date, end_date, [])
+    # 3. Verify dependencies were called
+    mock_temporal_db.query_ticker_data.assert_called_once_with(symbols, time_window)
+    mock_temporal_db.query_market_events.assert_called_once_with(symbols, time_window)
+    # mock_feature_store.get_features.assert_called_once() # Call depends on logic
     
-    assert len(batch["market_data"]) == 0
-    assert len(batch["news_data"]) == 1
-    
-    news_item = batch["news_data"][0]
-    # (E1 Fix) 验证它是否是 NewsData
-    assert news_item.id == "news1"
-    assert news_item.source == "Reuters"
+    # 4. Verify output structure
+    assert "ticker_data" in context_data
+    assert "market_events" in context_data
+    assert "features" in context_data
+    assert context_data["ticker_data"]["AAPL"][0] == SAMPLE_TICKER_DATA
+    assert context_data["market_events"][0] == SAMPLE_MARKET_EVENT_ADAPTED
