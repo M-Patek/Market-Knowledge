@@ -5,9 +5,9 @@ Responsible for L1 Task Initialization as per the blueprint.
 """
 from typing import Any, Dict, List
 
-from agents.l2.base import BaseL2Agent
-from core.pipeline_state import PipelineState
-from core.schemas.task_schema import TaskGraph
+from Phoenix_project.agents.l2.base import BaseL2Agent
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.task_schema import TaskGraph
 
 class PlannerAgent(BaseL2Agent):
     """
