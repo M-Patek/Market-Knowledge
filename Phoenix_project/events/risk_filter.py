@@ -4,10 +4,10 @@
 (例如：过滤掉不相关的符号、低可信度来源的新闻)
 """
 from typing import List, Dict, Any
-from config.loader import ConfigLoader
+from Phoenix_project.config.loader import ConfigLoader
 
 # FIX (E1): 导入统一后的核心模式
-from core.schemas.data_schema import MarketData, NewsData
+from Phoenix_project.core.schemas.data_schema import MarketData, NewsData
 
 class EventRiskFilter:
     """
