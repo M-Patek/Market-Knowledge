@@ -5,13 +5,13 @@
 from typing import List, Dict, Optional
 
 # FIX (E2, E3): 从统一的 data_schema 和 fusion_result 导入
-from core.schemas.data_schema import Signal, Order, PortfolioState, OrderStatus
-from core.schemas.fusion_result import FusionResult, AgentDecision
+from Phoenix_project.core.schemas.data_schema import Signal, Order, PortfolioState, OrderStatus
+from Phoenix_project.core.schemas.fusion_result import FusionResult, AgentDecision
 
 # FIX (E8): 导入 IPositionSizer 接口 (原为 SizingMethod)
-from sizing.base import IPositionSizer
+from Phoenix_project.sizing.base import IPositionSizer
 
-from monitor.logging import get_logger
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -110,4 +110,3 @@ class PortfolioConstructor:
                 orders.append(new_order)
 
         return orders
-
