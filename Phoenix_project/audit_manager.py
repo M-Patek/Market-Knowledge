@@ -1,10 +1,10 @@
 from typing import Dict, Any, Optional
 import uuid
-from audit.logger import AuditLogger
-from memory.cot_database import CoTDatabase
-from core.schemas.fusion_result import FusionResult
-from core.pipeline_state import PipelineState
-from monitor.logging import get_logger
+from Phoenix_project.audit.logger import AuditLogger
+from Phoenix_project.memory.cot_database import CoTDatabase
+from Phoenix_project.core.schemas.fusion_result import FusionResult
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
