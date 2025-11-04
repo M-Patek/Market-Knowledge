@@ -2,19 +2,19 @@ import pandas as pd
 # 修复：[FIX-15] 添加 'Callable' 用于类型提示
 from typing import Dict, Any, Optional, Callable
 
-# 修复：将相对导入 'from ..core.pipeline_state...' 更改为绝对导入
-from core.pipeline_state import PipelineState
-# 修复：将相对导入 'from ..data.data_iterator...' 更改为绝对导入
-from data.data_iterator import DataIterator
-# 修复：将相对导入 'from ..controller.orchestrator...' 更改为绝对导入
-from controller.orchestrator import Orchestrator
-# 修复：将相对导入 'from ..execution.trade_lifecycle_manager...' 更改为绝对导入
-from execution.trade_lifecycle_manager import TradeLifecycleManager
-# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
-from monitor.logging import get_logger
+# 修正：将 'core.pipeline_state' 转换为 'Phoenix_project.core.pipeline_state'
+from Phoenix_project.core.pipeline_state import PipelineState
+# 修正：将 'data.data_iterator' 转换为 'Phoenix_project.data.data_iterator'
+from Phoenix_project.data.data_iterator import DataIterator
+# 修正：将 'controller.orchestrator' 转换为 'Phoenix_project.controller.orchestrator'
+from Phoenix_project.controller.orchestrator import Orchestrator
+# 修正：将 'execution.trade_lifecycle_manager' 转换为 'Phoenix_project.execution.trade_lifecycle_manager'
+from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
+# 修正：将 'monitor.logging' 转换为 'Phoenix_project.monitor.logging'
+from Phoenix_project.monitor.logging import get_logger
 # 修复：[FIX-15] 导入 'render_report' (函数)，而不是 'ReportRenderer' (类)
-# 修复：将相对导入 'from ..output.renderer...' 更改为绝对导入
-from output.renderer import render_report
+# 修正：将 'output.renderer' 转换为 'Phoenix_project.output.renderer'
+from Phoenix_project.output.renderer import render_report
 
 logger = get_logger(__name__)
 
