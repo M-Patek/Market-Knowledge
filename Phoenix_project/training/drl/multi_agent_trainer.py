@@ -5,16 +5,16 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from typing import Dict, Any
 
 # --- [修复] ---
-# 修复：将相对导入 'from .trading_env...' 更改为绝对导入
-from training.drl.trading_env import TradingEnv
-# 修复：将相对导入 'from .agents.alpha_agent...' 更改为绝对导入
-from training.drl.agents.alpha_agent import AlphaAgent
-# 修复：将相对导入 'from .agents.risk_agent...' 更改为绝对导入
-from training.drl.agents.risk_agent import RiskAgent
-# 修复：将相对导入 'from ...utils.replay_buffer...' 更改为绝对导入
-from utils.replay_buffer import ReplayBuffer
-# 修复：将相对导入 'from ...monitor.logging...' 更改为绝对导入
-from monitor.logging import get_logger
+# 修复：将相对导入 'from training.drl.trading_env...' 更改为绝对导入
+from Phoenix_project.training.drl.trading_env import TradingEnv
+# 修复：将相对导入 'from training.drl.agents.alpha_agent...' 更改为绝对导入
+from Phoenix_project.training.drl.agents.alpha_agent import AlphaAgent
+# 修复：将相对导入 'from training.drl.agents.risk_agent...' 更改为绝对导入
+from Phoenix_project.training.drl.agents.risk_agent import RiskAgent
+# 修复：将相对导入 'from utils.replay_buffer...' 更改为绝对导入
+from Phoenix_project.utils.replay_buffer import ReplayBuffer
+# 修复：将相对导入 'from monitor.logging...' 更改为绝对导入
+from Phoenix_project.monitor.logging import get_logger
 # --- [修复结束] ---
 
 logger = get_logger(__name__)
