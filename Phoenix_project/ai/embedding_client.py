@@ -1,8 +1,8 @@
 from typing import List, Dict, Any, Optional
 import asyncio
-from models.registry import ModelRegistry
-from api.gateway import APIGateway
-from monitor.logging import get_logger
+from Phoenix_project.models.registry import ModelRegistry
+from Phoenix_project.api.gateway import APIGateway
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -64,7 +64,7 @@ class EmbeddingClient:
         logger.info(f"Generating {len(texts)} embeddings using model '{model_id}'...")
 
         # The API gateway should ideally handle the actual batching logic
-        # if the underlying API provider (e.gen., OpenAI) supports it.
+        # if the underlying API provider (e.g., OpenAI) supports it.
         # Here, we assume the gateway's `send_embedding_request`
         # can take a list of texts.
 
