@@ -10,32 +10,32 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 # (核心组件)
-from cognitive.engine import CognitiveEngine
-from cognitive.portfolio_constructor import PortfolioConstructor
-from core.pipeline_state import PipelineState
-from core.schemas.data_schema import Order, PortfolioState
+from Phoenix_project.cognitive.engine import CognitiveEngine
+from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.data_schema import Order, PortfolioState
 
 # FIX (E6): 从 signal_protocol 导入 (不存在的) StrategySignal
 # 我们将在 signal_protocol.py 中添加一个占位符
-from execution.signal_protocol import StrategySignal 
+from Phoenix_project.execution.signal_protocol import StrategySignal 
 
 # (AI/RAG 组件 - 用于初始化)
-from ai.retriever import Retriever
-from ai.ensemble_client import EnsembleClient
-from ai.metacognitive_agent import MetacognitiveAgent
-from ai.reasoning_ensemble import ReasoningEnsemble
-from evaluation.arbitrator import Arbitrator
-from evaluation.fact_checker import FactChecker
-from ai.prompt_manager import PromptManager
-from api.gateway import IAPIGateway
-from api.gemini_pool_manager import GeminiPoolManager
-from memory.vector_store import VectorStore
-from memory.cot_database import CoTDatabase
-from config.loader import ConfigLoader
-from sizing.base import IPositionSizer
-from sizing.fixed_fraction import FixedFractionSizer # 示例
+from Phoenix_project.ai.retriever import Retriever
+from Phoenix_project.ai.ensemble_client import EnsembleClient
+from Phoenix_project.ai.metacognitive_agent import MetacognitiveAgent
+from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
+from Phoenix_project.evaluation.arbitrator import Arbitrator
+from Phoenix_project.evaluation.fact_checker import FactChecker
+from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.api.gateway import IAPIGateway
+from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
+from Phoenix_project.memory.vector_store import VectorStore
+from Phoenix_project.memory.cot_database import CoTDatabase
+from Phoenix_project.config.loader import ConfigLoader
+from Phoenix_project.sizing.base import IPositionSizer
+from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # 示例
 
-from monitor.logging import get_logger
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
