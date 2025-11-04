@@ -1,28 +1,62 @@
 # tests/test_ai_validation.py
-# 修复：[FIX-11] 整个文件被注释掉，
-# 因为它测试的模块 'ai/validation.py' 已不存在。
-# 在 'ai/validation.py' 被恢复或重构之前，此测试无效。
-"""
 import pytest
 from pydantic import ValidationError
-# 错误：'ai.validation' 模块不存在
-from ai.validation import AssetAnalysisModel
 
-# --- AssetAnalysisModel Tests ---
+# --- [修复] ---
+# 修复：将 'core.schemas.evidence_schema' 转换为 'Phoenix_project.core.schemas.evidence_schema'
+from Phoenix_project.core.schemas.evidence_schema import Evidence, MarketImpactAssessment
+# --- [修复结束] ---
 
-def test_asset_analysis_valid():
-    data = {"ticker": "TEST", "adjustment_factor": 1.1, "confidence": 0.8, "reasoning": "Solid", "evidence": []}
-    model = AssetAnalysisModel.model_validate(data)
-    assert model.adjustment_factor == 1.1
-    assert model.confidence == 0.8
 
-@pytest.mark.parametrize("invalid_data", [
-    {"ticker": "TEST", "adjustment_factor": 5.0, "confidence": 0.8, "reasoning": "Factor too high", "evidence": []},
-    {"ticker": "TEST", "adjustment_factor": 1.0, "confidence": -0.5, "reasoning": "Confidence too low", "evidence": []},
-    {"ticker": "TEST", "confidence": 0.8, "reasoning": "Missing factor", "evidence": []},
-    {"ticker": "TEST", "adjustment_factor": 1.1, "confidence": "high", "reasoning": "Wrong type", "evidence": []},
-])
-def test_asset_analysis_invalid(invalid_data):
+def test_evidence_schema_valid():
+    """Tests that a valid Evidence object passes validation."""
+    data = {
+        "source": "test_source",
+        "content": "Test content",
+        "timestamp": "2023-01-01T12:00:00Z",
+        "confidence": 0.8,
+        "assessment": {
+            "direction": "UP",
+            "magnitude": "HIGH",
+            "confidence": 0.7,
+            "rationale": "Because tests said so."
+        }
+    }
+    try:
+        evidence = Evidence(**data)
+        assert evidence.source == "test_source"
+        assert evidence.assessment.direction == "UP"
+    except ValidationError as e:
+        pytest.fail(f"Valid data failed validation: {e}")
+
+def test_evidence_schema_invalid_direction():
+    """Tests that an invalid direction fails validation."""
+    data = {
+        "source": "test_source",
+        "content": "Test content",
+        "timestamp": "2023-01-01T12:00:00Z",
+        "confidence": 0.8,
+        "assessment": {
+            "direction": "INVALID_DIRECTION", # Invalid
+            "magnitude": "HIGH",
+            "confidence": 0.7
+        }
+    }
     with pytest.raises(ValidationError):
-        AssetAnalysisModel.model_validate(invalid_data)
-"""
+        Evidence(**data)
+
+def test_evidence_schema_invalid_confidence():
+    """Tests that an out-of-range confidence fails validation."""
+    data = {
+        "source": "test_source",
+        "content": "Test content",
+        "timestamp": "2023-01-01T12:00:00Z",
+        "confidence": 1.5, # Invalid (must be <= 1.0)
+        "assessment": {
+            "direction": "DOWN",
+            "magnitude": "LOW",
+            "confidence": 0.5
+        }
+    }
+    with pytest.raises(ValidationError):
+        Evidence(**data)
