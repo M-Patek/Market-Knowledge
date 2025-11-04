@@ -5,10 +5,10 @@ Responsible for "Capital Adjustment."
 """
 from typing import Any
 
-from agents.l3.base import BaseL3Agent
-from core.pipeline_state import PipelineState
-from core.schemas.fusion_result import FusionResult
-from core.schemas.risk_schema import RiskAdjustment
+from Phoenix_project.agents.l3.base import BaseL3Agent
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.fusion_result import FusionResult
+from Phoenix_project.core.schemas.risk_schema import RiskAdjustment
 
 class RiskAgent(BaseL3Agent):
     """
