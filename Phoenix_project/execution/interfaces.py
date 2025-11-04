@@ -7,7 +7,8 @@ from datetime import datetime
 
 # FIX (E4): 从此文件移除 Order, Fill, OrderStatus 的Pydantic定义。
 # 它们现在是核心模式的一部分，并从 data_schema 导入。
-from core.schemas.data_schema import Order, Fill, OrderStatus
+# 修正：将 'core.schemas...' 转换为 'Phoenix_project.core.schemas...'
+from Phoenix_project.core.schemas.data_schema import Order, Fill, OrderStatus
 
 # 定义回调函数类型
 FillCallback = Callable[[Fill], None]
