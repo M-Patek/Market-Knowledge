@@ -6,10 +6,13 @@ from typing import Dict, Any, List
 import pandas as pd
 from datetime import datetime
 
-from config.loader import ConfigLoader
+# 修正：将 'config.loader' 转换为 'Phoenix_project.config.loader'
+from Phoenix_project.config.loader import ConfigLoader
 # FIX (E8): 导入 BacktestingEngine (原为 TrainingEngine)
-from training.engine import BacktestingEngine 
-from optimizer import Optimizer # (假设的优化器类)
+# 修正：将 'training.engine' 转换为 'Phoenix_project.training.engine'
+from Phoenix_project.training.engine import BacktestingEngine 
+# 修正：将 'optimizer' 转换为 'Phoenix_project.optimizer'
+from Phoenix_project.optimizer import Optimizer # (假设的优化器类)
 
 class WalkForwardTrainer:
     """
