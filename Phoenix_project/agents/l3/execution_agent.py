@@ -6,11 +6,11 @@ Responsible for "Order Execution."
 from typing import Any, List, Optional
 import uuid
 
-from agents.l3.base import BaseL3Agent
-from core.pipeline_state import PipelineState
-from core.schemas.fusion_result import FusionResult
-from core.schemas.data_schema import Signal, Order, OrderStatus
-from core.schemas.risk_schema import RiskAdjustment
+from Phoenix_project.agents.l3.base import BaseL3Agent
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.fusion_result import FusionResult
+from Phoenix_project.core.schemas.data_schema import Signal, Order, OrderStatus
+from Phoenix_project.core.schemas.risk_schema import RiskAdjustment
 
 class ExecutionAgent(BaseL3Agent):
     """
