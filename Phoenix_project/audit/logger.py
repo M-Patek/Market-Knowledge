@@ -2,8 +2,8 @@ import json
 import aiofiles
 from datetime import datetime
 from typing import Dict, Any, Optional
-from config.loader import ConfigLoader
-from monitor.logging import get_logger as get_system_logger
+from Phoenix_project.config.loader import ConfigLoader
+from Phoenix_project.monitor.logging import get_logger as get_system_logger
 
 system_logger = get_system_logger(__name__)
 
