@@ -5,7 +5,7 @@ AI数据适配器
 from typing import List, Dict, Any, Union
 
 # FIX (E1): 导入统一后的核心模式
-from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
+from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
 
 class AIDataAdapter:
     """
