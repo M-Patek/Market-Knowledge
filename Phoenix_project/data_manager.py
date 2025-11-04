@@ -8,8 +8,8 @@ from datetime import datetime
 import os
 
 # FIX (E1): 导入统一后的核心模式
-from core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
-from config.loader import ConfigLoader
+from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
+from Phoenix_project.config.loader import ConfigLoader
 
 class DataManager:
     """
