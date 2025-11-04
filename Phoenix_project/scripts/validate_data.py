@@ -19,7 +19,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # 修复：现在使用绝对导入
-from core.schemas.data_schema import TickerData, MarketEvent, EconomicEvent
+from Phoenix_project.core.schemas.data_schema import TickerData, MarketEvent, EconomicEvent
 
 # --- 日志设置 ---
 logging.basicConfig(level=logging.INFO,
