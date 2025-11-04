@@ -1,9 +1,9 @@
 from typing import Dict, Any, Optional
 import time
 
-from monitor.logging import ESLogger
-from monitor.metrics import PrometheusMetrics
-from core.pipeline_state import PipelineState
+from Phoenix_project.monitor.logging import ESLogger
+from Phoenix_project.monitor.metrics import PrometheusMetrics
+from Phoenix_project.core.pipeline_state import PipelineState
 
 
 class MetricsCollector:
