@@ -1,8 +1,8 @@
 from typing import List, Dict, Any, Optional
-from ai.embedding_client import EmbeddingClient
-from memory.vector_store import VectorStore
-from memory.cot_database import CoTDatabase
-from monitor.logging import get_logger
+from Phoenix_project.ai.embedding_client import EmbeddingClient
+from Phoenix_project.memory.vector_store import VectorStore
+from Phoenix_project.memory.cot_database import CoTDatabase
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
