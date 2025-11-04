@@ -3,10 +3,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.executors.asyncio import AsyncIOExecutor
 from pytz import utc
-from monitor.logging import get_logger
+from Phoenix_project.monitor.logging import get_logger
 
 if TYPE_CHECKING:
-    from controller.orchestrator import Orchestrator
+    from Phoenix_project.controller.orchestrator import Orchestrator
 
 logger = get_logger(__name__)
 
