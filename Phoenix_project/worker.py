@@ -6,40 +6,40 @@ import os
 from celery import Celery
 
 # (导入所有组件以进行初始化)
-from config.loader import ConfigLoader
-from data_manager import DataManager
-from core.pipeline_state import PipelineState
-from events.event_distributor import EventDistributor
-from events.risk_filter import EventRiskFilter
-from events.stream_processor import StreamProcessor
-from cognitive.engine import CognitiveEngine
-from cognitive.portfolio_constructor import PortfolioConstructor
-from cognitive.risk_manager import RiskManager
-from execution.order_manager import OrderManager
-from execution.trade_lifecycle_manager import TradeLifecycleManager
+from Phoenix_project.config.loader import ConfigLoader
+from Phoenix_project.data_manager import DataManager
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.events.event_distributor import EventDistributor
+from Phoenix_project.events.risk_filter import EventRiskFilter
+from Phoenix_project.events.stream_processor import StreamProcessor
+from Phoenix_project.cognitive.engine import CognitiveEngine
+from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
+from Phoenix_project.cognitive.risk_manager import RiskManager
+from Phoenix_project.execution.order_manager import OrderManager
+from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
 
 # FIX (E6): 导入 AlpacaAdapter (我们将在 adapters.py 中添加它)
-from execution.adapters import SimulatedBrokerAdapter, AlpacaAdapter
-from controller.orchestrator import Orchestrator
-from controller.error_handler import ErrorHandler
-from audit_manager import AuditManager
-from snapshot_manager import SnapshotManager
-from metrics_collector import MetricsCollector
-from monitor.logging import setup_logging, get_logger
+from Phoenix_project.execution.adapters import SimulatedBrokerAdapter, AlpacaAdapter
+from Phoenix_project.controller.orchestrator import Orchestrator
+from Phoenix_project.controller.error_handler import ErrorHandler
+from Phoenix_project.audit_manager import AuditManager
+from Phoenix_project.snapshot_manager import SnapshotManager
+from Phoenix_project.metrics_collector import MetricsCollector
+from Phoenix_project.monitor.logging import setup_logging, get_logger
 
 # (AI/RAG components)
-from ai.retriever import Retriever
-from ai.ensemble_client import EnsembleClient
-from ai.metacognitive_agent import MetacognitiveAgent
-from ai.reasoning_ensemble import ReasoningEnsemble
-from evaluation.arbitrator import Arbitrator
-from evaluation.fact_checker import FactChecker
-from ai.prompt_manager import PromptManager
-from api.gateway import APIGateway
-from api.gemini_pool_manager import GeminiPoolManager
-from memory.vector_store import VectorStore
-from memory.cot_database import CoTDatabase
-from sizing.fixed_fraction import FixedFractionSizer
+from Phoenix_project.ai.retriever import Retriever
+from Phoenix_project.ai.ensemble_client import EnsembleClient
+from Phoenix_project.ai.metacognitive_agent import MetacognitiveAgent
+from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
+from Phoenix_project.evaluation.arbitrator import Arbitrator
+from Phoenix_project.evaluation.fact_checker import FactChecker
+from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.api.gateway import APIGateway
+from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
+from Phoenix_project.memory.vector_store import VectorStore
+from Phoenix_project.memory.cot_database import CoTDatabase
+from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer
 import json
 
 # --- Celery App Setup ---
