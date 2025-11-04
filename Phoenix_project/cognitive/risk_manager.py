@@ -1,7 +1,7 @@
 from typing import List, Dict, Any, Optional
-from core.pipeline_state import PipelineState
-from core.schemas.data_schema import Order, Signal
-from monitor.logging import get_logger
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.data_schema import Order, Signal
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
