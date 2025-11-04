@@ -4,7 +4,7 @@ import numpy as np
 from typing import List, Dict, Any
 
 # 修复：将相对导入 'from .base...' 更改为绝对导入
-from sizing.base import IPositionSizer
+from Phoenix_project.sizing.base import IPositionSizer
 
 class VolatilityParitySizer(IPositionSizer):
     """
