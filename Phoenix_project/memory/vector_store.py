@@ -9,8 +9,10 @@ from abc import ABC, abstractmethod
 # from langchain.text_splitter import RecursiveCharacterTextSplitter
 # For this example, we create a mock interface.
 
-from monitor.logging import ESLogger
-from ai.embedding_client import EmbeddingClient
+# 修正：将 'monitor.logging...' 转换为 'Phoenix_project.monitor.logging...'
+from Phoenix_project.monitor.logging import ESLogger
+# 修正：将 'ai.embedding_client...' 转换为 'Phoenix_project.ai.embedding_client...'
+from Phoenix_project.ai.embedding_client import EmbeddingClient
 
 # Mock Document class
 class Document:
