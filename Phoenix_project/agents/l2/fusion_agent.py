@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from Phoenix_project.agents.l2.base import BaseL2Agent
 from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceType
 from Phoenix_project.core.schemas.fusion_result import FusionResult
 
 class FusionAgent(BaseL2Agent):
