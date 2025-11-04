@@ -79,4 +79,3 @@ class StrategyConfig(BaseModel):
     observability: Observability
     audit: Audit
     data_manager: Optional[Dict[str, Any]] = None # 为 data_manager.cache_dir 添加
-
