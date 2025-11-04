@@ -8,15 +8,15 @@ import json
 import os
 from typing import Dict, Any
 
-from config.loader import ConfigLoader
-from data_manager import DataManager
-from monitor.logging import setup_logging, get_logger
+from Phoenix_project.config.loader import ConfigLoader
+from Phoenix_project.data_manager import DataManager
+from Phoenix_project.monitor.logging import setup_logging, get_logger
 
 # (根据需要导入具体的训练器)
-from training.walk_forward_trainer import WalkForwardTrainer
-from training.drl.multi_agent_trainer import MultiAgentTrainer
-from training.engine import BacktestingEngine # 用于评估
-from training.drl.trading_env import TradingEnv # DRL 环境
+from Phoenix_project.training.walk_forward_trainer import WalkForwardTrainer
+from Phoenix_project.training.drl.multi_agent_trainer import MultiAgentTrainer
+from Phoenix_project.training.engine import BacktestingEngine # 用于评估
+from Phoenix_project.training.drl.trading_env import TradingEnv # DRL 环境
 
 def load_data_catalog(config_loader: ConfigLoader) -> Dict[str, Any]:
     """
