@@ -1,10 +1,10 @@
 import asyncio
 from typing import Dict, Any, List
 
-from monitor.logging import ESLogger
-from core.pipeline_state import PipelineState
-from knowledge_graph_service import KnowledgeGraphService
-from ai.relation_extractor import RelationExtractor
+from Phoenix_project.monitor.logging import ESLogger
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.knowledge_graph_service import KnowledgeGraphService
+from Phoenix_project.ai.relation_extractor import RelationExtractor
 
 
 class KnowledgeInjector:
