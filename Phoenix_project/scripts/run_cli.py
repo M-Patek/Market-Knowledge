@@ -24,9 +24,9 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # 修复：现在使用绝对导入
-from controller.orchestrator import Orchestrator
-from worker import build_orchestrator
-from core.schemas.data_schema import MarketEvent
+from Phoenix_project.controller.orchestrator import Orchestrator
+from Phoenix_project.worker import build_orchestrator
+from Phoenix_project.core.schemas.data_schema import MarketEvent
 
 # --- 日志设置 ---
 logging.basicConfig(level=logging.INFO,
