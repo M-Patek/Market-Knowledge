@@ -10,24 +10,19 @@ services:
     volumes:
       - redis_data:/data
 
-  # FIX 1: 取消注释数据库服务
   # (可选: PostgreSQL - 用于表格 RAG)
   postgres_db:
     image: postgres:15-alpine
     container_name: phoenix_postgres
     environment:
-      # FIX 2: 使配置与 system.yaml 匹配
       POSTGRES_USER: phoenix_user
       POSTGRES_DB: phoenix_tabular
-      # FIX 3: 为数据库设置密码。
-      # 这个密码将通过下面的 worker/api 环境变量传递给应用程序
       POSTGRES_PASSWORD: "changeme_in_prod" 
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  # FIX 1: 取消注释数据库服务
   # (可选: Elasticsearch - 用于时序 RAG)
   elasticsearch:
     image: elasticsearch:8.6.2
@@ -41,6 +36,54 @@ services:
     volumes:
       - elastic_data:/usr/share/elasticsearch/data
 
+  # --- 新增的基础设施服务 ---
+
+  # 1. Neo4j (图数据库)
+  # (基于 requirements.txt 中的 'neo4j' 依赖)
+  neo4j:
+    image: neo4j:5-community
+    container_name: phoenix_neo4j
+    ports:
+      - "7474:7474" # HTTP
+      - "7687:7687" # Bolt
+    environment:
+      # 设置默认密码为 "password"
+      NEO4J_AUTH: neo4j/password
+    volumes:
+      - neo4j_data:/data
+
+  # 2. Zookeeper (Kafka 依赖)
+  # (基于 requirements.txt 中的 'kafka-python' 依赖)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.1
+    container_name: phoenix_zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  # 3. Kafka (事件流)
+  kafka:
+    image: confluentinc/cp-kafka:7.0.1
+    container_name: phoenix_kafka
+    depends_on:
+      - zookeeper
+    ports:
+      # 暴露 9092 以便从主机访问
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # 配置监听器以允许容器间 (kafka:29092) 和主机 (localhost:9092) 访问
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+  # --- 应用程序服务 ---
+
   worker:
     build:
       context: .
@@ -48,24 +91,22 @@ services:
     container_name: phoenix_worker
     depends_on:
       - redis
-      - postgres_db # 添加依赖
-      - elasticsearch # 添加依赖
-    # FIX 3: 注入环境变量
-    # env_file 用于加载 .env 中的 API 密钥 (例如 GEMINI_PRO_KEY)
+      - postgres_db 
+      - elasticsearch
+      - neo4j # <-- 已添加依赖
+      - kafka # <-- 已添加依赖
     env_file:
       - ./.env
-    # environment 用于传递此 compose 文件中定义的服务凭证
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - PHOENIX_CONFIG_PATH=/app/config
-      # 注入与 postgres_db 服务匹配的密码
       - POSTGRES_PASSWORD=changeme_in_prod 
+      # (应用程序需要知道如何连接到新服务)
+      - NEO4J_URI=bolt://neo4j:7687
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
     volumes:
       - .:/app
-    # (如果需要实时券商，取消注释)
-    # deploy:
-    #   restart: always
 
   api:
     build:
@@ -74,25 +115,26 @@ services:
     container_name: phoenix_api
     depends_on:
       - redis
-      - postgres_db # 添加依赖
-      - elasticsearch # 添加依赖
+      - postgres_db
+      - elasticsearch
+      - neo4j # <-- 已添加依赖
+      - kafka # <-- 已添加依赖
     ports:
       - "8000:8000"
-    # FIX 3: 注入环境变量
     env_file:
       - ./.env
     environment:
       - PHOENIX_CONFIG_PATH=/app/config
-      # 注入与 postgres_db 服务匹配的密码
       - POSTGRES_PASSWORD=changeme_in_prod
+      # (应用程序需要知道如何连接到新服务)
+      - NEO4J_URI=bolt://neo4j:7687
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
     volumes:
       - .:/app
-    
-    # FIX (E9): 修复 API 入口点
-    # command: gunicorn -w 4 -b 0.0.0.0:8000 api.gateway:app
     command: gunicorn -w 4 -b 0.0.0.0:8000 interfaces.api_server:app
 
 volumes:
   redis_data:
   postgres_data:
   elastic_data:
+  neo4j_data: # <-- 已添加卷
