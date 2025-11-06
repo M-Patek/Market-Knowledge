@@ -7,24 +7,17 @@ and validate each entry against the Pydantic schemas.
 This is crucial for ensuring data quality before ingesting a large
 dataset into the vector or temporal databases.
 """
-import sys
-import os
 import argparse
 import logging
 import json
 import pandas as pd
 from pydantic import ValidationError
-
-# 修复：将项目根目录 (Phoenix_project) 添加到 sys.path
-# 这允许脚本以 'python scripts/validate_dataset.py' 的方式运行
-# 并正确解析 'from ai...' 或 'from core...'
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+import os # 保留 os 用于 os.path.exists
 
 # 修复：现在使用绝对导入
 from Phoenix_project.ai.data_adapter import DataAdapter
-from Phoenix_project.core.schemas.data_schema import MarketEvent, TickerData
+# 修复 (第 4 阶段): 将 TickerData 重命名为 MarketData
+from Phoenix_project.core.schemas.data_schema import NewsData, MarketData
 
 # --- 日志设置 ---
 logging.basicConfig(level=logging.INFO,
@@ -37,7 +30,7 @@ def validate_dataset_file(file_path: str, data_type: str):
 
     Args:
         file_path (str): Path to the .jsonl or .csv file.
-        data_type (str): The type of data to validate ('market_event' or 'ticker_data').
+        data_type (str): The type of data to validate ('news_data' or 'market_data').
     """
     if not os.path.exists(file_path):
         logger.error(f"File not found: {file_path}")
@@ -47,12 +40,16 @@ def validate_dataset_file(file_path: str, data_type: str):
     logger.info(f"Expected data type: {data_type}")
 
     # 确定 Pydantic schema
-    if data_type == 'market_event':
-        schema_class = MarketEvent
-    elif data_type == 'ticker_data':
-        schema_class = TickerData
+    # 修复 (第 3 阶段): 将 'market_event' 更改为 'news_data'
+    if data_type == 'news_data':
+        schema_class = NewsData
+    # 修复 (第 4 阶段): 将 'ticker_data' 更改为 'market_data'
+    elif data_type == 'market_data':
+        # 修复 (第 4 阶段): 将 TickerData 更改为 MarketData
+        schema_class = MarketData
     else:
-        logger.error(f"Unknown data type: {data_type}. Must be 'market_event' or 'ticker_data'.")
+        # 修复 (第 4 阶段): 更新错误消息
+        logger.error(f"Unknown data type: {data_type}. Must be 'news_data' or 'market_data'.")
         return
 
     # DataAdapter 用于将原始字典转换为标准化的 schema
@@ -126,7 +123,8 @@ def main():
     parser.add_argument("-t", "--type", 
                         type=str, 
                         required=True, 
-                        choices=['market_event', 'ticker_data'],
+                        # 修复 (第 4 阶段): 更新 choices
+                        choices=['news_data', 'market_data'],
                         help="The type of data in the file.")
 
     args = parser.parse_args()
