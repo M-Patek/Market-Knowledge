@@ -1,10 +1,14 @@
 import yaml
 import os
 from typing import Dict, Any, Optional
-import logging
+# import logging # <-- 已替换
+from Phoenix_project.monitor.logging import get_logger # <-- 已添加
 
 # 使用标准 logging，因为 monitor.logging 可能尚未配置
-logger = logging.getLogger("PhoenixProject.ConfigLoader")
+# logger = logging.getLogger("PhoenixProject.ConfigLoader") # <-- 已替换
+# 使用统一的 get_logger，它能处理早期初始化问题
+logger = get_logger("PhoenixProject.ConfigLoader")
+
 
 def load_config(config_path: str) -> Optional[Dict[str, Any]]:
     """
