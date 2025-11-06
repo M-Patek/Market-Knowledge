@@ -145,16 +145,79 @@ class SimulatedBrokerAdapter(IBrokerAdapter):
 
 
 # FIX (E6): 移除了 AlpacaAdapter 的导入，添加一个占位符
-class LiveBrokerAdapter(IBrokerAdapter):
+# [任务 3 实现]：用 AlpacaAdapter 替换占位符 LiveBrokerAdapter
+class AlpacaAdapter(IBrokerAdapter):
     """
-    (占位符) 真实券商 (如 Alpaca) 的适配器。
+    [任务 3 实现]
+    (原占位符 LiveBrokerAdapter)
+    真实券商 (如 Alpaca) 的适配器。
     """
     def __init__(self, api_key: str, api_secret: str, base_url: str):
-        raise NotImplementedError("LiveBrokerAdapter is not implemented")
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url
+        self.api = None # 用于 Alpaca API 客户端
+        self.log_prefix = "AlpacaAdapter:"
+        print(f"{self.log_prefix} Initialized (API connection pending).")
 
     def connect(self) -> None:
-        raise NotImplementedError
-    
-    # ... (实现所有 IBrokerAdapter 方法) ...
+        print(f"{self.log_prefix} connect() called (pending implementation).")
+        # 真实实现：
+        # try:
+        #     self.api = tradeapi.REST(self.api_key, self.api_secret, self.base_url)
+        #     account = self.api.get_account()
+        #     print(f"{self.log_prefix} Connection successful. Account: {account.account_number}")
+        # except Exception as e:
+        #     print(f"{self.log_prefix} Connection failed: {e}")
+        #     raise
+        raise NotImplementedError("Alpaca integration pending")
 
-}
+    def disconnect(self) -> None:
+        print(f"{self.log_prefix} disconnect() called.")
+        # Alpaca REST 通常不需要显式断开
+        self.api = None
+
+    def subscribe_fills(self, callback: FillCallback) -> None:
+        print(f"{self.log_prefix} subscribe_fills() called (pending implementation - requires websocket).")
+        raise NotImplementedError("Alpaca integration pending")
+
+    def subscribe_order_status(self, callback: OrderStatusCallback) -> None:
+        print(f"{self.log_prefix} subscribe_order_status() called (pending implementation - requires websocket).")
+        raise NotImplementedError("Alpaca integration pending")
+
+    def place_order(self, order: Order) -> str:
+        print(f"{self.log_prefix} place_order() called for {order.symbol} (pending implementation).")
+        # 真实实现：
+        # try:
+        #     alpaca_order = self.api.submit_order(...)
+        #     return alpaca_order.id
+        # except Exception as e:
+        #     ...
+        raise NotImplementedError("Alpaca integration pending")
+
+    def cancel_order(self, order_id: str) -> bool:
+        print(f"{self.log_prefix} cancel_order() called for {order_id} (pending implementation).")
+        raise NotImplementedError("Alpaca integration pending")
+
+    def get_order_status(self, order_id: str) -> Optional[Order]:
+        print(f"{self.log_prefix} get_order_status() called for {order_id} (pending implementation).")
+        raise NotImplementedError("Alpaca integration pending")
+
+    def get_all_open_orders(self) -> List[Order]:
+        print(f"{self.log_prefix} get_all_open_orders() called (pending implementation).")
+        raise NotImplementedError("Alpaca integration pending")
+
+    def get_portfolio_value(self) -> float:
+        # 真实实现： self.api.get_account().portfolio_value
+        print(f"{self.log_prefix} get_portfolio_value() called (pending implementation).")
+        raise NotImplementedError("Alpaca integration pending")
+
+    def get_cash_balance(self) -> float:
+        # 真实实现： self.api.get_account().cash
+        print(f"{self.log_prefix} get_cash_balance() called (pending implementation).")
+        raise NotImplementedError("Alpaca integration pending")
+
+    def get_position(self, symbol: str) -> float:
+        # 真实实现： self.api.get_position(symbol).qty
+        print(f"{self.log_prefix} get_position() called for {symbol} (pending implementation).")
+        raise NotImplementedError("Alpaca integration pending")
