@@ -9,24 +9,17 @@ This script allows for:
 Run from the root 'Phoenix_project' directory:
 $ python scripts/run_cli.py --help
 """
-import sys
-import os
 import asyncio
 import logging
 import argparse
+import sys # 修复：重新添加 sys 用于 sys.exit
 from typing import Optional
-
-# 修复：将项目根目录 (Phoenix_project) 添加到 sys.path
-# 这允许脚本以 'python scripts/run_cli.py' 的方式运行
-# 并正确解析 'from controller...' 或 'from core...'
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
 
 # 修复：现在使用绝对导入
 from Phoenix_project.controller.orchestrator import Orchestrator
 from Phoenix_project.worker import build_orchestrator
-from Phoenix_project.core.schemas.data_schema import MarketEvent
+# 修复 (第 3 阶段): 将 MarketEvent 重命名为 NewsData
+from Phoenix_project.core.schemas.data_schema import NewsData
 
 # --- 日志设置 ---
 logging.basicConfig(level=logging.INFO,
@@ -62,11 +55,13 @@ async def trigger_scheduled_task(task_name: str):
     except Exception as e:
         logger.error(f"Error running task '{task_name}': {e}", exc_info=True)
 
-async def inject_market_event(content: str, source: str):
+# 修复 (第 3 阶段): 重命名函数以匹配 NewsData
+async def inject_news_data(content: str, source: str):
     """
-    Injects a new MarketEvent into the system.
+    Injects a new NewsData event into the system.
     """
-    logger.info(f"Injecting manual market event from '{source}'")
+    # 修复 (第 3 阶段): 更新日志消息
+    logger.info(f"Injecting manual news event from '{source}'")
     orchestrator = get_orchestrator()
 
     # 1. 创建事件对象
@@ -81,7 +76,8 @@ async def inject_market_event(content: str, source: str):
         # (假设 orchestrator.data_manager 有一个 adapter)
         # 为了简单起见，我们直接创建它
         from datetime import datetime
-        event = MarketEvent(
+        # 修复 (第 3 阶段): 实例化 NewsData 而不是 MarketEvent
+        event = NewsData(
             id=f"cli-{datetime.utcnow().timestamp()}",
             source=source,
             timestamp=datetime.utcnow(),
@@ -90,7 +86,8 @@ async def inject_market_event(content: str, source: str):
         )
         logger.info(f"Created event: {event.id}")
     except Exception as e:
-        logger.error(f"Failed to create MarketEvent object: {e}", exc_info=True)
+        # F修复 (第 3 阶段): 更新错误消息
+        logger.error(f"Failed to create NewsData object: {e}", exc_info=True)
         return
 
     # 2. 触发工作流
@@ -113,7 +110,8 @@ def main():
                                 help="The name of the task to trigger (e.g., 'daily_market_analysis')")
     
     # 'inject' 命令
-    inject_parser = subparsers.add_parser("inject", help="Inject a manual market event")
+    # 修复 (第 3 阶段): 更新帮助文本
+    inject_parser = subparsers.add_parser("inject", help="Inject a manual news event")
     inject_parser.add_argument("-s", "--source", 
                                type=str, 
                                default="cli_manual", 
@@ -132,7 +130,8 @@ def main():
     if args.command == "trigger":
         loop.run_until_complete(trigger_scheduled_task(args.task_name))
     elif args.command == "inject":
-        loop.run_until_complete(inject_market_event(args.content, args.source))
+        # 修复 (第 3 阶段): 调用重命名后的函数
+        loop.run_until_complete(inject_news_data(args.content, args.source))
     elif args.command == "status":
         logger.info("System status check is not yet implemented.")
     else:
