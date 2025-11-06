@@ -1,17 +1,8 @@
 # tests/conftest.py
 import pytest
-import os
-import sys
 from unittest.mock import MagicMock
 
-# --- [修复] ---
-# 修复：将项目根目录 (Phoenix_project) 添加到 sys.path
-# 这允许测试以 'pytest' 的方式运行
-# 并正确解析 'from controller...' 或 'from core...'
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-# --- [修复结束] ---
+# 修复 (第 3 阶段): 此文件没有引用 MarketEvent，因此无需更改。
 
 # Fixtures for AI components
 @pytest.fixture
