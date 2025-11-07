@@ -130,9 +130,11 @@ class Orchestrator:
                 return
 
             # 5. 投资组合构建 (Portfolio Construction)
+            # [主人喵的修复] 获取一次当前状态，供后续步骤使用
+            current_portfolio_state = self.trade_lifecycle_manager.get_current_portfolio_state()
             target_portfolio = self.portfolio_constructor.construct(
                 fusion_result,
-                self.trade_lifecycle_manager.get_current_portfolio_state()
+                current_portfolio_state
             )
 
             # 6. 风险管理 (Risk Management)
@@ -141,15 +143,35 @@ class Orchestrator:
                 self.pipeline_state
             )
             
+            # --- [主人喵的修复] 解决数据依赖缺陷：在执行前获取所有最新价格 ---
+            
+            # 收集所有相关符号
+            current_symbols = set(current_portfolio_state.positions.keys())
+            target_symbols = {p.symbol for p in final_portfolio.positions}
+            all_symbols = current_symbols.union(target_symbols)
+            
+            market_prices: Dict[str, float] = {}
+            for symbol in all_symbols:
+                # 假设 data_manager 能获取到最新的 L1 数据
+                market_data = self.data_manager.get_latest_market_data(symbol)
+                if market_data and market_data.close > 0:
+                    market_prices[symbol] = market_data.close
+                else:
+                    logger.warning(f"Orchestrator: Could not retrieve latest market price for {symbol}.")
+            # --- 结束修复 ---
+
             # 7. 执行 (Execution)
             # (FIX E3)
+            # [主人喵的修复] 传入 market_prices
             orders = self.order_manager.generate_orders(
-                self.trade_lifecycle_manager.get_current_portfolio_state(),
-                final_portfolio
+                current_portfolio_state,
+                final_portfolio,
+                market_prices
             )
             
             # (FIX E4)
-            executed_trades = self.order_manager.execute_orders(orders)
+            # [主人喵的修复] 传入 market_prices
+            executed_trades = self.order_manager.execute_orders(orders, market_prices)
 
             # 8. 状态更新 (TLM)
             self.trade_lifecycle_manager.update_portfolio(executed_trades)
