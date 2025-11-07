@@ -13,27 +13,24 @@ from Phoenix_project.monitor.logging import ESLogger
 
 class CoTDatabase:
     """
-    A simple filesystem-based database to store the Chain-of-Thought (CoT)
-    reasoning traces (FusionResult objects) for auditing and analysis.
-
-    In a production system, this would be replaced by a robust database
-    (e.g., MongoDB, BigQuery, or a dedicated audit store).
+    一个简单的基于文件系统的数据库，用于存储思维链 (CoT)
+    推理轨迹 (FusionResult 对象) 以供审计和分析。
     """
 
     def __init__(self, config: Dict[str, Any], logger: ESLogger):
         """
-        Initializes the CoTDatabase.
+        初始化 CoTDatabase。
 
         Args:
-            config: A dictionary containing configuration,
-                    specifically `db_path`.
-            logger: An instance of ESLogger for logging.
+            config: 包含配置的字典，
+                    特别是 `db_path`。
+            logger: ESLogger 实例，用于日志记录。
         """
         self.db_path = config.get("db_path", "./audit_traces")
         self.logger = logger
-        self.lock = asyncio.Lock()
+        self.lock = asyncio.Lock() # 用于 get_all_keys 的锁
 
-        # Ensure the database directory exists
+        # 确保数据库目录存在
         try:
             os.makedirs(self.db_path, exist_ok=True)
             self.logger.log_info(
@@ -47,8 +44,8 @@ class CoTDatabase:
             raise
 
     def _get_filepath(self, event_id: str) -> str:
-        """Helper to get the file path for a given event ID."""
-        # Sanitize event_id to prevent path traversal issues
+        """帮助程序：获取给定事件 ID 的文件路径。"""
+        # 清理 event_id 以防止路径遍历问题
         filename = "".join(c for c in event_id if c.isalnum() or c in ("-", "_", "."))
         if not filename:
             filename = f"invalid_event_id_{hash(event_id)}"
@@ -58,14 +55,14 @@ class CoTDatabase:
         self, event_id: str, trace_data: Dict[str, Any]
     ) -> bool:
         """
-        Stores the full reasoning trace (FusionResult) for a given event.
+        存储给定事件的完整推理轨迹 (FusionResult)。
 
         Args:
-            event_id: The unique identifier for the event.
-            trace_data: The FusionResult object (as a dictionary).
+            event_id: 事件的唯一标识符。
+            trace_data: FusionResult 对象 (作为字典)。
 
         Returns:
-            True if storage was successful, False otherwise.
+            如果存储成功，则为 True，否则为 False。
         """
         if not event_id:
             self.logger.log_warning("store_trace called with empty event_id. Skipping.")
@@ -75,10 +72,11 @@ class CoTDatabase:
         self.logger.log_debug(f"Storing trace for event {event_id} to {filepath}")
 
         try:
-            async with self.lock:
-                async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
-                    # We serialize the Pydantic model (passed as dict)
-                    await f.write(json.dumps(trace_data, indent=2, default=str))
+            # 在异步环境中，文件写入应该使用锁，
+            # 尽管 aiofiles 可能是线程安全的，但保险起见
+            async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
+                # 我们序列化 Pydantic 模型 (作为 dict 传入)
+                await f.write(json.dumps(trace_data, indent=2, default=str))
             self.logger.log_info(f"Successfully stored trace for event {event_id}.")
             return True
         except Exception as e:
@@ -89,13 +87,13 @@ class CoTDatabase:
 
     async def retrieve_trace(self, event_id: str) -> Optional[Dict[str, Any]]:
         """
-        Retrieves the reasoning trace for a specific event ID.
+        检索特定事件 ID 的推理轨迹。
 
         Args:
-            event_id: The unique identifier for the event.
+            event_id: 事件的唯一标识符。
 
         Returns:
-            The stored trace dictionary if found, otherwise None.
+            如果找到，则为存储的轨迹字典，否则为 None。
         """
         filepath = self._get_filepath(event_id)
         self.logger.log_debug(f"Retrieving trace for event {event_id} from {filepath}")
@@ -115,14 +113,58 @@ class CoTDatabase:
             )
             return None
 
-    # --- Methods for AuditViewer (Inefficient examples) ---
+    async def search_traces(self, keywords: List[str], limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        [已优化]
+        在所有存储的轨迹中搜索关键字。
+        警告：这是一个非常低效的 O(N) 文件系统扫描。
+        不适用于生产环境，但实现了所请求的功能。
+        """
+        self.logger.log_debug(f"Searching traces for keywords: {keywords} (limit {limit})")
+        if not keywords:
+            return []
+            
+        all_keys = await self.get_all_keys()
+        matches = []
+        keywords_lower = [k.lower() for k in keywords]
+        
+        # (并行读取文件以提高速度)
+        async def check_file(key):
+            try:
+                trace = await self.retrieve_trace(key)
+                if not trace:
+                    return None
+                
+                # 将整个 JSON 转换为小写字符串进行搜索
+                content_to_search = json.dumps(trace).lower()
+                
+                # 如果任何关键字匹配，则返回轨迹
+                if any(k in content_to_search for k in keywords_lower):
+                    return trace
+            except Exception as e:
+                self.logger.log_warning(f"Failed to search trace {key}: {e}")
+            return None
+
+        tasks = [check_file(key) for key in all_keys]
+        results = await asyncio.gather(*tasks)
+        
+        for trace in results:
+            if trace:
+                matches.append(trace)
+                if len(matches) >= limit:
+                    break
+                    
+        self.logger.log_info(f"Inefficient search_traces found {len(matches)} matches.")
+        
+        # (理想情况下，我们应该按相关性或日期排序，但目前只返回找到的前 N 个)
+        return matches
 
     async def query_by_time(
         self, start_time: datetime, end_time: datetime, limit: int
     ) -> List[Dict[str, Any]]:
         """
-        Inefficiently queries traces by time.
-        WARNING: This is a placeholder. It scales poorly.
+        按时间低效地查询轨迹。
+        警告：这是一个占位符。它扩展性很差。
         """
         self.logger.log_warning("query_by_time is highly inefficient on filesystem DB.")
         traces = []
@@ -134,19 +176,19 @@ class CoTDatabase:
             trace = await self.retrieve_trace(event_id)
             if trace and "timestamp" in trace:
                 try:
-                    # Assuming timestamp is in a standard ISO format
+                    # 假设时间戳是标准 ISO 格式
                     ts_str = trace["timestamp"]
-                    # Handle potential timezone info
+                    # 处理潜在的时区信息
                     ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                     
-                    # Make sure times are comparable (e.g., all aware or all naive)
-                    # This is a complex topic, simplified here.
+                    # 确保时间可比较 (例如，都是 aware 或都是 naive)
+                    # 这是一个复杂的主题，这里简化了。
                     if (
                         ts.tzinfo is None
                         and start_time.tzinfo is not None
                         and end_time.tzinfo is not None
                     ):
-                        # A-hoc: assume trace timestamp is UTC if others are
+                        # 临时：假设轨迹时间戳是 UTC (如果其他的是)
                         ts = ts.replace(tzinfo=datetime.timezone.utc)
                     
                     if start_time <= ts <= end_time:
@@ -159,16 +201,21 @@ class CoTDatabase:
 
     async def get_all_keys(self) -> List[str]:
         """
-        Inefficiently gets all event IDs (filenames).
-        WARNING: This is a placeholder.
+        低效地获取所有事件 ID (文件名)。
+        警告：这是一个占位符。
         """
         try:
             async with self.lock:
-                files = [
-                    f.replace(".json", "")
-                    for f in os.listdir(self.db_path)
-                    if f.endswith(".json")
-                ]
+                # (使用 os.listdir 是阻塞的，在异步代码中不好)
+                # (使用 asyncio.to_thread 运行它)
+                def list_dir_sync():
+                    return [
+                        f.replace(".json", "")
+                        for f in os.listdir(self.db_path)
+                        if f.endswith(".json")
+                    ]
+                
+                files = await asyncio.to_thread(list_dir_sync)
             return files
         except Exception as e:
             self.logger.log_error(f"Failed to list all keys in CoTDatabase: {e}")
