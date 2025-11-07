@@ -51,10 +51,14 @@ class FusionAgent(BaseL2Agent):
         target_symbol = task_query_data.get("symbol", "UNKNOWN")
 
         if not evidence_items:
+            # [FIXED] Added missing required fields: target_symbol, uncertainty
+            # Ensured confidence is float
             return FusionResult(
+                target_symbol=target_symbol,
                 final_decision="HOLD",
                 reasoning="No L1 evidence was generated to make a decision.",
-                confidence=Decimal("0.50"),
+                confidence=0.50,
+                uncertainty=0.50, # Mock uncertainty
                 metadata={"synthesis_model": "MockFusionAgent"}
             )
             
@@ -71,10 +75,15 @@ class FusionAgent(BaseL2Agent):
         synthesized_reasoning += f"Evidence Content: {best_evidence.content}\n"
         synthesized_reasoning += f"Final Decision: {mock_decision} with confidence {best_evidence.confidence}."
 
+        # [FIXED] Added missing fields: target_symbol, uncertainty
+        # [FIXED] Corrected item.item_id to item.id
+        # Ensured confidence is float
         return FusionResult(
+            target_symbol=target_symbol,
             final_decision=mock_decision,
             reasoning=synthesized_reasoning,
-            confidence=best_evidence.confidence,
-            supporting_evidence_ids=[item.item_id for item in evidence_items],
+            confidence=float(best_evidence.confidence),
+            uncertainty=float(1.0 - best_evidence.confidence), # Mock uncertainty based on confidence
+            supporting_evidence_ids=[item.id for item in evidence_items],
             metadata={"synthesis_model": "MockFusionAgent", "strongest_agent": best_evidence.agent_id}
         )
