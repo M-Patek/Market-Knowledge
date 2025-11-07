@@ -13,7 +13,7 @@ class AuditManager:
     Coordinates all auditing activities.
     - Generates unique IDs for decisions.
     - Logs events to the persistent AuditLogger (file/db).
-    - Stores Chain-of-Thought (CoT) reasoning in the CoTDatabase (vector db).
+    - Stores Chain-of-Thought (CoT) reasoning in the CoTDatabase.
     """
 
     def __init__(self, audit_logger: AuditLogger, cot_database: CoTDatabase):
@@ -54,19 +54,31 @@ class AuditManager:
 
         # 2. Store the reasoning trace (CoT) in the Vector DB for retrieval
         try:
-            # We store the final *synthesized* reasoning, as it's the
-            # most complete explanation for the action taken.
-            await self.cot_database.add_reasoning_trace(
-                decision_id=decision_id,
-                timestamp=pipeline_state.get_value("current_time"),
-                context=pipeline_state.get_full_context_formatted(), # Assumes this method exists
-                decision=fusion_result.final_decision,
-                reasoning=fusion_result.reasoning,
-                confidence=fusion_result.confidence,
-                metadata={
+            # (FIX) 构建 trace_data 字典以匹配 store_trace
+            trace_data = {
+                "decision_id": decision_id,
+                # (FIX) 调用新添加的 (已修复的) 方法
+                "context": pipeline_state.get_full_context_formatted(),
+                # (FIX) 直接访问属性
+                "timestamp": pipeline_state.current_time.isoformat(),
+                # (FIX) 访问 FusionResult 字段
+                "decision": fusion_result.decision,
+                "reasoning": fusion_result.reasoning,
+                "confidence": float(fusion_result.confidence), # 确保是 float
+                "metadata": {
+                    # (FIX) 使用 get_value 作为安全访问器
                     "cycle_time_ms": pipeline_state.get_value("last_cycle_time_ms"),
-                    "arbitrator_suggestion": pipeline_state.get_value("last_arbitration", {}).get("suggested_decision")
+                    "uncertainty": float(fusion_result.uncertainty),
+                    "supporting_evidence_ids": fusion_result.supporting_evidence_ids,
+                    "conflicting_evidence_ids": fusion_result.conflicting_evidence_ids,
+                    "contributing_agents": [item.agent_id for item in fusion_result.agent_decisions] if fusion_result.agent_decisions else []
                 }
+            }
+            
+            # (FIX) 调用 CoTDatabase 上的正确方法
+            await self.cot_database.store_trace(
+                event_id=decision_id,
+                trace_data=trace_data
             )
         except Exception as e:
             logger.error(f"Failed to store CoT trace in database: {e}", exc_info=True)
@@ -81,6 +93,7 @@ class AuditManager:
     ):
         """Logs a generic event (e.g., error, config change) to the audit trail."""
         if not decision_id and pipeline_state:
+            # (FIX) 使用 get_value 作为安全访问器
             decision_id = pipeline_state.get_value("current_decision_id")
             
         await self.audit_logger.log_event(
@@ -99,6 +112,7 @@ class AuditManager:
     ):
         """Logs a critical error to the audit trail."""
         if not decision_id and pipeline_state:
+            # (FIX) 使用 get_value 作为安全访问器
             decision_id = pipeline_state.get_value("current_decision_id")
 
         await self.audit_logger.log_error(
