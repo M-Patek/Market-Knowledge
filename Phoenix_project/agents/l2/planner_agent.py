@@ -51,14 +51,16 @@ class PlannerAgent(BaseL2Agent):
         }
         return TaskGraph(**graph_dict)
 
-    async def run(self, state: PipelineState, evidence_items: List[Any] = None) -> TaskGraph:
+    # 签名已更新：接受 dependencies=None 以保持一致性
+    async def run(self, state: PipelineState, dependencies: Dict[str, Any] = None) -> TaskGraph:
         """
         分析 PipelineState 中的主任务，并使用 LLM 生成一个
         JSON 格式的多步骤执行图（subgoals 和 dependencies）。
         
         Args:
             state (PipelineState): The current pipeline state, containing the main task.
-            evidence_items (List[Any], optional): Not used by the planner. Defaults to None.
+            dependencies (Dict[str, Any], optional): Not used by the planner, but required
+                                                  for a consistent L2 interface. Defaults to None.
             
         Returns:
             TaskGraph: A Pydantic model defining the subgoals and dependencies.
