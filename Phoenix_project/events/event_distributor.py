@@ -1,114 +1,99 @@
-import asyncio
-from typing import Dict, List, Callable, Coroutine, Any
-from Phoenix_project.core.pipeline_state import PipelineState
+"""
+事件分发器 (Event Distributor)
+
+[主人喵的修复 2]
+这个类现在是一个基于 Redis List 的可靠事件队列。
+- StreamProcessor (生产者) 使用 rpush (publish) 将事件推入列表。
+- Orchestrator (消费者) 使用 lrange/ltrim (get_pending_events) 批量拉取事件。
+这比 Pub/Sub 更适合 Celery worker 的离散工作模式。
+"""
+import redis
+import json
+import os
+from typing import List, Dict, Any
 from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 class EventDistributor:
-    """
-    A simple asynchronous pub/sub event bus.
-    Components can subscribe to events and publish new ones.
-    """
-
-    def __init__(self, pipeline_state: PipelineState):
-        self.pipeline_state = pipeline_state
-        self._subscribers: Dict[str, List[Callable[..., Coroutine]]] = {}
-        self._event_queue = asyncio.Queue()
-        self._worker_task: Optional[asyncio.Task] = None
-        logger.info("EventDistributor initialized.")
-
-    async def _event_worker(self):
-        """Worker task that processes events from the queue."""
-        logger.info("Event worker started.")
-        while True:
-            try:
-                event_name, kwargs = await self._event_queue.get()
-                if event_name == "__STOP__":
-                    logger.info("Event worker received stop signal.")
-                    break
-                    
-                logger.debug(f"Processing event: {event_name}")
-                
-                # Global subscribers
-                if "*" in self._subscribers:
-                    for callback in self._subscribers["*"]:
-                        try:
-                            await callback(event_name, self.pipeline_state, **kwargs)
-                        except Exception as e:
-                            logger.error(f"Error in global subscriber for event {event_name}: {e}", exc_info=True)
-
-                # Specific subscribers
-                if event_name in self._subscribers:
-                    for callback in self._subscribers[event_name]:
-                        try:
-                            await callback(self.pipeline_state, **kwargs)
-                        except Exception as e:
-                            logger.error(f"Error in subscriber for event {event_name}: {e}", exc_info=True)
-                
-                self._event_queue.task_done()
-                
-            except asyncio.CancelledError:
-                logger.info("Event worker cancelled.")
-                break
-            except Exception as e:
-                logger.error(f"Error in event worker loop: {e}", exc_info=True)
-                # Avoid busy-looping
-                await asyncio.sleep(1)
-
-    def start(self):
-        """Starts the event processing worker."""
-        if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._event_worker())
-            logger.info("Event worker task created.")
-        else:
-            logger.warning("Event worker task is already running.")
-
-    async def stop(self):
-        """Stops the event processing worker."""
-        if self._worker_task and not self._worker_task.done():
-            logger.info("Stopping event worker...")
-            await self._event_queue.put(("__STOP__", {}))
-            try:
-                await asyncio.wait_for(self._worker_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("Event worker did not stop gracefully. Cancelling.")
-                self._worker_task.cancel()
-            except asyncio.CancelledError:
-                pass # Expected
-            logger.info("Event worker stopped.")
-        self._worker_task = None
-
-    async def subscribe(self, event_name: str, callback: Callable[..., Coroutine]):
+    
+    def __init__(self):
         """
-        Subscribe a coroutine to a specific event.
-        
-        Callback signature should be:
-        async def my_callback(pipeline_state: PipelineState, **kwargs)
-        
-        For global ("*") subscriptions:
-        async def my_global_callback(event_name: str, pipeline_state: PipelineState, **kwargs)
+        初始化一个指向 Redis 的连接。
         """
-        if not asyncio.iscoroutinefunction(callback):
-            raise ValueError("Event callback must be a coroutine function (async def).")
+        try:
+            self.redis_client = redis.StrictRedis(
+                host=os.environ.get('REDIS_HOST', 'redis'),
+                port=int(os.environ.get('REDIS_PORT', 6379)),
+                db=0,
+                decode_responses=True # <-- 重要：将
+            )
+            self.queue_name = os.environ.get('PHOENIX_EVENT_QUEUE', 'phoenix_events')
+            self.redis_client.ping()
+            logger.info(f"EventDistributor connected to Redis at {self.redis_client.connection_pool.connection_kwargs.get('host')}:{self.redis_client.connection_pool.connection_kwargs.get('port')}")
+        except redis.exceptions.ConnectionError as e:
+            logger.critical(f"EventDistributor failed to connect to Redis: {e}", exc_info=True)
+            self.redis_client = None # 标记为失败
+
+    def publish(self, event_data: Dict[str, Any]) -> bool:
+        """
+        (生产者调用) 将一个新事件发布 (RPUSH) 到事件队列。
+        """
+        if not self.redis_client:
+            logger.error("Cannot publish event, Redis client is not connected.")
+            return False
             
-        if event_name not in self._subscribers:
-            self._subscribers[event_name] = []
-        self._subscribers[event_name].append(callback)
-        logger.info(f"New subscription for event: {event_name}")
+        try:
+            # 将字典序列化为 JSON 字符串
+            event_json = json.dumps(event_data)
+            self.redis_client.rpush(self.queue_name, event_json)
+            logger.debug(f"Published event to '{self.queue_name}': {event_data.get('id', 'N/A')}")
+            return True
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to serialize event data: {e}", exc_info=True)
+            return False
+        except redis.exceptions.RedisError as e:
+            logger.error(f"Failed to publish event to Redis: {e}", exc_info=True)
+            return False
 
-    async def publish(self, event_name: str, **kwargs):
+    def get_pending_events(self, max_events: int = 100) -> List[Dict[str, Any]]:
         """
-        Publish an event to the queue.
-        This method is non-blocking.
-        
-        Args:
-            event_name (str): The name of the event.
-            **kwargs: Arbitrary data to pass to subscribers.
+        (消费者调用) 以非阻塞方式批量获取所有待处理事件（最多 max_events）。
+        这是一个原子操作 (LRANGE + LTRIM)，确保事件不会被重复处理。
         """
-        if self._worker_task is None or self._worker_task.done():
-            logger.warning(f"Event '{event_name}' published, but event worker is not running.")
-            return
+        if not self.redis_client:
+            logger.error("Cannot get events, Redis client is not connected.")
+            return []
             
-        await self._event_queue.put((event_name, kwargs))
-        logger.debug(f"Event '{event_name}' published to queue.")
+        events = []
+        try:
+            # 1. (原子) 获取当前批次的事件...
+            pipe = self.redis_client.pipeline()
+            pipe.lrange(self.queue_name, 0, max_events - 1)
+            # 2. ...并立即从列表中修剪 (trim) 它们。
+            pipe.ltrim(self.queue_name, max_events, -1)
+            
+            results = pipe.execute()
+            
+            event_json_list = results[0] # lrange 的结果
+            
+            if not event_json_list:
+                logger.debug("No pending events found in queue.")
+                return []
+                
+            for event_json in event_json_list:
+                try:
+                    # 反序列化回字典
+                    events.append(json.loads(event_json))
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to deserialize event from queue, discarding: {e}. Data: {event_json[:50]}...")
+            
+            logger.info(f"Retrieved and trimmed {len(events)} events from '{self.queue_name}'.")
+            return events
+
+        except redis.exceptions.RedisError as e:
+            logger.error(f"Failed to get events from Redis: {e}", exc_info=True)
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error in get_pending_events: {e}", exc_info=True)
+            return []
