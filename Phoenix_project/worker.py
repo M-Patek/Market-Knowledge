@@ -5,6 +5,11 @@ Celery Worker
 import os
 from celery import Celery
 
+# --- 蓝图 1：导入 Celery 信号和 Prometheus 客户端 ---
+from celery.signals import worker_process_init
+from prometheus_client import start_http_server
+# --- 结束：蓝图 1 ---
+
 # (导入所有组件以进行初始化)
 from Phoenix_project.config.loader import ConfigLoader
 from Phoenix_project.data_manager import DataManager
@@ -75,6 +80,22 @@ celery_app.conf.update(
 # --- 全局单例 (Global Singleton) ---
 # 避免在每个 Celery 任务中都重新初始化整个应用程序
 orchestrator_instance: Orchestrator = None
+
+# --- 蓝图 1：为 Worker 启动 Prometheus 服务器 ---
+@worker_process_init.connect
+def start_prometheus_server(**kwargs):
+    """
+    在 Celery worker 进程启动时调用。
+    为这个 worker 启动一个专用的 metrics http 服务器。
+    """
+    port = int(os.environ.get('WORKER_METRICS_PORT', 8001))
+    try:
+        start_http_server(port)
+        print(f"Prometheus metrics server for worker started on port {port}")
+    except Exception as e:
+        print(f"Failed to start Prometheus metrics server on port {port}: {e}")
+# --- 结束：蓝图 1 ---
+
 
 def build_orchestrator() -> Orchestrator:
     """
