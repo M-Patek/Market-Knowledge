@@ -18,23 +18,34 @@ class FusionAgent(BaseL2Agent):
     In a real system, this would be a complex LLM call.
     """
     
-    def run(self, state: PipelineState, evidence_items: List[EvidenceItem]) -> FusionResult:
+    # 签名已更新，以匹配 Executor
+    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> FusionResult:
         """
         Synthesizes L1 evidence into a final decision.
         
         Args:
             state (PipelineState): The current state of the analysis pipeline.
-            evidence_items (List[EvidenceItem]): The collected list of outputs from the L1 agents.
+            dependencies (Dict[str, Any]): Outputs from L1 agents. 
+                                         Values are expected to be EvidenceItem.
             
         Returns:
             FusionResult: A unified decision object.
         """
         
-        # This is a mock synthesis logic.
-        # A real implementation would:
-        # 1. Get the main query (e.g., "Analyze NVDA") from the state.
-        # 2. Serialize all 'evidence_items' into a context block.
-        # 3. Use an LLM prompt (like prompts/fusion.json) to synthesize them.
+        # --- 新增逻辑：从 dependencies 提取 evidence_items ---
+        # 假设 L1 依赖项都返回 EvidenceItem
+        evidence_items: List[EvidenceItem] = []
+        for result in dependencies.values():
+            if isinstance(result, EvidenceItem):
+                evidence_items.append(result)
+            elif isinstance(result, list): # 处理 L1 agent 可能返回列表的情况
+                for item in result:
+                    if isinstance(item, EvidenceItem):
+                        evidence_items.append(item)
+        # --- 新增逻辑结束 ---
+        
+
+        # vvvv 现有的核心逻辑保持不变 vvvv
         
         task_query_data = state.get_main_task_query()
         target_symbol = task_query_data.get("symbol", "UNKNOWN")
@@ -47,12 +58,8 @@ class FusionAgent(BaseL2Agent):
                 metadata={"synthesis_model": "MockFusionAgent"}
             )
             
-        # Mock logic: If any L1 agent had high confidence, we'll go with that.
-        # (This is overly simple, but demonstrates the flow)
-        
         best_evidence = max(evidence_items, key=lambda x: x.confidence)
         
-        # A simple mock decision based on the "best" evidence type
         mock_decision = "HOLD"
         if best_evidence.evidence_type == EvidenceType.CATALYST and best_evidence.confidence > 0.8:
             mock_decision = "BUY"
