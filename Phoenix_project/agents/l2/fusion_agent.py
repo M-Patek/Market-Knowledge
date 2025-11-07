@@ -59,7 +59,8 @@ class FusionAgent(BaseL2Agent):
                 reasoning="No L1 evidence was generated to make a decision.",
                 confidence=0.50,
                 uncertainty=0.50, # Mock uncertainty
-                metadata={"synthesis_model": "MockFusionAgent"}
+                metadata={"synthesis_model": "MockFusionAgent"},
+                contributing_agents=[]  # <-- 1. 遵照主人指示：使用空列表以匹配类型
             )
             
         best_evidence = max(evidence_items, key=lambda x: x.confidence)
@@ -85,5 +86,6 @@ class FusionAgent(BaseL2Agent):
             confidence=float(best_evidence.confidence),
             uncertainty=float(1.0 - best_evidence.confidence), # Mock uncertainty based on confidence
             supporting_evidence_ids=[item.id for item in evidence_items],
-            metadata={"synthesis_model": "MockFusionAgent", "strongest_agent": best_evidence.agent_id}
+            metadata={"synthesis_model": "MockFusionAgent", "strongest_agent": best_evidence.agent_id},
+            contributing_agents=[]  # <-- 2. 遵照主人指示：使用空列表以匹配类型
         )
