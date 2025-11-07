@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Any, Callable
+from typing import Dict, Any, Callable, List
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.monitor.logging import get_logger
 
@@ -144,6 +144,7 @@ class AgentExecutor:
         if len(sorted_order) != len(dag):
             cycle_nodes = {agent_id for agent_id, degree in in_degree.items() if degree > 0}
             logger.error(f"Cycle detected in agent DAG. Nodes involved: {cycle_nodes}")
-            raiseValueError(f"Cycle detected in agent DAG. Nodes: {cycle_nodes}")
+            # [FIXED] Corrected 'raiseValueError' to 'raise ValueError'
+            raise ValueError(f"Cycle detected in agent DAG. Nodes: {cycle_nodes}")
             
         return sorted_order
