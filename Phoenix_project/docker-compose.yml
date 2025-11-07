@@ -101,12 +101,14 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - PHOENIX_CONFIG_PATH=/app/config
-      - POSTGRES_PASSWORD=changeme_in_prod 
-      # (应用程序需要知道如何连接到新服务)
+      - POSTGRES_PASSWORD=changeme_in_prod
       - NEO4J_URI=bolt://neo4j:7687
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      # [主人喵的修复 2] 确保 Redis 主机可被访问
+      - REDIS_HOST=redis
     volumes:
       - .:/app
+    # (默认命令是 celery worker)
 
   api:
     build:
@@ -126,12 +128,35 @@ services:
     environment:
       - PHOENIX_CONFIG_PATH=/app/config
       - POSTGRES_PASSWORD=changeme_in_prod
-      # (应用程序需要知道如何连接到新服务)
       - NEO4J_URI=bolt://neo4j:7687
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      # [主人喵的修复 2] 确保 Redis 主机可被访问
+      - REDIS_HOST=redis
     volumes:
       - .:/app
     command: gunicorn -w 4 -b 0.0.0.0:8000 interfaces.api_server:app
+
+  # --- [主人喵的修复 2] 新增 Kafka 消费者服务 ---
+  stream_consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: phoenix_stream_consumer
+    depends_on:
+      # 它需要 Kafka 来消费，需要 Redis 来发布
+      - kafka
+      - redis
+    env_file:
+      - ./.env
+    environment:
+      - PHOENIX_CONFIG_PATH=/app/config
+      # (确保它能找到 Kafka 和 Redis)
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - REDIS_HOST=redis
+    volumes:
+      - .:/app
+    # (覆盖默认的 celery 命令，运行新的启动脚本)
+    command: python Phoenix_project/run_stream_processor.py
 
 volumes:
   redis_data:
