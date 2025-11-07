@@ -107,3 +107,23 @@ tabular_db:
   # 将 'PG_PASSWORD' 更改为 'POSTGRES_PASSWORD' 以匹配 docker-compose.yml
   password_env_var: "POSTGRES_PASSWORD"
   database: "phoenix_tabular"
+
+# 调度器作业配置
+# 遵照主人的指示：
+# 1. 所有 func 键都设置为 "orchestrator.run_main_cycle"
+# 2. 不包含 "orchestrator.schedule_data_ingestion"
+jobs:
+  - id: "main_cycle_every_5_minutes"
+    func: "orchestrator.run_main_cycle"
+    trigger:
+      type: "interval"
+      args:
+        minutes: 5
+  
+  - id: "main_cycle_hourly_at_xx01"
+    func: "orchestrator.run_main_cycle"
+    trigger:
+      type: "cron"
+      args:
+        hour: "*"
+        minute: 1
