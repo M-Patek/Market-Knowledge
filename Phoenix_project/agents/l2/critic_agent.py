@@ -3,7 +3,7 @@ L2 Agent: Critic
 Refactored from evaluation/critic.py.
 Responsible for "Criticism & Fact Check" on L1 EvidenceItems.
 """
-from typing import Any, List
+from typing import Any, List, Dict
 
 from Phoenix_project.agents.l2.base import BaseL2Agent
 from Phoenix_project.core.pipeline_state import PipelineState
@@ -17,20 +17,33 @@ class CriticAgent(BaseL2Agent):
     to critique L1 EvidenceItems.
     """
     
-    def run(self, state: PipelineState, evidence_items: List[EvidenceItem]) -> List[CriticResult]:
+    # 签名已更新：接受 dependencies 而不是 evidence_items
+    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> List[CriticResult]:
         """
         Reviews L1 Agent outputs for logical consistency, factual accuracy,
         and constraint compliance.
         
         Args:
             state (PipelineState): The current state of the analysis pipeline.
-            evidence_items (List[EvidenceItem]): The collected list of outputs
-                                                 from the L1 agents.
+            dependencies (Dict[str, Any]): The dictionary of outputs from dependent tasks
+                                         (expected to contain L1 EvidenceItems).
             
         Returns:
             List[CriticResult]: A list of critique objects, one for each
                                 piece of evidence.
         """
+        
+        # --- 新增逻辑：从 dependencies 提取 evidence_items ---
+        evidence_items: List[EvidenceItem] = []
+        for result in dependencies.values():
+            if isinstance(result, EvidenceItem):
+                evidence_items.append(result)
+            elif isinstance(result, list): # 处理 L1 agent 可能返回列表的情况
+                for item in result:
+                    if isinstance(item, EvidenceItem):
+                        evidence_items.append(item)
+        # --- 新增逻辑结束 ---
+        
         critiques = []
         for item in evidence_items:
             # Format the evidence for critique
