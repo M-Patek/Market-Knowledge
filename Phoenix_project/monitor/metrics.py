@@ -117,5 +117,3 @@ class PrometheusMetrics(IMetricsCollector):
             # 回退到通用 (Histogram)
             metric = self._get_or_create_metric(self.generic_histograms, Histogram, name, tags)
             metric.labels(**tags).observe(value)
-
-# --- 结束：蓝图 1 ---
