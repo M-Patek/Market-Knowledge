@@ -28,10 +28,14 @@ class PipelineState:
         if initial_state:
             self.current_time: datetime = initial_state.get("current_time", datetime.utcnow())
             self.portfolio_state: PortfolioState = initial_state.get("portfolio_state")
+            # (FIX) 存储主任务查询
+            self.main_task_query: Dict[str, Any] = initial_state.get("main_task_query", {})
             # ... 其他状态的恢复
         else:
             self.current_time: datetime = datetime.min
             self.portfolio_state: Optional[PortfolioState] = None
+            # (FIX) 存储主任务查询
+            self.main_task_query: Dict[str, Any] = {"description": "Default state", "symbol": "N/A"}
 
         # 存储历史数据 (用于回溯分析)
         self.market_data_history: deque[MarketData] = deque(maxlen=self.max_history)
@@ -110,3 +114,66 @@ class PipelineState:
         FIX (E10): 替换 test_pipeline_state 中使用的旧方法
         """
         return self.portfolio_state
+
+    # --- FIX: 添加缺失的方法 ---
+
+    def get_value(self, key: str, default: Any = None) -> Any:
+        """
+        (FIX) 实现一个 getter 以兼容 AuditManager。
+        从状态属性中检索值。
+        """
+        if hasattr(self, key):
+            return getattr(self, key)
+        
+        # (FIX) 检查 portfolio_state，因为 audit_manager 可能需要
+        if self.portfolio_state and hasattr(self.portfolio_state, key):
+             return getattr(self.portfolio_state, key)
+             
+        # (FIX) 检查 main_task_query
+        if key == "main_task_query":
+            return self.main_task_query
+
+        logger.warning(f"{self.log_prefix} get_value for '{key}' not found, returning default.")
+        return default
+
+    def get_main_task_query(self) -> Dict[str, Any]:
+        """
+        (FIX) 为 L1/L2 智能体实现缺失的方法。
+        """
+        if not self.main_task_query:
+             logger.warning(f"{self.log_prefix} get_main_task_query returning mock data.")
+             return {
+                "symbol": "AAPL", # Mock default
+                "description": "Analyze default symbol AAPL."
+             }
+        return self.main_task_query
+
+    def get_full_context_formatted(self) -> str:
+        """
+        (FIX) 为 AuditManager 实现缺失的方法。
+        将最近的状态序列化为字符串用于日志记录。
+        """
+        context_str = "--- LATEST CONTEXT ---\n"
+        context_str += f"Current Time: {self.current_time.isoformat()}\n"
+        
+        if self.portfolio_state:
+            context_str += f"Portfolio Value: {self.portfolio_state.total_value}\n"
+            context_str += f"Cash: {self.portfolio_state.cash}\n"
+            context_str += f"Positions: {len(self.portfolio_state.positions)}\n"
+        
+        context_str += "\n--- Recent News (Last 5) ---\n"
+        news_items = list(self.news_history)[-5:]
+        if not news_items:
+            context_str += "No recent news.\n"
+        for news in news_items:
+            headline = news.headline or f"News ({news.source})"
+            context_str += f"[{news.timestamp.isoformat()}] {headline[:80]}...\n"
+            
+        context_str += "\n--- Recent Market Data (Last 5) ---\n"
+        market_items = list(self.market_data_history)[-5:]
+        if not market_items:
+            context_str += "No recent market data.\n"
+        for md in market_items:
+            context_str += f"[{md.timestamp.isoformat()}] {md.symbol}: Close={md.close}, Vol={md.volume}\n"
+            
+        return context_str
