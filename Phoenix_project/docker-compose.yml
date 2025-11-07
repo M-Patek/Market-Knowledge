@@ -108,7 +108,11 @@ services:
       - REDIS_HOST=redis
     volumes:
       - .:/app
-    # (默认命令是 celery worker)
+    # --- [主人喵的修复] ---
+    # 明确指定 Celery worker 命令，而不是使用 Dockerfile 的默认 CMD
+    # (基于 worker.py 中 celery_app 的位置)
+    command: celery -A Phoenix_project.worker.celery_app worker --loglevel=info
+    # --- [修复结束] ---
 
   api:
     build:
