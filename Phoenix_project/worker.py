@@ -9,9 +9,10 @@ from celery import Celery
 from Phoenix_project.config.loader import ConfigLoader
 from Phoenix_project.data_manager import DataManager
 from Phoenix_project.core.pipeline_state import PipelineState
+# [主人喵的修复 2] 导入 EventDistributor
 from Phoenix_project.events.event_distributor import EventDistributor
 from Phoenix_project.events.risk_filter import EventRiskFilter
-from Phoenix_project.events.stream_processor import StreamProcessor
+# [主人喵的修复 2] 移除 StreamProcessor
 from Phoenix_project.cognitive.engine import CognitiveEngine
 from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
 from Phoenix_project.cognitive.risk_manager import RiskManager
@@ -30,7 +31,8 @@ from Phoenix_project.monitor.logging import setup_logging, get_logger
 # (AI/RAG components)
 from Phoenix_project.ai.retriever import Retriever
 from Phoenix_project.ai.ensemble_client import EnsembleClient
-from Phoenix_project.ai.metacognitive_agent import MetacognitiveAgent
+# [主人喵的修复 1] 修复 MetacognitiveAgent 错误的导入路径
+from Phoenix_project.agents.l2.metacognitive_agent import MetacognitiveAgent 
 from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
 from Phoenix_project.evaluation.arbitrator import Arbitrator
 from Phoenix_project.evaluation.fact_checker import FactChecker
@@ -39,7 +41,15 @@ from Phoenix_project.api.gateway import APIGateway
 from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
 from Phoenix_project.memory.vector_store import VectorStore
 from Phoenix_project.memory.cot_database import CoTDatabase
-# from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # <-- [主人喵的修复 2] 不再硬编码
+
+# --- [主人喵的修复 1] 导入 GNN/KG 架构缺失的组件 ---
+from Phoenix_project.ai.embedding_client import EmbeddingClient
+from Phoenix_project.ai.tabular_db_client import TabularDBClient
+from Phoenix_project.ai.temporal_db_client import TemporalDBClient
+from Phoenix_project.ai.relation_extractor import RelationExtractor
+from Phoenix_project.knowledge_graph_service import KnowledgeGraphService
+# --- [修复结束] ---
+
 import json
 
 # --- [主人喵的修复 2] ---
@@ -69,6 +79,8 @@ orchestrator_instance: Orchestrator = None
 def build_orchestrator() -> Orchestrator:
     """
     FIX (E5): 重写此函数以正确初始化 Orchestrator 及其所有依赖项。
+    [主人喵的修复 1] 扩展此函数以包含 GNN/KG 组件。
+    [主人喵的修复 2] 移除 StreamProcessor，添加 EventDistributor。
     """
     
     global orchestrator_instance
@@ -104,8 +116,11 @@ def build_orchestrator() -> Orchestrator:
         snapshot_manager = SnapshotManager(config_loader)
 
         # 4. Event Stream
+        # [主人喵的修复 2] 实例化 EventDistributor (Redis 队列)
+        event_distributor = EventDistributor()
         event_filter = EventRiskFilter(config_loader)
-        stream_processor = StreamProcessor()
+        # [主人喵的修复 2] 移除 StreamProcessor (Kafka) 的实例化
+        # stream_processor = StreamProcessor() # <-- REMOVED
 
         # 5. Execution
         # (E6 Fix - 检查 Alpaca)
@@ -128,9 +143,36 @@ def build_orchestrator() -> Orchestrator:
         gemini_pool = GeminiPoolManager()
         api_gateway = APIGateway(gemini_pool)
         prompt_manager = PromptManager(config_loader.config_path)
+        
+        # --- [主人喵的修复 1] 实例化 GNN/KG 及其依赖项 ---
+        
+        # 6a. 实例化 RAG 依赖项 (DB 客户端, Embedding)
+        embedding_client = EmbeddingClient(config=system_config.get("embedding_models", {}))
+        tabular_client = TabularDBClient(config=system_config.get("postgres_db", {}))
+        temporal_client = TemporalDBClient(config=system_config.get("elasticsearch", {}))
+        
+        # 6b. 实例化图谱构建器 (Extractor)
+        relation_extractor = RelationExtractor(api_gateway, prompt_manager)
+        
+        # 6c. 实例化数据存储 (Vector, CoT, KG)
         vector_store = VectorStore()
         cot_db = CoTDatabase()
-        retriever = Retriever(vector_store, cot_db)
+        knowledge_graph_service = KnowledgeGraphService(
+            tabular_client=tabular_client,
+            temporal_client=temporal_client,
+            relation_extractor=relation_extractor
+        )
+        
+        # 6d. 实例化混合检索器 (Retriever)，注入所有数据源
+        retriever = Retriever(
+            vector_store=vector_store,
+            cot_database=cot_db,
+            embedding_client=embedding_client,
+            knowledge_graph_service=knowledge_graph_service
+        )
+        # --- [修复结束] ---
+        
+        # 6e. 实例化 AI 代理和协调器
         agent_registry = config_loader.get_agent_registry()
         ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry)
         metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
@@ -138,7 +180,7 @@ def build_orchestrator() -> Orchestrator:
         fact_checker = FactChecker(api_gateway, prompt_manager)
         
         reasoning_ensemble = ReasoningEnsemble(
-            retriever=retriever,
+            retriever=retriever, # 传入已实例化的混合检索器
             ensemble_client=ensemble_client,
             metacognitive_agent=metacognitive_agent,
             arbitrator=arbitrator,
@@ -192,7 +234,9 @@ def build_orchestrator() -> Orchestrator:
             pipeline_state=pipeline_state,
             data_manager=data_manager,
             event_filter=event_filter,
-            stream_processor=stream_processor,
+            # [主人喵的修复 2] 传入 event_distributor
+            event_distributor=event_distributor,
+            # [主人喵的修复 2] 移除 stream_processor
             cognitive_engine=cognitive_engine,
             portfolio_constructor=portfolio_constructor,
             risk_manager=risk_manager,
