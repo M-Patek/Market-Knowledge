@@ -1,78 +1,127 @@
 """
 知识图谱服务 (Knowledge Graph Service)
-负责构建、更新和查询知识图谱 (KG)。
-KG 结合了来自不同来源（结构化、非结构化、时序）的信息。
+[已优化] 负责构建、更新和查询连接到 Neo4j 实例的知识图谱 (KG)。
 """
-from typing import List, Dict, Any
+import asyncio
+import os
+from typing import List, Dict, Any, Optional
+from neo4j import GraphDatabase, AsyncGraphDatabase
+from Phoenix_project.monitor.logging import get_logger
 
-# FIX (E8): 导入正确的客户端名称 (TabularDBClient, TemporalDBClient)
-from Phoenix_project.ai.tabular_db_client import TabularDBClient
-from Phoenix_project.ai.temporal_db_client import TemporalDBClient
-# [主人喵的修复 1] 不再导入 Retriever，以避免循环依赖
-from Phoenix_project.ai.relation_extractor import RelationExtractor
-from Phoenix_project.core.schemas.data_schema import KGNode, NewsData
+logger = get_logger(__name__)
 
 class KnowledgeGraphService:
     """
-    管理知识图谱的生命周期。
+    [已优化]
+    管理知识图谱的生命周期，使用 neo4j 驱动程序连接到
+    docker-compose.yml 中定义的 Neo4j 服务。
     """
     
-    def __init__(
-        self,
-        tabular_client: TabularDBClient,
-        temporal_client: TemporalDBClient,
-        # [主人喵的修复 1] 移除 retriever
-        relation_extractor: RelationExtractor
-    ):
-        # FIX (E8): 使用正确的类型
-        self.tabular_client: TabularDBClient = tabular_client
-        self.temporal_client: TemporalDBClient = temporal_client
-        self.relation_extractor: RelationExtractor = relation_extractor
-        
-        # (在真实系统中，KG 可能存储在 Neo4j 或类似的图数据库中)
-        # (TODO: 初始化 Neo4j 客户端，使用 os.environ.get('NEO4J_URI'))
-        self.graph_db_stub: Dict[str, KGNode] = {} # 占位符
-        self.log_prefix = "KnowledgeGraphService:"
-        print(f"{self.log_prefix} Initialized.")
+    def __init__(self, config: Dict[str, Any]):
+        """
+        初始化 Neo4j 驱动程序。
+        """
+        try:
+            # 从环境变量获取连接信息
+            # 回退到 docker-compose.yml 中的默认值
+            uri = os.environ.get("NEO4J_URI", "bolt://neo4j:7687")
+            user = os.environ.get("NEO4J_USER", "neo4j")
+            password = os.environ.get("NEO4J_PASSWORD", "password") # 来自 docker-compose
+            
+            logger.info(f"KnowledgeGraphService: 正在尝试连接到 Neo4j at {uri}")
+            
+            # 使用异步驱动程序
+            self.driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
+            
+            # (在 asyncio 事件循环中，我们不能在这里同步验证连接)
+            # (我们将在第一次查询时验证)
+            self.log_prefix = "KnowledgeGraphService:"
+            logger.info(f"{self.log_prefix} 驱动程序已初始化。")
 
-    async def update_from_news(self, news_item: NewsData):
+        except Exception as e:
+            logger.error(f"{self.log_prefix} 初始化 Neo4j 驱动程序失败: {e}", exc_info=True)
+            self.driver = None
+
+    async def verify_connectivity(self):
+        """检查与 Neo4j 的连接。"""
+        if not self.driver:
+            logger.error(f"{self.log_prefix} 无法验证连接：驱动程序未初始化。")
+            return False
+        try:
+            await self.driver.verify_connectivity()
+            logger.info(f"{self.log_prefix} Neo4j 连接已成功验证。")
+            return True
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Neo4j 连接验证失败: {e}", exc_info=True)
+            return False
+
+    async def query(self, cypher_query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
-        [主人喵的修复 1]
-        从一篇新闻中提取关系并更新图谱 (异步)。
+        [已优化]
+        对 Neo4j 数据库执行一个只读的 Cypher 查询。
+        
+        Args:
+            cypher_query (str): 要执行的 Cypher 查询语句。
+            params (Optional[Dict[str, Any]]): 查询参数。
+
+        Returns:
+            List[Dict[str, Any]]: 结果记录列表，每条记录是一个字典。
         """
-        print(f"{self.log_prefix} Updating KG from news item {news_item.id}")
-        
-        # 1. 提取关系 (调用正确的异步方法)
-        relations = await self.relation_extractor.extract_relations_from_text(news_item.content)
-        
-        # 2. (占位符) 更新图数据库
-        for rel in relations:
-            # rel 是 RelationTuple(subject, predicate, object)
-            print(f"{self.log_prefix} Extracted Relation: {rel.subject} -[{rel.predicate}]-> {rel.object}")
-            # (在此处实现更新 self.graph_db_stub 或 Neo4j 的逻辑)
-            pass
+        if not self.driver:
+            logger.error(f"{self.log_prefix} 查询失败：驱动程序未初始化。")
+            return []
             
-    async def query(self, query_text: str) -> List[Dict[str, Any]]:
+        params = params or {}
+        logger.debug(f"{self.log_prefix} 正在执行查询: {cypher_query} with params {params}")
+        
+        try:
+            async with self.driver.session() as session:
+                result = await session.run(cypher_query, params)
+                # 将 Neo4j 记录转换为标准字典
+                data = [record.data() async for record in result]
+                logger.debug(f"{self.log_prefix} 查询返回 {len(data)} 条记录。")
+                return data
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Cypher 查询执行失败: {e}", exc_info=True)
+            return []
+
+    async def execute_write(self, cypher_query: str, params: Optional[Dict[str, Any]] = None) -> bool:
         """
-        [主人喵的修复 1]
-        (占位符) 异步查询知识图谱。
-        这可能涉及将自然语言转换为图查询 (如 Cypher)。
+        [新功能]
+        对 Neo4j 数据库执行一个写入事务 (WRITE query)。
+        供 KnowledgeInjector 使用。
+        
+        Args:
+            cypher_query (str): 要执行的写入查询 (e.g., CREATE, MERGE, SET)。
+            params (Optional[Dict[str, Any]]): 查询参数。
+
+        Returns:
+            bool: 事务是否成功。
         """
-        print(f"{self.log_prefix} Querying KG: {query_text}")
-        
-        # (TODO: 实现 Neo4j 查询逻辑)
-        # (例如：解析 query_text，转换为 Cypher，使用 self.graph_db_stub 或真实的 neo4j 客户端)
-        
-        # 返回模拟的图谱结果
-        mock_graph_result = [
-            {"node_id": "AAPL", "property": "CEO", "value": "Tim Cook", "source": "KG"},
-            {"node_id": "TSLA", "relation": "COMPETES_WITH", "target_node": "BYD", "source": "KG"}
-        ]
-        
-        # 仅返回与查询相关的模拟结果
-        if "AAPL" in query_text.upper():
-            return [mock_graph_result[0]]
-        if "TSLA" in query_text.upper():
-            return [mock_graph_result[1]]
+        if not self.driver:
+            logger.error(f"{self.log_prefix} 写入失败：驱动程序未初始化。")
+            return False
             
-        return [] # 默认返回空
+        params = params or {}
+        logger.debug(f"{self.log_prefix} 正在执行写入: {cypher_query} with params {params}")
+        
+        try:
+            async with self.driver.session() as session:
+                # 在事务中执行写入
+                await session.write_transaction(
+                    lambda tx, q, p: tx.run(q, p), 
+                    cypher_query, 
+                    params
+                )
+            logger.debug(f"{self.log_prefix} 写入事务成功。")
+            return True
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Cypher 写入事务失败: {e}", exc_info=True)
+            return False
+
+    async def close(self):
+        """关闭 Neo4j 驱动程序连接。"""
+        if self.driver:
+            logger.info(f"{self.log_prefix} 正在关闭 Neo4j 驱动程序...")
+            await self.driver.close()
+            logger.info(f"{self.log_prefix} Neo4j 驱动程序已关闭。")
