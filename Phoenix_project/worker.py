@@ -44,7 +44,8 @@ from Phoenix_project.evaluation.fact_checker import FactChecker
 from Phoenix_project.ai.prompt_manager import PromptManager
 from Phoenix_project.api.gateway import APIGateway
 from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
-from Phoenix_project.memory.vector_store import VectorStore
+# [蓝图 2] 导入 BaseVectorStore
+from Phoenix_project.memory.vector_store import get_vector_store
 from Phoenix_project.memory.cot_database import CoTDatabase
 
 # --- [主人喵的修复 1] 导入 GNN/KG 架构缺失的组件 ---
@@ -64,6 +65,14 @@ import pydash # 用于将 "VolatilityParitySizer" 转换为 "volatility_parity"
 from Phoenix_project.sizing.base import IPositionSizer
 from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # 作为安全回退
 # --- [修复结束] ---
+
+# [蓝图 2 修复] 导入 registry (假设它在 registry.py 中)
+try:
+    from Phoenix_project.registry import registry
+except ImportError:
+    logger = get_logger(__name__)
+    logger.warning("Could not import 'registry' from 'Phoenix_project.registry'. Using empty dict.")
+    registry = {} # 回退
 
 
 # --- Celery App Setup ---
@@ -93,6 +102,7 @@ def start_prometheus_server(**kwargs):
         start_http_server(port)
         print(f"Prometheus metrics server for worker started on port {port}")
     except Exception as e:
+        # 可能是端口已在使用中（如果 worker 重启）
         print(f"Failed to start Prometheus metrics server on port {port}: {e}")
 # --- 结束：蓝图 1 ---
 
@@ -102,6 +112,7 @@ def build_orchestrator() -> Orchestrator:
     FIX (E5): 重写此函数以正确初始化 Orchestrator 及其所有依赖项。
     [主人喵的修复 1] 扩展此函数以包含 GNN/KG 组件。
     [主人喵的修复 2] 移除 StreamProcessor，添加 EventDistributor。
+    [蓝图 2] 更新 Retriever 的依赖项注入。
     """
     
     global orchestrator_instance
@@ -116,15 +127,20 @@ def build_orchestrator() -> Orchestrator:
         # 1. Config
         config_path = os.environ.get('PHOENIX_CONFIG_PATH', 'config')
         config_loader = ConfigLoader(config_path)
-        system_config = config_loader.get_system_config() # <-- [主人喵的修复 2]
+        # [蓝图 2] 加载 system.yaml
+        system_config = config_loader.load_config('config/system.yaml') 
         
         # 2. Data
         catalog_path = system_config.get("data_catalog_path", "data_catalog.json")
-        with open(catalog_path, 'r') as f:
-            data_catalog = json.load(f)
+        try:
+            with open(catalog_path, 'r') as f:
+                data_catalog = json.load(f)
+        except FileNotFoundError:
+            logger.error(f"Data catalog '{catalog_path}' not found!")
+            data_catalog = {} # 回退
             
         # 3. Core Components
-        error_handler = ErrorHandler()
+        error_handler = ErrorHandler(config=system_config.get("error_handler", {})) # <--- [蓝图 2] 传入配置
         
         # (E5 Fix)
         data_manager = DataManager(config_loader, data_catalog)
@@ -168,34 +184,42 @@ def build_orchestrator() -> Orchestrator:
         # --- [主人喵的修复 1] 实例化 GNN/KG 及其依赖项 ---
         
         # 6a. 实例化 RAG 依赖项 (DB 客户端, Embedding)
-        embedding_client = EmbeddingClient(config=system_config.get("embedding_models", {}))
-        tabular_client = TabularDBClient(config=system_config.get("postgres_db", {}))
-        temporal_client = TemporalDBClient(config=system_config.get("elasticsearch", {}))
+        # [蓝图 2] 使用 system_config
+        embedding_client = EmbeddingClient(model_name=system_config.get("ai",{}).get("embedding_client",{}).get("model", "text-embedding-004"))
+        
+        # [蓝图 2 修复]：传入正确的配置子树
+        tabular_client = TabularDBClient(config=system_config.get("tabular_db", {}))
+        temporal_client = TemporalDBClient(config=system_config.get("temporal_db", {}))
         
         # 6b. 实例化图谱构建器 (Extractor)
         relation_extractor = RelationExtractor(api_gateway, prompt_manager)
         
         # 6c. 实例化数据存储 (Vector, CoT, KG)
-        vector_store = VectorStore()
-        cot_db = CoTDatabase()
-        knowledge_graph_service = KnowledgeGraphService(
-            tabular_client=tabular_client,
-            temporal_client=temporal_client,
-            relation_extractor=relation_extractor
+        # [蓝图 2] 使用 system_config 和 get_vector_store 工厂
+        vector_store = get_vector_store(
+            config=system_config.get("ai", {}).get("vector_database", {}),
+            embedding_client=embedding_client,
+            logger=logger
         )
+        cot_db = CoTDatabase(config=system_config.get("cot_database", {}), logger=logger) # 假设 cot_db 在 system.yaml 中
+        knowledge_graph_service = KnowledgeGraphService(config=system_config.get("neo4j_db", {})) # 假设 neo4j_db 在 system.yaml 中
         
-        # 6d. 实例化混合检索器 (Retriever)，注入所有数据源
+        # 6d. [蓝图 2] 实例化混合检索器 (Retriever)，注入所有数据源
         retriever = Retriever(
+            config_loader=config_loader, # <--- [蓝图 2] 注入
             vector_store=vector_store,
             cot_database=cot_db,
             embedding_client=embedding_client,
-            knowledge_graph_service=knowledge_graph_service
+            knowledge_graph_service=knowledge_graph_service,
+            temporal_client=temporal_client, # <--- [蓝图 2] 注入
+            tabular_client=tabular_client   # <--- [蓝图 2] 注入
         )
         # --- [修复结束] ---
         
         # 6e. 实例化 AI 代理和协调器
-        agent_registry = config_loader.get_agent_registry()
-        ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry)
+        agent_registry_config = config_loader.get_agent_registry()
+        # [蓝图 2 修复]：传入 agent_registry_config 和 全局 registry
+        ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry_config, registry) 
         metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
         arbitrator = Arbitrator(api_gateway, prompt_manager)
         fact_checker = FactChecker(api_gateway, prompt_manager)
@@ -291,6 +315,8 @@ def run_main_cycle_task():
         orchestrator = build_orchestrator()
         
         # FIX (E7): 调用 run_main_cycle() 而不是 run_main_loop_async()
+        # [主人喵的修复 2.1] 修复：run_main_cycle 不是异步的
+        # await orchestrator.run_main_cycle()
         orchestrator.run_main_cycle() 
         
         logger.info("Task: run_main_cycle_task finished.")
