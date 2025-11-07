@@ -3,7 +3,7 @@ L2 Agent: Metacognitive Agent
 Refactored from ai/metacognitive_agent.py.
 Responsible for "Supervision" of L1/L2 agent reasoning (CoT).
 """
-from typing import Any, List
+from typing import Any, List, Dict
 
 from Phoenix_project.agents.l2.base import BaseL2Agent
 from Phoenix_project.core.pipeline_state import PipelineState
@@ -33,18 +33,30 @@ class MetacognitiveAgent(BaseL2Agent):
         self.api_gateway = api_gateway
         logger.info(f"MetacognitiveAgent (id='{self.agent_id}') initialized.")
 
-
-    async def run(self, state: PipelineState, evidence_items: List[EvidenceItem]) -> SupervisionResult:
+    # 签名已更新：接受 dependencies 而不是 evidence_items
+    async def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> SupervisionResult:
         """
         Monitors the CoT (reasoning) of L1 EvidenceItems.
         
         Args:
             state (PipelineState): The current state, used to access CoT traces.
-            evidence_items (List[EvidenceItem]): The collected list of L1 outputs.
+            dependencies (Dict[str, Any]): The dictionary of outputs from dependent tasks
+                                         (expected to contain L1 EvidenceItems).
             
         Returns:
             SupervisionResult: A single result object summarizing the findings.
         """
+        
+        # --- 新增逻辑：从 dependencies 提取 evidence_items ---
+        evidence_items: List[EvidenceItem] = []
+        for result in dependencies.values():
+            if isinstance(result, EvidenceItem):
+                evidence_items.append(result)
+            elif isinstance(result, list): # 处理 L1 agent 可能返回列表的情况
+                for item in result:
+                    if isinstance(item, EvidenceItem):
+                        evidence_items.append(item)
+        # --- 新增逻辑结束 ---
         
         target_agents = [item.agent_id for item in evidence_items]
         
