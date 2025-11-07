@@ -13,6 +13,10 @@ pipeline:
   uncertainty_threshold: 0.4
   auto_retry: 3
   audit_log_retention_days: 30
+  # 修正：根据任务指令，将 CognitiveEngine 阈值迁移至此
+  fact_check_threshold: 0.7
+  fc_confidence_boost: 0.1
+  fc_confidence_penalty: 0.2
   
 ai:
   # 1. AI Client Providers (from config/ai_clients.yaml)
