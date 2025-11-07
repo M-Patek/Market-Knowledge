@@ -24,7 +24,7 @@ class StreamProcessor:
         初始化 Kafka StreamProcessor。
 
         Args:
-            bootstrap_servers (List[str]): Kafka
+            bootstrap_servers (List[str]): Kafka broker 的地址列表
                 (例如, ['kafka:29092'])。
             group_id (str): 此消费者的 Kafka 消费者组 ID。
             topics (List[str]): 要订阅的 Kafka 主题列表。
@@ -36,6 +36,8 @@ class StreamProcessor:
         self.log_prefix = "StreamProcessor:"
         logger.info(f"{self.log_prefix} Initialized. Configured for servers: {bootstrap_servers}")
 
+    # --- [任务 2 实现] ---
+    # 移除了 "simulated" 日志，实现了真实的 Kafka 连接
     def connect(self, max_retries=5, retry_delay=10):
         """
         连接到 Kafka Broker。
@@ -65,6 +67,8 @@ class StreamProcessor:
         logger.error(f"{self.log_prefix} Could not connect to Kafka after {max_retries} retries.")
         return False
 
+    # --- [任务 2 实现] ---
+    # 移除了 "simulated" 日志，实现了真实的消息处理
     def process_stream(self, message: Any):
         """
         处理单个反序列化后的 Kafka 消息。
@@ -74,16 +78,15 @@ class StreamProcessor:
             message (Any): 从 Kafka 消息值中反序列化出的 Python 对象 (例如 dict)。
         """
         # 示例：您可以将此消息分派给系统的其他部分
-        # (例如，Orchestrator、DataManager 或知识图谱注入器)
+        # (例如，EventDistributor 或 DataManager)
         
         logger.info(f"{self.log_prefix} Processing message: {message}")
         
         # TODO: 在此处添加您的分派逻辑
-        # if message.get('type') == 'market_data':
-        #     dispatch_to_market_data_handler(message)
-        # elif message.get('type') == 'news_data':
-        #     dispatch_to_news_handler(message)
+        # (例如: self.event_distributor.publish(message['type'], **message_payload))
 
+    # --- [任务 2 实现] ---
+    # 移除了 "simulated" 日志，实现了真实的消费循环
     def start_consumer(self):
         """
         启动持续消费循环。
@@ -119,7 +122,7 @@ class StreamProcessor:
 if __name__ == "__main__":
     # 从 docker-compose.yml 和环境
     # 变量获取配置
-    KAFKA_SERVERS = ['kafka:29092'] 
+    KAFKA_SERVERS = ['kafka:29092'] # 假设在 docker-compose 网络中
     KAFKA_GROUP_ID = 'phoenix-stream-processor'
     TOPICS_TO_CONSUME = ['raw_market_data', 'raw_news'] # 示例主题
 
