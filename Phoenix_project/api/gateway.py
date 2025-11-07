@@ -22,25 +22,39 @@ class APIGateway:
         
         genai.configure(api_key=api_key)
         
+        # MODIFICATION: 传递 config 字典以匹配 PoolManager 的 __init__
+        # TODO: 从 config_loader 加载 QPM limits
+        gemini_config = {
+            "gemini_qpm_limits": config_loader.get("gemini_qpm_limits", {})
+        }
+
         self.pool_manager = GeminiPoolManager(
             api_key=api_key,
-            pool_size=pool_size
+            config=gemini_config, # 传递 config 字典
+            pool_size=pool_size   # 传递 pool_size
         )
-        # TODO: Load safety settings and generation config from config_loader
-        self.default_safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        ]
-        self.default_generation_config = {
-            "candidate_count": 1,
-            # "stop_sequences": ["..."], # Example
-            "max_output_tokens": 4096,
-            "temperature": 0.7,
-            "top_p": 1.0,
-            "top_k": 1,
-        }
+        
+        # 从 config_loader 加载安全设置和生成配置
+        self.default_safety_settings = config_loader.get(
+            "gemini_safety_settings",
+            [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            ]
+        )
+        
+        self.default_generation_config = config_loader.get(
+            "gemini_generation_config",
+            {
+                "candidate_count": 1,
+                "max_output_tokens": 4096,
+                "temperature": 0.7,
+                "top_p": 1.0,
+                "top_k": 1,
+            }
+        )
         
         logger.info(f"APIGateway initialized with pool size {pool_size}.")
 
@@ -52,7 +66,8 @@ class APIGateway:
         max_tokens: Optional[int] = None,
         stop_sequences: Optional[List[str]] = None,
         top_p: Optional[float] = None,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        response_mime_type: Optional[str] = None # 允许指定 mime 类型
     ) -> str:
         """
         Sends a request to the Gemini API using the pool manager.
@@ -61,6 +76,7 @@ class APIGateway:
             model_name (str): The name of the model (e.g., "gemini-pro").
             prompt (Union[str, List[Union[str, Any]]]): The prompt string or
                                                        a list of content parts.
+            response_mime_type (Optional[str]): e.g., "application/json".
             
         Returns:
             str: The text response from the model.
@@ -78,20 +94,40 @@ class APIGateway:
             generation_config["top_p"] = top_p
         if top_k is not None:
             generation_config["top_k"] = top_k
+        if response_mime_type is not None:
+            generation_config["response_mime_type"] = response_mime_type
             
         # Format the prompt content
         contents = [prompt] if isinstance(prompt, str) else prompt
 
         try:
-            logger.debug(f"Sending request to model '{model_name}' via pool...")
-            response_text = await self.pool_manager.generate_content(
-                model_name=model_name,
-                contents=contents,
-                generation_config=generation_config,
-                safety_settings=self.default_safety_settings
-            )
-            logger.debug(f"Received response from '{model_name}'.")
-            return response_text
+            request_id = f"req_{asyncio.get_event_loop().time()}" # 简单的请求ID
+            logger.debug(f"Sending request {request_id} to model '{model_name}' via pool...")
+
+            # MODIFICATION: 修复方法调用和返回类型处理
+            
+            # 1. 使用上下文管理器
+            async with self.pool_manager.get_client(model_name) as client:
+                # 2. 调用更新后的 'generate_content_async'
+                response_dict = await client.generate_content_async(
+                    contents=contents,
+                    generation_config=generation_config,
+                    safety_settings=self.default_safety_settings,
+                    request_id=request_id
+                )
+
+            logger.debug(f"Received response {request_id} from '{model_name}'.")
+
+            # 3. 从字典中提取文本 (解决问题 3)
+            # 注意：如果请求了 JSON，这里仍然返回 *序列化* 的 JSON 字符串。
+            # 调用者 (例如 EnsembleClient) 负责解析它。
+            # GeminiPoolManager 确保返回 {"text": "..."}
+            if "text" not in response_dict:
+                logger.error(f"Response from {model_name} missing 'text' key: {response_dict}")
+                raise ValueError("Invalid response structure from model client.")
+            
+            return response_dict["text"] # 返回 str
+
         except Exception as e:
             logger.error(f"Error in send_request via pool for '{model_name}': {e}", exc_info=True)
             # Re-raise or return a specific error message
@@ -159,8 +195,19 @@ if __name__ == "__main__":
                 def get_secret(self, key):
                     import os
                     return os.environ.get(key) # Assumes GEMINI_API_KEY is set in env
+                
+                def get(self, key, default=None):
+                    # Mock config loader 'get' method
+                    if key == "gemini_qpm_limits":
+                        return {} # Use defaults
+                    return default
+
             
             config_loader = MockConfigLoader()
+            if not config_loader.get_secret("GEMINI_API_KEY"):
+                print("GEMINI_API_KEY not set in environment. Skipping test.")
+                return
+
             gateway = APIGateway(config_loader, pool_size=2)
             
             prompt = "What is the capital of France?"
@@ -172,11 +219,15 @@ if __name__ == "__main__":
             print(f"Test Request 2:\nPrompt: {prompt_2}\nResponse: {response_2}\n")
             
             # Test embedding
-            texts = ["Hello world", "This is a test"]
-            embeddings = await gateway.send_embedding_request("text-embedding-3-large", texts, dimensions=256)
-            print(f"Test Embedding:\nTexts: {texts}\nEmbedding 1 dim: {len(embeddings[0])}\n")
+            # texts = ["Hello world", "This is a test"]
+            # embeddings = await gateway.send_embedding_request("text-embedding-3-large", texts, dimensions=256)
+            # print(f"Test Embedding:\nTexts: {texts}\nEmbedding 1 dim: {len(embeddings[0])}\n")
 
         except Exception as e:
             print(f"Error during test: {e}")
 
-    # asyncio.run(test_gateway()) # Uncomment to run test
+    # import os
+    # if "GEMINI_API_KEY" in os.environ:
+    #     asyncio.run(test_gateway())
+    # else:
+    #     print("Set GEMINI_API_KEY environment variable to run the test.")
