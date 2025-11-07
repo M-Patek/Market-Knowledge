@@ -97,6 +97,10 @@ services:
       - kafka # <-- 已添加依赖
     env_file:
       - ./.env
+    # --- 蓝图 1：为 worker 暴露指标端口 ---
+    ports:
+      - "8001:8001"
+    # --- 结束：蓝图 1 ---
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
@@ -106,6 +110,9 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
       # [主人喵的修复 2] 确保 Redis 主机可被访问
       - REDIS_HOST=redis
+      # --- 蓝图 1：将端口 8001 传递给 worker ---
+      - WORKER_METRICS_PORT=8001
+      # --- 结束：蓝图 1 ---
     volumes:
       - .:/app
     # --- [主人喵的修复] ---
@@ -160,7 +167,7 @@ services:
     volumes:
       - .:/app
     # (覆盖默认的 celery 命令，运行新的启动脚本)
-    command: python Phoenix_project/run_stream_processor.py
+    command: python Phoenix_project.run_stream_processor.py
 
 volumes:
   redis_data:
