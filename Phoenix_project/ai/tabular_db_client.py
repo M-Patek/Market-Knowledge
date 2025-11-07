@@ -43,6 +43,51 @@ class TabularDBClient:
             await self.pool.close()
             logger.info("TabularDB connection pool closed.")
 
+    # --- 新增的真实查询方法 (任务 1 实现) ---
+    async def query_metric(self, symbol: str, metric_name: str) -> Optional[Any]:
+        """
+        Fetches the latest value for a specific metric and symbol.
+        This implements the query capability described in RAG_ARCHITECTURE.md.
+        
+        Args:
+            symbol (str): The ticker symbol (e.g., 'AAPL').
+            metric_name (str): The metric name (e.g., 'Revenue', 'eps').
+            
+        Returns:
+            Optional[Any]: The value of the metric, or None if not found.
+        """
+        if not self.pool:
+            logger.error("Connection pool is not initialized. Call connect() first.")
+            return None
+            
+        # 此查询基于 RAG_ARCHITECTURE.md 中的设计
+        # 它假设有一个包含 [symbol, metric_name, metric_value, report_date] 的表
+        query = """
+        SELECT metric_value FROM financial_metrics
+        WHERE symbol = $1 AND metric_name = $2
+        ORDER BY report_date DESC
+        LIMIT 1;
+        """
+        
+        try:
+            async with self.pool.acquire() as connection:
+                # fetchval() 直接获取第一行第一列的值
+                value = await connection.fetchval(query, symbol, metric_name)
+            
+            if value is not None:
+                logger.debug(f"Successfully fetched metric {metric_name} for {symbol}: {value}")
+                return value
+            else:
+                logger.debug(f"No metric '{metric_name}' found for symbol: {symbol}")
+                return None
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.error("Query failed: 'financial_metrics' table does not exist.")
+            return None
+        except Exception as e:
+            logger.error(f"Error querying TabularDB for {symbol} metric {metric_name}: {e}", exc_info=True)
+            return None
+    # --- 任务 1 结束 ---
+
     async def get_latest_financials(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
         Example query: Fetches the latest financial metrics for a given symbol.
