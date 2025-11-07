@@ -15,6 +15,16 @@ from Phoenix_project.core.pipeline_state import PipelineState
 # 修正：将 'context_bus' 转换为 'Phoenix_project.context_bus'
 from Phoenix_project.context_bus import ContextBus
 
+# --- 蓝图 1：添加 Prometheus 中间件 ---
+# 备注：您的蓝图提到了 'prometheus-fastapi-instrumentator'，
+# 但这是一个 Flask (WSGI) 应用。我们将使用 'prometheus-client'
+# (已在 requirements.txt 中) 提供的标准 WSGI 中间件。
+# 这将暴露 /metrics 端点，但不会自动检测 Flask 路由。
+# (自动检测需要 'prometheus-flask-exporter' 库)
+from prometheus_client import make_wsgi_app
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
+# --- 结束：蓝图 1 ---
+
 # Pydantic models for request validation
 class EventInput(BaseModel):
     source: str
@@ -31,12 +41,7 @@ class ManualOverrideInput(BaseModel):
 class APIServer:
     """
     Provides an external API interface (e.g., REST) for the system.
-
-    This server allows external systems to:
-    1. Inject new data/events into the system.
-    2. Query the current state of the system or specific components.
-    3. Manually override or control system behavior (e.g., pause, resume).
-    4. View system audit logs or performance metrics.
+    ...
     """
 
     def __init__(
@@ -49,6 +54,15 @@ class APIServer:
     ):
         self.app = Flask(__name__, template_folder='../templates')
         CORS(self.app)  # Enable CORS for all routes
+        
+        # --- 蓝图 1：暴露 Prometheus /metrics 端点 ---
+        # 使用中间件来暴露 /metrics，而不干扰 Flask 路由
+        # 这将暴露所有在 `monitor/metrics.py` 中定义的自定义指标
+        self.app.wsgi_app = DispatcherMiddleware(self.app.wsgi_app, {
+            '/metrics': make_wsgi_app()
+        })
+        # --- 结束：蓝图 1 ---
+        
         self.host = host
         self.port = port
         self.context_bus = context_bus
@@ -59,6 +73,8 @@ class APIServer:
         
         self._register_routes()
         self.logger.log_info(f"APIServer initialized. Will run on {self.host}:{self.port}")
+        self.logger.log_info("Prometheus /metrics 端点已在 /metrics 激活")
+
 
     def _register_routes(self):
         """Registers all Flask routes."""
@@ -73,6 +89,8 @@ class APIServer:
         def health_check():
             """Endpoint for health checks (e.g., K8s liveness probe)."""
             return jsonify({"status": "healthy"}), 200
+        
+        # ... (所有其他路由保持不变) ...
 
         @self.app.route("/api/v1/status", methods=["GET"])
         def get_status():
@@ -182,7 +200,7 @@ class APIServer:
         """
         self.logger.log_info("Starting APIServer in a new thread.")
         config = uvicorn.Config(
-            self.app,
+            self.app, # Uvicorn 可以运行 WSGI 应用 (如 Flask)
             host=self.host,
             port=self.port,
             log_level="warning",
@@ -239,6 +257,7 @@ if __name__ == "__main__":
     
     print("API Server is running in the background.")
     print("Access http://0.0.0.0:8080/ or http://0.0.0.0:8080/api/v1/health")
+    print("Metrics exposed at http://0.0.0.0:8080/metrics") # 蓝图 1 备注
     
     try:
         # Keep the main thread alive to let the server thread run
