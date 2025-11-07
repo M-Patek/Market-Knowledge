@@ -47,20 +47,55 @@ class Scheduler:
                 job_id = job_config["id"]
                 trigger_type = job_config["trigger"]["type"]
                 trigger_args = job_config["trigger"]["args"]
+                func_path = job_config["func"] # e.g., "orchestrator.run_main_cycle"
                 
+                # --- [主人喵的修复 3] ---
+                # 动态解析函数，替换 if/elif 结构
+                
+                parts = func_path.split('.')
+                
+                if len(parts) != 2:
+                    logger.error(f"无效的任务 func 格式: '{func_path}'。预期格式为 'component.method_name'。")
+                    continue
+
+                component_name, method_name = parts
+                
+                # 从 'self' (即 Scheduler 实例) 获取组件
+                # (注意: 这要求 orchestrator 必须是 self 的属性)
+                if not hasattr(self, component_name):
+                    logger.error(f"在 Scheduler 中未找到名为 '{component_name}' 的组件。")
+                    continue
+                    
+                component = getattr(self, component_name)
+                
+                # 从该组件获取方法
+                if not hasattr(component, method_name):
+                    logger.error(f"在 '{component_name}' 组件上未找到名为 '{method_name}' 的方法。")
+                    continue
+                    
+                job_func = getattr(component, method_name)
+
+                if not callable(job_func):
+                     logger.error(f"任务函数 '{func_path}' 不可调用。")
+                     continue
+                
+                # --- [修复结束] ---
+
+                # --- [旧的硬编码逻辑] ---
                 # Resolve the function to call
                 # This is a simple mapper. A real system might use
                 # dynamic imports or a registration pattern.
-                if job_config["func"] == "orchestrator.run_main_cycle":
-                    job_func = self.orchestrator.run_main_cycle
-                elif job_config["func"] == "orchestrator.schedule_data_ingestion":
-                    # This method needs to exist on the orchestrator
-                    # job_func = self.orchestrator.schedule_data_ingestion
-                    logger.warning("Job 'orchestrator.schedule_data_ingestion' not implemented.")
-                    continue
-                else:
-                    logger.error(f"Unknown job function: {job_config['func']}")
-                    continue
+                # if job_config["func"] == "orchestrator.run_main_cycle":
+                #     job_func = self.orchestrator.run_main_cycle
+                # elif job_config["func"] == "orchestrator.schedule_data_ingestion":
+                #     # This method needs to exist on the orchestrator
+                #     # job_func = self.orchestrator.schedule_data_ingestion
+                #     logger.warning("Job 'orchestrator.schedule_data_ingestion' not implemented.")
+                #     continue
+                # else:
+                #     logger.error(f"Unknown job function: {job_config['func']}")
+                #     continue
+                # --- [旧逻辑结束] ---
                     
                 self.scheduler.add_job(
                     job_func,
@@ -68,10 +103,10 @@ class Scheduler:
                     id=job_id,
                     **trigger_args
                 )
-                logger.info(f"Scheduled job '{job_id}' ({job_config['func']}) with trigger: {trigger_type} {trigger_args}")
+                logger.info(f"已调度任务 '{job_id}' ({func_path}) 触发器: {trigger_type} {trigger_args}")
                 
             except Exception as e:
-                logger.error(f"Failed to schedule job {job_config.get('id')}: {e}", exc_info=True)
+                logger.error(f"调度任务 {job_config.get('id')} 失败: {e}", exc_info=True)
 
     def start(self):
         """Starts the scheduler."""
