@@ -6,10 +6,12 @@
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import uuid
+import asyncio # [主人喵的修复 2.1] 确保导入 asyncio
 
 from Phoenix_project.core.pipeline_state import PipelineState 
 from Phoenix_project.core.schemas.fusion_result import AgentDecision, FusionResult
 from Phoenix_project.ai.ensemble_client import EnsembleClient
+# [主人喵的修复 1] 修复 MetacognitiveAgent 错误的导入路径
 from Phoenix_project.agents.l2.metacognitive_agent import MetacognitiveAgent 
 from Phoenix_project.evaluation.arbitrator import Arbitrator
 from Phoenix_project.evaluation.fact_checker import FactChecker
@@ -38,7 +40,7 @@ class ReasoningEnsemble:
         初始化 ReasoningEnsemble。
         
         参数:
-            retriever (Retriever): 用于 RAG 的检索器。
+            retriever (Retriever): [主人喵的修复 1] (现在是混合检索器)
             ensemble_client (EnsembleClient): 用于运行 L1 智能体。
             metacognitive_agent (MetacognitiveAgent): L2 元认知/监督智能体。
             arbitrator (Arbitrator): L2 仲裁器。
@@ -74,7 +76,9 @@ class ReasoningEnsemble:
             logger.info(f"{self.log_prefix} Starting reasoning for query: '{query}'")
 
             # 1. RAG - 检索
+            # [主人喵的修复 1] 调用 retriever.retrieve (它现在执行混合检索)
             retrieved_data = await self.retriever.retrieve(query, target_symbols)
+            # [主人喵的修复 1] 调用 retriever.format_context (它现在存在了)
             context = self.retriever.format_context(retrieved_data)
             
             pipeline_state.add_context(context)
