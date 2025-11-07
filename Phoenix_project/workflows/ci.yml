@@ -21,5 +21,22 @@ jobs:
     - name: Install Dependencies
       run: pip install -r requirements.txt
 
+    # --- [主人喵的修复] ---
+    # 新增：运行 Linter (Ruff)
+    - name: Run Linter (Ruff)
+      run: ruff check .
+
+    # 新增：检查代码格式 (Black)
+    - name: Check Code Formatting (Black)
+      run: black --check .
+
+    # 新增：运行静态类型检查 (Mypy)
+    - name: Run Static Type Checking (Mypy)
+      run: mypy .
+    # --- [修复结束] ---
+
     - name: Run Tests (Layer 8)
-      run: pytest --maxfail=1 --disable-warnings -q
+      # --- [主人喵的修复] ---
+      # 修改：添加 pytest-cov 以进行测试覆盖率报告
+      run: pytest --cov=. --cov-report=term-missing --maxfail=1 --disable-warnings -q
+      # --- [修复结束] ---
