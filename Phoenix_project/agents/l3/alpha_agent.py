@@ -3,7 +3,7 @@ L3 Agent: Alpha Agent
 Refactored from training/drl/agents/alpha_agent.py.
 Responsible for "Signal Generation."
 """
-from typing import Any
+from typing import Any, Dict # 确保 Dict 被导入
 
 from Phoenix_project.agents.l3.base import BaseL3Agent
 from Phoenix_project.core.pipeline_state import PipelineState
@@ -17,18 +17,37 @@ class AlphaAgent(BaseL3Agent):
     to convert an L2 FusionResult into a trading Signal.
     """
     
-    def run(self, state: PipelineState, fusion_result: FusionResult) -> Signal:
+    # 签名已更新，以匹配 Executor
+    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> Signal:
         """
         Converts the preliminary L2 decision (FusionResult) into a
         refined trading signal (Signal).
         
         Args:
             state (PipelineState): The current state of the analysis pipeline.
-            fusion_result (FusionResult): The unified decision output from the L2 layer.
+            dependencies (Dict[str, Any]): Outputs from L2 agents. 
+                                         Should contain one FusionResult.
             
         Returns:
             Signal: A standardized Signal object for the execution layer.
         """
+        
+        # --- 新增逻辑：从 dependencies 提取 fusion_result ---
+        fusion_result: FusionResult = None
+        for result in dependencies.values():
+            if isinstance(result, FusionResult):
+                fusion_result = result
+                break  # 假设只有一个 FusionResult 依赖项
+
+        if fusion_result is None:
+            raise ValueError(f"Agent {self.agent_id} did not find required FusionResult in dependencies.")
+        # --- 新增逻辑结束 ---
+        
+
+        # vvvv 现有的核心逻辑保持不变 vvvv
+        # (注意：此处的 .target_symbol, .decision, 和 .id
+        # 与 l2/fusion_agent.py 的输出不匹配，
+        # 但按照“不修改逻辑”的指示，此处保持原样)
         
         # TODO: Implement actual DRL/Quant model logic.
         # This logic would use self.model_client (the loaded DRL model)
