@@ -8,15 +8,46 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# NOTE: 移除了多余的 pip install 命令。
-# 'prometheus-client', 'pytest', 'celery', 'pydantic' 已经包含在 requirements.txt 中。
-
 # FIX (E-DOCKER-2): 将暴露的端口从 5000 更改为 8000，以匹配 docker-compose.yml 中的 Gunicorn 命令
 EXPOSE 8000
 
-# Copy the rest of the application code
-# FIX (E-DOCKER-1): 修复了 'COPY' 指令的语法错误
-COPY . .
+# (FIX) 替换 'COPY . .'
+# 显式复制所有 Python 源代码目录和根 .py 文件
+# 这可以防止对 README.md 或 Makefile 的更改破坏构建缓存
+COPY Phoenix_project /app/Phoenix_project
+COPY agents /app/agents
+COPY ai /app/ai
+COPY audit /app/audit
+COPY cognitive /app/cognitive
+COPY config /app/config
+COPY controller /app/controller
+COPY core /app/core
+COPY data /app/data
+COPY evaluation /app/evaluation
+COPY events /app/events
+COPY execution /app/execution
+COPY features /app/features
+COPY fusion /app/fusion
+COPY interfaces /app/interfaces
+COPY memory /app/memory
+COPY models /app/models
+COPY monitor /app/monitor
+COPY output /app/output
+COPY prompts /app/prompts
+COPY reasoning /app/reasoning
+COPY sizing /app/sizing
+COPY storage /app/storage
+COPY templates /app/templates
+COPY training /app/training
+COPY utils /app/utils
+COPY scripts /app/scripts
+
+# 复制根目录中的所有 Python 文件和 .json/.yaml 配置文件
+# 使用 shell 通配符来处理文件不存在的情况 (COPY 会失败)
+COPY *.py .
+COPY *.json .
+COPY *.yaml .
+
 
 # Default command (can be overridden in docker-compose)
 # FIXED: 路径已修正，以匹配 /app 工作目录
