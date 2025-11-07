@@ -76,10 +76,10 @@ class ReasoningEnsemble:
             logger.info(f"{self.log_prefix} Starting reasoning for query: '{query}'")
 
             # 1. RAG - 检索
-            # [主人喵的修复 1] 调用 retriever.retrieve (它现在执行混合检索)
+            # [蓝图 2] 调用 retriever.retrieve (它现在执行混合检索)
             retrieved_data = await self.retriever.retrieve(query, target_symbols)
-            # [主人喵的修复 1] 调用 retriever.format_context (它现在存在了)
-            context = self.retriever.format_context(retrieved_data)
+            # [蓝图 2] 调用 retriever.format_context (它现在执行 RRF+Rerank)
+            context = self.retriever.format_context(query, retrieved_data)
             
             pipeline_state.add_context(context)
             
@@ -170,6 +170,7 @@ class ReasoningEnsemble:
             return None
 
         # 4. Arbitration (V1) - 仲裁 (同步)
+        # [蓝图 2 修复]：仲裁器 arbitrate 不是异步的
         fusion_result: FusionResult = self.arbitrator.arbitrate(
             decisions=verified_decisions,
             context=context
