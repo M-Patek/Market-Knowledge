@@ -43,7 +43,8 @@ class TabularDBClient:
             await self.pool.close()
             logger.info("TabularDB connection pool closed.")
 
-    # --- 新增的真实查询方法 (任务 1 实现) ---
+    # --- [任务 2 实现] ---
+    # 移除了模拟数据，实现了真实的 asyncpg 查询
     async def query_metric(self, symbol: str, metric_name: str) -> Optional[Any]:
         """
         Fetches the latest value for a specific metric and symbol.
@@ -86,7 +87,7 @@ class TabularDBClient:
         except Exception as e:
             logger.error(f"Error querying TabularDB for {symbol} metric {metric_name}: {e}", exc_info=True)
             return None
-    # --- 任务 1 结束 ---
+    # --- [任务 2 结束] ---
 
     async def get_latest_financials(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
