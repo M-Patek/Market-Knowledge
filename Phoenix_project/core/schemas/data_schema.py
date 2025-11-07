@@ -9,6 +9,9 @@ FIX (E1, E2, E4):
 3.  重命名 EconomicEvent -> EconomicIndicator
 4.  从 execution/interfaces.py 移入 Order, Fill, OrderStatus, Position 的定义。
 5.  添加了 Signal, PortfolioState 的定义。
+
+[主人喵的修复]
+6. 添加 TargetPosition 和 TargetPortfolio，供 PortfolioConstructor 和 RiskManager 使用。
 """
 
 from pydantic import BaseModel, Field
@@ -149,3 +152,22 @@ class PortfolioState(BaseModel):
     total_value: float = Field(..., description="投资组合总价值 (cash + positions market_value)")
     positions: Dict[str, Position] = Field(default_factory=dict, description="当前持仓")
     realized_pnl: float = Field(0.0, description="已实现盈亏")
+
+# --- [主人喵的修复] 新增：目标投资组合模式 ---
+
+class TargetPosition(BaseModel):
+    """
+    由 PortfolioConstructor 和 RiskManager 定义的单个资产的目标分配。
+    """
+    symbol: str = Field(..., description="资产代码")
+    target_weight: float = Field(..., description="目标投资组合权重 (e.g., 0.1 for 10%, -0.05 for -5%)")
+    reasoning: str = Field("N/A", description="做出此分配的理由")
+
+class TargetPortfolio(BaseModel):
+    """
+    认知层和风险层输出的完整目标投资组合。
+    这是 OrderManager 的输入。
+    """
+    timestamp: datetime = Field(default_factory=datetime.utcnow, description="目标生成时间 (UTC)")
+    positions: List[TargetPosition] = Field(default_factory=list, description="目标持仓列表")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="元数据 (e.g., strategy_id)")
