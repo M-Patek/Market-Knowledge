@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict
 
 from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.fusion_result import FusionResult
+# from Phoenix_project.core.schemas.fusion_result import FusionResult # 不再需要
 
 class BaseL3Agent(ABC):
     """
@@ -28,16 +28,17 @@ class BaseL3Agent(ABC):
         self.model_client = model_client
 
     @abstractmethod
-    def run(self, state: PipelineState, fusion_result: FusionResult) -> Any:
+    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> Any:
         """
         The main execution method for the agent.
         
-        It takes the L2 FusionResult and converts it into its specific
-        output (e.g., Signal, CapitalModifier).
+        It takes the current pipeline state and a dictionary of dependency outputs
+        (e.g., from L2) and converts it into its specific output.
         
         Args:
             state (PipelineState): The current state of the analysis pipeline.
-            fusion_result (FusionResult): The unified decision output from the L2 layer.
+            dependencies (Dict[str, Any]): A dictionary mapping dependency agent IDs
+                                         to their execution results.
             
         Returns:
             Any: The specific result object for that agent's task (e.g., Signal).
