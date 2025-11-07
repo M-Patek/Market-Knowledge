@@ -1,136 +1,122 @@
 """
-事件流处理器
-(实现为 Kafka 消费者)
+事件流处理器 (Kafka 消费者)
+
+[主人喵的修复 2]
+此类现在被设计为独立运行 (参见 run_stream_processor.py)。
+它不再被 Orchestrator 拥有，而是通过 EventDistributor (Redis)
+与 Orchestrator 通信。
 """
+import os
 import json
-import logging
-from typing import List, Callable, Any
 from kafka import KafkaConsumer
-from kafka.errors import NoBrokersAvailable
-import time
+from Phoenix_project.config.loader import ConfigLoader
+from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.events.event_distributor import EventDistributor # <-- [主人喵的修复 2] 导入
 
-# (假设您有一个日志记录器)
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-
+logger = get_logger(__name__)
 
 class StreamProcessor:
-    """
-    使用 kafka-python 实现的真实 Kafka 消费者，
-    用于处理传入的数据流。
-    """
-    def __init__(self, bootstrap_servers: List[str], group_id: str, topics: List[str]):
+    
+    def __init__(
+        self, 
+        config_loader: ConfigLoader,
+        event_distributor: EventDistributor # <-- [主人喵的修复 2] 注入
+    ):
         """
-        初始化 Kafka StreamProcessor。
-
-        Args:
-            bootstrap_servers (List[str]): Kafka broker 的地址列表
-                (例如, ['kafka:29092'])。
-            group_id (str): 此消费者的 Kafka 消费者组 ID。
-            topics (List[str]): 要订阅的 Kafka 主题列表。
+        初始化 Kafka 消费者。
+        
+        参数:
+            config_loader (ConfigLoader): 用于加载配置。
+            event_distributor (EventDistributor): 用于将处理后的消息推送到 Redis。
         """
-        self.bootstrap_servers = bootstrap_servers
-        self.group_id = group_id
-        self.topics = topics
+        self.config_loader = config_loader
+        self.system_config = config_loader.get_system_config()
+        self.kafka_config = self.system_config.get("kafka", {})
+        
+        # [主人喵的修复 2] 注入 EventDistributor
+        self.event_distributor = event_distributor
+        
         self.consumer = None
-        self.log_prefix = "StreamProcessor:"
-        logger.info(f"{self.log_prefix} Initialized. Configured for servers: {bootstrap_servers}")
-
-    # --- [任务 2 实现] ---
-    # 移除了 "simulated" 日志，实现了真实的 Kafka 连接
-    def connect(self, max_retries=5, retry_delay=10):
-        """
-        连接到 Kafka Broker。
-        由于 Kafka 启动可能需要时间，因此包含重试逻辑。
-        """
-        retries = 0
-        while retries < max_retries:
-            try:
-                self.consumer = KafkaConsumer(
-                    *self.topics,
-                    bootstrap_servers=self.bootstrap_servers,
-                    group_id=self.group_id,
-                    auto_offset_reset='earliest',
-                    # 假设消息是 JSON 编码的 UTF-8 字符串
-                    value_deserializer=lambda m: json.loads(m.decode('utf-8'))
-                )
-                logger.info(f"{self.log_prefix} KafkaConsumer connected and subscribed to topics: {self.topics}")
-                return True
-            except NoBrokersAvailable:
-                retries += 1
-                logger.warning(f"{self.log_prefix} No Kafka brokers available. Retrying ({retries}/{max_retries}) in {retry_delay}s...")
-                time.sleep(retry_delay)
-            except Exception as e:
-                logger.error(f"{self.log_prefix} Failed to connect to Kafka: {e}", exc_info=True)
-                return False
+        self.bootstrap_servers = os.environ.get(
+            'KAFKA_BOOTSTRAP_SERVERS', 
+            self.kafka_config.get('bootstrap_servers', 'localhost:9092')
+        )
+        self.topic = self.kafka_config.get('topic', 'market_data')
+        self.group_id = self.kafka_config.get('group_id', 'phoenix_consumer_group')
         
-        logger.error(f"{self.log_prefix} Could not connect to Kafka after {max_retries} retries.")
-        return False
+        logger.info(f"StreamProcessor configured for topic '{self.topic}' at {self.bootstrap_servers}")
 
-    # --- [任务 2 实现] ---
-    # 移除了 "simulated" 日志，实现了真实的消息处理
-    def process_stream(self, message: Any):
+    def connect(self):
         """
-        处理单个反序列化后的 Kafka 消息。
-        (这是验收标准中的“解析和分派”步骤)
-        
-        Args:
-            message (Any): 从 Kafka 消息值中反序列化出的 Python 对象 (例如 dict)。
-        """
-        # 示例：您可以将此消息分派给系统的其他部分
-        # (例如，EventDistributor 或 DataManager)
-        
-        logger.info(f"{self.log_prefix} Processing message: {message}")
-        
-        # TODO: 在此处添加您的分派逻辑
-        # (例如: self.event_distributor.publish(message['type'], **message_payload))
-
-    # --- [任务 2 实现] ---
-    # 移除了 "simulated" 日志，实现了真实的消费循环
-    def start_consumer(self):
-        """
-        启动持续消费循环。
-        这是一个阻塞操作，通常在专用的工作进程或线程中运行。
-        """
-        if not self.consumer:
-            logger.error(f"{self.log_prefix} Consumer not connected. Call connect() first.")
-            return
-
-        logger.info(f"{self.log_prefix} Starting message consumption loop...")
-        try:
-            # 持续循环消费消息
-            for message in self.consumer:
-                # message.value 已经是反序列化后的 Python 对象
-                self.process_stream(message.value)
-                
-        except KeyboardInterrupt:
-            logger.info(f"{self.log_prefix} Consumer loop stopped by user.")
-        except Exception as e:
-            logger.error(f"{self.log_prefix} Error in consumer loop: {e}", exc_info=True)
-        finally:
-            self.close()
-
-    def close(self):
-        """
-        关闭 Kafka 消费者。
+        (阻塞) 尝试连接到 Kafka。
         """
         if self.consumer:
-            self.consumer.close()
-            logger.info(f"{self.log_prefix} Kafka consumer closed.")
+            logger.warning("Consumer already connected.")
+            return
+            
+        try:
+            logger.info(f"Connecting to Kafka: {self.bootstrap_servers}...")
+            self.consumer = KafkaConsumer(
+                self.topic,
+                bootstrap_servers=self.bootstrap_servers.split(','),
+                auto_offset_reset='earliest', # 从最早的消息开始
+                group_id=self.group_id,
+                value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+            )
+            logger.info("Kafka Consumer connected successfully.")
+        except Exception as e:
+            logger.critical(f"Failed to connect to Kafka: {e}", exc_info=True)
+            self.consumer = None
+            raise # 允许 run_stream_processor.py 捕获并重试
 
-# 示例：如何运行 (通常由您的主应用程序或工作进程调用)
-if __name__ == "__main__":
-    # 从 docker-compose.yml 和环境
-    # 变量获取配置
-    KAFKA_SERVERS = ['kafka:29092'] # 假设在 docker-compose 网络中
-    KAFKA_GROUP_ID = 'phoenix-stream-processor'
-    TOPICS_TO_CONSUME = ['raw_market_data', 'raw_news'] # 示例主题
+    def process_stream(self, raw_message: dict):
+        """
+        处理来自 Kafka 的单个消息。
+        [主人喵的修复 2] 现在将处理后的消息推送到 EventDistributor (Redis)。
+        """
+        try:
+            # (假设 raw_message 已经是反序列化后的 dict)
+            
+            # 1. (TODO) 在此处添加任何需要的验证或转换
+            data = raw_message
+            if 'id' not in data:
+                logger.warning(f"Message missing 'id', discarding: {data}")
+                return
 
-    processor = StreamProcessor(
-        bootstrap_servers=KAFKA_SERVERS,
-        group_id=KAFKA_GROUP_ID,
-        topics=TOPICS_TO_CONSUME
-    )
-    
-    if processor.connect():
-        processor.start_consumer()
+            # 2. [主人喵的修复 2] 将事件发布到 Redis 队列
+            success = self.event_distributor.publish(data)
+            
+            if success:
+                logger.debug(f"Successfully processed and published event {data['id']} to distributor.")
+            else:
+                logger.error(f"Failed to publish event {data['id']} to distributor.")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Message value is not valid JSON: {e}. Value: {raw_message}")
+        except Exception as e:
+            logger.error(f"Error processing Kafka message: {e}", exc_info=True)
+
+    def start_consumer(self):
+        """
+        (阻塞) 启动消费者循环。
+        这应该在一个专用的服务中运行。
+        """
+        if not self.consumer:
+            logger.error("Consumer is not connected. Call connect() first.")
+            return
+
+        logger.info("Starting Kafka consumer loop (blocking)...")
+        try:
+            for message in self.consumer:
+                # message.value 已经是 dict (归功于 value_deserializer)
+                logger.debug(f"Received message from Kafka: {message.topic}:{message.partition}:{message.offset}")
+                self.process_stream(message.value)
+        
+        except KeyboardInterrupt:
+            logger.info("Consumer loop stopped by user.")
+        except Exception as e:
+            logger.critical(f"Kafka consumer loop crashed: {e}", exc_info=True)
+        finally:
+            if self.consumer:
+                self.consumer.close()
+            logger.info("Kafka consumer closed.")
