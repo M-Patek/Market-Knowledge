@@ -1,57 +1,133 @@
 """
 事件流处理器
-(目前似乎是一个占位符或概念)
-在更复杂的系统中，这可能是一个 Kafka/Spark 流处理器。
-在当前架构中，Orchestrator 扮演了这个角色。
+(实现为 Kafka 消费者)
 """
-from typing import Any, Dict, List
+import json
+import logging
+from typing import List, Callable, Any
+from kafka import KafkaConsumer
+from kafka.errors import NoBrokersAvailable
+import time
 
-# FIX (E1): 导入统一后的核心模式
-from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
+# (假设您有一个日志记录器)
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
 
 class StreamProcessor:
     """
-    处理传入的数据流，可能进行聚合、转换或充实。
+    使用 kafka-python 实现的真实 Kafka 消费者，
+    用于处理传入的数据流。
     """
-    def __init__(self):
+    def __init__(self, bootstrap_servers: List[str], group_id: str, topics: List[str]):
+        """
+        初始化 Kafka StreamProcessor。
+
+        Args:
+            bootstrap_servers (List[str]): Kafka
+                (例如, ['kafka:29092'])。
+            group_id (str): 此消费者的 Kafka 消费者组 ID。
+            topics (List[str]): 要订阅的 Kafka 主题列表。
+        """
+        self.bootstrap_servers = bootstrap_servers
+        self.group_id = group_id
+        self.topics = topics
+        self.consumer = None
         self.log_prefix = "StreamProcessor:"
-        print(f"{self.log_prefix} Initialized.")
-        
-    def process_batch(self, data_batch: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        logger.info(f"{self.log_prefix} Initialized. Configured for servers: {bootstrap_servers}")
+
+    def connect(self, max_retries=5, retry_delay=10):
         """
-        处理来自 DataManager 的原始批次。
-        
-        示例：
-        - 充实市场数据（例如，添加技术指标）。
-        - 聚合新闻情绪。
+        连接到 Kafka Broker。
+        由于 Kafka 启动可能需要时间，因此包含重试逻辑。
         """
+        retries = 0
+        while retries < max_retries:
+            try:
+                self.consumer = KafkaConsumer(
+                    *self.topics,
+                    bootstrap_servers=self.bootstrap_servers,
+                    group_id=self.group_id,
+                    auto_offset_reset='earliest',
+                    # 假设消息是 JSON 编码的 UTF-8 字符串
+                    value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+                )
+                logger.info(f"{self.log_prefix} KafkaConsumer connected and subscribed to topics: {self.topics}")
+                return True
+            except NoBrokersAvailable:
+                retries += 1
+                logger.warning(f"{self.log_prefix} No Kafka brokers available. Retrying ({retries}/{max_retries}) in {retry_delay}s...")
+                time.sleep(retry_delay)
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Failed to connect to Kafka: {e}", exc_info=True)
+                return False
         
-        # FIX (E1): 使用 MarketData
-        if "market_data" in data_batch:
-            for data_point in data_batch["market_data"]:
-                if isinstance(data_point, MarketData):
-                    # 示例：可以在这里添加一个TA指标
-                    # data_point.metadata["RSI_14"] = calculate_rsi(data_point) # 假设...
-                    pass
+        logger.error(f"{self.log_prefix} Could not connect to Kafka after {max_retries} retries.")
+        return False
 
-        # FIX (E1): 使用 NewsData
-        if "news_data" in data_batch:
-             for data_point in data_batch["news_data"]:
-                if isinstance(data_point, NewsData):
-                    # 示例：可以在这里进行初步的情绪分析
-                    # data_point.metadata["sentiment"] = analyze_sentiment(data_point.content)
-                    pass
-
-        # FIX (E1): 使用 EconomicIndicator
-        if "economic_indicators" in data_batch:
-            for data_point in data_batch["economic_indicators"]:
-                 if isinstance(data_point, EconomicIndicator):
-                    # 示例：计算“意外” (Surprise)
-                    if data_point.expected is not None:
-                        data_point.metadata["surprise"] = data_point.value - data_point.expected
-                    pass
-
-        print(f"{self.log_prefix} Processed batch.")
+    def process_stream(self, message: Any):
+        """
+        处理单个反序列化后的 Kafka 消息。
+        (这是验收标准中的“解析和分派”步骤)
         
-        # 在这个简单的实现中，我们只返回原始批次（可能已充实）
-        return data_batch
+        Args:
+            message (Any): 从 Kafka 消息值中反序列化出的 Python 对象 (例如 dict)。
+        """
+        # 示例：您可以将此消息分派给系统的其他部分
+        # (例如，Orchestrator、DataManager 或知识图谱注入器)
+        
+        logger.info(f"{self.log_prefix} Processing message: {message}")
+        
+        # TODO: 在此处添加您的分派逻辑
+        # if message.get('type') == 'market_data':
+        #     dispatch_to_market_data_handler(message)
+        # elif message.get('type') == 'news_data':
+        #     dispatch_to_news_handler(message)
+
+    def start_consumer(self):
+        """
+        启动持续消费循环。
+        这是一个阻塞操作，通常在专用的工作进程或线程中运行。
+        """
+        if not self.consumer:
+            logger.error(f"{self.log_prefix} Consumer not connected. Call connect() first.")
+            return
+
+        logger.info(f"{self.log_prefix} Starting message consumption loop...")
+        try:
+            # 持续循环消费消息
+            for message in self.consumer:
+                # message.value 已经是反序列化后的 Python 对象
+                self.process_stream(message.value)
+                
+        except KeyboardInterrupt:
+            logger.info(f"{self.log_prefix} Consumer loop stopped by user.")
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Error in consumer loop: {e}", exc_info=True)
+        finally:
+            self.close()
+
+    def close(self):
+        """
+        关闭 Kafka 消费者。
+        """
+        if self.consumer:
+            self.consumer.close()
+            logger.info(f"{self.log_prefix} Kafka consumer closed.")
+
+# 示例：如何运行 (通常由您的主应用程序或工作进程调用)
+if __name__ == "__main__":
+    # 从 docker-compose.yml 和环境
+    # 变量获取配置
+    KAFKA_SERVERS = ['kafka:29092'] 
+    KAFKA_GROUP_ID = 'phoenix-stream-processor'
+    TOPICS_TO_CONSUME = ['raw_market_data', 'raw_news'] # 示例主题
+
+    processor = StreamProcessor(
+        bootstrap_servers=KAFKA_SERVERS,
+        group_id=KAFKA_GROUP_ID,
+        topics=TOPICS_TO_CONSUME
+    )
+    
+    if processor.connect():
+        processor.start_consumer()
