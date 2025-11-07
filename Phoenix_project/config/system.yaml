@@ -108,6 +108,22 @@ tabular_db:
   password_env_var: "POSTGRES_PASSWORD"
   database: "phoenix_tabular"
 
+# --- [主人喵的修复 1] ---
+# 动态配置仓位管理器 (Sizer)
+# 允许我们在这里切换 VolatilityParitySizer 和 FixedFractionSizer
+portfolio:
+  sizer:
+    # 默认选项 (已注释掉)
+    # type: "FixedFractionSizer"
+    # params:
+    #   fraction_per_position: 0.05
+    
+    # 你提到的 VolatilityParitySizer 选项
+    type: "VolatilityParitySizer"
+    params:
+      volatility_period: 20
+# --- [修复结束] ---
+
 # 调度器作业配置
 # 遵照主人的指示：
 # 1. 所有 func 键都设置为 "orchestrator.run_main_cycle"
