@@ -39,8 +39,17 @@ from Phoenix_project.api.gateway import APIGateway
 from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
 from Phoenix_project.memory.vector_store import VectorStore
 from Phoenix_project.memory.cot_database import CoTDatabase
-from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer
+# from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # <-- [主人喵的修复 2] 不再硬编码
 import json
+
+# --- [主人喵的修复 2] ---
+# 导入动态加载所需的模块
+import importlib
+import pydash # 用于将 "VolatilityParitySizer" 转换为 "volatility_parity"
+from Phoenix_project.sizing.base import IPositionSizer
+from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # 作为安全回退
+# --- [修复结束] ---
+
 
 # --- Celery App Setup ---
 celery_app = Celery(
@@ -74,9 +83,10 @@ def build_orchestrator() -> Orchestrator:
         # 1. Config
         config_path = os.environ.get('PHOENIX_CONFIG_PATH', 'config')
         config_loader = ConfigLoader(config_path)
+        system_config = config_loader.get_system_config() # <-- [主人喵的修复 2]
         
         # 2. Data
-        catalog_path = config_loader.get_system_config().get("data_catalog_path", "data_catalog.json")
+        catalog_path = system_config.get("data_catalog_path", "data_catalog.json")
         with open(catalog_path, 'r') as f:
             data_catalog = json.load(f)
             
@@ -87,7 +97,7 @@ def build_orchestrator() -> Orchestrator:
         data_manager = DataManager(config_loader, data_catalog)
         
         # (E5 Fix)
-        max_history = config_loader.get_system_config().get("max_pipeline_history", 100)
+        max_history = system_config.get("max_pipeline_history", 100)
         pipeline_state = PipelineState(initial_state=None, max_history=max_history)
         
         audit_manager = AuditManager(config_loader)
@@ -99,7 +109,7 @@ def build_orchestrator() -> Orchestrator:
 
         # 5. Execution
         # (E6 Fix - 检查 Alpaca)
-        broker_config = config_loader.get_system_config().get("broker", {})
+        broker_config = system_config.get("broker", {})
         if broker_config.get("type") == "alpaca":
             broker = AlpacaAdapter(
                 api_key=os.environ.get(broker_config.get("api_key_env")),
@@ -110,7 +120,7 @@ def build_orchestrator() -> Orchestrator:
             logger.warning("Defaulting to SimulatedBrokerAdapter for worker.")
             broker = SimulatedBrokerAdapter()
             
-        initial_cash = config_loader.get_system_config().get("trading", {}).get("initial_cash", 1000000)
+        initial_cash = system_config.get("trading", {}).get("initial_cash", 1000000)
         trade_lifecycle_manager = TradeLifecycleManager(initial_cash=initial_cash)
         order_manager = OrderManager(broker)
 
@@ -141,8 +151,37 @@ def build_orchestrator() -> Orchestrator:
         )
             
         # 7. Portfolio
-        sizer = FixedFractionSizer() # 示例
+        
+        # --- [主人喵的修复 2] ---
+        # 动态加载 Sizer，而不是硬编码
+        sizer_config = system_config.get("portfolio", {}).get("sizer", {})
+        sizer_type_name = sizer_config.get("type", "FixedFractionSizer") # e.g., "VolatilityParitySizer"
+        sizer_params = sizer_config.get("params", {}) # e.g., {"volatility_period": 20}
+
+        sizer: IPositionSizer
+        try:
+            # 将 "VolatilityParitySizer" 转换为 "volatility_parity"
+            module_name = pydash.snake_case(sizer_type_name.replace("Sizer", ""))
+            module = importlib.import_module(f"Phoenix_project.sizing.{module_name}")
+            SizerClass = getattr(module, sizer_type_name)
+            
+            # 如果没有提供参数，请使用安全默认值
+            if sizer_type_name == "FixedFractionSizer" and not sizer_params:
+                 sizer_params = {"fraction_per_position": 0.05}
+            elif sizer_type_name == "VolatilityParitySizer" and not sizer_params:
+                 sizer_params = {"volatility_period": 20} # 合理的默认值
+
+            sizer = SizerClass(**sizer_params)
+            logger.info(f"成功从配置加载 Sizer: {sizer_type_name} (Params: {sizer_params})")
+
+        except (ImportError, AttributeError, TypeError) as e:
+            logger.error(f"无法从配置加载 sizer '{sizer_type_name}' (Params: {sizer_params}): {e}。回退到 FixedFractionSizer。")
+            sizer = FixedFractionSizer(fraction_per_position=0.05) # 安全回退
+        
+        # sizer = FixedFractionSizer() # <-- [主人喵的修复 2] 已被替换
         portfolio_constructor = PortfolioConstructor(position_sizer=sizer)
+        # --- [修复结束] ---
+        
         risk_manager = RiskManager(config_loader)
 
         # 8. Monitoring
