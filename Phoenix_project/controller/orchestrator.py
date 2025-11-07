@@ -1,196 +1,188 @@
-import time
-import asyncio
-import datetime  # <--- 添加了缺失的导入
-from typing import Dict, Any, Optional
+"""
+Orchestrator
+协调 Phoenix 系统的主要数据和逻辑流。
+"""
+from typing import List, Dict, Any
+
 from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.config.loader import ConfigLoader
-from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.controller.scheduler import Scheduler
-from Phoenix_project.controller.error_handler import ErrorHandler
 from Phoenix_project.data_manager import DataManager
+from Phoenix_project.events.risk_filter import EventRiskFilter
+# [主人喵的修复 2] 导入 EventDistributor
 from Phoenix_project.events.event_distributor import EventDistributor
+# [主人喵的修复 2] 移除 StreamProcessor
 from Phoenix_project.cognitive.engine import CognitiveEngine
 from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
 from Phoenix_project.cognitive.risk_manager import RiskManager
 from Phoenix_project.execution.order_manager import OrderManager
-from Phoenix_project.audit_manager import AuditManager
-from Phoenix_project.metrics_collector import MetricsCollector
+from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
 from Phoenix_project.snapshot_manager import SnapshotManager
-from Phoenix_project.core.exceptions import CognitiveError, PhoenixError # Import our new exceptions
+from Phoenix_project.metrics_collector import MetricsCollector
+from Phoenix_project.audit_manager import AuditManager
+from Phoenix_project.controller.error_handler import ErrorHandler
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 class Orchestrator:
     """
-    The central coordinator of the entire system.
-    It owns all major components and triggers the main processing
-    cycle in response to events (e.g., from the Scheduler).
+    管理整个 AI 交易系统的端到端生命周期，
+    从数据摄取到执行。
     """
-
+    
     def __init__(
         self,
-        config_loader: ConfigLoader,
         pipeline_state: PipelineState,
         data_manager: DataManager,
+        event_filter: EventRiskFilter,
+        # [主人喵的修复 2] 移除 stream_processor，添加 event_distributor
         event_distributor: EventDistributor,
         cognitive_engine: CognitiveEngine,
         portfolio_constructor: PortfolioConstructor,
         risk_manager: RiskManager,
         order_manager: OrderManager,
-        audit_manager: AuditManager,
-        metrics_collector: MetricsCollector,
+        trade_lifecycle_manager: TradeLifecycleManager,
         snapshot_manager: SnapshotManager,
-        error_handler: ErrorHandler,
+        metrics_collector: MetricsCollector,
+        audit_manager: AuditManager,
+        error_handler: ErrorHandler
     ):
-        self.config_loader = config_loader
         self.pipeline_state = pipeline_state
         self.data_manager = data_manager
+        self.event_filter = event_filter
+        # [主人喵的修复 2] 存储 event_distributor
         self.event_distributor = event_distributor
         self.cognitive_engine = cognitive_engine
         self.portfolio_constructor = portfolio_constructor
         self.risk_manager = risk_manager
         self.order_manager = order_manager
-        self.audit_manager = audit_manager
-        self.metrics_collector = metrics_collector
+        self.trade_lifecycle_manager = trade_lifecycle_manager
         self.snapshot_manager = snapshot_manager
+        self.metrics_collector = metrics_collector
+        self.audit_manager = audit_manager
         self.error_handler = error_handler
+        
+        self.is_running = False
+        logger.info("Orchestrator initialized.")
 
-        self.scheduler = Scheduler(self, config_loader.get_config("scheduler"))
-        self._is_running_cycle = False
-        logger.info("Orchestrator initialized with all components.")
-
-    def start_scheduler(self):
-        """Starts the job scheduler (for live mode)."""
-        logger.info("Starting scheduler...")
-        self.scheduler.start()
-
-    def stop_scheduler(self):
-        """Stops the job scheduler."""
-        logger.info("Stopping scheduler...")
-        self.scheduler.stop()
-
-    async def run_main_cycle(self, decision_id: Optional[str] = None):
+    def _check_for_events(self) -> List[Dict[str, Any]]:
         """
-        Executes one full processing cycle, from cognition to execution.
-        This is the "heartbeat" of the system, triggered by the scheduler.
+        [主人喵的修复 2]
+        从 EventDistributor (Redis 队列) 批量拉取待处理事件。
         """
-        if self._is_running_cycle:
-            logger.warning("Main cycle triggered but a previous cycle is still running. Skipping.")
-            return
-            
-        self._is_running_cycle = True
-        start_time = time.perf_counter()
-        
-        if not decision_id:
-            decision_id = self.audit_manager.generate_decision_id()
-        
-        await self.pipeline_state.update_state({
-            "current_decision_id": decision_id,
-            "cycle_start_time": datetime.datetime.utcnow()  # <--- 修正了调用
-        })
-        
-        logger.info(f"--- Starting Main Cycle: {decision_id} ---")
-
         try:
-            # 0. Portfolio/Risk Health Check
-            self.risk_manager.check_portfolio_risk(self.pipeline_state)
-            if self.risk_manager.circuit_breaker_tripped:
-                logger.critical(f"Cycle aborted: Circuit breaker is tripped: {self.risk_manager.circuit_breaker_reason}")
-                await self.audit_manager.audit_event(
-                    "CYCLE_ABORTED", {"reason": "Circuit breaker tripped"}, self.pipeline_state
-                )
-                self._is_running_cycle = False
-                return # Do not proceed
+            # (默认拉取最多 100 个事件，以避免阻塞循环)
+            pending_events = self.event_distributor.get_pending_events(max_events=100)
+            
+            if pending_events:
+                logger.info(f"Retrieved {len(pending_events)} new events from EventDistributor.")
+                
+            # (TODO: 在这里添加事件的初步验证或 Schema 检查)
+            
+            return pending_events
+            
+        except Exception as e:
+            logger.error(f"Failed to check for events: {e}", exc_info=True)
+            return []
 
-            # 1. Data Ingestion (triggered by scheduler, assumed done)
-            # In a backtest, data would be loaded here.
-            # In live, we just assume data has arrived.
+    def run_main_cycle(self):
+        """
+        执行一个单独的、离散的系统运行周期。
+        (这是由 Celery worker 调用的)
+        """
+        if self.is_running:
+            logger.warning("Main cycle already in progress. Skipping.")
+            return
+
+        self.is_running = True
+        logger.info("--- Orchestrator Main Cycle START ---")
+        
+        try:
+            # 1. 事件摄取 (Event Ingestion)
+            # [主人喵的修复 2] 从 EventDistributor (Redis) 拉取，而不是 Kafka
+            new_events = self._check_for_events()
             
-            # 2. Cognitive Cycle
-            logger.debug(f"[{decision_id}] Running CognitiveEngine...")
-            cognitive_output = await self.cognitive_engine.process_cognitive_cycle(self.pipeline_state)
+            # (如果需要，也可以安排数据管理器的主动拉取)
+            # self.data_manager.pull_scheduled_data()
+
+            # 2. 事件过滤 (Event Filtering)
+            # (FIX E1)
+            filtered_events = self.event_filter.apply_all_filters(new_events)
+            if not filtered_events:
+                logger.info("No significant events after filtering. Cycle END.")
+                self.is_running = False
+                return
+
+            # 3. 状态更新 (State Update)
+            self.pipeline_state.start_new_cycle(filtered_events)
             
-            fusion_result = cognitive_output["final_decision"]
-            fusion_result.decision_id = decision_id # Stamp the ID
+            # (FIX E2)
+            # 4. 认知引擎 (Cognitive Engine)
+            # (假设 cognitive_engine.run() 是一个同步/阻塞的调用)
+            fusion_result = self.cognitive_engine.run(self.pipeline_state)
             
-            # 3. Audit the Cognitive Decision (crucial)
-            await self.audit_manager.audit_decision_cycle(
-                self.pipeline_state, fusion_result, decision_id
+            if not fusion_result:
+                # (E2.b) 认知引擎没有产生决策
+                logger.warning("Cognitive Engine did not produce a final decision.")
+                self.is_running = False
+                # (E2.c) 我们仍然需要记录审计
+                self.audit_manager.log_cycle(self.pipeline_state)
+                logger.info("--- Orchestrator Main Cycle END (No Decision) ---")
+                return
+
+            # 5. 投资组合构建 (Portfolio Construction)
+            target_portfolio = self.portfolio_constructor.construct(
+                fusion_result,
+                self.trade_lifecycle_manager.get_current_portfolio_state()
             )
 
-            # 4. Portfolio Construction (Signal & Order Generation)
-            logger.debug(f"[{decision_id}] Running PortfolioConstructor...")
-            signal = self.portfolio_constructor.generate_signal(fusion_result)
+            # 6. 风险管理 (Risk Management)
+            final_portfolio, risk_report = self.risk_manager.evaluate_and_adjust(
+                target_portfolio,
+                self.pipeline_state
+            )
             
-            # 5. Pre-Signal Risk Check
-            rejection_reason = await self.risk_manager.validate_signal(signal, self.pipeline_state)
-            if rejection_reason:
-                logger.warning(f"Signal for {signal.symbol} rejected by RiskManager: {rejection_reason}")
-                await self.audit_manager.audit_event(
-                    "SIGNAL_REJECTED", {"signal": signal.model_dump(), "reason": rejection_reason}, self.pipeline_state
-                )
-            else:
-                # 6. Generate Orders
-                orders = self.portfolio_constructor.generate_orders_from_signal(
-                    signal, self.pipeline_state
-                )
-                
-                # 7. Pre-Trade Risk Check & Execution
-                for order in orders:
-                    order_rejection = await self.risk_manager.validate_order(order, self.pipeline_state)
-                    if order_rejection:
-                        logger.warning(f"Order for {order.symbol} rejected by RiskManager: {order_rejection}")
-                        await self.audit_manager.audit_event(
-                            "ORDER_REJECTED", {"order": order.model_dump(), "reason": order_rejection}, self.pipeline_state
-                        )
-                    else:
-                        # 8. Submit Order for Execution
-                        logger.info(f"Submitting valid order for {order.symbol} ({order.quantity}).")
-                        await self.order_manager.submit_order(order)
-                        
-            # 9. End-of-cycle tasks
-            end_time = time.perf_counter()
-            cycle_time_ms = (end_time - start_time) * 1000
+            # 7. 执行 (Execution)
+            # (FIX E3)
+            orders = self.order_manager.generate_orders(
+                self.trade_lifecycle_manager.get_current_portfolio_state(),
+                final_portfolio
+            )
             
-            await self.pipeline_state.update_state({
-                "last_cycle_time_ms": cycle_time_ms,
-                "last_successful_cycle_time": datetime.datetime.utcnow() # <--- 修正了调用
-            })
-            
-            self.metrics_collector.gauge("cycle.time_ms", cycle_time_ms)
-            self.metrics_collector.increment("cycle.success")
-            
-            await self.snapshot_manager.take_snapshot(self.pipeline_state, "cycle_end")
-            
-            logger.info(f"--- Main Cycle {decision_id} Complete ({cycle_time_ms:.2f} ms) ---")
-            
-            # Reset error count for the main cycle component
-            self.error_handler.reset_failure_count("run_main_cycle")
+            # (FIX E4)
+            executed_trades = self.order_manager.execute_orders(orders)
 
-        except CognitiveError as e:
-            # Specific handling for known cognitive failures
-            end_time = time.perf_counter()
-            cycle_time_ms = (end_time - start_time) * 1000
+            # 8. 状态更新 (TLM)
+            self.trade_lifecycle_manager.update_portfolio(executed_trades)
             
-            logger.error(f"--- Main Cycle {decision_id} FAILED ({cycle_time_ms:.2f} ms) due to CognitiveError: {e} ---", exc_info=False) # No need for full traceback
-            self.metrics_collector.increment("cycle.failure.cognitive")
+            # (FIX E9)
+            # 9. 监控 & 审计
+            self.metrics_collector.collect_all(
+                self.pipeline_state,
+                fusion_result,
+                risk_report,
+                self.trade_lifecycle_manager.get_current_portfolio_state()
+            )
+            self.audit_manager.log_cycle(self.pipeline_state)
             
-            await self.error_handler.handle_error(e, "run_main_cycle.cognitive_engine", {"decision_id": decision_id})
-            await self.audit_manager.audit_error(e, "run_main_cycle.cognitive_engine", self.pipeline_state, decision_id)
-
+            # 10. 快照 (Snapshot)
+            self.snapshot_manager.save_state(
+                self.pipeline_state,
+                self.trade_lifecycle_manager.get_current_portfolio_state()
+            )
 
         except Exception as e:
-            end_time = time.perf_counter()
-            cycle_time_ms = (end_time - start_time) * 1000
-            
-            logger.error(f"--- Main Cycle {decision_id} FAILED ({cycle_time_ms:.2f} ms): {e} ---", exc_info=True)
-            self.metrics_collector.increment("cycle.failure")
-            
-            # Log to central error handler
-            await self.error_handler.handle_error(e, "run_main_cycle", {"decision_id": decision_id})
-            
-            # Also log to audit trail
-            await self.audit_manager.audit_error(e, "run_main_cycle", self.pipeline_state, decision_id)
-
+            # (FIX E10) 捕获主循环中的所有异常
+            logger.critical(f"Orchestrator main cycle failed: {e}", exc_info=True)
+            self.error_handler.handle_critical_error(e, self.pipeline_state)
+        
         finally:
-            self._is_running_cycle = False
+            self.is_running = False
+            logger.info("--- Orchestrator Main Cycle END ---")
+
+    def shutdown(self):
+        """
+        (可选) 安全关闭 Orchestrator。
+        """
+        logger.info("Orchestrator shutting down...")
+        self.is_running = False
+        # (清理其他资源)
