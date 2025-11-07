@@ -3,10 +3,10 @@ Base class for all L2 (Metacognition & Arbitration) Agents.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List # 确保 Dict 和 Any 被导入
 
 from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
+# from Phoenix_project.core.schemas.evidence_schema import EvidenceItem # 不再需要
 
 class BaseL2Agent(ABC):
     """
@@ -28,17 +28,17 @@ class BaseL2Agent(ABC):
         self.llm_client = llm_client
 
     @abstractmethod
-    def run(self, state: PipelineState, evidence_items: List[EvidenceItem]) -> Any:
+    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> Any:
         """
         The main execution method for the agent.
         
-        It takes the current pipeline state and the list of L1 EvidenceItems,
-        performs its specialized analysis (e.g., criticism, fusion), and
-        returns its result. The return type varies by agent (e.g., CriticResult, FusionResult).
+        It takes the current pipeline state and a dictionary of dependency outputs,
+        performs its specialized analysis, and returns its result.
         
         Args:
             state (PipelineState): The current state of the analysis pipeline.
-            evidence_items (List[EvidenceItem]): The collected list of outputs from the L1 agents.
+            dependencies (Dict[str, Any]): A dictionary mapping dependency agent IDs
+                                         to their execution results.
             
         Returns:
             Any: The specific result object for that agent's task.
