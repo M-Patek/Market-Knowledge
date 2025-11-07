@@ -2,43 +2,39 @@
 AI 集成客户端
 负责并行（或串行）调用多个 AI 智能体。
 """
+import asyncio # <-- (FIX 2.2) 为 asyncio.gather 导入
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-# 恢复原有逻辑所需的新增导入
 import json
 from datetime import datetime
 from pydantic import ValidationError
-
-# FIX (E3): 导入 AgentDecision (这个保留)
 from Phoenix_project.core.schemas.fusion_result import AgentDecision
 from Phoenix_project.ai.prompt_manager import PromptManager
-from Phoenix_project.api.gateway import IAPIGateway
+# --- (FIX 3) 修正导入：IAPIGateway -> APIGateway ---
+from Phoenix_project.api.gateway import APIGateway
+# --- (FIX 3 结束) ---
 from Phoenix_project.monitor.logging import get_logger
-
-# (新增) 导入 PipelineState
 from Phoenix_project.core.pipeline_state import PipelineState
 
 logger = get_logger(__name__)
-
 class EnsembleClient:
     """
     管理 AI 智能体的池，并执行推理请求。
     """
     
-    def __init__(self, api_gateway: IAPIGateway, prompt_manager: PromptManager, agent_registry: Dict[str, Any]):
+    # --- (FIX 3) 修正类型提示：IAPIGateway -> APIGateway ---
+    def __init__(self, api_gateway: APIGateway, prompt_manager: PromptManager, agent_registry: Dict[str, Any]):
+    # --- (FIX 3 结束) ---
         self.api_gateway = api_gateway
         self.prompt_manager = prompt_manager
-        self.agent_registry = agent_registry # 来自 agents/registry.yaml
+        self.agent_registry = agent_registry 
         self.max_workers = agent_registry.get("config", {}).get("max_parallel_agents", 5)
         self.log_prefix = "EnsembleClient:"
 
-    # (新增) execute_ensemble 的 (PipleineState) 版本
+    # --- V2 逻辑 (保持不变) ---
     def execute_ensemble_v2(self, state: PipelineState) -> List[AgentDecision]:
-        """
-        (V2) 并行执行在 agent_registry 中定义的所有 "analyst" 角色的智能体。
-        使用 PipelineState 作为上下文。
-        """
+        # ... (此 V2 方法保持不变) ...
         tasks = []
         results = []
         
@@ -53,15 +49,11 @@ class EnsembleClient:
             for agent_config in analyst_agents:
                 agent_name = agent_config["name"]
                 
-                # (V2) 我们不再渲染提示，而是将状态传递给智能体
-                # 智能体将自己负责从状态中提取数据并渲染提示
-                
                 tasks.append(
                     executor.submit(
                         self._run_agent_inference_v2,
                         state=state,
                         agent_name=agent_name
-                        # (model_id 等其他配置可以传入)
                     )
                 )
 
@@ -76,24 +68,18 @@ class EnsembleClient:
         logger.info(f"{self.log_prefix} Ensemble execution V2 finished. Received {len(results)} decisions.")
         return results
 
-    # (新增) _run_agent_inference 的 (PipleineState) 版本
     def _run_agent_inference_v2(self, state: PipelineState, agent_name: str) -> Optional[AgentDecision]:
-        """
-        (V2) 运行单个智能体。
-        """
+        # ... (此 V2 方法保持不变) ...
         try:
             start_time = time.time()
             
-            # 1. (V2) 从注册表获取智能体实例 (假设已注册)
-            from Phoenix_project.registry import registry # (循环导入风险？)
+            from Phoenix_project.registry import registry 
             agent_instance = registry.resolve(agent_name)
             
             if not agent_instance:
                  logger.error(f"{self.log_prefix} Agent '{agent_name}' not found in registry.")
                  return None
 
-            # 2. (V2) 运行智能体
-            # 智能体自己处理 API 调用和解析
             decision: AgentDecision = agent_instance.run(state)
             
             duration = time.time() - start_time
@@ -107,12 +93,13 @@ class EnsembleClient:
 
     # --- (V1 - 旧版逻辑) ---
 
-    def execute_ensemble(self, context: str, target_symbols: List[str]) -> List[AgentDecision]:
+    # --- (FIX 2.2) 更改为 'async def' ---
+    async def execute_ensemble(self, context: str, target_symbols: List[str]) -> List[AgentDecision]:
         """
         (V1) 并行执行在 agent_registry 中定义的所有 "analyst" 角色的智能体。
+        (已重构为异步)
         """
         tasks = []
-        results = []
         
         analyst_agents = [
             agent for agent in self.agent_registry.get("agents", [])
@@ -121,53 +108,62 @@ class EnsembleClient:
 
         logger.info(f"{self.log_prefix} Executing ensemble (V1) for {target_symbols} with {len(analyst_agents)} agents...")
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            for agent_config in analyst_agents:
-                agent_name = agent_config["name"]
-                prompt_name = agent_config["prompt"]
-                
-                # 渲染该智能体特定的提示
-                prompt_text = self.prompt_manager.render_prompt(
-                    prompt_name,
-                    context=context,
-                    target_symbols=target_symbols
-                )
-                
-                if prompt_text:
-                    tasks.append(
-                        executor.submit(
-                            self._run_agent_inference,
-                            agent_name=agent_name,
-                            prompt=prompt_text,
-                            model_id=agent_config.get("model_id") # (e.g., "gemini-1.5-pro")
-                        )
+        # --- (FIX 2.2) 用 asyncio.gather 替换 ThreadPoolExecutor ---
+        for agent_config in analyst_agents:
+            agent_name = agent_config["name"]
+            prompt_name = agent_config["prompt"]
+            
+            prompt_text = self.prompt_manager.render_prompt(
+                prompt_name,
+                context=context,
+                target_symbols=target_symbols
+            )
+            
+            if prompt_text:
+                # 添加协程任务
+                tasks.append(
+                    self._run_agent_inference(
+                        agent_name=agent_name,
+                        prompt=prompt_text,
+                        model_id=agent_config.get("model_id")
                     )
-                else:
-                    logger.warning(f"{self.log_prefix} Skipping agent {agent_name}: Failed to render prompt {prompt_name}")
+                )
+            else:
+                logger.warning(f"{self.log_prefix} Skipping agent {agent_name}: Failed to render prompt {prompt_name}")
 
-            for future in as_completed(tasks):
-                try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                except Exception as e:
-                    logger.error(f"{self.log_prefix} Agent inference (V1) failed: {e}", exc_info=True)
+        # 并发执行所有异步任务
+        # return_exceptions=True 确保一个任务失败不会导致所有任务崩溃
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        results = []
+        for result in all_results:
+            if isinstance(result, AgentDecision):
+                results.append(result)
+            elif isinstance(result, Exception):
+                logger.error(f"{self.log_prefix} Agent inference (V1) failed in asyncio.gather: {result}", exc_info=result)
+        # --- (FIX 2.2 结束) ---
                     
         logger.info(f"{self.log_prefix} Ensemble execution (V1) finished. Received {len(results)} decisions.")
         return results
 
-    def _run_agent_inference(self, agent_name: str, prompt: str, model_id: Optional[str] = None) -> Optional[AgentDecision]:
+    # --- (FIX 2.1) 更改为 'async def' ---
+    async def _run_agent_inference(self, agent_name: str, prompt: str, model_id: Optional[str] = None) -> Optional[AgentDecision]:
         """
         (V1) 调用 LLM API 并将结果解析为 AgentDecision。
+        (已重构为异步)
         """
         try:
             start_time = time.time()
             
-            # 1. 调用 API Gateway (假设返回文本)
-            response_text = self.api_gateway.generate(
-                prompt=prompt,
-                model_id=model_id
+            # --- (FIX 2.1) 适配异步 API (gateway.send_request) ---
+            model_to_use = model_id if model_id else "gemini-pro"
+            
+            # 使用 'await' 而不是 'asyncio.run()'
+            response_text = await self.api_gateway.send_request(
+                model_name=model_to_use,
+                prompt=prompt
             )
+            # --- (FIX 2.1 结束) ---
             
             duration = time.time() - start_time
             logger.info(f"{self.log_prefix} Agent '{agent_name}' (V1) completed in {duration:.2f}s")
@@ -178,7 +174,6 @@ class EnsembleClient:
 
             # 2. 将响应文本 (JSON) 解析为字典
             try:
-                # 尝试找到json代码块，以防模型返回额外的文本
                 if "```json" in response_text:
                     json_text = response_text.split("```json")[1].split("```")[0].strip()
                 else:
@@ -192,8 +187,8 @@ class EnsembleClient:
             # 3. 验证字典并转换为 Pydantic 模型
             try:
                 decision = AgentDecision(
-                    agent_name=agent_name, # 覆盖 agent name
-                    timestamp=datetime.utcnow(), # 添加时间戳
+                    agent_name=agent_name,
+                    timestamp=datetime.utcnow(),
                     **response_data
                 )
                 return decision
