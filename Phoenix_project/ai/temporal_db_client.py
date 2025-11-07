@@ -1,6 +1,6 @@
 import pandas as pd
 from elasticsearch import AsyncElasticsearch
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
 # 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
@@ -22,7 +22,8 @@ class TemporalDBClient:
             config (Dict[str, Any]): Configuration dict, expects 'temporal_db'
                                       with 'hosts' and 'index_name'.
         """
-        db_config = config.get('temporal_db', {})
+        # [蓝图 2 修复]：配置现在是 config['temporal_db']
+        db_config = config # 假设 config 已经是 config['temporal_db']
         self.es = AsyncElasticsearch(
             hosts=db_config.get('hosts', ["http://localhost:9200"])
         )
@@ -65,7 +66,7 @@ class TemporalDBClient:
         """
         try:
             # Ensure timestamp is in correct format
-            if 'timestamp' in event_data and isinstance(event_data['timestamp'], pd.Timestamp):
+            if 'timestamp' in event_data and isinstance(event_data['timestamp'], (pd.Timestamp, datetime)):
                 event_data['timestamp'] = event_data['timestamp'].isoformat()
                 
             response = await self.es.index(
@@ -90,7 +91,7 @@ class TemporalDBClient:
         end_time: Optional[datetime] = None,
         query_string: Optional[str] = None,
         size: int = 25
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Tuple[Dict[str, Any], float]]: # <--- [蓝图 2] 更改返回类型
         """
         Searches the temporal database for events matching the criteria.
         
@@ -102,7 +103,7 @@ class TemporalDBClient:
             size: The maximum number of hits to return.
             
         Returns:
-            List[Dict[str, Any]]: A list of event data dictionaries.
+            List[Tuple[Dict[str, Any], float]]: A list of (event_data, score) tuples.
         """
         try:
             query = {"bool": {"filter": []}}
@@ -125,19 +126,34 @@ class TemporalDBClient:
                 query["bool"]["must"] = {
                     "query_string": {
                         "query": query_string,
-                        "fields": ["headline", "summary", "tags"]
+                        # 假设这些字段在 ES 映射中存在
+                        "fields": ["headline", "summary", "tags", "content"] # <--- [蓝图 2] 添加 'content'
                     }
                 }
             
+            # 如果没有 query_string，我们仍然希望有结果，但按时间排序
+            sort_order = [{"_score": "desc"}, {"timestamp": "desc"}]
+            if not query_string:
+                sort_order = [{"timestamp": "desc"}] # 如果没有查询，则按时间排序
+
             response = await self.es.search(
                 index=self.index_name,
                 query=query,
                 size=size,
-                sort=[{"timestamp": "desc"}] # Most recent first
+                sort=sort_order # <--- [蓝图 2] 按分数排序
             )
             
             hits = response.get('hits', {}).get('hits', [])
-            return [hit.get('_source', {}) for hit in hits]
+            
+            # [蓝图 2] 提取 _source 和 _score
+            results_with_scores = []
+            for hit in hits:
+                source_data = hit.get('_source', {})
+                # 如果没有提供 query_string，ES 可能不会返回 _score，或者返回 0.0
+                score = float(hit.get('_score') or 1.0) # 如果没有分数则默认为 1.0
+                results_with_scores.append((source_data, score))
+                
+            return results_with_scores
             
         except Exception as e:
             logger.error(f"Error searching Elasticsearch: {e}", exc_info=True)
