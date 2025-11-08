@@ -2,9 +2,10 @@ import os
 import asyncio
 import google.generativeai as genai
 from typing import List, Union, Optional
-from core.exceptions import EmbeddingError
-# 假设日志记录器已经设置好
-# from monitor.logging import log
+# 修复：将相对导入 'core.exceptions' 更改为绝对导入
+from Phoenix_project.core.exceptions import EmbeddingError
+# [主人喵的清洁计划 1.1] 导入 Phoenix logger 和类型
+from Phoenix_project.monitor.logging import get_logger, ESLogger
 
 class EmbeddingClient:
     """
@@ -15,32 +16,47 @@ class EmbeddingClient:
     来为单个文本或批量文本生成 embedding。
     """
     
-    def __init__(self, model_name: str = "text-embedding-004", api_key: Optional[str] = None):
+    # [主人喵的清洁计划 1.2 修复] __init__ 签名不变，但逻辑改变
+    def __init__(
+        self, 
+        model_name: str = "text-embedding-004", 
+        api_key: Optional[str] = None, # 接受注入的 API Key
+        logger: Optional[ESLogger] = None
+    ):
         """
         初始化 EmbeddingClient。
 
         Args:
             model_name (str): 要使用的 embedding 模型的名称。
                               默认为 "text-embedding-004"，根据 RAG_ARCHITECTURE.md。
-            api_key (Optional[str]): Google AI API 密钥。如果为 None，
-                                     将尝试从 'GOOGLE_API_KEY' 环境变量中读取。
+            api_key (Optional[str]): Google AI API 密钥。
+                                     [重构] 调用者(例如服务容器)负责从配置(system.yaml)
+                                     和环境(os.getenv)中读取此密钥并将其注入。
+            logger (Optional[ESLogger]): 外部日志记录器。
         
         Raises:
-            ValueError: 如果 API 密钥既未提供也未在环境变量中设置。
+            ValueError: 如果 'api_key' 参数未提供 (为 None 或空字符串)。
+            EmbeddingError: 如果 Google AI SDK 配置失败。
         """
         self.model_name = model_name
+        # [主人喵的清洁计划 1.1 修复] 使用传入的 logger
+        self.logger = logger or get_logger(__name__)
         
-        used_api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        # [主人喵的清洁计划 1.2 修复]
+        # 移除: used_api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        # 客户端不应了解环境变量。它只接受一个 api_key。
         
-        if not used_api_key:
-            # log.error("GOOGLE_API_KEY 未设置。请设置环境变量或在初始化时提供 api_key。")
-            raise ValueError("API key for Google AI not provided or set in environment variables.")
+        if not api_key:
+            # 更新了错误信息，使其不再引用特定的环境变量
+            self.logger.log_error("EmbeddingClient 初始化失败：未提供 'api_key'。")
+            raise ValueError("API key for Google AI was not provided to EmbeddingClient.")
             
         try:
-            genai.configure(api_key=used_api_key)
-            # log.info(f"EmbeddingClient initialized with model: {self.model_name}")
+            # 使用传入的 api_key
+            genai.configure(api_key=api_key)
+            self.logger.log_info(f"EmbeddingClient initialized with model: {self.model_name}")
         except Exception as e:
-            # log.error(f"配置 Google AI API 密钥时出错: {e}")
+            self.logger.log_error(f"配置 Google AI API 密钥时出错: {e}")
             raise EmbeddingError(f"Failed to configure Google AI: {e}")
 
     async def get_embedding(self, text: str) -> List[float]:
@@ -57,7 +73,7 @@ class EmbeddingClient:
             EmbeddingError: 如果 API 调用失败。
         """
         if not text:
-            # log.warning("get_embedding 接收到空文本字符串。")
+            self.logger.log_warning("get_embedding 接收到空文本字符串。")
             return []
             
         try:
@@ -70,7 +86,7 @@ class EmbeddingClient:
             )
             return result['embedding']
         except Exception as e:
-            # log.error(f"为文本生成 embedding 时出错: {e}")
+            self.logger.log_error(f"为文本生成 embedding 时出错: {e}")
             raise EmbeddingError(f"Error generating embedding: {e}")
 
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
@@ -87,7 +103,7 @@ class EmbeddingClient:
             EmbeddingError: 如果 API 调用失败或返回的 embedding 数量不匹配。
         """
         if not texts:
-            # log.warning("get_embeddings 接收到空文本列表。")
+            self.logger.log_warning("get_embeddings 接收到空文本列表。")
             return []
             
         try:
@@ -102,20 +118,34 @@ class EmbeddingClient:
             embeddings = result['embedding']
             
             if len(embeddings) != len(texts):
-                # log.error(f"Embedding 数量不匹配: 需要 {len(texts)}, 得到 {len(embeddings)}")
+                self.logger.log_error(f"Embedding 数量不匹配: 需要 {len(texts)}, 得到 {len(embeddings)}")
                 raise EmbeddingError(f"Mismatch in embedding count: expected {len(texts)}, got {len(embeddings)}")
                 
             return embeddings
         except Exception as e:
-            # log.error(f"为批量文本生成 embedding 时出错: {e}")
+            self.logger.log_error(f"为批量文本生成 embedding 时出错: {e}")
             raise EmbeddingError(f"Error generating embeddings batch: {e}")
 
 # 示例用法 (用于测试)
 async def main_test():
     """异步测试函数"""
     try:
-        # 确保设置了 GOOGLE_API_KEY 环境变量
-        client = EmbeddingClient()
+        # [测试] 演示新的初始化流程
+        # 调用者 (此处的 main_test) 负责从环境中读取密钥
+        # 生产代码将从 config/system.yaml 中读取 'GEMINI_PRO_KEY'
+        
+        # 为了测试方便，我们检查两个可能的键
+        api_key_for_test = os.getenv("GEMINI_PRO_KEY") or os.getenv("GOOGLE_API_KEY")
+        
+        if not api_key_for_test:
+            print("测试错误：请设置 GEMINI_PRO_KEY 或 GOOGLE_API_KEY 环境变量以运行测试。")
+            return
+
+        # 修复：为测试实例化一个 logger
+        test_logger = get_logger("main_test")
+        
+        # 将密钥作为参数传递
+        client = EmbeddingClient(api_key=api_key_for_test, logger=test_logger)
         
         # 测试单个 embedding
         text1 = "Hello, world!"
