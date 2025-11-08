@@ -1,118 +1,124 @@
 # tests/test_cognitive_engine_properties.py
 import pytest
-from unittest.mock import MagicMock
+import asyncio # 任务 3: 导入 asyncio
+from unittest.mock import MagicMock, AsyncMock # 任务 3: 需要 AsyncMock
 
 # --- [修复] ---
 # 修复：将 'cognitive.engine' 转换为 'Phoenix_project.cognitive.engine'
-from Phoenix_project.cognitive.engine import CognitiveEngine
+from Phoenix_project.cognitive.engine import CognitiveEngine, CognitiveError # 导入 CognitiveError
 # 修复：将 'core.pipeline_state' 转换为 'Phoenix_project.core.pipeline_state'
 from Phoenix_project.core.pipeline_state import PipelineState
 # 修复：将 'core.schemas.fusion_result' 转换为 'Phoenix_project.core.schemas.fusion_result'
 from Phoenix_project.core.schemas.fusion_result import FusionResult
-# 修复：将 'core.schemas.data_schema' 转换为 'Phoenix_project.core.schemas.data_schema'
-from Phoenix_project.core.schemas.data_schema import Signal
-# --- [修复结束] ---
+# [任务 3] 导入 (模拟) 依赖项
+from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
+from Phoenix_project.evaluation.fact_checker import FactChecker
+from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
+from Phoenix_project.evaluation.voter import Voter
 
-# We use the fixtures from conftest.py
-# mock_data_manager, mock_risk_manager, mock_portfolio_constructor
+# 标记所有测试为 asyncio
+pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
-def cognitive_engine(mock_data_manager, mock_risk_manager, mock_portfolio_constructor):
-    """Fixture to create a CognitiveEngine with mocked dependencies."""
+def mock_dependencies():
+    """Mocks all async dependencies for CognitiveEngine."""
+    mock_reasoning_ensemble = MagicMock(spec=ReasoningEnsemble)
+    mock_fact_checker = MagicMock(spec=FactChecker)
+    mock_uncertainty_guard = MagicMock(spec=UncertaintyGuard)
+    mock_voter = MagicMock(spec=Voter)
     
-    # Mock config
-    config = {
-        "cognitive_engine": {
-            "max_allocation_per_asset": 0.10,
-            "max_total_allocation": 0.80,
-            "risk_model": "global_stop_loss",
-            "portfolio_sizer": "fixed_fraction"
-        },
-        # Mocks for sizers (used by PortfolioConstructor)
-        "position_sizers": [
-             {"name": "fixed_fraction", "type": "FixedFraction", "params": {"fraction_per_position": 0.05}}
-        ]
+    # [任务 3] 模拟 async 方法
+    mock_reasoning_ensemble.reason = AsyncMock()
+    mock_fact_checker.check_facts = AsyncMock()
+    # uncertainty_guard.apply_guardrail 是同步的 (根据 engine.py)
+    mock_uncertainty_guard.apply_guardrail = MagicMock()
+    
+    return {
+        "reasoning_ensemble": mock_reasoning_ensemble,
+        "fact_checker": mock_fact_checker,
+        "uncertainty_guard": mock_uncertainty_guard,
+        "voter": mock_voter
     }
-    
-    # Mock logger
-    mock_logger = MagicMock()
+
+@pytest.fixture
+def cognitive_engine(mock_dependencies):
+    """Fixture to create a CognitiveEngine with mocked dependencies."""
+    # 基于 cognitive/engine.py 的 __init__
+    config = {
+        "fact_check_threshold": 0.7,
+        "uncertainty_threshold": 0.6,
+        "fc_confidence_boost": 0.1,
+        "fc_confidence_penalty": 0.2
+    }
     
     engine = CognitiveEngine(
         config=config,
-        data_manager=mock_data_manager,
-        risk_manager=mock_risk_manager,
-        portfolio_constructor=mock_portfolio_constructor,
-        logger=mock_logger,
-        metrics=MagicMock() # Mock metrics
+        **mock_dependencies
     )
     return engine
 
-def test_cognitive_engine_generates_signals(cognitive_engine, mock_portfolio_constructor):
+# 任务 3: 重构测试 1
+async def test_cognitive_engine_runs_cycle(cognitive_engine, mock_dependencies):
     """
-    Tests the main `generate_signals` workflow.
+    Tests the main `process_cognitive_cycle` workflow.
+    (替换 test_cognitive_engine_generates_signals)
     """
-    # 1. Create a PipelineState with a FusionResult
-    state = PipelineState(event_id="test_event_002")
-    state.fusion_result = FusionResult(
-        event_id="test_event_002",
-        timestamp="2023-01-01T12:00:00Z",
-        # This is the key input: candidates
-        trade_candidates=[
-            {"ticker": "AAPL", "reasoning": "Strong buy", "confidence": 0.9, "volatility": 0.2},
-            {"ticker": "GOOG", "reasoning": "Weak buy", "confidence": 0.6, "volatility": 0.3}
-        ],
-        assessment="Overall bullish"
-    )
-
-    # 2. Mock the output of the PortfolioConstructor
-    # (which is called by the engine)
-    mock_battle_plan = [
-        {"ticker": "AAPL", "capital_allocation_pct": 0.05},
-        {"ticker": "GOOG", "capital_allocation_pct": 0.05}
-    ]
-    mock_portfolio_constructor.construct_battle_plan.return_value = mock_battle_plan
-
-    # 3. Run the engine's signal generation
-    final_state = cognitive_engine.generate_signals(state)
-
-    # 4. Verify the results
+    # 1. 创建一个 PipelineState
+    state = PipelineState(initial_state={"main_task_query": {"description": "Test"}}, max_history=10)
     
-    # Check that the portfolio constructor was called correctly
-    mock_portfolio_constructor.construct_battle_plan.assert_called_once_with(
-        candidates=state.fusion_result.trade_candidates,
-        max_total_allocation=0.80 # From config
-    )
+    # 2. 模拟依赖项的返回值
+    mock_fusion_result = MagicMock(spec=FusionResult)
+    mock_fusion_result.confidence = 0.9 # 高于 0.7 的 fact_check_threshold
+    mock_fusion_result.reasoning = "Test reasoning"
+    mock_fusion_result.final_decision = "BUY"
     
-    # Check that the final signals are in the state
-    assert final_state.signals is not None
-    assert len(final_state.signals) == 2
+    mock_dependencies["reasoning_ensemble"].reason.return_value = mock_fusion_result
     
-    # Check the Signal objects
-    assert isinstance(final_state.signals[0], Signal)
-    assert final_state.signals[0].symbol == "AAPL"
-    assert final_state.signals[0].signal_type == "BUY" # Assumes conversion logic
-    assert final_state.signals[0].strength == 0.05 # Strength = allocation %
+    # 模拟 FactChecker
+    mock_fact_check_report = {"overall_support": "Supported"}
+    mock_dependencies["fact_checker"].check_facts.return_value = mock_fact_check_report
     
-    assert final_state.signals[1].symbol == "GOOG"
-    assert final_state.signals[1].strength == 0.05
+    # 模拟 UncertaintyGuard (它返回修改后的 fusion_result)
+    # 在这个测试中，我们让 guard 返回一个新对象，以确认它被调用了
+    mock_guarded_result = MagicMock(spec=FusionResult)
+    mock_guarded_result.final_decision = "BUY" # 未更改
+    mock_dependencies["uncertainty_guard"].apply_guardrail.return_value = mock_guarded_result
 
-def test_cognitive_engine_handles_no_candidates(cognitive_engine, mock_portfolio_constructor):
+    # 3. 运行引擎的认知周期
+    cognitive_result = await cognitive_engine.process_cognitive_cycle(state)
+
+    # 4. 验证结果
+    
+    # 检查是否调用了 reason
+    mock_dependencies["reasoning_ensemble"].reason.assert_called_once_with(state)
+    
+    # 检查是否调用了 fact_checker (因为 confidence > 0.7)
+    mock_dependencies["fact_checker"].check_facts.assert_called_once_with("Test reasoning")
+    
+    # 检查是否调用了 uncertainty_guard
+    mock_dependencies["uncertainty_guard"].apply_guardrail.assert_called_once()
+    
+    # 检查最终返回的字典
+    assert isinstance(cognitive_result, dict)
+    assert cognitive_result["final_decision"] == mock_guarded_result
+    assert cognitive_result["fact_check_report"] == mock_fact_check_report
+    assert state.get_value("last_fusion_result") == mock_fusion_result
+
+# 任务 3: 重构测试 2
+async def test_cognitive_engine_handles_reasoning_failure(cognitive_engine, mock_dependencies):
     """
-    Tests that the engine handles a FusionResult with no candidates.
+    Tests that the engine raises a CognitiveError if reasoning fails.
+    (替换 test_cognitive_engine_handles_no_candidates)
     """
-    state = PipelineState(event_id="test_event_003")
-    state.fusion_result = FusionResult(
-        event_id="test_event_003",
-        timestamp="2023-01-01T12:00:00Z",
-        trade_candidates=[], # No candidates
-        assessment="Neutral"
-    )
-
-    final_state = cognitive_engine.generate_signals(state)
-
-    # Ensure portfolio constructor was not called
-    mock_portfolio_constructor.construct_battle_plan.assert_not_called()
+    state = PipelineState(initial_state={"main_task_query": {"description": "Test"}}, max_history=10)
     
-    # Ensure no signals are generated
-    assert final_state.signals is not None
-    assert len(final_state.signals) == 0
+    # 模拟 reasoning_ensemble.reason 抛出异常
+    mock_dependencies["reasoning_ensemble"].reason.side_effect = ValueError("LLM API failed")
+    
+    # 运行并断言
+    with pytest.raises(CognitiveError, match="ReasoningEnsemble failed: LLM API failed"):
+        await cognitive_engine.process_cognitive_cycle(state)
+    
+    # 确保 fact_checker 和 guard 未被调用
+    mock_dependencies["fact_checker"].check_facts.assert_not_called()
+    mock_dependencies["uncertainty_guard"].apply_guardrail.assert_not_called()
