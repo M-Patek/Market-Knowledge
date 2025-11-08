@@ -1,49 +1,102 @@
-"""
-L1 Agent: Innovation & IP Tracker
-"""
-from typing import Any, Dict
-from decimal import Decimal
+import json
+import logging
+from typing import List, Any, Generator, AsyncGenerator
+import time
 
-from Phoenix_project.agents.l1.base import BaseL1Agent
-from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceType
+from Phoenix_project.agents.l1.base import L1Agent
+from Phoenix_project.core.schemas.task_schema import Task
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 
-class InnovationTrackerAgent(BaseL1Agent):
+# 获取日志记录器
+logger = logging.getLogger(__name__)
+
+class InnovationTrackerAgent(L1Agent):
     """
-    Implements the L1 Innovation & IP Tracker agent.
-    Inherits from BaseL1Agent and implements the run method.
+    L1 智能体：创新追踪者
+    监控新技术、专利和研发。
     """
-    
-    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> EvidenceItem:
+    def __init__(
+        self,
+        agent_id: str,
+        llm_client: Any,
+        data_manager: Any,
+    ):
         """
-        Evaluates patents, academic papers, and talent migration
-        to track the long-term technological moat.
+        初始化 InnovationTrackerAgent。
         
-        Args:
-            state (PipelineState): The current state of the analysis pipeline.
-            dependencies (Dict[str, Any]): Outputs from any upstream tasks.
-            
-        Returns:
-            EvidenceItem: An EvidenceItem object with the innovation analysis.
+        参数:
+            agent_id (str): 智能体的唯一标识符。
+            llm_client (Any): 用于与 LLM API 交互的客户端 (例如 EnsembleClient)。
+            data_manager (Any): 用于检索数据的 DataManager。
         """
-        
-        # We assume the target symbol is accessible via the state.
-        task_query_data = state.get_main_task_query() 
-        target_symbol = task_query_data.get("symbol", "UNKNOWN")
-        
-        # TODO: Implement actual LLM call to analyze patent/paper databases.
-        # This is a mock analysis result.
-        mock_analysis_content = f"INNOVATION: {target_symbol} has filed 3 new patents this quarter related to 'AI-driven ad optimization', indicating a strengthening technological moat."
-
-        return EvidenceItem(
-            agent_id=self.agent_id,
-            symbols=[target_symbol],
-            evidence_type=EvidenceType.INNOVATION,
-            content=mock_analysis_content,
-            confidence=Decimal("0.82"),
-            data_horizon="Long-Term (1-3 Years)",
-            metadata={"source": "Mock Patent Office"}
+        super().__init__(
+            agent_id=agent_id,
+            llm_client=llm_client,
+            data_manager=data_manager
         )
+        logger.info(f"[{self.agent_id}] InnovationTrackerAgent initialized.")
 
-    def __repr__(self) -> str:
-        return f"<InnovationTrackerAgent(id='{self.agent_id}')>"
+    async def run(self, task: Task, context: List[Any]) -> AsyncGenerator[EvidenceItem, None]:
+        """
+        异步运行智能体以追踪技术创新。
+        
+        参数:
+            task (Task): 分配给智能体的任务。
+            context (List[Any]): 智能体运行所需的附加上下文（例如，原始文档）。
+
+        收益:
+            AsyncGenerator[EvidenceItem, None]: 异步生成一个或多个 EvidenceItem。
+        """
+        logger.info(f"[{self.agent_id}] Running innovation tracking for task: {task.task_id} on symbols: {task.symbols}")
+
+        if not task.symbols:
+            logger.warning(f"[{self.agent_id}] Task {task.task_id} has no symbols. Skipping.")
+            return
+
+        # 1. 准备 Prompt 的上下文
+        symbol = task.symbols[0]
+        context_str = "\n---\n".join([doc.content for doc in context if hasattr(doc, 'content')])
+        
+        if not context_str:
+            logger.warning(f"[{self.agent_id}] No string content found in context for task {task.task_id}. Skipping.")
+            return
+
+        context_map = {
+            "symbol": symbol,
+            "context": context_str
+        }
+        
+        # [关键] 设置此智能体对应的 Prompt 名称
+        agent_prompt_name = "l1_innovation_tracker" 
+
+        try:
+            # 2. 异步调用 LLM
+            logger.debug(f"[{self.agent_id}] Calling LLM with prompt: {agent_prompt_name} for symbol: {symbol}")
+            
+            response_str = await self.llm_client.run_llm_task(
+                agent_prompt_name=agent_prompt_name,
+                context_map=context_map
+            )
+            
+            if not response_str:
+                logger.warning(f"[{self.agent_id}] LLM returned no response for task {task.task_id}.")
+                return
+
+            # 3. 解析和验证 JSON 输出
+            logger.debug(f"[{self.agent_id}] Received LLM response (raw): {response_str[:200]}...")
+            response_data = json.loads(response_str)
+            
+            # 4. 验证并生成 EvidenceItem
+            evidence = EvidenceItem.model_validate(response_data)
+            evidence.agent_id = self.agent_id
+            
+            logger.info(f"[{self.agent_id}] Successfully generated evidence for {symbol} with confidence {evidence.confidence}")
+            yield evidence
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[{self.agent_id}] Failed to decode LLM JSON response for task {task.task_id}. Error: {e}")
+            logger.debug(f"[{self.agent_id}] Faulty JSON string: {response_str}")
+            return
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] An error occurred during agent run for task {task.task_id}. Error: {e}")
+            return
