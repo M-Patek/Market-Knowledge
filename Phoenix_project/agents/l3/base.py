@@ -1,49 +1,52 @@
-"""
-Base class for all L3 (DRL/Control) Agents.
-"""
-
+import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict
+from typing import List, Any, AsyncGenerator
 
-from Phoenix_project.core.pipeline_state import PipelineState
-# from Phoenix_project.core.schemas.fusion_result import FusionResult # 不再需要
+# 确保导入 Task 类型（即使是作为类型提示）
+try:
+    from Phoenix_project.core.schemas.task_schema import Task
+except ImportError:
+    Task = Any # Fallback
 
-class BaseL3Agent(ABC):
+logger = logging.getLogger(__name__)
+
+class L3Agent(ABC):
     """
-    Abstract Base Class for all L3 agents.
-    L3 agents are DRL/Control models responsible for converting L2
-    decisions into executable trading instructions.
+    L3 智能体基类（决策与执行转换层）。
+    这些智能体（例如 DRL/Quant）将 L2 的决策（例如 FusionResult）
+    转换为 L4 执行层可以理解的信号（例如 Signal）。
     """
-    
-    def __init__(self, agent_id: str, model_client: Any = None):
+    def __init__(
+        self, 
+        agent_id: str,
+        model_client: Any,  # DRL/Quant/Quant 模型的客户端
+        data_manager: Any   # 用于获取实时状态/特征
+    ):
         """
-        Initializes the L3 agent.
+        初始化 L3 智能体。
         
-        Args:
-            agent_id (str): The unique identifier for the agent (from registry.yaml).
-            model_client (Any, optional): A client for interacting with a
-                                      loaded DRL model or quantitative function.
+        参数:
+            agent_id (str): 智能体的唯一标识符。
+            model_client (Any): 用于加载和运行 DRL/Quant 模型的客户端。
+            data_manager (Any): 用于检索数据（例如：实时价格、波动率）。
         """
         self.agent_id = agent_id
         self.model_client = model_client
+        self.data_manager = data_manager
+        logger.info(f"L3 Agent {self.agent_id} (Type: {type(self).__name__}) initialized.")
 
     @abstractmethod
-    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> Any:
+    async def run(self, task: "Task", dependencies: List[Any]) -> AsyncGenerator[Any, None]:
         """
-        The main execution method for the agent.
+        异步运行智能体。
+        L3 智能体接收 'dependencies' (来自 L2 的输出)
         
-        It takes the current pipeline state and a dictionary of dependency outputs
-        (e.g., from L2) and converts it into its specific output.
-        
-        Args:
-            state (PipelineState): The current state of the analysis pipeline.
-            dependencies (Dict[str, Any]): A dictionary mapping dependency agent IDs
-                                         to their execution results.
+        参数:
+            task (Task): 当前任务。
+            dependencies (List[Any]): 来自上游智能体（L2）的输出列表。
             
-        Returns:
-            Any: The specific result object for that agent's task (e.g., Signal).
+        收益:
+            AsyncGenerator[Any, None]: 异步生成结果（例如 Signal）。
         """
-        pass
-
-    def __repr__(self) -> str:
-        return f"<{self.__class__.__name__}(id='{self.agent_id}')>"
+        raise NotImplementedError
+        yield
