@@ -5,6 +5,7 @@ from google.generativeai import GenerativeModel
 import google.generativeai as genai
 from typing import Dict, Any, List, Optional, Union
 from contextlib import asynccontextmanager
+from collections import defaultdict # <-- 步骤 1: 添加 Import
 
 # 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
 from Phoenix_project.monitor.logging import get_logger
@@ -124,70 +125,87 @@ class GeminiPoolManager:
     Provides a context manager to acquire and release clients.
     """
     
-    # MODIFICATION: 更改 __init__ 签名以匹配 APIGateway 的调用
-    def __init__(self, api_key: str, config: Dict[str, Any] = None, pool_size: int = 10):
-        if not api_key:
-            logger.error("API key not provided to GeminiPoolManager.")
-            raise ValueError("API_KEY not set")
-        self.api_key = api_key # 使用传入的 api_key
-            
+    # 步骤 2: 重构 __init__ 方法
+    def __init__(self, config: Dict[str, Any] = None):
         if config is None:
             config = {}
 
-        self.pool: Dict[str, GeminiClient] = {}
-        self.pool_lock = asyncio.Lock()
+        # 1. 加载共享密钥池
+        keys_str = os.environ.get("GEMINI_API_KEYS")
+        if not keys_str:
+            logger.error("环境变量 'GEMINI_API_KEYS' 未设置或为空。")
+            raise ValueError("GEMINI_API_KEYS 环境变量未设置")
+            
+        self.shared_key_pool: List[str] = [key.strip() for key in keys_str.split(',')]
+        if not self.shared_key_pool:
+            logger.error("API 密钥池为空，请检查 'GEMINI_API_KEYS'。")
+            raise ValueError("API 密钥池为空")
+
+        logger.info(f"GeminiPoolManager 初始化，加载了 {len(self.shared_key_pool)} 个共享密钥。")
+
+        # 2. 为每个模型ID设置独立的轮询计数器
+        self.model_counters: Dict[str, int] = defaultdict(int)
+
+        # 3. 为每个【密钥】缓存一个【GeminiClient】实例
+        self.client_cache: Dict[str, GeminiClient] = {}
         
-        # Load QPM limits from config, fallback to defaults
+        # 4. 需要一个锁来保护 client_cache 的写入，防止竞态
+        self.cache_lock = asyncio.Lock()
+
+        # 5. 保留 QPM 限制的配置
         qpm_limits_config = config.get('gemini_qpm_limits', {})
         self.qpm_limits = {**DEFAULT_QPM_LIMITS, **qpm_limits_config}
-        
-        # pool_size 在这个实现中没有真正使用，因为我们为每个
-        # model_id 创建一个客户端，而客户端内部处理速率限制，
-        # 而不是限制并发客户端的数量。
-        logger.info(f"GeminiPoolManager initialized (pool_size arg ignored, manages clients by model_id).")
 
 
-    async def _get_or_create_client(self, model_id: str) -> GeminiClient:
-        """
-        Initializes a client for a specific model_id if it doesn't exist.
-        """
-        # 优化：在不持有锁的情况下检查
-        if model_id in self.pool:
-            return self.pool[model_id]
-            
-        async with self.pool_lock:
-            # 再次检查，以防在等待锁时被创建
-            if model_id not in self.pool:
-                logger.info(f"Creating new GeminiClient for model: {model_id}")
-                qpm_limit = self.qpm_limits.get(model_id, self.qpm_limits['default'])
-                
-                self.pool[model_id] = GeminiClient(
-                    model_id=model_id,
-                    api_key=self.api_key,
-                    qpm_limit=qpm_limit
-                )
-            return self.pool[model_id]
+    # 步骤 4: 删除旧方法
+    # async def _get_or_create_client(self, model_id: str) -> GeminiClient:
+    #    ... (已移除) ...
 
+    # 步骤 3: 重构 get_client 方法
     @asynccontextmanager
     async def get_client(self, model_id: str) -> GeminiClient:
         """
-        Asynchronous context manager to get a client from the pool.
-        
-        Usage:
-            async with gemini_pool.get_client("gemini-1.5-pro") as client:
-                await client.generate_content_async(...)
+        根据 model_id 的独立循环，从共享池中获取一个密钥，
+        并返回该密钥对应的、带速率限制的客户端。
         """
         
-        client = await self._get_or_create_client(model_id)
+        # 步骤 1: 根据 model_id 独立循环，选择一个密钥
+        current_index = self.model_counters[model_id]
+        key_to_use = self.shared_key_pool[current_index]
         
+        # 步骤 2: 更新该 model_id 的计数器（循环）
+        self.model_counters[model_id] = (current_index + 1) % len(self.shared_key_pool)
+
+        # 步骤 3: 检查此【密钥】是否已有缓存的客户端
+        client = self.client_cache.get(key_to_use)
+
+        if client is None:
+            # 步骤 4: 如果没有，加锁并创建客户端
+            async with self.cache_lock:
+                # 再次检查，防止在等待锁时其他协程已创建
+                client = self.client_cache.get(key_to_use)
+                if client is None:
+                    # 获取此模型（或默认）的 QPM 限制
+                    qpm_limit = self.qpm_limits.get(model_id, self.qpm_limits['default'])
+                    
+                    logger.info(f"为 model '{model_id}' 创建新的 GeminiClient (使用密钥 ...{key_to_use[-4:]}, QPM: {qpm_limit})")
+                    
+                    # 创建客户端（它内部有自己的速率限制器）
+                    client = GeminiClient(
+                        model_id=model_id,
+                        api_key=key_to_use,
+                        qpm_limit=qpm_limit
+                    )
+                    
+                    # 缓存这个【密钥】的客户端
+                    self.client_cache[key_to_use] = client
+
+        # 步骤 5: 产出客户端供 'async with' 使用
         try:
-            # The client itself handles rate limiting internally,
-            # so we just yield the client instance.
             yield client
         except Exception as e:
-            logger.error(f"Exception during Gemini client usage for {model_id}: {e}", exc_info=True)
+            logger.error(f"Gemini client (model: {model_id}, key: ...{key_to_use[-4:]}) 使用时出错: {e}", exc_info=True)
             raise
         finally:
-            # No explicit release needed as the client is persistent
-            # and manages its own semaphore.
+            # (如原设计，无需释放)
             pass
