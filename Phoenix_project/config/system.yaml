@@ -33,7 +33,7 @@ ai:
   # [从旧版本合并]
   ai_providers:
     google:
-      api_key_env_var: "GEMINI_PRO_KEY"
+      api_key_env_var: "GEMINI_API_KEYS" # <--- [✅ 修复] 与 .env.example (Source 2) 保持一致
       models:
         - name: "gemini-2.5-pro"
           type: "generative"
