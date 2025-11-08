@@ -3,6 +3,7 @@ Orchestrator
 协调 Phoenix 系统的主要数据和逻辑流。
 """
 from typing import List, Dict, Any
+from datetime import datetime # [阶段 4 变更] 导入 datetime
 
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.data_manager import DataManager
@@ -88,6 +89,10 @@ class Orchestrator:
         """
         执行一个单独的、离散的系统运行周期。
         (这是由 Celery worker 调用的)
+        
+        [阶段 4 重构]
+        - 移除对 execute_orders 和 update_portfolio 的调用。
+        - 添加对 order_manager.process_target_portfolio 的调用。
         """
         if self.is_running:
             logger.warning("Main cycle already in progress. Skipping.")
@@ -107,10 +112,15 @@ class Orchestrator:
             # 2. 事件过滤 (Event Filtering)
             # (FIX E1)
             filtered_events = self.event_filter.apply_all_filters(new_events)
-            if not filtered_events:
-                logger.info("No significant events after filtering. Cycle END.")
-                self.is_running = False
-                return
+            if not filtered_events and not new_events: # [修复] 如果有事件但都被过滤了，也许我们仍想运行
+                 logger.info("No new events found. Cycle END.")
+                 self.is_running = False
+                 return
+            elif not filtered_events:
+                logger.info("No significant events after filtering, but processing cycle anyway...")
+            else:
+                 logger.info(f"Processing {len(filtered_events)} filtered events.")
+
 
             # 3. 状态更新 (State Update)
             self.pipeline_state.start_new_cycle(filtered_events)
@@ -131,7 +141,41 @@ class Orchestrator:
 
             # 5. 投资组合构建 (Portfolio Construction)
             # [主人喵的修复] 获取一次当前状态，供后续步骤使用
-            current_portfolio_state = self.trade_lifecycle_manager.get_current_portfolio_state()
+            # [阶段 4 变更] TLM 现在通过回调更新，所以我们需要最新的市场数据
+            # ... (在步骤 6 中获取)
+            
+            # [阶段 4 变更] 我们需要在这里获取价格，以便 TLM 可以计算当前状态
+            # all_symbols_for_pricing = set() # TODO: 从 fusion_result 和 TLM 获取
+            # (这个逻辑流有点问题，TLM 需要价格来 get_state，
+            # 但我们可能还没有价格。假设 TLM 可以处理)
+            
+            # [阶段 4 修复] 我们必须先获取价格，才能构造
+            # current_portfolio_state = self.trade_lifecycle_manager.get_current_portfolio_state({}) # 传入空价格
+            
+            # --- [主人喵的修复] 解决数据依赖缺陷：在执行前获取所有最新价格 ---
+            
+            # 收集所有相关符号
+            current_portfolio_for_symbols = self.trade_lifecycle_manager.get_current_portfolio_state({})
+            current_symbols = set(current_portfolio_for_symbols.positions.keys())
+            target_symbols_from_fusion = {t.symbol for t in fusion_result.targets}
+            all_symbols = current_symbols.union(target_symbols_from_fusion)
+
+            market_prices: Dict[str, float] = {}
+            for symbol in all_symbols:
+                # 假设 data_manager 能获取到最新的 L1 数据
+                market_data = self.data_manager.get_latest_market_data(symbol)
+                if market_data and market_data.close > 0:
+                    market_prices[symbol] = market_data.close
+                else:
+                    logger.warning(f"Orchestrator: Could not retrieve latest market price for {symbol}.")
+            # --- 结束修复 ---
+
+            # [阶段 4 变更] 在构造前，使用新价格更新 TLM 的市值
+            self.trade_lifecycle_manager.mark_to_market(datetime.utcnow(), market_prices)
+            # 并获取最终的 "当前" 状态
+            current_portfolio_state = self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
+
+            
             target_portfolio = self.portfolio_constructor.construct(
                 fusion_result,
                 current_portfolio_state
@@ -143,38 +187,43 @@ class Orchestrator:
                 self.pipeline_state
             )
             
-            # --- [主人喵的修复] 解决数据依赖缺陷：在执行前获取所有最新价格 ---
+            # [阶段 4 修复] 重新获取价格，因为 risk_manager 可能添加了对冲（例如 SPY）
+            final_target_symbols = {p.symbol for p in final_portfolio.positions}
+            all_symbols_final = all_symbols.union(final_target_symbols)
             
-            # 收集所有相关符号
-            current_symbols = set(current_portfolio_state.positions.keys())
-            target_symbols = {p.symbol for p in final_portfolio.positions}
-            all_symbols = current_symbols.union(target_symbols)
-            
-            market_prices: Dict[str, float] = {}
-            for symbol in all_symbols:
-                # 假设 data_manager 能获取到最新的 L1 数据
-                market_data = self.data_manager.get_latest_market_data(symbol)
-                if market_data and market_data.close > 0:
+            # [修复] 仅获取缺失的价格
+            missing_symbols = all_symbols_final - set(market_prices.keys())
+            for symbol in missing_symbols:
+                 market_data = self.data_manager.get_latest_market_data(symbol)
+                 if market_data and market_data.close > 0:
                     market_prices[symbol] = market_data.close
-                else:
-                    logger.warning(f"Orchestrator: Could not retrieve latest market price for {symbol}.")
-            # --- 结束修复 ---
+                 else:
+                    logger.warning(f"Orchestrator: Could not retrieve latest market price for risk-added symbol {symbol}.")
+
+            # [阶段 4 变更] 再次更新 TLM 市值
+            self.trade_lifecycle_manager.mark_to_market(datetime.utcnow(), market_prices)
+            current_portfolio_state_final = self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
+
 
             # 7. 执行 (Execution)
-            # (FIX E3)
-            # [主人喵的修复] 传入 market_prices
-            orders = self.order_manager.generate_orders(
-                current_portfolio_state,
+            # [阶段 4 重构]
+            # (FIX E3) 移除 generate_orders
+            # orders = self.order_manager.generate_orders(...)
+            
+            # (FIX E4) 移除 execute_orders
+            # executed_trades = self.order_manager.execute_orders(orders, market_prices)
+
+            # [阶段 4 新增] 调用新的统一方法
+            self.order_manager.process_target_portfolio(
+                current_portfolio_state_final,
                 final_portfolio,
                 market_prices
             )
-            
-            # (FIX E4)
-            # [主人喵的修复] 传入 market_prices
-            executed_trades = self.order_manager.execute_orders(orders, market_prices)
 
             # 8. 状态更新 (TLM)
-            self.trade_lifecycle_manager.update_portfolio(executed_trades)
+            # [阶段 4 重构] 移除
+            # TLM 现在通过 OrderManager 的 _on_fill 回调异步更新
+            # self.trade_lifecycle_manager.update_portfolio(executed_trades)
             
             # (FIX E9)
             # 9. 监控 & 审计
@@ -182,14 +231,14 @@ class Orchestrator:
                 self.pipeline_state,
                 fusion_result,
                 risk_report,
-                self.trade_lifecycle_manager.get_current_portfolio_state()
+                self.trade_lifecycle_manager.get_current_portfolio_state(market_prices) # 获取最新状态
             )
             self.audit_manager.log_cycle(self.pipeline_state)
             
             # 10. 快照 (Snapshot)
             self.snapshot_manager.save_state(
                 self.pipeline_state,
-                self.trade_lifecycle_manager.get_current_portfolio_state()
+                self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
             )
 
         except Exception as e:
