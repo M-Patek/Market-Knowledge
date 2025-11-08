@@ -1,11 +1,11 @@
 Phoenix Project: RAG Infrastructure Architectural Design
-Version: 2.1 (已根据代码库 v2.0 更新)
-Status: Implemented (部分为 Mock)
-Date: 2025-11-08
+Version: 2.2 (已根据代码库 v2.1 更新)
+Status: Implemented
+Date: 2025-11-09
 
 概述 & 设计哲学 (Overview & Design Philosophy)
 
-本文档阐明了 Phoenix Project (V2.0) 的检索增强生成 (RAG) 基础设施架构。该系统旨在为 AI 认知层提供高度相关、及时且多模式的证据，以支持其分析任务。
+本文档阐明了 Phoenix Project (V2.1) 的检索增强生成 (RAG) 基础设施架构。该系统旨在为 AI 认知层提供高度相关、及时且多模式的证据，以支持其分析任务。
 
 核心哲学是一种混合、并行的检索架构。此设计承认金融数据是异构的，单一索引方法不足以应对。通过并发查询多个专业化索引并融合其结果，我们实现了比任何单一方法都更全面、上下文感知能力更强的检索。
 
@@ -43,17 +43,19 @@ Embedding 模型 (Embedding Models):
 
 查询能力 (Query Capability): 允许精确的 SQL 查询，例如：SELECT metric_value FROM financial_metrics WHERE ticker = 'AAPL' AND metric_name = 'Revenue' AND report_date > '2023-01-01'。
 
-统一查询与 AI 层 (Unified Query & AI Layer)
+[已更新] 统一查询与 AI 层 (Unified Query & AI Layer)
 
 该层充当整个检索和知识处理过程的协调器。
 
 查询调度器 (Query Dispatcher - ai/retriever.py):
 
-Retriever 类（在 ai/retriever.py 中实现）协调对各种数据存储的查询。
+Retriever 类（在 ai/retriever.py 中实现）协调对所有数据存储（向量、时序、CoT 历史、图数据库）的并发异步查询。
 
-retrieve_relevant_context 方法调用 vector_store.search (用于向量) 和 cot_database.search_traces (用于历史推理)。
+[已确认] 高级检索已实现: 与旧版文档不同，高级检索功能 已在 ai/retriever.py 代码中完全实现。
 
-注意: RAG_ARCHITECTURE.md (V2.0) 中描述的 HyDE、RRF (Reciprocal Rank Fusion) 和 Cross-Encoder 深度重排 (Stage 1 & 2) 尚未在 ai/retriever.py 的当前代码中实现。config/system.yaml 中虽然定义了 rerank.model，但检索器代码目前仅执行简单的上下文组装。
+1. RRF 融合: retrieve_relevant_context 方法调用 _apply_rrf，使用倒数排序融合 (Reciprocal Rank Fusion) 算法，将来自多个异构索引的搜索结果合并为一个统一的排序列表。
+
+2. Cross-Encoder 重排: 随后，retrieve_relevant_context 方法调用 _apply_reranking，它使用 sentence-transformers 库中的 CrossEncoder 模型（在 __init__ 中加载，模型名称由 config/system.yaml 定义）对 RRF 融合后的结果进行深度的语义重排，以确保最高的上下文相关性。
 
 知识图谱 (Knowledge Graph - ai/graph_encoder.py, ai/relation_extractor.py):
 
@@ -61,10 +63,10 @@ GraphEncoder 和 RelationExtractor 类使用 LLM 从非结构化文本中提取�
 
 KnowledgeGraphService (knowledge_graph_service.py) 协调这些模块，以更新图谱（在代码中目前为存根 graph_db_stub）。
 
-requirements.txt 中包含 tensorflow-gnn，表明 GNN (图神经网络) 是此架构的预期部分，符合原始 V2.0 文档的 Stage 3 描述。
+requirements.txt 中包含 tensorflow-gnn，表明 GNN (图神经网络) 是此架构的预期部分。
 
 消费者 (Consumer - ai/reasoning_ensemble.py):
 
 Retriever 的主要消费者是 ReasoningEnsemble (在 ai/reasoning_ensemble.py 中)。
 
-ReasoningEnsemble 在其 reason 方法中调用 retriever.retrieve 和 retriever.format_context，然后将检索到的上下文和 L1/L2 智能体的决策传递给 MetacognitiveAgent (metacognitive_agent.supervise) 进行监督。
+ReasoningEnsemble 在其 reason 方法中调用 retriever.retrieve_relevant_context 和 retriever.format_context_for_prompt，然后将检索到的上下文和 L1/L2 智能体的决策传递给 MetacognitiveAgent (agents/l2/metacognitive_agent.py) 进行监督。
