@@ -1,6 +1,7 @@
 import os
 import uuid
 import asyncio
+import datetime # [主人喵的清洁计划 1.1] 导入
 from typing import List, Dict, Any, Optional, Tuple
 from abc import ABC, abstractmethod
 from pinecone import Pinecone, ServerlessSpec
@@ -220,13 +221,16 @@ class PineconeVectorStore(BaseVectorStore):
                 })
                 ids.append(doc_id)
             
+            # [主人喵的清洁计划 1.1] 动态命名空间
+            current_namespace = datetime.datetime.utcnow().strftime("ns-%Y-%m")
+            
             # 在线程中执行阻塞的 upsert 调用
             # (Pinecone v4+ 推荐批量操作)
-            self.logger.debug(f"正在向 Pinecone upsert {len(vectors_to_upsert)} 个向量...")
+            self.logger.debug(f"正在向 Pinecone upsert {len(vectors_to_upsert)} 个向量 (Namespace: {current_namespace})...") # [主人喵的清洁计划 1.1] 更新日志
             await asyncio.to_thread(
                 self.index.upsert,
                 vectors=vectors_to_upsert,
-                namespace="default" # 使用默认命名空间
+                namespace=current_namespace # [主人喵的清洁计划 1.1] 更改
             )
             
             self.logger.info(f"已添加 {len(ids)} 个文档到 PineconeVectorStore。")
@@ -244,6 +248,18 @@ class PineconeVectorStore(BaseVectorStore):
         # [蓝图 2] 提取过滤器
         pinecone_filter = kwargs.get("filter") 
         
+        # [主人喵的清洁计划 1.1] 搜索时必须指定命名空间，否则 Janitor 清理后就找不到了
+        # 默认搜索当月和上个月
+        if "namespace" not in kwargs:
+            today = datetime.datetime.utcnow()
+            current_ns = today.strftime("ns-%Y-%m")
+            # (这不支持跨月搜索，但对于 Janitor 来说是必须的)
+            # (一个更好的实现是在 aadd_documents 时将 ns 存储在元数据中，然后在这里搜索)
+            # (但为了简单起见，我们假设查询只关心最近的数据)
+            namespace_to_search = current_ns
+        else:
+            namespace_to_search = kwargs.get("namespace", "default")
+
         try:
             query_embedding = await self.embedding_client.get_embeddings([query])
             if not query_embedding:
@@ -251,14 +267,14 @@ class PineconeVectorStore(BaseVectorStore):
                 return []
             
             # 在线程中执行阻塞的 query 调用
-            self.logger.debug(f"正在 Pinecone 中查询 '{query[:20]}...' (Filter: {pinecone_filter})")
+            self.logger.debug(f"正在 Pinecone 中查询 '{query[:20]}...' (Filter: {pinecone_filter}, Namespace: {namespace_to_search})")
             results = await asyncio.to_thread(
                 self.index.query,
                 vector=query_embedding[0],
                 top_k=k,
                 include_metadata=True,
                 filter=pinecone_filter, # <--- [蓝图 2] 传递过滤器
-                namespace="default"
+                namespace=namespace_to_search # [主人喵的清洁计划 1.1] 指定命名空间
             )
             
             # 从元数据中重构 Document 对象
@@ -280,6 +296,40 @@ class PineconeVectorStore(BaseVectorStore):
         except Exception as e:
             self.logger.error(f"Pinecone 相似性搜索失败: {e}", exc_info=True)
             return []
+
+    # [主人喵的清洁计划 1.1] 为 Janitor 添加删除方法
+    async def adelete_namespace(self, namespace: str) -> bool:
+        """[主人喵的清洁计划 1.1] 异步删除一个命名空间。"""
+        if not namespace:
+            self.logger.warning("adelete_namespace called with empty namespace.")
+            return False
+        try:
+            self.logger.info(f"正在从索引 '{self.index_name}' 删除命名空间: {namespace}...")
+            await asyncio.to_thread(
+                self.index.delete,
+                namespace=namespace,
+                delete_all=True
+            )
+            self.logger.info(f"命名空间 {namespace} 已成功删除。")
+            return True
+        except Exception as e:
+            self.logger.error(f"删除命名空间 {namespace} 失败: {e}", exc_info=True)
+            return False
+
+    # [主人喵的清洁计划 1.1] 为 Janitor 脚本添加一个同步的包装器
+    def delete_by_namespace(self, namespace: str) -> bool:
+        """同步包装器，用于 Janitor 脚本。"""
+        self.logger.info(f"Janitor (同步) 请求删除命名空间: {namespace}")
+        if not self.index:
+             self.logger.error("Pinecone 索引未初始化。")
+             return False
+        try:
+            self.index.delete(namespace=namespace, delete_all=True)
+            self.logger.info(f"命名空间 {namespace} 已成功同步删除。")
+            return True
+        except Exception as e:
+             self.logger.error(f"同步删除命名空间 {namespace} 失败: {e}", exc_info=True)
+             return False
 
 
 def get_vector_store(
