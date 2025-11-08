@@ -1,4 +1,6 @@
 import asyncio
+import httpx  # [✅ 修复] 阶段 5 添加
+import os     # [✅ 修复] 阶段 5 添加
 from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
@@ -18,6 +20,12 @@ class ErrorHandler:
         
         # Track failures for specific components
         self.failure_counts = {}
+        
+        # --- [✅ 修复] 阶段 5 添加 ---
+        self.slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
+        if not self.slack_webhook_url:
+            logger.warning("ErrorHandler: SLACK_WEBHOOK_URL 未设置。将跳过 Slack 警报。")
+        # --- [修复结束] ---
         
         logger.info("ErrorHandler initialized.")
 
@@ -73,16 +81,34 @@ class ErrorHandler:
         # restart a component or switch to a fallback.
         
     async def send_alert(self, error: Exception, component: str, context: dict):
-        """Placeholder for sending an alert to an external system."""
+        """[✅ 修复] 阶段 5 修复：发送警报到 Slack (替换占位符)。"""
         alert_message = (
-            f"Phoenix Alert:\n"
+            f"🔥 Phoenix Project 严重警报 🔥\n"
             f"Component: {component}\n"
             f"Error: {str(error)}\n"
-            f"Context: {context}\n"
+            f"Context: {str(context)}\n" # [修复] 确保 context 被序列化为 str
         )
-        # TODO: Integrate with Sentry, PagerDuty, Slack, etc.
-        logger.info(f"--- ALERT (Placeholder) ---\n{alert_message}")
-        await asyncio.sleep(0.01) # Simulate async I/O
+
+        # 仍然在本地日志中记录
+        logger.info(f"--- ALERT (Sending) ---\n{alert_message}")
+
+        if not self.slack_webhook_url:
+            # (已经在 __init__ 中警告过了, 这里可以安静跳过)
+            return
+
+        payload = {"text": alert_message}
+        try:
+            # 使用 httpx (已在 requirements.txt 中) 异步发送
+            async with httpx.AsyncClient() as client:
+                response = await client.post(self.slack_webhook_url, json=payload)
+                response.raise_for_status() # 如果是 4xx/5xx 则抛出异常
+            logger.info("警报已成功发送至 Slack。")
+        except Exception as e:
+            # 即使 Slack 发送失败，也不应让 ErrorHandler 崩溃
+            logger.error(f"发送 Slack 警报失败: {e}", exc_info=True)
+
+        # [✅ 修复] 移除旧的占位符 sleep
+        # await asyncio.sleep(0.01)
 
     def reset_failure_count(self, component: str):
         """Resets the failure count for a component upon success."""
