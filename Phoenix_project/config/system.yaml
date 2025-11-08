@@ -61,13 +61,6 @@ ai:
     port: 9200
     index: "phoenix-cot-traces" # [主人喵的清洁计划] 明确指定索引
 
-# [主人喵的清洁计划] 为 AuditLogger 添加专用配置 (Janitor 需要)
-audit_db:
-  provider: "elasticsearch"
-  host: "phoenix_elastic"
-  port: 9200
-  index: "phoenix-audit-logs" # [主人喵的清洁计划] 明确指定索引
-
   # [从旧版本合并] RAG 检索器和重排
   retriever:
     rrf_k: 60
@@ -110,6 +103,13 @@ audit_db:
       - name: "DeepForestReasoner"
         class: "ai.reasoning_ensemble.DeepForestReasoner"
         enabled: true
+
+# [主人喵的清洁计划] 为 AuditLogger 添加专用配置 (Janitor 需要)
+audit_db:
+  provider: "elasticsearch"
+  host: "phoenix_elastic"
+  port: 9200
+  index: "phoenix-audit-logs" # [主人喵的清洁计划] 明确指定索引
     
 # 数据库 (KG) - [您的最新设置 - 已修复]
 neo4j_db:
@@ -144,21 +144,4 @@ error_handler:
   max_retries: 3
   retry_delay_seconds: 60
 
-# 调度器作业配置 - [从旧版本合并]
-# [主人喵的清洁计划] 注意：这些作业由 controller/scheduler.py (APScheduler) 运行。
-# Celery Beat 调度在 worker.py 中单独配置。
-jobs:
-  - id: "main_cycle_every_5_minutes"
-    func: "orchestrator.run_main_cycle"
-    trigger:
-      type: "interval"
-      args:
-        minutes: 5
-  
-  - id: "main_cycle_hourly_at_xx01"
-    func: "orchestrator.run_main_cycle"
-    trigger:
-      type: "cron"
-      args:
-        hour: "*"
-        minute: 1
+# [主人喵的最终优化] 已移除 'jobs:' 部分，因为它已被 worker.py 中的 Celery Beat 调度替代。
