@@ -1,49 +1,51 @@
-"""
-Base class for all L2 (Metacognition & Arbitration) Agents.
-"""
-
+import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List # 确保 Dict 和 Any 被导入
+from typing import List, Any, AsyncGenerator
 
-from Phoenix_project.core.pipeline_state import PipelineState
-# from Phoenix_project.core.schemas.evidence_schema import EvidenceItem # 不再需要
+# 确保导入 Task 类型（即使是作为类型提示）
+try:
+    from Phoenix_project.core.schemas.task_schema import Task
+except ImportError:
+    Task = Any # Fallback
 
-class BaseL2Agent(ABC):
+logger = logging.getLogger(__name__)
+
+class L2Agent(ABC):
     """
-    Abstract Base Class for all L2 agents.
-    L2 agents are responsible for integrating, cross-validating, and
-    making advanced decisions based on the EvidenceItems from L1.
+    L2 智能体基类（元认知层）。
+    这些智能体通常依赖于 L1 智能体的输出。
     """
-    
-    def __init__(self, agent_id: str, llm_client: Any = None):
+    def __init__(
+        self,
+        agent_id: str,
+        llm_client: Any,
+        data_manager: Any,
+    ):
         """
-        Initializes the L2 agent.
+        初始化 L2 智能体。
         
-        Args:
-            agent_id (str): The unique identifier for the agent (from registry.yaml).
-            llm_client (Any, optional): An instance of an LLM client. Required by
-                                      agents like critic, adversary, and fusion.
+        参数:
+            agent_id (str): 智能体的唯一标识符。
+            llm_client (Any): 用于与 LLM API 交互的客户端。
+            data_manager (Any): 用于检索数据的 DataManager (L2 可能也需要)。
         """
         self.agent_id = agent_id
         self.llm_client = llm_client
+        self.data_manager = data_manager
+        logger.info(f"L2 Agent {self.agent_id} (Type: {type(self).__name__}) initialized.")
 
     @abstractmethod
-    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> Any:
+    async def run(self, task: "Task", dependencies: List[Any]) -> AsyncGenerator[Any, None]:
         """
-        The main execution method for the agent.
+        异步运行智能体。
+        L2 智能体接收 'dependencies' (来自 L1 的输出) 而不是 'context'。
         
-        It takes the current pipeline state and a dictionary of dependency outputs,
-        performs its specialized analysis, and returns its result.
-        
-        Args:
-            state (PipelineState): The current state of the analysis pipeline.
-            dependencies (Dict[str, Any]): A dictionary mapping dependency agent IDs
-                                         to their execution results.
+        参数:
+            task (Task): 当前任务。
+            dependencies (List[Any]): 来自上游智能体（L1）的输出列表。
             
-        Returns:
-            Any: The specific result object for that agent's task.
+        收益:
+            AsyncGenerator[Any, None]: 异步生成结果（例如 EvidenceItem, CriticResult）。
         """
-        pass
-
-    def __repr__(self) -> str:
-        return f"<{self.__class__.__name__}(id='{self.agent_id}')>"
+        raise NotImplementedError
+        yield
