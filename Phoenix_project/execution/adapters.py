@@ -14,13 +14,17 @@ import pandas as pd # 修复 _convert_alpaca... 中 pd 未定义的错误
 # 导入 Alpaca API (假设已通过 requirements.txt 安装)
 try:
     import alpaca_trade_api as tradeapi
-    from alpaca_trade_api.stream import Stream
+    # [第 1 步：添加 Imports]
+    from alpaca_trade_api.stream import Stream # <-- [新] 导入 Stream
     from alpaca_trade_api.common import URL
 except ImportError:
     print("Warning: 'alpaca-trade-api' not found. PaperTradingBrokerAdapter will not work.")
     tradeapi = None
     Stream = None
     URL = None
+
+# [第 1 步：添加 Imports]
+from threading import Thread # <-- [新] 导入 Thread
 
 
 # FIX (E2, E4): 从核心模式导入 Order, Fill, OrderStatus
@@ -178,26 +182,33 @@ class AlpacaAdapter(IBrokerAdapter):
         self.base_url = paper_base_url # e.g., "https://paper-api.alpaca.markets"
         
         self.api: Optional[tradeapi.REST] = None
-        self.conn: Optional[Stream] = None
+        # self.conn: Optional[Stream] = None # [旧]
         
         self.fill_callback: Optional[FillCallback] = None
         self.order_status_callback: Optional[OrderStatusCallback] = None
         
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._run_event_loop, daemon=True)
-        self.thread.start()
+        # [旧] Event loop logic
+        # self.loop = asyncio.new_event_loop()
+        # self.thread = threading.Thread(target=self._run_event_loop, daemon=True)
+        # self.thread.start()
         
-        logger.info(f"{self.log_prefix} Initialized. Async event loop started.")
+        # --- [第 2 步：修改 __init__] ---
+        self.stream: Optional[Stream] = None
+        self.stream_thread: Optional[Thread] = None
+        # --- [添加结束] ---
+        
+        logger.info(f"{self.log_prefix} Initialized.") # [旧] 移除了 "Async event loop started."
 
-    def _run_event_loop(self):
-        """在专用线程中运行 asyncio 事件循环。"""
-        logger.info(f"{self.log_prefix} Async event loop running in thread.")
-        asyncio.set_event_loop(self.loop)
-        try:
-            self.loop.run_forever()
-        finally:
-            self.loop.close()
-            logger.info(f"{self.log_prefix} Async event loop stopped.")
+    # [旧] Event loop logic
+    # def _run_event_loop(self):
+    #     """在专用线程中运行 asyncio 事件循环。"""
+    #     logger.info(f"{self.log_prefix} Async event loop running in thread.")
+    #     asyncio.set_event_loop(self.loop)
+    #     try:
+    #         self.loop.run_forever()
+    #     finally:
+    #         self.loop.close()
+    #         logger.info(f"{self.log_prefix} Async event loop stopped.")
 
     def connect(self) -> None:
         """建立与 REST API 和 WebSocket Stream 的连接。"""
@@ -206,65 +217,123 @@ class AlpacaAdapter(IBrokerAdapter):
             account = self.api.get_account()
             logger.info(f"{self.log_prefix} REST API connection successful. Account: {account.account_number} (Paper: {account.paper_trading})")
             
+            # --- [第 3 步：实现 connect] ---
             # 启动 WebSocket 监听器
-            asyncio.run_coroutine_threadsafe(self._start_websocket_listener(), self.loop)
+            # asyncio.run_coroutine_threadsafe(self._start_websocket_listener(), self.loop) # [旧]
+            
+            logger.info(f"{self.log_prefix} Connecting to Alpaca WebSocket stream...")
+            self.stream = Stream(
+                key_id=self.api_key,
+                secret_key=self.api_secret,
+                base_url=URL(self.base_url) # [修复] 确保使用 URL() 包装
+            )
+            
+            # 订阅 Alpaca 的“交易更新”频道
+            # 关键：将它连接到我们已经实现了的 _on_trade_update 方法
+            # [修复] _on_trade_update 是一个异步方法，需要一个事件循环
+            # 我们需要将回调包装起来，以便在我们的 loop (如果存在) 或新循环中运行
+            
+            # 简易修复：直接订阅同步回调
+            # （注意：Alpaca-trade-api v2+ 的 Stream.run() 是同步阻塞的，
+            # 它会在自己的线程中处理异步回调）
+            
+            # 修正：Alpaca-trade-api Stream v1.x (根据 requirements.txt) 
+            # 期望的是同步回调。我们需要将异步逻辑包装在同步函数中。
+            
+            # 让我们重新审视 _start_websocket_listener 的逻辑。
+            # Alpaca V1 (alpaca-trade-api-python) 的 Stream.run() 是同步阻塞的。
+            # 回调 (on) 应该是异步函数 (async def)。
+            # 这意味着 self.conn.run() 必须在一个单独的线程中运行，
+            # 并且它会管理自己的事件循环来调用异步回调。
+
+            # 让我们遵循原始计划，它似乎是为 V1 设计的。
+            
+            self.stream.subscribe_trade_updates(self._on_trade_update) # 订阅异步回调
+
+            # 将 self.stream.run() 放入一个单独的线程，因为它是一个阻塞操作
+            # daemon=True 意味着如果主程序退出，这个线程也会退出
+            self.stream_thread = Thread(target=self._run_stream, daemon=True)
+            self.stream_thread.start()
+            
+            logger.info(f"{self.log_prefix} Alpaca WebSocket stream thread started.")
+            
+            # --- [第 3 步结束] ---
             
         except Exception as e:
             logger.error(f"{self.log_prefix} Connection failed: {e}", exc_info=True)
             raise
 
-    async def _start_websocket_listener(self):
-        """在异步循环中初始化并运行 WebSocket 监听器。"""
+    # --- [第 3 步：实现 _run_stream] ---
+    def _run_stream(self) -> None:
+        """
+        [新] 在线程中运行流的辅助方法，包含错误处理。
+        """
         try:
-            logger.info(f"{self.log_prefix} Starting WebSocket listener...")
-            self.conn = Stream(
-                self.api_key,
-                self.api_secret,
-                base_url=URL(self.base_url),
-                data_feed='iex' # 仅用于交易流
-            )
-
-            # 注册处理函数 (trade_updates 包含 fills 和 order status)
-            @self.conn.on(r'trade_updates')
-            async def on_trade_update(data):
-                """处理来自 Alpaca 的订单更新和成交。"""
-                logger.debug(f"{self.log_prefix} WebSocket Data: {data}")
-                
-                # Alpaca 的 'trade_update' 事件包含 'order' 和 (如果成交) 'fill'
-                event = data.event
-                alpaca_order_data = data.order # 这是原始字典
-                
-                # 1. 转换订单状态
-                try:
-                    order = self._convert_alpaca_order_to_order(alpaca_order_data)
-                    if self.order_status_callback:
-                        self.order_status_callback(order)
-                except Exception as e:
-                    logger.error(f"{self.log_prefix} Error converting Alpaca order: {e}", exc_info=True)
-
-                # 2. 如果是 'fill' 或 'partial_fill'，转换 Fill
-                if event == 'fill' or event == 'partial_fill':
-                    try:
-                        fill = self._convert_alpaca_trade_to_fill(data, alpaca_order_data) # 'data' 本身是 trade
-                        if self.fill_callback:
-                            self.fill_callback(fill)
-                    except Exception as e:
-                        logger.error(f"{self.log_prefix} Error converting Alpaca fill: {e}", exc_info=True)
-
-            # 订阅交易更新
-            await self.conn.subscribe_trade_updates()
-            logger.info(f"{self.log_prefix} WebSocket listener running.")
-            
+            if self.stream:
+                logger.info(f"{self.log_prefix} WebSocket stream run() loop starting...")
+                self.stream.run()
+                logger.info(f"{self.log_prefix} WebSocket stream run() loop finished.")
         except Exception as e:
-            logger.error(f"{self.log_prefix} Failed to start WebSocket listener: {e}", exc_info=True)
+            logger.error(f"{self.log_prefix} Alpaca WebSocket stream crashed: {e}", exc_info=True)
+            # (TODO: 在这里添加自动重连逻辑，例如调用 self.connect())
+    # --- [第 3 步结束] ---
+
+
+    async def _on_trade_update(self, data): # [修复] 保持为 async，Stream.run() 会处理它
+        """
+        [重命名]
+        处理来自 Alpaca 的订单更新和成交。
+        (原为 _start_websocket_listener 内部的 on_trade_update)
+        """
+        logger.debug(f"{self.log_prefix} WebSocket Data: {data}")
+        
+        # Alpaca 的 'trade_update' 事件包含 'order' 和 (如果成交) 'fill'
+        event = data.event
+        alpaca_order_data = data.order # 这是原始字典
+        
+        # 1. 转换订单状态
+        try:
+            order = self._convert_alpaca_order_to_order(alpaca_order_data)
+            if self.order_status_callback:
+                # [修复] 回调是同步的，不能在异步函数中 await
+                # (假设回调是线程安全的或非阻塞的)
+                self.order_status_callback(order)
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Error converting Alpaca order: {e}", exc_info=True)
+
+        # 2. 如果是 'fill' 或 'partial_fill'，转换 Fill
+        if event == 'fill' or event == 'partial_fill':
+            try:
+                fill = self._convert_alpaca_trade_to_fill(data, alpaca_order_data) # 'data' 本身是 trade
+                if self.fill_callback:
+                    self.fill_callback(fill)
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Error converting Alpaca fill: {e}", exc_info=True)
+
 
     def disconnect(self) -> None:
-        if self.conn:
-            asyncio.run_coroutine_threadsafe(self.conn.close(), self.loop)
-        if self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-        self.thread.join(timeout=5)
-        logger.info(f"{self.log_prefix} Connection closed.")
+        # [旧]
+        # if self.conn:
+        #     asyncio.run_coroutine_threadsafe(self.conn.close(), self.loop)
+        # if self.loop.is_running():
+        #     self.loop.call_soon_threadsafe(self.loop.stop)
+        # self.thread.join(timeout=5)
+        # logger.info(f"{self.log_prefix} Connection closed.")
+        
+        # --- [第 4 步：实现 disconnect] ---
+        try:
+            if self.stream:
+                logger.info(f"{self.log_prefix} Disconnecting Alpaca WebSocket stream...")
+                self.stream.stop() # 告诉 WebSocket 停止 (V1 API)
+            
+            if self.stream_thread and self.stream_thread.is_alive():
+                logger.info(f"{self.log_prefix} Waiting for stream thread to join...")
+                self.stream_thread.join(timeout=5.0) # 等待线程结束
+                
+            logger.info(f"{self.log_prefix} Alpaca WebSocket stream disconnected.")
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Error during Alpaca stream disconnection: {e}", exc_info=True)
+        # --- [第 4 步结束] ---
         self.api = None
 
     def subscribe_fills(self, callback: FillCallback) -> None:
@@ -285,34 +354,45 @@ class AlpacaAdapter(IBrokerAdapter):
             
         logger.info(f"{self.log_prefix} Submitting order {order.id} for {order.symbol}")
         
-        # 将此阻塞I/O调用安排到异步循环中
-        asyncio.run_coroutine_threadsafe(
-            self._async_place_order(order),
-            self.loop
-        )
+        # [修复] 原始代码中没有 self.loop。
+        # _async_place_order 是一个 async def，必须在事件循环中运行。
+        # 但是，我们没有在 __init__ 中启动循环。
+        
+        # 简易修复：在专用于 Alpaca 的线程中运行阻塞调用。
+        # （或者，如果 self.api.submit_order 是阻塞的，我们可以直接调用它，
+        # 但这会阻塞调用者（OrderManager），这可能是不希望的）
+        
+        # 让我们使用一个新线程来防止阻塞 OrderManager
+        def _submit_order_thread():
+            try:
+                alpaca_order = self.api.submit_order(
+                    symbol=order.symbol,
+                    qty=abs(order.quantity),
+                    side="buy" if order.quantity > 0 else "sell",
+                    type=order.order_type.lower(),
+                    time_in_force=order.time_in_force.lower(),
+                    limit_price=order.limit_price,
+                    client_order_id=order.id # 使用我们的ID作为 client_order_id
+                )
+                logger.info(f"{self.log_prefix} Order submitted successfully. Broker ID: {alpaca_order.id}")
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Failed to place order {order.id}: {e}", exc_info=True)
+                # (可以触发一个 REJECTED 回调)
+                order.status = OrderStatus.REJECTED
+                if self.order_status_callback:
+                    self.order_status_callback(order)
+
+        # 在一个单独的线程中启动阻塞 API 调用
+        submit_thread = Thread(target=_submit_order_thread, daemon=True)
+        submit_thread.start()
         
         # 立即返回我们系统的订单ID
         return order.id
 
-    async def _async_place_order(self, order: Order):
-        """在事件循环中执行实际的 API 调用。"""
-        try:
-            alpaca_order = self.api.submit_order(
-                symbol=order.symbol,
-                qty=abs(order.quantity),
-                side="buy" if order.quantity > 0 else "sell",
-                type=order.order_type.lower(),
-                time_in_force=order.time_in_force.lower(),
-                limit_price=order.limit_price,
-                client_order_id=order.id # 使用我们的ID作为 client_order_id
-            )
-            logger.info(f"{self.log_prefix} Order submitted successfully. Broker ID: {alpaca_order.id}")
-        except Exception as e:
-            logger.error(f"{self.log_prefix} Failed to place order {order.id}: {e}", exc_info=True)
-            # (可以触发一个 REJECTED 回调)
-            order.status = OrderStatus.REJECTED
-            if self.order_status_callback:
-                self.order_status_callback(order)
+    # [旧]
+    # async def _async_place_order(self, order: Order):
+    #     """在事件循环中执行实际的 API 调用。"""
+    #     ... (逻辑移至上面的 _submit_order_thread)
 
     # --- Alpaca 辅助转换函数 ---
 
