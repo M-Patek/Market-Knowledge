@@ -1,78 +1,131 @@
-"""
-L2 Agent: Adversary
-Refactored from ai/counterfactual_tester.py.
-Responsible for "Counter-Argument" and "Pressure Testing" L1 Evidence.
-"""
-from typing import Any, List, Dict
+import json
+import logging
+import asyncio
+from typing import List, Any, AsyncGenerator, Optional
 
-from Phoenix_project.agents.l2.base import BaseL2Agent
-from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceType
+from Phoenix_project.agents.l2.base import L2Agent
+from Phoenix_project.core.schemas.task_schema import Task
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 from Phoenix_project.core.schemas.adversary_result import AdversaryResult
+from pydantic import ValidationError
 
-class AdversaryAgent(BaseL2Agent):
+# 获取日志记录器
+logger = logging.getLogger(__name__)
+
+class AdversaryAgent(L2Agent):
     """
-    Implements the L2 Adversary agent.
-    Inherits from BaseL2Agent and implements the run method
-    to generate counter-arguments against L1 EvidenceItems.
+    L2 智能体：诘难者 (Adversary)
+    审查 L1 证据并生成反驳论点。
     """
-    
-    # 签名已更新：接受 dependencies 而不是 evidence_items
-    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> List[AdversaryResult]:
-        """
-        Actively seeks flaws and counter-arguments against the EvidenceItems
-        provided by L1 Agents.
-        
-        Args:
-            state (PipelineState): The current state of the analysis pipeline.
-            dependencies (Dict[str, Any]): The dictionary of outputs from dependent tasks
-                                         (expected to contain L1 EvidenceItems).
-            
-        Returns:
-            List[AdversaryResult]: A list of counter-argument objects.
-        """
-        
-        # --- 新增逻辑：从 dependencies 提取 evidence_items ---
-        evidence_items: List[EvidenceItem] = []
-        for result in dependencies.values():
-            if isinstance(result, EvidenceItem):
-                evidence_items.append(result)
-            elif isinstance(result, list): # 处理 L1 agent 可能返回列表的情况
-                for item in result:
-                    if isinstance(item, EvidenceItem):
-                        evidence_items.append(item)
-        # --- 新增逻辑结束 ---
-        
-        counter_arguments = []
-        for item in evidence_items:
-            # Format the evidence for pressure testing
-            text_to_test = f"Agent '{item.agent_id}' claimed: '{item.content}'"
-            
-            # TODO: Implement actual LLM call using self.llm_client.
-            # This logic should be adapted from the original CounterfactualTester:
-            # 1. Get a prompt from a prompt_manager to generate a counter-argument.
-            # 2. Call self.llm_client.send_request(prompt=...).
-            # 3. Parse the JSON response.
-            
-            # This is a mock counter-argument.
-            if item.evidence_type == EvidenceType.FUNDAMENTAL:
-                mock_counter = "Counter: What if the 'strong earnings growth' is due to a one-time asset sale, not core business improvement?"
-                mock_success = True
-                mock_impact = -0.3
-            else:
-                mock_counter = "Counter: The 'bullish MACD crossover' could be a false signal, as volume on the breakout was below average."
-                mock_success = True
-                mock_impact = -0.25
 
-            counter_arguments.append(AdversaryResult(
-                agent_id=self.agent_id,
-                target_evidence_id=item.id,
-                counter_argument=mock_counter,
-                is_challenge_successful=mock_success,
-                confidence_impact=mock_impact
-            ))
-            
-        return counter_arguments
+    async def _challenge_evidence(self, evidence: EvidenceItem) -> Optional[EvidenceItem]:
+        """
+        (内部) 异步挑战单个 EvidenceItem。
+        
+        参数:
+            evidence (EvidenceItem): L1 智能体生成的证据。
 
-    def __repr__(self) -> str:
-        return f"<AdversaryAgent(id='{self.agent_id}')>"
+        返回:
+            Optional[EvidenceItem]: 一个新的、类型为 "Adversary" 的 EvidenceItem，
+                                    如果挑战失败则返回 None。
+        """
+        logger.debug(f"[{self.agent_id}] Challenging evidence: {evidence.evidence_id} from agent {evidence.agent_id}")
+        
+        agent_prompt_name = "l2_adversary"
+        
+        try:
+            # 1. 准备 Prompt 上下文
+            context_map = {
+                "agent_id": evidence.agent_id,
+                "original_evidence_json": evidence.model_dump_json(),
+                "original_evidence_id": str(evidence.evidence_id),
+                "symbols_list_str": json.dumps(evidence.symbols)
+            }
+
+            # 2. 异步调用 LLM
+            response_str = await self.llm_client.run_llm_task(
+                agent_prompt_name=agent_prompt_name,
+                context_map=context_map
+            )
+
+            if not response_str:
+                logger.warning(f"[{self.agent_id}] LLM returned no response for challenging evidence {evidence.evidence_id}")
+                return None
+
+            # 3. 解析和验证 AdversaryResult
+            response_data = json.loads(response_str)
+            adversary_result = AdversaryResult.model_validate(response_data)
+
+            # 4. [关键] 将 AdversaryResult 转换为 EvidenceItem 以便 Executor 处理
+            counter_evidence = EvidenceItem(
+                symbols=adversary_result.symbols,
+                evidence_type="Adversary",
+                content=adversary_result.counter_argument,
+                confidence=adversary_result.confidence,
+                data_horizon=evidence.data_horizon, # 继承原始数据范围
+                parent_evidence_id=evidence.evidence_id, # 追踪溯源
+                metadata={
+                    **adversary_result.metadata,
+                    "original_evidence_id": str(adversary_result.original_evidence_id),
+                    "risk_level": adversary_result.risk_level
+                }
+                # evidence_id 和 created_at 将由 Pydantic 自动生成
+            )
+            
+            logger.info(f"[{self.agent_id}] Successfully generated counter-evidence for {evidence.evidence_id}")
+            return counter_evidence
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[{self.agent_id}] Failed to decode LLM JSON response for challenge task. Error: {e}")
+            logger.debug(f"[{self.agent_id}] Faulty JSON string for challenge: {response_str}")
+            return None
+        except ValidationError as e:
+            logger.error(f"[{self.agent_id}] Failed to validate AdversaryResult schema. Error: {e}")
+            logger.debug(f"[{self.agent_id}] Faulty JSON data for challenge: {response_data}")
+            return None
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] An unexpected error occurred during challenge task. Error: {e}")
+            return None
+
+    async def run(self, task: Task, dependencies: List[Any]) -> AsyncGenerator[EvidenceItem, None]:
+        """
+        异步运行智能体，并行挑战所有 L1 证据。
+        
+        参数:
+            task (Task): 当前任务。
+            dependencies (List[Any]): 来自 L1 智能体的 EvidenceItem 列表。
+
+        收益:
+            AsyncGenerator[EvidenceItem, None]: 异步生成类型为 "Adversary" 的新 EvidenceItem。
+        """
+        logger.info(f"[{self.agent_id}] Running AdversaryAgent for task: {task.task_id}")
+
+        # 1. 过滤出有效的 L1 证据
+        l1_evidence_items = [item for item in dependencies if isinstance(item, EvidenceItem)]
+
+        if not l1_evidence_items:
+            logger.warning(f"[{self.agent_id}] No L1 EvidenceItems found in dependencies for task {task.task_id}. Skipping.")
+            return
+
+        logger.info(f"[{self.agent_id}] Found {len(l1_evidence_items)} L1 evidence items to challenge.")
+
+        # 2. 为每个 L1 证据创建并行的挑战任务
+        challenge_tasks = [
+            self._challenge_evidence(evidence) for evidence in l1_evidence_items
+        ]
+
+        # 3. 异步并行执行所有挑战
+        results = await asyncio.gather(*challenge_tasks, return_exceptions=True)
+
+        # 4. 处理结果并 Yield
+        for result in results:
+            if isinstance(result, Exception):
+                # 记录在 gather 中发生的异常
+                logger.error(f"[{self.agent_id}] An exception occurred in a challenge task: {result}")
+            elif isinstance(result, EvidenceItem):
+                # 这是一个成功的挑战，yield 新的 "Adversary" 证据
+                result.agent_id = self.agent_id
+                yield result
+            elif result is None:
+                # 内部挑战失败（已在 _challenge_evidence 中记录）
+                continue
