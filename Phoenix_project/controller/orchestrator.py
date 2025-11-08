@@ -2,10 +2,12 @@
 Orchestrator
 协调 Phoenix 系统的主要数据和逻辑流。
 """
+import asyncio # <-- [新] 添加 asyncio
 from typing import List, Dict, Any
 from datetime import datetime # [阶段 4 变更] 导入 datetime
 
 from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.exceptions import CognitiveError # <-- [新] 导入异常
 from Phoenix_project.data_manager import DataManager
 from Phoenix_project.events.risk_filter import EventRiskFilter
 # [主人喵的修复 2] 导入 EventDistributor
@@ -127,12 +129,43 @@ class Orchestrator:
             
             # (FIX E2)
             # 4. 认知引擎 (Cognitive Engine)
-            # (假设 cognitive_engine.run() 是一个同步/阻塞的调用)
-            fusion_result = self.cognitive_engine.run(self.pipeline_state)
+            # [修复] 使用 asyncio.run() 来调用异步的 cognitive_engine
+            fusion_result = None
+            try:
+                logger.info("Calling async CognitiveEngine...")
+                
+                # 关键修复：从同步的 Celery 任务中，启动一个新的事件循环
+                # 来运行并等待异步的 process_cognitive_cycle 方法
+                cognitive_result = asyncio.run(
+                    self.cognitive_engine.process_cognitive_cycle(self.pipeline_state)
+                )
+                
+                # cognitive_engine 返回一个字典，"final_decision" 键包含 FusionResult
+                fusion_result = cognitive_result.get("final_decision")
+                
+                # (可选) 存储事实检查报告
+                fact_check_report = cognitive_result.get("fact_check_report")
+                if fact_check_report:
+                    self.pipeline_state.update_value("last_fact_check_report", fact_check_report)
+
+            except CognitiveError as e:
+                # 捕获来自 cognitive_engine 的已知业务逻辑错误
+                logger.error(f"CognitiveEngine failed with a known error: {e}")
+                self.is_running = False
+                self.audit_manager.log_cycle(self.pipeline_state) # 记录失败的周期
+                logger.info("--- Orchestrator Main Cycle END (Cognitive Error) ---")
+                return
+            except Exception as e:
+                # 捕获 asyncio.run() 或其他未知的基础设施错误
+                logger.critical(f"Failed to run CognitiveEngine: {e}", exc_info=True)
+                self.error_handler.handle_critical_error(e, self.pipeline_state)
+                self.is_running = False
+                return # 退出循环
             
+            # 保持原有的检查，以防 cognitive_result 成功返回，但 "final_decision" 为 None
             if not fusion_result:
                 # (E2.b) 认知引擎没有产生决策
-                logger.warning("Cognitive Engine did not produce a final decision.")
+                logger.warning("Cognitive Engine ran successfully but did not produce a final decision.")
                 self.is_running = False
                 # (E2.c) 我们仍然需要记录审计
                 self.audit_manager.log_cycle(self.pipeline_state)
