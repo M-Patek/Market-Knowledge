@@ -50,6 +50,8 @@ from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
 # [蓝图 2] 导入 BaseVectorStore
 from Phoenix_project.memory.vector_store import get_vector_store
 from Phoenix_project.memory.cot_database import CoTDatabase
+# [主人喵的清洁计划 1.2] 导入新的 AuditLogger
+from Phoenix_project.audit.logger import AuditLogger
 
 # --- [主人喵的修复 1] 导入 GNN/KG 架构缺失的组件 ---
 from Phoenix_project.ai.embedding_client import EmbeddingClient
@@ -159,16 +161,15 @@ def build_orchestrator() -> Orchestrator:
         # 3. Core Components
         error_handler = ErrorHandler(config=system_config.get("error_handler", {}))
         data_manager = DataManager(config_loader, data_catalog)
-        max_history = system_config.get("max_pipeline_history", 100)
+        max_history = system_config.get("system", {}).get("max_pipeline_history", 100) # [主人喵的清洁计划 4.1] 修复路径
         pipeline_state = PipelineState(initial_state=None, max_history=max_history)
         
         # [主人喵的清洁计划 1.2/1.3] 修复 AuditManager 的初始化
         # 它需要 AuditLogger 和 CoTDatabase 实例
         audit_logger = AuditLogger(
-            config=system_config.get('audit_db', system_config.get('ai', {}).get('cot_database', {}))
+            # [主人喵的清洁计划 4.1] 从 system.yaml 获取 'audit_db' 配置
+            config=system_config.get('audit_db', {})
         )
-        # (确保为 audit_logger 设置了正确的索引，Janitor 假设是 'phoenix-audit-logs')
-        audit_logger.index_name = "phoenix-audit-logs"
 
         cot_db = CoTDatabase(
             config=system_config.get("ai", {}).get("cot_database", {}), 
@@ -176,7 +177,7 @@ def build_orchestrator() -> Orchestrator:
         )
         audit_manager = AuditManager(audit_logger=audit_logger, cot_database=cot_db)
         
-        # [主人喵的清洁计划] 修复 SnapshotManager 的初始化
+        # [主人喵的清洁计划] 修复 SnapshotManager 的初始化 (它不需要参数)
         snapshot_manager = SnapshotManager()
 
         # 4. Event Stream
@@ -235,7 +236,10 @@ def build_orchestrator() -> Orchestrator:
         api_gateway = APIGateway(gemini_pool)
         prompt_manager = PromptManager(config_loader.config_path)
         
-        embedding_client = EmbeddingClient(model_name=system_config.get("ai",{}).get("embedding_client",{}).get("model", "text-embedding-004"))
+        embedding_client = EmbeddingClient(
+            model_name=system_config.get("ai",{}).get("embedding_client",{}).get("model", "text-embedding-004"),
+            logger=logger # [主人喵的清洁计划 1.1 修复] 传递 logger
+        )
         tabular_client = TabularDBClient(config=system_config.get("tabular_db", {}))
         temporal_client = TemporalDBClient(config=system_config.get("temporal_db", {}))
         relation_extractor = RelationExtractor(api_gateway, prompt_manager)
@@ -381,10 +385,18 @@ def run_system_janitor_task():
 @celery_app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
     """
-    [主人喵的清洁计划 4.1]
+    [主人喵的清洁计划 4.1] [已更新]
     使用 Celery Beat 设置定时任务。
     这替代了 controller/scheduler.py。
     """
+    
+    # [主人喵的最终优化] 添加主循环调度 (每 5 分钟，来自旧的 system.yaml)
+    sender.add_periodic_task(
+        300.0, # 300 秒 = 5 分钟
+        run_main_cycle_task.s(),
+        name='run main cycle every 5 minutes'
+    )
+    
     # [主人喵的清洁计划 4.1] 每天凌晨 3:00 运行 Janitor
     if run_all_cleanup_tasks:
         sender.add_periodic_task(
@@ -392,13 +404,6 @@ def setup_periodic_tasks(sender, **kwargs):
             run_system_janitor_task.s(),
             name='run system janitor daily'
         )
-    
-    # (您可以在这里添加 'main_cycle' 的 Celery Beat 调度)
-    # sender.add_periodic_task(
-    #     60.0, # (示例：每 60 秒)
-    #     run_main_cycle_task.s(),
-    #     name='run main cycle every 60s'
-    # )
 
 
 if __name__ == '__main__':
