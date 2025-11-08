@@ -13,7 +13,8 @@ class ErrorHandler:
     def __init__(self, config: dict):
         self.config = config.get("error_handler", {})
         self.max_retries = self.config.get("max_retries", 3)
-        self.retry_delay_base = self.config.get("retry_delay_base_s", 5) # 5s
+        # [✅ 修复] 键名与 system.yaml (Source 31) 中的 "retry_delay_seconds" 保持一致
+        self.retry_delay_base = self.config.get("retry_delay_seconds", 5) 
         
         # Track failures for specific components
         self.failure_counts = {}
