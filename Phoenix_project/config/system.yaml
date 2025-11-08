@@ -17,6 +17,9 @@ pipeline:
   fact_check_threshold: 0.7
   fc_confidence_boost: 0.1
   fc_confidence_penalty: 0.2
+  cot_log_retention_days: 14     # [主人喵的清洁计划 4.1]
+  snapshot_retention_days: 7  # [主人喵的清洁计划 4.1]
+  vector_retention_days: 90   # [主人喵的清洁计划 4.1] (为 Janitor 添加一个默认值)
 
 # [阶段 3 & 4 新增：券商配置]
 broker:
@@ -56,6 +59,14 @@ ai:
     provider: "elasticsearch"
     host: "phoenix_elastic" # [✅ 修复] "localhost" -> "phoenix_elastic" (Docker 服务名)
     port: 9200
+    index: "phoenix-cot-traces" # [主人喵的清洁计划] 明确指定索引
+
+# [主人喵的清洁计划] 为 AuditLogger 添加专用配置 (Janitor 需要)
+audit_db:
+  provider: "elasticsearch"
+  host: "phoenix_elastic"
+  port: 9200
+  index: "phoenix-audit-logs" # [主人喵的清洁计划] 明确指定索引
 
   # [从旧版本合并] RAG 检索器和重排
   retriever:
@@ -134,6 +145,8 @@ error_handler:
   retry_delay_seconds: 60
 
 # 调度器作业配置 - [从旧版本合并]
+# [主人喵的清洁计划] 注意：这些作业由 controller/scheduler.py (APScheduler) 运行。
+# Celery Beat 调度在 worker.py 中单独配置。
 jobs:
   - id: "main_cycle_every_5_minutes"
     func: "orchestrator.run_main_cycle"
