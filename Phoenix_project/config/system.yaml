@@ -1,48 +1,63 @@
-# Phoenix_project/config/system.yaml
-# Global configuration for the Phoenix Project AI system
+# Phoenix Project 核心系统配置
+# 详细的 schema 见 core/schemas/config_schema.py
 
-# System-wide settings
 system:
-  environment: "development" # "production" or "development"
-  log_level: "INFO"
+  environment: "development" # "development" (回测) 或 "production" (实时/虚拟交易)
+  max_pipeline_history: 100 # PipelineState 中保留的最大周期数
+  data_catalog_path: "data_catalog.json"
+  log_level: "INFO" # 从旧版本合并
 
-# Pipeline settings from Task 20
+# [从旧版本合并] Pipeline 核心设置
 pipeline:
   K_paths: 5
   conflict_threshold: 0.6
   uncertainty_threshold: 0.4
   auto_retry: 3
   audit_log_retention_days: 30
-  # 修正：根据任务指令，将 CognitiveEngine 阈值迁移至此
   fact_check_threshold: 0.7
   fc_confidence_boost: 0.1
   fc_confidence_penalty: 0.2
-  
+
+# [阶段 3 & 4 新增：券商配置]
+broker:
+  type: "alpaca" # 匹配 adapters.py 中的逻辑
+  api_key_env: "ALPACA_API_KEY" # 告诉代码从 .env 中读取哪个变量
+  api_secret_env: "ALPACA_API_SECRET" # 告诉代码从 .env 中读取哪个变量
+  base_url: "https://paper-api.alpaca.markets" # 确保这是虚拟交易 (Paper) 的 URL
+
+# AI 和 RAG 配置
 ai:
-  # 1. AI Client Providers (from config/ai_clients.yaml)
+  # [从旧版本合并]
   ai_providers:
     google:
       api_key_env_var: "GEMINI_PRO_KEY"
       models:
-        # 修正：根据主人的决定，将推理模型更新为 gemini-2.5-pro
         - name: "gemini-2.5-pro"
           type: "generative"
-        # 修正：根据主人的决定，嵌入模型为 text-embedding-004 (已正确)
         - name: "text-embedding-004"
           type: "embedding"
-  
-  # 2. Embedding Client Configuration (from config/ai_clients.yaml)
+
+  # [合并]
   embedding_client:
-    provider: "google"
-    model: "text-embedding-004"
-    batch_size: 100
-    
-  # 3. Vector Database Configuration (from config/ai_clients.yaml)
+    provider: "google" # 从旧版本合并
+    model: "text-embedding-004" # 您的最新设置
+    batch_size: 100 # 从旧版本合并
+
+  # [您的最新设置]
   vector_database:
-    index_name: "phoenix-project-rag"
-    embedding_dimension: 768
-  
-  # 4. Hybrid Retriever & Re-ranking Settings (from config/ai_clients.yaml)
+    provider: "pinecone" # "pinecone" 或 "faiss"
+    index_name: "phoenix-project-rag" # 从旧版本合并 (假设)
+    embedding_dimension: 768 # 从旧版本合并 (假设)
+    # faiss_path: "/path/to/faiss.index"
+
+  # [您的最新设置 - 已修复]
+  cot_database:
+    # CoT (Chain of Thought) 数据库配置
+    provider: "elasticsearch"
+    host: "phoenix_elastic" # [✅ 修复] "localhost" -> "phoenix_elastic" (Docker 服务名)
+    port: 9200
+
+  # [从旧版本合并] RAG 检索器和重排
   retriever:
     rrf_k: 60
     freshness_decay_rate: 0.05
@@ -54,14 +69,11 @@ ai:
       "Analyst Report": 0.6
       "Market Data": 0.9
       "Other": 0.5
-      
-    # 修复：基于 Phoenix_project.md (V2.0) 文档中的明确引用
-    # "第二阶段使用 Cross-Encoder (cross-encoder/ms-marco-MiniLM-L-6-v2) 进行深度语义重排。"
     rerank:
       model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
-      top_n: 10 # 这是一个合理的默认值
+      top_n: 10 
       
-  # 5. Reasoning Ensemble (from ai/model_config.yaml)
+  # [从旧版本合并] AI 推理
   reasoning_ensemble:
     meta_learner:
       n_timesteps: 5
@@ -87,47 +99,41 @@ ai:
       - name: "DeepForestReasoner"
         class: "ai.reasoning_ensemble.DeepForestReasoner"
         enabled: true
+    
+# 数据库 (KG) - [您的最新设置 - 已修复]
+neo4j_db:
+  uri: "bolt://phoenix_neo4j:7687" # [✅ 修复] "localhost" -> "phoenix_neo4j" (Docker 服务名)
+  user: "neo4j"
+  password_env: "NEO4J_PASSWORD"
 
-# 修复：基于 RAG_ARCHITECTURE.md 文档的推断
-# "Technology: Elasticsearch"
-# FIX (E-CONFIG-1): 将 'localhost' 更改为 Docker 服务名 'elasticsearch'
-temporal_db:
-  host: "elasticsearch"
-  port: 9200
-  index: "phoenix-temporal"
-
-# 修复：基于 RAG_ARCHITECTURE.md 文档的推断
-# "Technology: PostgreSQL"
-# FIX (E-CONFIG-1): 将 'localhost' 更改为 Docker 服务名 'postgres_db'
+# (其他数据库...) - [您的最新设置]
 tabular_db:
-  host: "postgres_db"
-  port: 5432
-  user: "phoenix_user"
-  # FIX: 修复了密码逻辑断裂
-  # 将 'PG_PASSWORD' 更改为 'POSTGRES_PASSWORD' 以匹配 docker-compose.yml
-  password_env_var: "POSTGRES_PASSWORD"
-  database: "phoenix_tabular"
+  provider: "postgres"
+  uri_env: "TABULAR_DB_URI" # (在 Docker 中, .env 应设为 "postgresql://user:pass@phoenix_postgres:5432/db")
+  
+temporal_db:
+  provider: "influxdb"
+  uri_env: "TEMPORAL_DB_URI" # (在 Docker 中, .env 应设为 "http://phoenix_influxdb:8086")
+  token_env: "TEMPORAL_DB_TOKEN"
+  org: "phoenix"
 
-# --- [主人喵的修复 1] ---
-# 动态配置仓位管理器 (Sizer)
-# 允许我们在这里切换 VolatilityParitySizer 和 FixedFractionSizer
+# 交易和投资组合 - [您的最新设置]
+trading:
+  initial_cash: 1000000.0 # 回测/模拟账户的初始资金
+  
 portfolio:
   sizer:
-    # 默认选项 (已注释掉)
-    # type: "FixedFractionSizer"
-    # params:
-    #   fraction_per_position: 0.05
-    
-    # 你提到的 VolatilityParitySizer 选项
-    type: "VolatilityParitySizer"
+    type: "FixedFractionSizer" # "FixedFractionSizer" 或 "VolatilityParitySizer"
     params:
-      volatility_period: 20
-# --- [修复结束] ---
+      fraction_per_position: 0.05 # 适用于 FixedFractionSizer
+      # volatility_period: 20 # 适用于 VolatilityParitySizer
 
-# 调度器作业配置
-# 遵照主人的指示：
-# 1. 所有 func 键都设置为 "orchestrator.run_main_cycle"
-# 2. 不包含 "orchestrator.schedule_data_ingestion"
+# 错误处理 - [您的最新设置]
+error_handler:
+  max_retries: 3
+  retry_delay_seconds: 60
+
+# 调度器作业配置 - [从旧版本合并]
 jobs:
   - id: "main_cycle_every_5_minutes"
     func: "orchestrator.run_main_cycle"
