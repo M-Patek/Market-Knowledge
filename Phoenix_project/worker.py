@@ -24,8 +24,9 @@ from Phoenix_project.cognitive.risk_manager import RiskManager
 from Phoenix_project.execution.order_manager import OrderManager
 from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
 
-# FIX (E6): 导入 AlpacaAdapter (我们将在 adapters.py 中添加它)
-from Phoenix_project.execution.adapters import SimulatedBrokerAdapter, AlpacaAdapter
+# [阶段 3] 导入所有适配器
+from Phoenix_project.execution.interfaces import IBrokerAdapter # [修复] 导入接口
+from Phoenix_project.execution.adapters import SimulatedBrokerAdapter, PaperTradingBrokerAdapter
 from Phoenix_project.controller.orchestrator import Orchestrator
 from Phoenix_project.controller.error_handler import ErrorHandler
 from Phoenix_project.audit_manager import AuditManager
@@ -70,6 +71,8 @@ from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # 作为安
 try:
     from Phoenix_project.registry import registry
 except ImportError:
+    # 提前设置日志记录器以捕获此警告
+    setup_logging() 
     logger = get_logger(__name__)
     logger.warning("Could not import 'registry' from 'Phoenix_project.registry'. Using empty dict.")
     registry = {} # 回退
@@ -109,10 +112,10 @@ def start_prometheus_server(**kwargs):
 
 def build_orchestrator() -> Orchestrator:
     """
-    FIX (E5): 重写此函数以正确初始化 Orchestrator 及其所有依赖项。
-    [主人喵的修复 1] 扩展此函数以包含 GNN/KG 组件。
-    [主人喵的修复 2] 移除 StreamProcessor，添加 EventDistributor。
-    [蓝图 2] 更新 Retriever 的依赖项注入。
+    [阶段 3 & 4 重构]
+    初始化 Orchestrator 及其所有依赖项。
+    - 实现基于 system.environment 的 Broker 依赖注入。
+    - 将 TradeLifecycleManager 注入 OrderManager。
     """
     
     global orchestrator_instance
@@ -127,148 +130,157 @@ def build_orchestrator() -> Orchestrator:
         # 1. Config
         config_path = os.environ.get('PHOENIX_CONFIG_PATH', 'config')
         config_loader = ConfigLoader(config_path)
-        # [蓝图 2] 加载 system.yaml
-        system_config = config_loader.load_config('config/system.yaml') 
+        # [修复] system.yaml 路径应相对于 config_path
+        system_config = config_loader.load_config('system.yaml') 
         
         # 2. Data
         catalog_path = system_config.get("data_catalog_path", "data_catalog.json")
         try:
-            with open(catalog_path, 'r') as f:
+            # [修复] catalog_path 可能是相对路径，使用 config_loader 解析
+            catalog_file_path = os.path.join(config_loader.config_path, catalog_path)
+            with open(catalog_file_path, 'r') as f:
                 data_catalog = json.load(f)
         except FileNotFoundError:
-            logger.error(f"Data catalog '{catalog_path}' not found!")
+            logger.error(f"Data catalog '{catalog_path}' not found at '{catalog_file_path}'!")
             data_catalog = {} # 回退
             
         # 3. Core Components
-        error_handler = ErrorHandler(config=system_config.get("error_handler", {})) # <--- [蓝图 2] 传入配置
-        
-        # (E5 Fix)
+        error_handler = ErrorHandler(config=system_config.get("error_handler", {}))
         data_manager = DataManager(config_loader, data_catalog)
-        
-        # (E5 Fix)
         max_history = system_config.get("max_pipeline_history", 100)
         pipeline_state = PipelineState(initial_state=None, max_history=max_history)
-        
         audit_manager = AuditManager(config_loader)
         snapshot_manager = SnapshotManager(config_loader)
 
         # 4. Event Stream
-        # [主人喵的修复 2] 实例化 EventDistributor (Redis 队列)
         event_distributor = EventDistributor()
         event_filter = EventRiskFilter(config_loader)
-        # [主人喵的修复 2] 移除 StreamProcessor (Kafka) 的实例化
-        # stream_processor = StreamProcessor() # <-- REMOVED
 
         # 5. Execution
-        # (E6 Fix - 检查 Alpaca)
+        
+        # --- [阶段 3：实现依赖注入] ---
+        env = system_config.get("system", {}).get("environment", "development")
         broker_config = system_config.get("broker", {})
-        if broker_config.get("type") == "alpaca":
-            broker = AlpacaAdapter(
-                api_key=os.environ.get(broker_config.get("api_key_env")),
-                api_secret=os.environ.get(broker_config.get("api_secret_env")),
-                base_url=broker_config.get("base_url")
-            )
+        broker: IBrokerAdapter
+
+        if env == "production":
+            logger.info(f"Production environment detected. Attempting to load PaperTradingBrokerAdapter.")
+            if broker_config.get("type") == "alpaca":
+                api_key_env = broker_config.get("api_key_env")
+                api_secret_env = broker_config.get("api_secret_env")
+                
+                if not api_key_env or not api_secret_env:
+                     logger.critical("Broker config 'api_key_env' or 'api_secret_env' missing in system.yaml")
+                     raise ValueError("Missing broker API key env var names")
+
+                api_key = os.environ.get(api_key_env)
+                api_secret = os.environ.get(api_secret_env)
+                
+                if not api_key or not api_secret:
+                    logger.critical(f"Environment variables {api_key_env} or {api_secret_env} not set.")
+                    raise ValueError("Missing Alpaca API credentials in environment")
+                    
+                broker = PaperTradingBrokerAdapter(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    paper_base_url=broker_config.get("base_url") # 确保这是 paper URL
+                )
+                broker.connect() # 在启动时连接
+            else:
+                logger.critical("Production environment selected, but no valid 'alpaca' broker configured.")
+                raise ValueError("Production environment requires a valid broker configuration.")
         else:
-            logger.warning("Defaulting to SimulatedBrokerAdapter for worker.")
+            logger.info(f"Development environment detected. Loading SimulatedBrokerAdapter.")
             broker = SimulatedBrokerAdapter()
+            # (SimBroker 不再需要 data_manager)
             
+        # --- [阶段 4：注入 TLM 到 OrderManager] ---
         initial_cash = system_config.get("trading", {}).get("initial_cash", 1000000)
         trade_lifecycle_manager = TradeLifecycleManager(initial_cash=initial_cash)
-        order_manager = OrderManager(broker)
+        order_manager = OrderManager(
+            broker=broker, 
+            trade_lifecycle_manager=trade_lifecycle_manager # <--- 注入
+        )
+        # --- [结束 阶段 3 & 4] ---
 
         # 6. AI/Cognitive (与 phoenix_project.py 相同)
         gemini_pool = GeminiPoolManager()
         api_gateway = APIGateway(gemini_pool)
         prompt_manager = PromptManager(config_loader.config_path)
         
-        # --- [主人喵的修复 1] 实例化 GNN/KG 及其依赖项 ---
-        
-        # 6a. 实例化 RAG 依赖项 (DB 客户端, Embedding)
-        # [蓝图 2] 使用 system_config
         embedding_client = EmbeddingClient(model_name=system_config.get("ai",{}).get("embedding_client",{}).get("model", "text-embedding-004"))
-        
-        # [蓝图 2 修复]：传入正确的配置子树
         tabular_client = TabularDBClient(config=system_config.get("tabular_db", {}))
         temporal_client = TemporalDBClient(config=system_config.get("temporal_db", {}))
-        
-        # 6b. 实例化图谱构建器 (Extractor)
         relation_extractor = RelationExtractor(api_gateway, prompt_manager)
         
-        # 6c. 实例化数据存储 (Vector, CoT, KG)
-        # [蓝图 2] 使用 system_config 和 get_vector_store 工厂
         vector_store = get_vector_store(
             config=system_config.get("ai", {}).get("vector_database", {}),
             embedding_client=embedding_client,
             logger=logger
         )
-        cot_db = CoTDatabase(config=system_config.get("cot_database", {}), logger=logger) # 假设 cot_db 在 system.yaml 中
-        knowledge_graph_service = KnowledgeGraphService(config=system_config.get("neo4j_db", {})) # 假设 neo4j_db 在 system.yaml 中
+        cot_db = CoTDatabase(config=system_config.get("cot_database", {}), logger=logger)
+        knowledge_graph_service = KnowledgeGraphService(config=system_config.get("neo4j_db", {}))
         
-        # 6d. [蓝图 2] 实例化混合检索器 (Retriever)，注入所有数据源
         retriever = Retriever(
-            config_loader=config_loader, # <--- [蓝图 2] 注入
+            config_loader=config_loader,
             vector_store=vector_store,
             cot_database=cot_db,
             embedding_client=embedding_client,
             knowledge_graph_service=knowledge_graph_service,
-            temporal_client=temporal_client, # <--- [蓝图 2] 注入
-            tabular_client=tabular_client   # <--- [蓝图 2] 注入
+            temporal_client=temporal_client,
+            tabular_client=tabular_client
         )
-        # --- [修复结束] ---
         
-        # 6e. 实例化 AI 代理和协调器
         agent_registry_config = config_loader.get_agent_registry()
-        # [蓝图 2 修复]：传入 agent_registry_config 和 全局 registry
         ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry_config, registry) 
         metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
         arbitrator = Arbitrator(api_gateway, prompt_manager)
         fact_checker = FactChecker(api_gateway, prompt_manager)
         
         reasoning_ensemble = ReasoningEnsemble(
-            retriever=retriever, # 传入已实例化的混合检索器
+            retriever=retriever,
             ensemble_client=ensemble_client,
             metacognitive_agent=metacognitive_agent,
             arbitrator=arbitrator,
             fact_checker=fact_checker
         )
         
+        # [修复] 导入 CognitiveEngine 缺少的依赖
+        from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
+        from Phoenix_project.evaluation.voter import Voter
+        uncertainty_guard = UncertaintyGuard()
+        voter = Voter()
+
         cognitive_engine = CognitiveEngine(
             reasoning_ensemble=reasoning_ensemble,
-            fact_checker=fact_checker
+            fact_checker=fact_checker,
+            uncertainty_guard=uncertainty_guard, # [修复]
+            voter=voter, # [修复]
+            config=system_config.get("cognitive_engine", {}) # [修复]
         )
             
         # 7. Portfolio
-        
-        # --- [主人喵的修复 2] ---
-        # 动态加载 Sizer，而不是硬编码
         sizer_config = system_config.get("portfolio", {}).get("sizer", {})
-        sizer_type_name = sizer_config.get("type", "FixedFractionSizer") # e.g., "VolatilityParitySizer"
-        sizer_params = sizer_config.get("params", {}) # e.g., {"volatility_period": 20}
-
+        sizer_type_name = sizer_config.get("type", "FixedFractionSizer")
+        sizer_params = sizer_config.get("params", {})
         sizer: IPositionSizer
         try:
-            # 将 "VolatilityParitySizer" 转换为 "volatility_parity"
             module_name = pydash.snake_case(sizer_type_name.replace("Sizer", ""))
             module = importlib.import_module(f"Phoenix_project.sizing.{module_name}")
             SizerClass = getattr(module, sizer_type_name)
             
-            # 如果没有提供参数，请使用安全默认值
             if sizer_type_name == "FixedFractionSizer" and not sizer_params:
                  sizer_params = {"fraction_per_position": 0.05}
             elif sizer_type_name == "VolatilityParitySizer" and not sizer_params:
-                 sizer_params = {"volatility_period": 20} # 合理的默认值
+                 sizer_params = {"volatility_period": 20}
 
             sizer = SizerClass(**sizer_params)
             logger.info(f"成功从配置加载 Sizer: {sizer_type_name} (Params: {sizer_params})")
-
         except (ImportError, AttributeError, TypeError) as e:
             logger.error(f"无法从配置加载 sizer '{sizer_type_name}' (Params: {sizer_params}): {e}。回退到 FixedFractionSizer。")
-            sizer = FixedFractionSizer(fraction_per_position=0.05) # 安全回退
+            sizer = FixedFractionSizer(fraction_per_position=0.05)
         
-        # sizer = FixedFractionSizer() # <-- [主人喵的修复 2] 已被替换
         portfolio_constructor = PortfolioConstructor(position_sizer=sizer)
-        # --- [修复结束] ---
-        
         risk_manager = RiskManager(config_loader)
 
         # 8. Monitoring
@@ -279,9 +291,7 @@ def build_orchestrator() -> Orchestrator:
             pipeline_state=pipeline_state,
             data_manager=data_manager,
             event_filter=event_filter,
-            # [主人喵的修复 2] 传入 event_distributor
             event_distributor=event_distributor,
-            # [主人喵的修复 2] 移除 stream_processor
             cognitive_engine=cognitive_engine,
             portfolio_constructor=portfolio_constructor,
             risk_manager=risk_manager,
@@ -298,7 +308,6 @@ def build_orchestrator() -> Orchestrator:
     
     except Exception as e:
         logger.error(f"Worker: Failed to build Orchestrator: {e}", exc_info=True)
-        # (在 Celery 中，我们可能希望任务失败而不是让 worker 崩溃)
         raise
 
 # --- Celery Tasks ---
@@ -311,12 +320,9 @@ def run_main_cycle_task():
     logger = get_logger('phoenix.run_main_cycle')
     try:
         logger.info("Task: run_main_cycle_task started...")
-        # (获取或构建单例)
         orchestrator = build_orchestrator()
         
-        # FIX (E7): 调用 run_main_cycle() 而不是 run_main_loop_async()
-        # [主人喵的修复 2.1] 修复：run_main_cycle 不是异步的
-        # await orchestrator.run_main_cycle()
+        # [阶段 4] run_main_cycle 是同步的
         orchestrator.run_main_cycle() 
         
         logger.info("Task: run_main_cycle_task finished.")
@@ -332,15 +338,8 @@ def setup_periodic_tasks(sender, **kwargs):
     (可选) 如果使用 Celery Beat，可以在这里设置定时任务。
     这替代了 controller/scheduler.py。
     """
-    # 示例：每5分钟运行一次
-    # sender.add_periodic_task(
-    #     300.0,
-    #     run_main_cycle_task.s(),
-    #     name='Run main cycle every 5 minutes'
-    # )
     pass
 
 if __name__ == '__main__':
     # 直接运行 worker (用于开发)
-    # celery -A worker worker --loglevel=info
     celery_app.worker_main(argv=['worker', '--loglevel=info'])
