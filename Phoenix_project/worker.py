@@ -4,6 +4,8 @@ Celery Worker
 """
 import os
 from celery import Celery
+# [主人喵的清洁计划 3] 导入 Celery 调度器
+from celery.schedules import crontab
 
 # --- 蓝图 1：导入 Celery 信号和 Prometheus 客户端 ---
 from celery.signals import worker_process_init
@@ -66,6 +68,16 @@ import pydash # 用于将 "VolatilityParitySizer" 转换为 "volatility_parity"
 from Phoenix_project.sizing.base import IPositionSizer
 from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # 作为安全回退
 # --- [修复结束] ---
+
+# [主人喵的清洁计划 3] 导入 Janitor 任务
+try:
+    from Phoenix_project.scripts.run_system_janitor import run_all_cleanup_tasks
+except ImportError:
+    setup_logging()
+    logger = get_logger(__name__)
+    logger.critical("无法导入 'run_all_cleanup_tasks'。Janitor 任务将无法运行。")
+    run_all_cleanup_tasks = None
+
 
 # [蓝图 2 修复] 导入 registry (假设它在 registry.py 中)
 try:
@@ -149,8 +161,23 @@ def build_orchestrator() -> Orchestrator:
         data_manager = DataManager(config_loader, data_catalog)
         max_history = system_config.get("max_pipeline_history", 100)
         pipeline_state = PipelineState(initial_state=None, max_history=max_history)
-        audit_manager = AuditManager(config_loader)
-        snapshot_manager = SnapshotManager(config_loader)
+        
+        # [主人喵的清洁计划 1.2/1.3] 修复 AuditManager 的初始化
+        # 它需要 AuditLogger 和 CoTDatabase 实例
+        audit_logger = AuditLogger(
+            config=system_config.get('audit_db', system_config.get('ai', {}).get('cot_database', {}))
+        )
+        # (确保为 audit_logger 设置了正确的索引，Janitor 假设是 'phoenix-audit-logs')
+        audit_logger.index_name = "phoenix-audit-logs"
+
+        cot_db = CoTDatabase(
+            config=system_config.get("ai", {}).get("cot_database", {}), 
+            logger=logger
+        )
+        audit_manager = AuditManager(audit_logger=audit_logger, cot_database=cot_db)
+        
+        # [主人喵的清洁计划] 修复 SnapshotManager 的初始化
+        snapshot_manager = SnapshotManager()
 
         # 4. Event Stream
         event_distributor = EventDistributor()
@@ -218,7 +245,9 @@ def build_orchestrator() -> Orchestrator:
             embedding_client=embedding_client,
             logger=logger
         )
-        cot_db = CoTDatabase(config=system_config.get("cot_database", {}), logger=logger)
+        
+        # (cot_db 已在上面初始化)
+        
         knowledge_graph_service = KnowledgeGraphService(config=system_config.get("neo4j_db", {}))
         
         retriever = Retriever(
@@ -332,13 +361,45 @@ def run_main_cycle_task():
         # (可选: 重试)
         # raise self.retry(exc=e, countdown=60)
 
+# [主人喵的清洁计划 3] 新增 Janitor 任务
+@celery_app.task(name='phoenix.run_system_janitor')
+def run_system_janitor_task():
+    """[主人喵的清洁计划 3] Celery 任务，用于执行系统清理。"""
+    logger = get_logger('phoenix.run_system_janitor')
+    try:
+        if run_all_cleanup_tasks:
+            logger.info("Task: run_system_janitor_task started...")
+            run_all_cleanup_tasks() # <--- [主人喵的清洁计划 3] 直接调用
+            logger.info("Task: run_system_janitor_task finished.")
+        else:
+            logger.error("Task: run_system_janitor_task failed: 'run_all_cleanup_tasks' 未能导入。")
+            
+    except Exception as e:
+        logger.error(f"Task: run_system_janitor_task failed: {e}", exc_info=True)
+
+
 @celery_app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
     """
-    (可选) 如果使用 Celery Beat，可以在这里设置定时任务。
+    [主人喵的清洁计划 4.1]
+    使用 Celery Beat 设置定时任务。
     这替代了 controller/scheduler.py。
     """
-    pass
+    # [主人喵的清洁计划 4.1] 每天凌晨 3:00 运行 Janitor
+    if run_all_cleanup_tasks:
+        sender.add_periodic_task(
+            crontab(hour=3, minute=0), # 每天 3:00 AM
+            run_system_janitor_task.s(),
+            name='run system janitor daily'
+        )
+    
+    # (您可以在这里添加 'main_cycle' 的 Celery Beat 调度)
+    # sender.add_periodic_task(
+    #     60.0, # (示例：每 60 秒)
+    #     run_main_cycle_task.s(),
+    #     name='run main cycle every 60s'
+    # )
+
 
 if __name__ == '__main__':
     # 直接运行 worker (用于开发)
