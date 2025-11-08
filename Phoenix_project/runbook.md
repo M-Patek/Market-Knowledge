@@ -1,181 +1,129 @@
-Phoenix Project - Operational Runbook
-Version: 2.1 (已根据代码库 v2.0 更新)
-Last Updated: 2025-11-08
-Contact: Phoenix Project Team
+Phoenix Project 运维手册 (Runbook)
 
-系统概述 (System Overview)
+本文档是用于诊断和解决 Phoenix Project 生产环境中常见问题的操作指南。
 
-Phoenix Project 是一个全面的量化交易研究平台。它旨在自动化整个回测流程，包括数据采集、特征计算、AI 增强分析、策略执行模拟和报告。
+关键服务健康检查
 
-系统可以运行在两种主要模式下，如 phoenix_project.py 和 worker.py 所示：
+Docker 容器 (docker ps):
 
-回测模式 (Backtest Mode): 通过运行 python phoenix_project.py 触发。这将使用 config/system.yaml 中定义的参数（如 start_date, end_date）执行单次回测。
+确保所有核心服务都在运行 (phoenix_api, phoenix_worker, phoenix_stream_consumer, phoenix_data_producer)。
 
-实时模式 (Live Mode): 通过 Celery worker (worker.py) 或主应用的 run_live() 方法启动。此模式依赖 controller/scheduler.py 中定义的调度任务来定期触发 Orchestrator 的 run_main_cycle。
+检查基础设施 (phoenix_redis, phoenix_postgres, phoenix_elastic, phoenix_neo4j, phoenix_kafka) 是否都在运行。
 
-先决条件与设置 (Prerequisites & Setup)
+API 服务 (phoenix_api):
 
-a. 克隆仓库
+操作: curl http://localhost:8000/health
 
-git clone <repository_url>
-cd Phoenix_project
+预期: {"status": "ok"}
 
+Celery Worker (phoenix_worker):
 
-b. 环境设置
+操作: docker logs phoenix_worker
 
-Python 版本: 推荐 Python 3.10 或更高版本 (如 Dockerfile 所示)。
+预期: 寻找 celery@...: Ready。寻找 Orchestrator Main Cycle START/END 日志，确认 run_main_cycle 正在被 controller/scheduler.py 调度。
 
-安装依赖:
+Kafka & Zookeeper:
 
-pip install -r requirements.txt
+操作: (进入 Kafka 容器) kafka-topics --list --bootstrap-server localhost:29092
 
+预期: 看到已创建的主题（例如 market_data_stream, news_events_stream）。
 
-c. 配置环境变量
+数据生产者 (phoenix_data_producer):
 
-系统需要 API 密钥用于数据提供商和 AI 模型。
+操作: docker logs phoenix_data_producer
 
-复制示例环境文件：
+预期: 看到连接到券商 WebSocket 并成功生产 Kafka 消息的日志。
 
-cp env.example .env
+流消费者 (phoenix_stream_consumer):
 
+操作: docker logs phoenix_stream_consumer
 
-打开 .env 文件并填入您的实际 API 密钥 (例如 GEMINI_PRO_KEY, PINECONE_API_KEY, POSTGRES_PASSWORD 等)。变量名称必须与 config/system.yaml 和 docker-compose.yml 中引用的名称匹配。
+预期: 看到从 Kafka 消费消息并将其推送到 Redis (EventDistributor) 的日志。
 
-核心操作 (Core Operations)
+常见问题 (FAQ) 与故障排查
 
-a. 配置运行
+症状: API 返回 500 错误
 
-所有操作都由中央配置文件 config/system.yaml 控制。在运行之前，请检查此文件以配置：
+检查 API 日志: docker logs phoenix_api
 
-system.environment: "development" 或 "production"
+问题: ConnectionError (连接到 Redis, Postgres, Neo4j...)
 
-pipeline: (例如 fact_check_threshold)
+解决: 检查 docker ps 确保目标数据库容器正在运行。检查 .env 文件中的 ..._URI 变量是否使用了正确的 Docker 服务名称（例如 phoenix_postgres 而不是 localhost）。
 
-ai: (例如 gemini-2.5-pro 模型)
+问题: GeminiPoolManager 相关的 ValueError (例如 GEMINI_API_KEYS 未设置)。
 
-temporal_db / tabular_db: 数据库连接（主机名应匹配 docker-compose.yml 服务名，如 elasticsearch, postgres_db）。
+解决: 检查 .env 文件，确保 GEMINI_API_KEYS 已设置并包含至少一个有效的、用逗号分隔的 API 密钥。
 
-b. 运行回测 (Backtest Mode)
+症状: 系统没有做出任何决策 (Orchestrator 循环空转)
 
-主入口点 phoenix_project.py 的 if __name__ == "__main__": 块被配置为运行回测。
+检查 Celery Worker 日志: docker logs phoenix_worker
 
-python phoenix_project.py
+寻找: Retrieved 0 new events from EventDistributor.
 
+诊断路径:
 
-预期输出:
-控制台将显示来自 monitor/logging.py (loguru) 的结构化日志。您将看到系统初始化、LoopManager 运行回测，以及 Orchestrator 处理每个时间步的消息。
+Orchestrator 正在运行，但 EventDistributor (Redis 队列) 是空的。
 
-c. 运行实时模式 (Live Mode / Worker)
+检查上游 -> docker logs phoenix_stream_consumer
 
-实时模式依赖于基础设施（Redis, Kafka, PG, ES, Neo4j）和 Celery worker。
+问题 (Consumer): KafkaError: No brokers available 或无法连接。
 
-启动基础设施 (推荐):
+解决 (Consumer): 重启 phoenix_stream_consumer 和 phoenix_kafka。
 
-docker-compose up -d
+问题 (Consumer): 消费者正在运行，但没有收到消息。
 
+检查上游 -> docker logs phoenix_data_producer
 
-启动 Celery Worker:
-(确保您的 .env 文件已加载或环境变量已设置)
+问题 (Producer): 生产者未能连接到券商 (例如 Alpaca WebSocket 认证失败)。
 
-celery -A worker.celery_app worker --loglevel=info
+解决 (Producer): 检查 .env 中的 ALPACA_API_KEY / ALPACA_API_SECRET。
 
+问题 (Producer): 生产者未能连接到 Kafka。
 
-启动 API 服务 (用于手动控制):
-(在单独的终端中)
+解决 (Producer): 检查 .env 中的 KAFKA_BOOTSTRAP_SERVERS 是否设置为 kafka:29092。
 
-gunicorn -w 4 -b 0.0.0.0:8000 interfaces.api_server:app
+[已更新] 症状: Critical Failure: Cognitive Engine Fails or Hangs
 
+这是最严重的故障之一，意味着 orchestrator.py 在 run_main_cycle 期间失败。
 
-注意: docker-compose.yml 也定义了 api 和 worker 服务，make run (或 docker-compose up -d --build) 是启动所有服务的首选方式。
+检查 Celery Worker 日志: docker logs phoenix_worker
 
-d. 运行数据验证
+[新] 寻找特定错误:
 
-在导入大型数据集之前，使用 scripts/validate_dataset.py 检查模式。
+日志: CognitiveEngine failed with a known error: ...
 
-[重要] runbook (V2.0) 中的 market_event 类型已过时。请使用 news_data 或 market_data。
+含义: 这是 CognitiveEngine (cognitive/engine.py) 内部的业务逻辑失败（例如，ReasoningEnsemble 失败或 FactChecker 崩溃）。
 
-# 验证新闻/事件 JSONL 文件
-python scripts/validate_dataset.py /path/to/your/news.jsonl --type news_data
+[新] 诊断: 这是由 orchestrator.py 中的 except CognitiveError 捕获的。错误消息将明确指出是哪个 AI 子系统（如 ReasoningEnsemble）失败了。请深入检查该子系统的日志。
 
-# 验证市场数据 CSV 文件 (假设)
-python scripts/validate_dataset.py /path/to/your/prices.csv --type market_data
+寻找严重错误:
 
+日志: Failed to run CognitiveEngine: ... 或 Orchestrator main cycle failed: ...
 
-e. 运行 CLI
+含义: 这是一个更深层次的系统崩溃。
 
-使用 scripts/run_cli.py 手动与系统交互。
+[新] 诊断 (Sync/Async): 如果错误是关于 asyncio.run() 或 coroutine 相关的，这可能表明 cognitive_engine.py 中的某个深层异步调用失败了。
 
-# 示例：手动注入一个新闻事件
-python scripts/run_cli.py inject -s "Manual CLI" "突发新闻：美联储意外宣布降息。"
+诊断 (配置): 检查 config/system.yaml。CognitiveEngine 依赖于 ai.reasoning_ensemble 和 evaluation.fact_checker 的配置。检查这些配置是否正确。
 
-# 示例：手动触发一个计划任务 (如果 Orchestrator 已配置)
-python scripts/run_cli.py trigger "daily_market_analysis"
+诊断 (API): 检查 GeminiPoolManager 日志。AI 引擎可能因为所有 API 密钥均已达到速率限制或失效而无法执行。
 
+症状: 订单未被执行
 
-验证与监控
+检查 Celery Worker 日志: docker logs phoenix_worker
 
-a. 检查 API 端点
+寻找: order_manager.process_target_portfolio 相关的日志。
 
-当 api 服务 (或 interfaces/api_server.py) 运行时 (默认在 http://localhost:8000)，您可以使用以下端点：
+诊断:
 
-Health Check: GET /api/v1/health
+问题: DataManager 无法获取最新价格 (Could not retrieve latest market price for ...)。
 
-检查 API 服务是否正在运行。
+解决: 检查 phoenix_data_producer 是否正在运行，并为该资产向 Redis (latest_prices) 推送数据。
 
-System Status: GET /api/v1/status
+问题: RiskManager 拒绝了交易 (RiskManager evaluation triggered adjustments...)。
 
-查询 ContextBus (或同等组件) 以获取系统当前状态的摘要。
+解决: 这是正常行为。检查 risk_report 日志以了解原因。
 
-Audit Logs: GET /api/v1/audit?limit=10
+问题: OrderManager 尝试下单但失败 (例如 alpaca_trade_api.rest.APIError)。
 
-从 AuditViewer 检索最新的审计日志。
-
-b. 审查 HTML 报告
-
-(用于回测运行) 检查 output/renderer.py 和 training/engine.py (或 phoenix_project.py) 中配置的报告输出路径。默认情况下，这可能是 logs/backtest_report.html (取决于 BacktestingEngine 的实现)。
-
-检查权益曲线图。
-
-审查关键指标（夏普比率、最大回撤）。
-
-c. 监控 (Prometheus)
-
-[注意] runbook (V2.0) 中提到的 Prometheus 指标 (如 phoenix_cache_hits_total) 尚未完全实现。monitor/metrics.py 中的 PrometheusMetrics 类目前是一个占位符 (Stub)，它只将指标打印到控制台，而没有启动 HTTP /metrics 端点。
-
-故障排除 (Troubleshooting)
-
-1. 警报: Pydantic 验证错误
-
-诊断: config/system.yaml 中的值无效或缺少必填字段，或者 scripts/validate_dataset.py 中的数据格式不正确。
-
-响应:
-
-仔细阅读控制台中的 Pydantic 错误消息。它会精确指出哪个字段不正确。
-
-纠正 config/system.yaml 或数据文件，然后重新运行。
-
-2. 警报: AI 分析失败 (例如 Gemini 错误)
-
-诊断: GEMINI_API_KEY (在 .env 中定义) 可能无效，或者网络连接有问题，或者 ai/prompt_manager.py 无法加载提示 (例如 prompts/analyst.json)。
-
-响应:
-
-验证 .env 文件中的 GEMINI_API_KEY。
-
-检查审计日志: RAG_ARCHITECTURE.md (V2.0) 提到的 ai_audit_logs/ 路径不正确。根据代码：
-
-检查 memory/cot_database.py 中定义的 ./audit_traces 目录 (用于 CoT 数据库)。
-
-检查 audit/logger.py 中定义的 logs/audit_trail.jsonl 文件 (用于 AuditLogger)。
-
-3. 警报: 数据库连接失败 (PG, ES, Neo4j, Redis)
-
-诊断: Docker 容器可能未运行，或者 .env / config/system.yaml 中的连接设置 (主机、密码) 不正确。
-
-响应:
-
-运行 docker-compose ps 确保所有服务 ( phoenix_redis, phoenix_postgres, phoenix_elastic, phoenix_neo4j, phoenix_kafka) 都在运行 (Running)。
-
-检查 config/system.yaml 中的 temporal_db 和 tabular_db 的 host 是否与 docker-compose.yml 中的 container_name 匹配。
-
-确保 .env 中的 POSTGRES_PASSWORD 与 docker-compose.yml 中的 POSTGRES_PASSWORD 匹配。
+解决: 检查 Alpaca 账户状态、API 密钥权限和可用购买力。
