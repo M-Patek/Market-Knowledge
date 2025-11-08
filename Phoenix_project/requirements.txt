@@ -12,7 +12,6 @@ websockets # <--- [阶段 2] 为 PaperTrading/Alpaca 添加
 
 celery[redis]
 schedule
-kafka-python # <--- 添加了缺失的依赖 (用于 events/stream_processor.py)
 
 数据科学 & 机器学习 (核心)
 
