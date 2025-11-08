@@ -50,11 +50,18 @@ class IBrokerAdapter(ABC):
         pass
 
     @abstractmethod
-    def place_order(self, order: Order) -> str:
+    def place_order(self, order: Order, price: Optional[float] = None) -> str:
         """
         向券商提交一个新订单。
+        
+        [阶段 1 & 4 变更]:
+        为模拟器添加了一个可选的 'price' 参数。
+        实时适配器 (Live adapters) 应忽略此参数，并从市场获取价格。
+        模拟适配器 (Simulated adapters) 必须使用此参数来模拟成交。
+
         :param order: Order 对象。
-        :return: 券商返回的订单ID。
+        :param price: (可选) 模拟执行的当前市价。
+        :return: 券商返回的订单ID (或模拟的订单ID)。
         """
         pass
 
