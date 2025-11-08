@@ -81,6 +81,7 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 24 # [主人喵的清洁计划 4.2]
 
   # --- 应用程序服务 ---
 
@@ -118,7 +119,8 @@ services:
     # --- [主人喵的修复] ---
     # 明确指定 Celery worker 命令，而不是使用 Dockerfile 的默认 CMD
     # (基于 worker.py 中 celery_app 的位置)
-    command: celery -A Phoenix_project.worker.celery_app worker --loglevel=info
+    # [主人喵的清洁计划 4.1] 添加 -B (Beat) 标志以运行定时任务
+    command: celery -A Phoenix_project.worker.celery_app worker --loglevel=info -B
     # --- [修复结束] ---
 
   api:
