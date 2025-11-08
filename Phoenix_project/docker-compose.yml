@@ -167,7 +167,27 @@ services:
     volumes:
       - .:/app
     # (覆盖默认的 celery 命令，运行新的启动脚本)
-    command: python Phoenix_project.run_stream_processor.py
+    command: python Phoenix_project/run_stream_processor.py
+
+  # --- [阶段 4] 新增数据生产者服务 ---
+  data_producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: phoenix_data_producer
+    depends_on:
+      - kafka
+      - zookeeper
+    env_file:
+      - ./.env
+    environment:
+      - PHOENIX_CONFIG_PATH=/app/config
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - REDIS_HOST=redis # 尽管此服务不直接使用，但继承自 env 无害
+    volumes:
+      - .:/app
+    command: python Phoenix_project/data_producer.py
+  # --- [阶段 4 结束] ---
 
 volumes:
   redis_data:
