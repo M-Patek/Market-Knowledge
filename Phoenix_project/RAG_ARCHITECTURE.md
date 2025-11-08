@@ -1,6 +1,6 @@
 Phoenix Project: RAG Infrastructure Architectural Design
-Version: 2.2 (已根据代码库 v2.1 更新)
-Status: Implemented
+Version: 2.3 (已根据代码库 v2.1 更新)
+Status: Implemented & Verified
 Date: 2025-11-09
 
 概述 & 设计哲学 (Overview & Design Philosophy)
@@ -28,6 +28,7 @@ Embedding 模型 (Embedding Models):
 时序索引是一种专门的倒排索引，设计用于对基于事件的数据进行快速、带时间窗口的查询。
 
 技术 (Technology): elasticsearch>=8.13 (如 requirements.txt 和 config/system.yaml 所示)。
+[审查确认 (2025-11-09)]: 本文档的描述与 requirements.txt, config/system.yaml (temporal_db) 和 ai/temporal_db_client.py (AsyncElasticsearch 实现) 完全一致。
 
 索引结构 (Index Structure): 存储包含 timestamp, entities (例如 'Federal Reserve', 'AAPL'), keywords 和 source_id 的文档。
 
@@ -53,9 +54,9 @@ Retriever 类（在 ai/retriever.py 中实现）协调对所有数据存储（�
 
 [已确认] 高级检索已实现: 与旧版文档不同，高级检索功能 已在 ai/retriever.py 代码中完全实现。
 
-1. RRF 融合: retrieve_relevant_context 方法调用 _apply_rrf，使用倒数排序融合 (Reciprocal Rank Fusion) 算法，将来自多个异构索引的搜索结果合并为一个统一的排序列表。
+RRF 融合: retrieve_relevant_context 方法调用 _apply_rrf，使用倒数排序融合 (Reciprocal Rank Fusion) 算法，将来自多个异构索引的搜索结果合并为一个统一的排序列表。
 
-2. Cross-Encoder 重排: 随后，retrieve_relevant_context 方法调用 _apply_reranking，它使用 sentence-transformers 库中的 CrossEncoder 模型（在 __init__ 中加载，模型名称由 config/system.yaml 定义）对 RRF 融合后的结果进行深度的语义重排，以确保最高的上下文相关性。
+Cross-Encoder 重排: 随后，retrieve_relevant_context 方法调用 _apply_reranking，它使用 sentence-transformers 库中的 CrossEncoder 模型（在 init 中加载，模型名称由 config/system.yaml 定义）对 RRF 融合后的结果进行深度的语义重排，以确保最高的上下文相关性。
 
 知识图谱 (Knowledge Graph - ai/graph_encoder.py, ai/relation_extractor.py):
 
