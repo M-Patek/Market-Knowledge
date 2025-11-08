@@ -1,82 +1,138 @@
-"""
-L2 Agent: Critic
-Refactored from evaluation/critic.py.
-Responsible for "Criticism & Fact Check" on L1 EvidenceItems.
-"""
-from typing import Any, List, Dict
+import json
+import logging
+import asyncio
+from typing import List, Any, AsyncGenerator, Optional
 
-from Phoenix_project.agents.l2.base import BaseL2Agent
-from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.agents.l2.base import L2Agent
+from Phoenix_project.core.schemas.task_schema import Task
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 from Phoenix_project.core.schemas.critic_result import CriticResult
+from pydantic import ValidationError
 
-class CriticAgent(BaseL2Agent):
+# 获取日志记录器
+logger = logging.getLogger(__name__)
+
+class CriticAgent(L2Agent):
     """
-    Implements the L2 Critic agent.
-    Inherits from BaseL2Agent and implements the run method
-    to critique L1 EvidenceItems.
+    L2 智能体：批评家 (Critic)
+    评估 L1 证据的质量、清晰度、偏见和可信度。
     """
-    
-    # 签名已更新：接受 dependencies 而不是 evidence_items
-    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> List[CriticResult]:
-        """
-        Reviews L1 Agent outputs for logical consistency, factual accuracy,
-        and constraint compliance.
-        
-        Args:
-            state (PipelineState): The current state of the analysis pipeline.
-            dependencies (Dict[str, Any]): The dictionary of outputs from dependent tasks
-                                         (expected to contain L1 EvidenceItems).
-            
-        Returns:
-            List[CriticResult]: A list of critique objects, one for each
-                                piece of evidence.
-        """
-        
-        # --- 新增逻辑：从 dependencies 提取 evidence_items ---
-        evidence_items: List[EvidenceItem] = []
-        for result in dependencies.values():
-            if isinstance(result, EvidenceItem):
-                evidence_items.append(result)
-            elif isinstance(result, list): # 处理 L1 agent 可能返回列表的情况
-                for item in result:
-                    if isinstance(item, EvidenceItem):
-                        evidence_items.append(item)
-        # --- 新增逻辑结束 ---
-        
-        critiques = []
-        for item in evidence_items:
-            # Format the evidence for critique
-            text_to_critique = f"Agent '{item.agent_id}' produced the following evidence with confidence {item.confidence}:\n{item.content}"
-            
-            # TODO: Implement actual LLM call using self.llm_client.
-            # This logic should be adapted from the original Critic class:
-            # 1. Get a prompt from a prompt_manager.
-            # 2. Call self.llm_client.send_request(prompt=..., model=...).
-            # 3. Parse the JSON response.
-            
-            # This is a mock critique result.
-            if "strong" in item.content:
-                mock_critique = "Critique: The term 'strong' is vague. Analysis lacks specific supporting data."
-                mock_is_valid = False
-                mock_confidence_adj = 0.8
-                mock_flags = ["VAGUE_LANGUAGE", "DATA_MISSING"]
-            else:
-                mock_critique = "Critique: Analysis appears logical and consistent with provided context."
-                mock_is_valid = True
-                mock_confidence_adj = 1.0
-                mock_flags = []
 
-            critiques.append(CriticResult(
-                agent_id=self.agent_id,
-                target_evidence_id=item.id,
-                is_valid=mock_is_valid,
-                critique=mock_critique,
-                confidence_adjustment=mock_confidence_adj,
-                flags=mock_flags
-            ))
-            
-        return critiques
+    async def _critique_evidence(self, evidence: EvidenceItem) -> Optional[EvidenceItem]:
+        """
+        (内部) 异步评估单个 EvidenceItem 的质量。
+        
+        参数:
+            evidence (EvidenceItem): L1 智能体生成的证据。
 
-    def __repr__(self) -> str:
-        return f"<CriticAgent(id='{self.agent_id}')>"
+        返回:
+            Optional[EvidenceItem]: 一个新的、类型为 "Critic" 的 EvidenceItem，
+                                    如果评估失败则返回 None。
+        """
+        logger.debug(f"[{self.agent_id}] Critiquing evidence: {evidence.evidence_id} from agent {evidence.agent_id}")
+        
+        agent_prompt_name = "l2_critic"
+        
+        try:
+            # 1. 准备 Prompt 上下文
+            context_map = {
+                "agent_id": evidence.agent_id,
+                "original_evidence_json": evidence.model_dump_json(),
+                "original_evidence_id": str(evidence.evidence_id),
+                "symbols_list_str": json.dumps(evidence.symbols)
+            }
+
+            # 2. 异步调用 LLM
+            response_str = await self.llm_client.run_llm_task(
+                agent_prompt_name=agent_prompt_name,
+                context_map=context_map
+            )
+
+            if not response_str:
+                logger.warning(f"[{self.agent_id}] LLM returned no response for critiquing evidence {evidence.evidence_id}")
+                return None
+
+            # 3. 解析和验证 CriticResult
+            response_data = json.loads(response_str)
+            critic_result = CriticResult.model_validate(response_data)
+
+            # 4. [关键] 将 CriticResult 转换为 EvidenceItem 以便 Executor 处理
+            # 我们使用 'quality_score' 作为新证据的 'confidence'
+            critique_evidence = EvidenceItem(
+                symbols=critic_result.symbols,
+                evidence_type="Critic",
+                content=critic_result.critique,
+                confidence=critic_result.quality_score, # 映射质量分
+                data_horizon=evidence.data_horizon, # 继承原始数据范围
+                parent_evidence_id=evidence.evidence_id, # 追踪溯源
+                metadata={
+                    "original_evidence_id": str(critic_result.original_evidence_id),
+                    "quality_score": critic_result.quality_score,
+                    "clarity_score": critic_result.clarity_score,
+                    "bias_score": critic_result.bias_score,
+                    "relevance_score": critic_result.relevance_score,
+                    "suggestions": critic_result.suggestions_for_improvement or "None"
+                }
+                # evidence_id 和 created_at 将由 Pydantic 自动生成
+            )
+            
+            logger.info(f"[{self.agent_id}] Successfully generated critique for {evidence.evidence_id} (Quality: {critic_result.quality_score})")
+            return critique_evidence
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[{self.agent_id}] Failed to decode LLM JSON response for critique task. Error: {e}")
+            logger.debug(f"[{self.agent_id}] Faulty JSON string for critique: {response_str}")
+            return None
+        except ValidationError as e:
+            logger.error(f"[{self.agent_id}] Failed to validate CriticResult schema. Error: {e}")
+            logger.debug(f"[{self.agent_id}] Faulty JSON data for critique: {response_data}")
+            return None
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] An unexpected error occurred during critique task. Error: {e}")
+            return None
+
+    async def run(self, task: Task, dependencies: List[Any]) -> AsyncGenerator[EvidenceItem, None]:
+        """
+        异步运行智能体，并行评估所有 L1 证据的质量。
+        
+        参数:
+            task (Task): 当前任务。
+            dependencies (List[Any]): 来自 L1 智能体的 EvidenceItem 列表。
+
+        收益:
+            AsyncGenerator[EvidenceItem, None]: 异步生成类型为 "Critic" 的新 EvidenceItem。
+        """
+        logger.info(f"[{self.agent_id}] Running CriticAgent for task: {task.task_id}")
+
+        # 1. 过滤出有效的 L1 证据 (和 Adversary 证据)
+        evidence_items = [
+            item for item in dependencies 
+            if isinstance(item, EvidenceItem)
+        ]
+
+        if not evidence_items:
+            logger.warning(f"[{self.agent_id}] No EvidenceItems found in dependencies for task {task.task_id}. Skipping.")
+            return
+
+        logger.info(f"[{self.agent_id}] Found {len(evidence_items)} evidence items to critique.")
+
+        # 2. 为每个证据创建并行的评估任务
+        critique_tasks = [
+            self._critique_evidence(evidence) for evidence in evidence_items
+        ]
+
+        # 3. 异步并行执行所有评估
+        results = await asyncio.gather(*critique_tasks, return_exceptions=True)
+
+        # 4. 处理结果并 Yield
+        for result in results:
+            if isinstance(result, Exception):
+                # 记录在 gather 中发生的异常
+                logger.error(f"[{self.agent_id}] An exception occurred in a critique task: {result}")
+            elif isinstance(result, EvidenceItem):
+                # 这是一个成功的评估，yield 新的 "Critic" 证据
+                result.agent_id = self.agent_id
+                yield result
+            elif result is None:
+                # 内部评估失败（已在 _critique_evidence 中记录）
+                continue
