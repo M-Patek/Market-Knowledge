@@ -85,7 +85,7 @@ def clean_elasticsearch_cot(cot_db: CoTDatabase): # [主人喵的清洁计划] J
     清理 2: 删除 Elasticsearch 中的过时 CoT 日志 (无占位符)
     """
     try:
-        retention_days = get_retention_days('cot_retention_days', 30) # [主人喵的清洁计划] 使用任务 4.1 中定义的新 key
+        retention_days = get_retention_days('cot_retention_days', 14) # [主人喵的清洁计划] 使用任务 4.1 中定义的新 key
         cutoff_date = datetime.utcnow() - timedelta(days=retention_days)
         cutoff_iso = cutoff_date.isoformat()
         
@@ -168,6 +168,7 @@ def run_all_cleanup_tasks():
         embedding_config = system_config.get('ai', {}).get('embedding_client', {})
         embedding_client = EmbeddingClient(
             model_name=embedding_config.get("model", "text-embedding-004"),
+            # [主人喵的清洁计划 1.1 修复] 传递 logger 实例
             logger=janitor_logger
         )
         
@@ -183,10 +184,14 @@ def run_all_cleanup_tasks():
         )
         
         # [修复] 审计日志也需要配置
-        # (假设它使用与 CoT 相同的 ES，但索引不同)
-        audit_config = system_config.get('audit_db', system_config.get('ai', {}).get('cot_database', {}))
-        # (audit/logger.py 现在从 config 获取索引)
-        audit_config['index'] = "phoenix-audit-logs" 
+        # (从 system.yaml 获取 'audit_db' 部分)
+        audit_config = system_config.get('audit_db', {})
+        if not audit_config:
+             logger.warning("config/system.yaml 中缺少 'audit_db' 配置。")
+             # 回退到 CoT 配置 (如旧版所示)
+             audit_config = system_config.get('ai', {}).get('cot_database', {})
+             audit_config['index'] = "phoenix-audit-logs" # 确保索引正确
+        
         audit_db = AuditLogger(config=audit_config)
         
         # [主人喵的清洁计划] SnapshotManager 的 __init__ 不需要 config_loader
