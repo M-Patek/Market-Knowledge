@@ -5,9 +5,15 @@
 此类现在被设计为独立运行 (参见 run_stream_processor.py)。
 它不再被 Orchestrator 拥有，而是通过 EventDistributor (Redis)
 与 Orchestrator 通信。
+
+[阶段 2 更新]
+- 现在订阅 'phoenix_market_data' 和 'phoenix_news_events'。
+- 将行情数据路由到 Redis 缓存 ('latest_prices')。
+- 将新闻数据路由到 EventDistributor (现有逻辑)。
 """
 import os
 import json
+import redis # <-- [阶段 2] 添加
 from kafka import KafkaConsumer
 from Phoenix_project.config.loader import ConfigLoader
 from Phoenix_project.monitor.logging import get_logger
@@ -30,7 +36,8 @@ class StreamProcessor:
             event_distributor (EventDistributor): 用于将处理后的消息推送到 Redis。
         """
         self.config_loader = config_loader
-        self.system_config = config_loader.get_system_config()
+        # [修复] 确保 get_system_config 被调用
+        self.system_config = config_loader.load_config('system.yaml') 
         self.kafka_config = self.system_config.get("kafka", {})
         
         # [主人喵的修复 2] 注入 EventDistributor
@@ -41,10 +48,30 @@ class StreamProcessor:
             'KAFKA_BOOTSTRAP_SERVERS', 
             self.kafka_config.get('bootstrap_servers', 'localhost:9092')
         )
-        self.topic = self.kafka_config.get('topic', 'market_data')
+        
+        # --- [阶段 2] 更改 ---
+        # 订阅计划中定义的两个新主题
+        self.topics = ["phoenix_market_data", "phoenix_news_events"]
+        # self.topic = self.kafka_config.get('topic', 'market_data') # <-- [阶段 2] 移除
+        
         self.group_id = self.kafka_config.get('group_id', 'phoenix_consumer_group')
         
-        logger.info(f"StreamProcessor configured for topic '{self.topic}' at {self.bootstrap_servers}")
+        # [阶段 2] 添加 Redis 客户端用于写入 'latest_prices'
+        try:
+            self.redis_client = redis.StrictRedis(
+                host=os.environ.get('REDIS_HOST', 'redis'),
+                port=int(os.environ.get('REDIS_PORT', 6379)),
+                db=0,
+                decode_responses=True # 确保 hset 使用字符串
+            )
+            self.redis_client.ping()
+            logger.info(f"StreamProcessor 已连接到 Redis for latest_prices。")
+        except redis.exceptions.ConnectionError as e:
+            logger.critical(f"StreamProcessor 无法连接到 Redis: {e}", exc_info=True)
+            self.redis_client = None
+        # --- [阶段 2 结束] ---
+
+        logger.info(f"StreamProcessor configured for topics '{self.topics}' at {self.bootstrap_servers}")
 
     def connect(self):
         """
@@ -57,7 +84,8 @@ class StreamProcessor:
         try:
             logger.info(f"Connecting to Kafka: {self.bootstrap_servers}...")
             self.consumer = KafkaConsumer(
-                self.topic,
+                # [阶段 2] 更改: 订阅多个主题
+                *self.topics,
                 bootstrap_servers=self.bootstrap_servers.split(','),
                 auto_offset_reset='earliest', # 从最早的消息开始
                 group_id=self.group_id,
@@ -69,30 +97,44 @@ class StreamProcessor:
             self.consumer = None
             raise # 允许 run_stream_processor.py 捕获并重试
 
-    def process_stream(self, raw_message: dict):
+    def process_stream(self, topic: str, data: dict):
         """
         处理来自 Kafka 的单个消息。
+        [阶段 2] 更改: 签名包含 'topic' 以便路由。
         [主人喵的修复 2] 现在将处理后的消息推送到 EventDistributor (Redis)。
         """
         try:
-            # (假设 raw_message 已经是反序列化后的 dict)
+            # --- [阶段 2] 路由逻辑 ---
             
-            # 1. (TODO) 在此处添加任何需要的验证或转换
-            data = raw_message
-            if 'id' not in data:
-                logger.warning(f"Message missing 'id', discarding: {data}")
-                return
+            if topic == "phoenix_news_events":
+                # 阶段 2 逻辑: 推送到 EventDistributor (Redis 队列)
+                success = self.event_distributor.publish(data)
+                if success:
+                    logger.debug(f"Successfully processed and published event {data.get('id', 'N/A')} to distributor.")
+                else:
+                    logger.error(f"Failed to publish event {data.get('id', 'N/A')} to distributor.")
+            
+            elif topic == "phoenix_market_data":
+                # 阶段 2 逻辑: 写入 Redis 缓存 (HSET)
+                if not self.redis_client:
+                    logger.error("Cannot write latest_prices, Redis client not connected.")
+                    return
 
-            # 2. [主人喵的修复 2] 将事件发布到 Redis 队列
-            success = self.event_distributor.publish(data)
+                symbol = data.get("symbol")
+                price = data.get("close") # MarketData 模式使用 'close'
+                
+                if symbol and price is not None:
+                    self.redis_client.hset("latest_prices", symbol, str(price)) # 确保值为 str
+                    logger.debug(f"Updated latest_prices for {symbol}: {price}")
+                else:
+                    logger.warning(f"Invalid market data message received from Kafka: {data}")
             
-            if success:
-                logger.debug(f"Successfully processed and published event {data['id']} to distributor.")
             else:
-                logger.error(f"Failed to publish event {data['id']} to distributor.")
+                logger.warning(f"Received message from unhandled topic: {topic}")
+            # --- [阶段 2 结束] ---
 
         except json.JSONDecodeError as e:
-            logger.error(f"Message value is not valid JSON: {e}. Value: {raw_message}")
+            logger.error(f"Message value is not valid JSON: {e}. Value: {data}")
         except Exception as e:
             logger.error(f"Error processing Kafka message: {e}", exc_info=True)
 
@@ -110,7 +152,9 @@ class StreamProcessor:
             for message in self.consumer:
                 # message.value 已经是 dict (归功于 value_deserializer)
                 logger.debug(f"Received message from Kafka: {message.topic}:{message.partition}:{message.offset}")
-                self.process_stream(message.value)
+                
+                # [阶段 2] 更改: 传递 topic 和 value
+                self.process_stream(message.topic, message.value)
         
         except KeyboardInterrupt:
             logger.info("Consumer loop stopped by user.")
