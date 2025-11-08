@@ -1,91 +1,95 @@
-"""
-L2 Agent: Fusion & Synthesis
-"""
-from typing import Any, Dict, List
-from decimal import Decimal
+import json
+import logging
+from typing import List, Any, AsyncGenerator, Optional
 
-from Phoenix_project.agents.l2.base import BaseL2Agent
-from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceType
+from Phoenix_project.agents.l2.base import L2Agent
+from Phoenix_project.core.schemas.task_schema import Task
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 from Phoenix_project.core.schemas.fusion_result import FusionResult
+from pydantic import ValidationError
 
-class FusionAgent(BaseL2Agent):
-    """
-    Implements the L2 Fusion agent.
-    This agent is responsible for synthesizing all L1 EvidenceItems
-    into a single, unified FusionResult.
-    
-    In a real system, this would be a complex LLM call.
-    """
-    
-    # 签名已更新，以匹配 Executor
-    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> FusionResult:
-        """
-        Synthesizes L1 evidence into a final decision.
-        
-        Args:
-            state (PipelineState): The current state of the analysis pipeline.
-            dependencies (Dict[str, Any]): Outputs from L1 agents. 
-                                         Values are expected to be EvidenceItem.
-            
-        Returns:
-            FusionResult: A unified decision object.
-        """
-        
-        # --- 新增逻辑：从 dependencies 提取 evidence_items ---
-        # 假设 L1 依赖项都返回 EvidenceItem
-        evidence_items: List[EvidenceItem] = []
-        for result in dependencies.values():
-            if isinstance(result, EvidenceItem):
-                evidence_items.append(result)
-            elif isinstance(result, list): # 处理 L1 agent 可能返回列表的情况
-                for item in result:
-                    if isinstance(item, EvidenceItem):
-                        evidence_items.append(item)
-        # --- 新增逻辑结束 ---
-        
+# 获取日志记录器
+logger = logging.getLogger(__name__)
 
-        # vvvv 现有的核心逻辑保持不变 vvvv
+class FusionAgent(L2Agent):
+    """
+    L2 智能体：融合 (Fusion)
+    审查所有 L1 和 L2 的证据，融合冲突信息，并得出最终的 L2 决策。
+    """
+
+    async def run(self, task: Task, dependencies: List[Any]) -> AsyncGenerator[FusionResult, None]:
+        """
+        异步运行智能体，以融合所有 L1/L2 证据。
+        此智能体运行一次（不使用 gather），产出一个 FusionResult。
         
-        task_query_data = state.get_main_task_query()
-        target_symbol = task_query_data.get("symbol", "UNKNOWN")
+        参数:
+            task (Task): 当前任务。
+            dependencies (List[Any]): 来自 L1 和 L2 (Adversary, Critic) 的 EvidenceItem 列表。
+
+        收益:
+            AsyncGenerator[FusionResult, None]: 异步生成 *单一* 的 FusionResult 对象。
+        """
+        logger.info(f"[{self.agent_id}] Running FusionAgent for task: {task.task_id}")
+
+        # 1. 过滤出所有有效的证据
+        evidence_items = [
+            item for item in dependencies 
+            if isinstance(item, EvidenceItem)
+        ]
 
         if not evidence_items:
-            # [FIXED] Added missing required fields: target_symbol, uncertainty
-            # Ensured confidence is float
-            return FusionResult(
-                target_symbol=target_symbol,
-                final_decision="HOLD",
-                reasoning="No L1 evidence was generated to make a decision.",
-                confidence=0.50,
-                uncertainty=0.50, # Mock uncertainty
-                metadata={"synthesis_model": "MockFusionAgent"},
-                contributing_agents=[]  # <-- 1. 遵照主人指示：使用空列表以匹配类型
+            logger.warning(f"[{self.agent_id}] No EvidenceItems found in dependencies for task {task.task_id}. Skipping fusion.")
+            return
+
+        logger.info(f"[{self.agent_id}] Found {len(evidence_items)} total evidence items (L1+L2) to fuse.")
+
+        agent_prompt_name = "l2_fusion"
+
+        try:
+            # 2. 准备 Prompt 上下文
+            # [关键] 序列化整个证据列表。
+            # 我们使用 .model_dump() 并设置 default=str 来处理 UUID 和 datetime
+            evidence_json_list = json.dumps(
+                [item.model_dump() for item in evidence_items], 
+                default=str
             )
             
-        best_evidence = max(evidence_items, key=lambda x: x.confidence)
-        
-        mock_decision = "HOLD"
-        if best_evidence.evidence_type == EvidenceType.CATALYST and best_evidence.confidence > 0.8:
-            mock_decision = "BUY"
-        elif best_evidence.evidence_type == EvidenceType.FUNDAMENTAL and best_evidence.confidence < 0.3:
-            mock_decision = "SELL"
-            
-        synthesized_reasoning = f"Mock Synthesis for {target_symbol}:\n"
-        synthesized_reasoning += f"Decision based on strongest L1 evidence (Agent: {best_evidence.agent_id}, Type: {best_evidence.evidence_type.value}).\n"
-        synthesized_reasoning += f"Evidence Content: {best_evidence.content}\n"
-        synthesized_reasoning += f"Final Decision: {mock_decision} with confidence {best_evidence.confidence}."
+            context_map = {
+                "symbols_list_str": json.dumps(task.symbols),
+                "evidence_json_list": evidence_json_list
+            }
 
-        # [FIXED] Added missing fields: target_symbol, uncertainty
-        # [FIXED] Corrected item.item_id to item.id
-        # Ensured confidence is float
-        return FusionResult(
-            target_symbol=target_symbol,
-            final_decision=mock_decision,
-            reasoning=synthesized_reasoning,
-            confidence=float(best_evidence.confidence),
-            uncertainty=float(1.0 - best_evidence.confidence), # Mock uncertainty based on confidence
-            supporting_evidence_ids=[item.id for item in evidence_items],
-            metadata={"synthesis_model": "MockFusionAgent", "strongest_agent": best_evidence.agent_id},
-            contributing_agents=[]  # <-- 2. 遵照主人指示：使用空列表以匹配类型
-        )
+            # 3. 异步调用 LLM (只调用一次)
+            logger.debug(f"[{self.agent_id}] Calling LLM with prompt: {agent_prompt_name} for fusion task.")
+            
+            response_str = await self.llm_client.run_llm_task(
+                agent_prompt_name=agent_prompt_name,
+                context_map=context_map
+            )
+
+            if not response_str:
+                logger.warning(f"[{self.agent_id}] LLM returned no response for fusion task {task.task_id}.")
+                return
+
+            # 4. 解析和验证 FusionResult
+            logger.debug(f"[{self.agent_id}] Received LLM fusion response (raw): {response_str[:200]}...")
+            response_data = json.loads(response_str)
+            fusion_result = FusionResult.model_validate(response_data)
+            
+            logger.info(f"[{self.agent_id}] Successfully generated FusionResult for {task.symbols} with sentiment: {fusion_result.overall_sentiment}")
+            
+            # 5. [关键] Yield 单一的 FusionResult
+            # 我们不转换它，L3 (AlphaAgent) 会直接消费这个对象
+            yield fusion_result
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[{self.agent_id}] Failed to decode LLM JSON response for fusion task. Error: {e}")
+            logger.debug(f"[{self.agent_id}] Faulty JSON string for fusion: {response_str}")
+            return
+        except ValidationError as e:
+            logger.error(f"[{self.agent_id}] Failed to validate FusionResult schema. Error: {e}")
+            logger.debug(f"[{self.agent_id}] Faulty JSON data for fusion: {response_data}")
+            return
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] An unexpected error occurred during fusion task. Error: {e}")
+            return
