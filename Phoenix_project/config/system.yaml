@@ -1,160 +1,161 @@
-# Phoenix Project 核心系统配置
-# 详细的 schema 见 core/schemas/config_schema.py
+# Phoenix (Market Knowledge) 系统配置文件 (system.yaml)
+# [RAG 架构]：此文件定义了 RAG 架构图中所有组件的配置。
 
-system:
-  environment: "development" # "development" (回测) 或 "production" (实时/虚拟交易)
-  max_pipeline_history: 100 # PipelineState 中保留的最大周期数
-  data_catalog_path: "data_catalog.json"
-  log_level: "INFO" # 从旧版本合并
-
-# [从旧版本合并] Pipeline 核心设置
-pipeline:
-  K_paths: 5
-  conflict_threshold: 0.6
-  uncertainty_threshold: 0.4
-  auto_retry: 3
-  audit_log_retention_days: 30
-  fact_check_threshold: 0.7
-  fc_confidence_boost: 0.1
-  fc_confidence_penalty: 0.2
-  cot_log_retention_days: 14     # [主人喵的清洁计划 4.1]
-  snapshot_retention_days: 7  # [主人喵的清洁计划 4.1]
-  vector_retention_days: 90   # [主人喵的清洁计划 4.1] (为 Janitor 添加一个默认值)
-
-# [阶段 3 & 4 新增：券商配置]
-broker:
-  type: "alpaca" # 匹配 adapters.py 中的逻辑
-  api_key_env: "ALPACA_API_KEY" # 告诉代码从 .env 中读取哪个变量
-  api_secret_env: "ALPACA_API_SECRET" # 告诉代码从 .env 中读取哪个变量
-  base_url: "https://paper-api.alpaca.markets" # 确保这是虚拟交易 (Paper) 的 URL
-
-# AI 和 RAG 配置
-ai:
-  # [从旧版本合并]
-  ai_providers:
-    google:
-      api_key_env_var: "GEMINI_API_KEYS" # <--- [✅ 修复] 与 .env.example (Source 2) 保持一致
-      models:
-        - name: "gemini-2.5-pro"
-          type: "generative"
-        - name: "text-embedding-004"
-          type: "embedding"
-
-  # [合并]
-  embedding_client:
-    provider: "google" # 从旧版本合并
-    model: "text-embedding-004" # 您的最新设置
-    batch_size: 100 # 从旧版本合并
-
-  # [您的最新设置]
-  vector_database:
-    provider: "pinecone" # "pinecone" 或 "faiss"
-    index_name: "phoenix-project-rag" # 从旧版本合并 (假设)
-    embedding_dimension: 768 # 从旧版本合并 (假设)
-    # faiss_path: "/path/to/faiss.index"
-
-  # [您的最新设置 - 已修复]
-  cot_database:
-    # CoT (Chain of Thought) 数据库配置
-    provider: "elasticsearch"
-    host: "phoenix_elastic" # [✅ 修复] "localhost" -> "phoenix_elastic" (Docker 服务名)
-    port: 9200
-    index: "phoenix-cot-traces" # [主人喵的清洁计划] 明确指定索引
-
-  # [从旧版本合并] RAG 检索器和重排
-  retriever:
-    rrf_k: 60
-    freshness_decay_rate: 0.05
-    source_type_weights:
-      "10-K": 1.0
-      "10-Q": 0.9
-      "Press Release": 0.8
-      "News": 0.7
-      "Analyst Report": 0.6
-      "Market Data": 0.9
-      "Other": 0.5
-    rerank:
-      model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
-      top_n: 10 
-      
-  # [从旧版本合并] AI 推理
-  reasoning_ensemble:
-    meta_learner:
-      n_timesteps: 5
-      n_features: 16
-    loss_function:
-      beta_nll_weight: 0.5
-      focal_loss_gamma: 2.0
-    adversarial_training:
-      enabled: true
-      epsilon: 0.02
-    reasoners:
-      - name: "SymbolicLogicReasoner"
-        class: "ai.reasoning_ensemble.SymbolicLogicReasoner"
-        enabled: true
-        config:
-          rules_path: "config/symbolic_rules.yaml"
-      - name: "BayesianBeliefNetworkReasoner"
-        class: "ai.reasoning_ensemble.BayesianBeliefNetworkReasoner"
-        enabled: true
-      - name: "LLMExplainerReasoner"
-        class: "ai.reasoning_ensemble.LLMExplainerReasoner"
-        enabled: true
-      - name: "DeepForestReasoner"
-        class: "ai.reasoning_ensemble.DeepForestReasoner"
-        enabled: true
-
-# --- [任务 1: 新增 L3 DRL 智能体配置] ---
-# 为 RLLib "心脏移植" 添加配置
-l3_agents:
-  alpha_agent:
-    # 路径指向 RLLib 检查点目录, 而不是旧的 .zip 文件
-    model_path: "models/drl_agents_v1_rllib/alpha/checkpoint_000100"
-  risk_agent:
-    model_path: "models/drl_agents_v1_rllib/risk/checkpoint_000100"
-  execution_agent:
-    model_path: "models/drl_agents_v1_rllib/exec/checkpoint_000100"
-# --- [任务 1 结束] ---
-
-# [主人喵的清洁计划] 为 AuditLogger 添加专用配置 (Janitor 需要)
-audit_db:
-  provider: "elasticsearch"
-  host: "phoenix_elastic"
-  port: 9200
-  index: "phoenix-audit-logs" # [主人喵的清洁计划] 明确指定索引
-    
-# 数据库 (KG) - [您的最新设置 - 已修复]
-neo4j_db:
-  uri: "bolt://phoenix_neo4j:7687" # [✅ 修复] "localhost" -> "phoenix_neo4j" (Docker 服务名)
-  user: "neo4j"
-  password_env: "NEO4J_PASSWORD"
-
-# (其他数据库...) - [您的最新设置]
-tabular_db:
-  provider: "postgres"
-  uri_env: "TABULAR_DB_URI" # (在 Docker 中, .env 应设为 "postgresql://user:pass@phoenix_postgres:5432/db")
+# 1. 控制器 (Controller) & 循环 (Loops)
+controller:
+  # (L0/L1/L2) 认知循环 (Cognitive Loop) - (由 LoopManager 管理)
+  l0_l1_loop_frequency_sec: 60  # (L0) 检查新数据源的频率 (例如 1 分钟)
+  l2_loop_frequency_sec: 120    # (L2) 运行 L2 智能体 (融合, 批评) 的频率 (例如 2 分钟)
   
-# 数据库 (Temporal - 时序事件) - [✅ 修复] 与 RAG 架构和代码实现 (temporal_db_client.py) 保持一致
-temporal_db:
-  provider: "elasticsearch"
-  host: "phoenix_elastic"     # [✅ 修复] "localhost" -> "phoenix_elastic" (Docker 服务名)
-  port: 9200
-  index_name: "phoenix-temporal-events" # [✅ 修复] 明确指定索引名称 (与 RAG 架构对应)
+  # (L3) 决策循环 (Decision Loop) - (由 Orchestrator 管理)
+  l3_loop_frequency_sec: 300    # (L3) 运行 L3 智能体 (Alpha, Risk) 的频率 (例如 5 分钟)
+
+# 2. API 网关 (APIGateway)
+api_gateway:
+  # (用于 LLM, Embedding, Tools)
+  # (RAG) 'embedding_model' 和 'llm' (用于合成) 是 RAG 的关键
+  
+  # 嵌入模型 (Embedding Model) - [✅ 修复] 与 RAG 架构和代码实现 (embedding_client.py) 保持一致
+  embedding_model:
+    provider: "openai" # (或 "gemini", "local" 等)
+    model_name: "text-embedding-3-large" # (与 RAG 架构对应)
+    dimensions: 3072 # (text-embedding-3-large 的维度)
+    # (API 密钥应来自 .env, 例如 OPENAI_API_KEY)
+  
+  # LLM (用于 L1/L2/L3 智能体, RAG 合成)
+  llm:
+    provider: "gemini" # (或 "openai")
+    model_name: "gemini-1.5-pro-latest" # (RAG) 用于 L1/L2 和 RAG 合成
+    # (API 密钥应来自 .env, 例如 GEMINI_API_KEY)
+    
+  # (API 池/限速器配置 - [您的最新设置])
+  pool:
+    max_workers: 10 # 并行 API 调用的最大数量
+    rate_limit_calls: 5 # 每
+    rate_limit_period: 1 # 1 秒
+  
+  # (工具 API，例如搜索) - (RAG) [✅ 修复] 明确定义工具 (RAG 架构)
+  tools:
+    search_api:
+      provider: "tavily" # (或 "google", "serper" 等)
+      api_key_env: "TAVILY_API_KEY" # (来自 .env)
+
+# 3. 数据管理器 (DataManager)
+data_manager:
+  # (RAG) DataManager 充当 RAG 管道的 "Data Sources" (数据源) 接口
+  
+  # 数据库 (Tabular - 财务/基本面) - [✅ 修复] 与 RAG 架构和代码实现 (tabular_db_client.py) 保持一致
+  tabular_db:
+    type: "postgresql"
+    host_env: "TABULAR_DB_HOST"
+    port_env: "TABULAR_DB_PORT"
+    db_env: "TABULAR_DB_NAME"
+    user_env: "TABULAR_DB_USER"
+    pass_env: "TABULAR_DB_PASS"
+    # (RAG) 用于 DataAdapter (table-to-text)
+    uri_env: "TABULAR_DB_URI" # (在 Docker 中, .env 应设为 "postgresql://user:pass@phoenix_postgres:5432/db")
+  
+  # 数据库 (Temporal - 时序事件) - [✅ 修复] 与 RAG 架构和代码实现 (temporal_db_client.py) 保持一致
+  temporal_db:
+    type: "elasticsearch" # (或 "opensearch", "timescale")
+    host: "phoenix_elasticsearch" # (Docker 服务名称)
+    port: 9200
+    index_name: "phoenix-temporal-events" # [✅ 修复] 明确指定索引名称 (与 RAG 架构对应)
 
 # 交易和投资组合 - [您的最新设置]
 trading:
   initial_cash: 1000000.0 # 回测/模拟账户的初始资金
+  # [FIX] Add default symbols list to remove hardcoding from orchestrator
+  default_symbols: ["AAPL", "GOOG", "MSFT", "TSLA"]
   
 portfolio:
   sizer:
-    type: "FixedFractionSizer" # "FixedFractionSizer" 或 "VolatilityParitySizer"
-    params:
-      fraction_per_position: 0.05 # 适用于 FixedFractionSizer
-      # volatility_period: 20 # 适用于 VolatilityParitySizer
+    default_method: "fixed_fraction" # (默认仓位大小调整方法)
+    fixed_fraction:
+      fraction: 0.01 # (例如，每次交易承担 1% 的风险)
+    volatility_parity:
+      lookback: 20 # (例如，20 天的波动率)
 
-# 错误处理 - [您的最新设置]
-error_handler:
-  max_retries: 3
-  retry_delay_seconds: 60
+# 4. (RAG) 知识图谱 (Knowledge Graph) - [✅ 修复] 与 RAG 架构和代码实现 (graph_db_client.py) 保持一致
+knowledge_graph:
+  type: "neo4j"
+  uri_env: "NEO4J_URI" # (例如 "bolt://phoenix_neo4j:7687")
+  user_env: "NEO4J_USER"
+  pass_env: "NEO4J_PASS"
+  # (RAG) GraphDBClient (用于 Graph-RAG)
 
-# [主人喵的最终优化] 已移除 'jobs:' 部分，因为它已被 worker.py 中的 Celery Beat 调度替代。
+# 5. (RAG) 内存/向量存储 (Memory / Vector Store)
+memory:
+  # (RAG) VectorStore (用于 L1/L2 智能体的 RAG 检索)
+  vector_store:
+    type: "qdrant" # (或 "chroma", "pinecone")
+    host: "phoenix_qdrant" # (Docker 服务名称)
+    port: 6333
+    # (RAG) 存储 L1 证据 (Evidence) 和 RAG 文档 (Documents) 的集合
+    l1_evidence_collection: "phoenix_l1_evidence"
+    rag_documents_collection: "phoenix_rag_documents" # (RAG) [✅ 修复] 明确的 RAG 文档集合
+  
+  # (CoT) 思维链/审计数据库
+  cot_database:
+    type: "mongodb"
+    uri_env: "MONGO_URI" # (例如 "mongodb://phoenix_mongo:27017/")
+    database: "phoenix_cot"
+    collection: "agent_traces" # (存储 L1/L2/L3 的 CoT)
+
+# 6. L1 智能体配置 (L1 Agent Configuration)
+# (这些是 CognitiveEngine (L2) 依赖的 L1 智能体)
+l1_agents:
+  # (RAG) L1 智能体是 RAG (Retrieve) 和 RAG (Generate) 的主要消费者
+  # (它们使用 RAG (Retriever) 来获取上下文)
+  
+  # (技术分析师)
+  technical_analyst:
+    enabled: true
+    # [FIX] Add lookback period config
+    technical_lookback_days: 90
+    
+  # (基本面分析师) - (RAG) 可能使用 Tabular-RAG
+  fundamental_analyst:
+    enabled: true
+    
+  # (宏观策略师) - (RAG) 可能使用 Search-RAG
+  macro_strategist:
+    enabled: true
+    
+  # (地缘政治分析师) - (RAG) 可能使用 Search-RAG
+  geopolitical_analyst:
+    enabled: true
+    
+  # (催化剂监控器)
+  catalyst_monitor:
+    enabled: true
+    
+  # (供应链情报) - (RAG) 可能使用 Graph-RAG
+  supply_chain_intelligence:
+    enabled: true
+    
+  # (创新追踪器)
+  innovation_tracker:
+    enabled: true
+
+# 7. (RAG) AI 组件配置
+ai_components:
+  # (RAG) 检索器 (Retriever) - [✅ 修复] 与 RAG 架构和代码实现 (retriever.py) 保持一致
+  retriever:
+    # (L1 智能体用于 RAG 的检索器)
+    l1_retriever:
+      vector_top_k: 5 # (RAG) 从 VectorDB 检索 5 个
+      graph_top_k: 3  # (RAG) 从 GraphDB 检索 3 个
+      search_top_k: 2 # (RAG) 从 Search Tool 检索 2 个
+      
+    # (L2 智能体用于 RAG 的检索器)
+    l2_retriever:
+      vector_top_k: 10 # (L2 需要更广泛的 L1 证据上下文)
+      graph_top_k: 5
+      search_top_k: 0
+      
+  # (RAG) 关系提取器 (Relation Extractor) - [✅ 修复] (用于 KG 填充)
+  relation_extractor:
+    # (用于 KnowledgeInjector)
+    enabled: true
+    llm_model: "gemini-1.5-flash-latest" # (使用 Flash 进行提取)
