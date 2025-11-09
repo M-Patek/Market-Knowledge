@@ -71,21 +71,51 @@ class Orchestrator:
             # (假设 data_manager.process_perception_cycle 更新了 state)
             
             # --- 2. L2 认知 (Cognition) ---
-            # (运行 L2 智能体 (Fusion, Critic 等) 来生成 L2 分析)
-            # (假设 cognitive_engine.process_cognitive_cycle 返回 L2 结果)
+            self.logger.info("Step 2: Engaging L2 Cognitive Engine...")
+            try:
+                # 调用 cognitive_engine (来自 cognitive/engine.py)
+                # 假设它会返回 L2 融合结果，或将其存入 state
+                # [注意]：这里的认知引擎 (CognitiveEngine) 似乎被设计为每个周期运行一次。
+                # 而 L3 DRL 智能体 (AlphaAgent) 期望按资产 (per-symbol) 获得 L2 结果。
+                # 这是一个潜在的设计不匹配。
             
-            # [任务 2.3] 确保 L2 结果 (fusion_results) 被保存到 state
-            # (我们假设 L2 结果是一个字典: Dict[str, FusionResult])
-            # self.cognitive_engine.process...
-            # state.set_value("l2_fusion_results", l2_results_dict)
+                # 临时解决方案：我们假设 cognitive_engine.run_l2_for_all_symbols(state)
+                # 是一个应该存在的方法。
+                # 鉴于我们只有 process_cognitive_cycle，我们将使用它，
+                # 并假设它能正确填充 state。
             
-            # (模拟 L2 步骤 - 在实际代码中，这将由 cognitive_engine 完成)
-            if not state.get_value("l2_fusion_results"):
-                 self.logger.warning("L2 认知未运行，模拟 L2 结果...")
-                 state.set_value("l2_fusion_results", {
-                     "AAPL": FusionResult(symbol="AAPL", final_decision="BUY", confidence=0.8, sentiment_score=0.8, reasoning="Simulated L2 Buy"),
-                     "GOOG": FusionResult(symbol="GOOG", final_decision="SELL", confidence=0.7, sentiment_score=-0.7, reasoning="Simulated L2 Sell")
-                 })
+                # (一个更简单的假设是认知引擎在 Orchestrator 运行 *之前* 已经运行)
+                # (但这里的模拟代码表明 Orchestrator 负责触发它)
+            
+                # 最终方案：我们必须调用它。
+                l2_cycle_output_dict = await self.cognitive_engine.process_cognitive_cycle(state)
+            
+                # 从 cognitive/engine.py 看，它返回 { "final_decision": FusionResult, ... }
+                # L3 需要 Dict[str, FusionResult]。
+            
+                final_decision_obj = l2_cycle_output_dict.get("final_decision")
+            
+                if final_decision_obj and isinstance(final_decision_obj, FusionResult):
+                    # 这是一个临时修复，以解决设计不匹配的问题
+                    self.logger.warning("Applying single portfolio-level L2 decision to all symbols.")
+                    l2_results_dict = {}
+            
+                    # (我们需要知道要处理哪些符号，这应该来自 L0 或配置)
+                    # (暂时依赖 L3 循环中的模拟数据)
+                    symbols_to_process = ["AAPL", "GOOG"] # (这也是一个需要修复的硬编码)
+            
+                    for symbol in symbols_to_process:
+                        symbol_fusion_result = final_decision_obj.model_copy(deep=True)
+                        symbol_fusion_result.symbol = symbol
+                        l2_results_dict[symbol] = symbol_fusion_result
+            
+                    state.set_value("l2_fusion_results", l2_results_dict)
+                else:
+                    self.logger.error("L2 cognitive_engine did not return a valid FusionResult.")
+                    state.set_value("l2_fusion_results", {})
+            except CognitiveError as e:
+                self.logger.error(f"L2 Cognitive Engine failed: {e}. Using empty results.")
+                state.set_value("l2_fusion_results", {})
             
             # --- 3. 获取当前投资组合状态 ---
             # (这对于 L3 DRL 智能体至关重要)
@@ -93,14 +123,28 @@ class Orchestrator:
             current_portfolio_state = await self.order_manager.get_current_portfolio_state()
             state.set_value("current_portfolio_state", current_portfolio_state)
             
-            # (模拟 L0 市场数据 - 在实际代码中，这将由 data_manager 完成)
-            market_data = {"AAPL": 150.0, "GOOG": 175.0}
-            state.set_value("current_market_data", market_data)
+            # (L0 市场数据现在应该作为 PortfolioState 的一部分被获取)
+            current_portfolio_state: PortfolioState = state.get_value("current_portfolio_state")
+            if current_portfolio_state and hasattr(current_portfolio_state, 'market_data') and current_portfolio_state.market_data:
+                # 提取 L3 DRL 智能体所需的 {symbol: price} 字典
+                market_data = {
+                    symbol: data.get('close')
+                    for symbol, data in current_portfolio_state.market_data.items()
+                    if data and data.get('close')
+                }
+                state.set_value("current_market_data", market_data)
+                self.logger.info(f"Extracted L0 market data for {list(market_data.keys())} from portfolio state.")
+            else:
+                self.logger.error("No L0 market data found in current_portfolio_state. L3 agents will use empty data.")
+                state.set_value("current_market_data", {})
 
             # --- 4. L3 认知 (DRL 决策) [任务 2.3 核心替换] ---
             self.logger.info("Step 4: Engaging L3 DRL Agents for portfolio decision...")
             
             l2_fusion_results: Dict[str, FusionResult] = state.get_value("l2_fusion_results")
+            
+            # [任务 1.2 修改] 从 state 中获取 market_data
+            market_data: Dict[str, float] = state.get_value("current_market_data", {})
 
             target_positions = []
             
