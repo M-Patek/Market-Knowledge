@@ -1,79 +1,108 @@
-import logging
-from typing import Dict, Any, List
-import re
+import json
+import os
+from typing import Dict, Any, Union, List
+from string import Template # [任务 B.3] 导入 Template
+
+from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.monitor.logging import get_logger
+
+logger = get_logger(__name__)
 
 class PromptRenderer:
     """
-    处理提示模板的渲染。
-    现在还包括用于 Map-Reduce RAG 的分块和融合逻辑 (Task 1.3)。
+    Dynamically renders prompt templates using provided context.
     """
-    def __init__(self):
-        self.logger = logging.getLogger("PhoenixProject.PromptRenderer")
-        # 在实际场景中，您可能会从文件加载模板
-        self.templates = {}
-
-    def _count_tokens(self, text: str) -> int:
+    
+    def __init__(self, prompt_manager: PromptManager):
         """
-        一个简单的Token计数启发式方法。
-        注意：这是一个近似值。为了精确计数，
-        会使用像 tiktoken 这样的库，但我们使用基于单词的估计以避免新的依赖。
-        """
-        return len(re.findall(r'\w+', text))
-
-    def chunk_context(self, long_text: str, max_tokens_per_chunk: int = 90000) -> List[str]:
-        """
-        根据Token限制将长文本分割成块。
-        (Task 1.3 - Chunking Logic)
-        """
-        words = long_text.split()
-        if not words:
-            return []
+        Initializes the PromptRenderer.
         
-        chunks = []
-        current_chunk = []
-        
-        for word in words:
-            # 检查添加下一个词是否会超过限制
-            if self._count_tokens(" ".join(current_chunk + [word])) > max_tokens_per_chunk:
-                # 完成当前块
-                if current_chunk:
-                    chunks.append(" ".join(current_chunk))
-                current_chunk = [word] # 开始新块
-            else:
-                current_chunk.append(word)
-        
-        # 添加最后一个剩余的块
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-        
-        self.logger.info(f"Split long text into {len(chunks)} chunks.")
-        return chunks
-
-    def render_reducer_prompt(self, original_query: str, sub_conclusions: List[str]) -> str:
+        Args:
+            prompt_manager: An instance of PromptManager to load templates.
         """
-        创建一个最终提示，将子结论合成为一个单一的答案。
-        (Task 1.3 - Fusion Logic)
+        self.prompt_manager = prompt_manager
+        logger.info("PromptRenderer initialized.")
+
+    def render(
+        self, 
+        prompt_name: str, 
+        context: Dict[str, Any]
+    ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         """
-        formatted_conclusions = "\n".join(f"- {conclusion}" for conclusion in sub_conclusions)
-
-        reducer_template = """
-原始查询是："{query}"
-
-多个AI代理分析了一个大文档的各个区块，并提供了以下子结论：
-{conclusions}
-
-请将以上所有信息合成为一个单一、连贯、全面的最终答案，以回应原始查询。
-"""
-        return reducer_template.format(query=original_query, conclusions=formatted_conclusions)
-
-    def render(self, template_name: str, context: Dict[str, Any]) -> str:
-        """
-        使用命名模板和上下文词典渲染提示。
-        """
-        # 这是一个占位符。一个真实的实现会从 self.templates 中查找
-        # 并使用 str.format() 或 jinja2 这样的模板引擎。
-        if template_name == "example_prompt":
-            return f"Analyzing {context.get('ticker')} with data point {context.get('data')}"
+        [任务 B.3] Implemented.
+        Renders a prompt template by name, filling placeholders with context.
         
-        self.logger.warning(f"Unknown prompt template '{template_name}'. Returning raw context.")
-        return str(context)
+        It handles both dictionary (e.g., {"system": "...", "user": "..."})
+        and list (e.g., [{"role": "system", "content": "..."}, ...])
+        JSON template structures.
+
+        Args:
+            prompt_name: The name of the prompt (e.g., 'l1_technical_analyst').
+            context: A dictionary of key-value pairs to fill in.
+            
+        Returns:
+            The rendered prompt structure (dict or list).
+            
+        Raises:
+            KeyError: If the prompt_name is not found.
+            TypeError: If the loaded prompt is not a dict or list.
+        """
+        logger.debug(f"Rendering prompt '{prompt_name}'...")
+        
+        try:
+            # 1. 获取原始模板 (可能是 dict 或 list)
+            template_data = self.prompt_manager.get_prompt(prompt_name)
+            
+            if not template_data:
+                logger.error(f"Prompt template '{prompt_name}' is empty or None.")
+                raise KeyError(f"Prompt template '{prompt_name}' is empty or None.")
+            
+            # 2. 递归地渲染模板
+            rendered_data = self._render_recursive(template_data, context)
+            
+            logger.debug(f"Successfully rendered prompt '{prompt_name}'.")
+            return rendered_data
+
+        except KeyError:
+            logger.error(f"Prompt template '{prompt_name}' not found.")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to render prompt '{prompt_name}': {e}", exc_info=True)
+            # 重新抛出异常，以便调用者可以处理
+            raise
+
+    def _render_recursive(
+        self, 
+        template_part: Any, 
+        context: Dict[str, Any]
+    ) -> Any:
+        """
+        Helper function to recursively render parts of a prompt structure.
+        """
+        
+        # Case 1: 模板部分是字符串 -> 渲染它
+        if isinstance(template_part, str):
+            try:
+                # 使用 safe_substitute 避免因缺少键而引发 KeyError
+                return Template(template_part).safe_substitute(context)
+            except Exception as e:
+                logger.warning(f"Error substituting template string: {e}")
+                return template_part # 返回原始字符串
+
+        # Case 2: 模板部分是字典 -> 递归渲染它的值
+        elif isinstance(template_part, dict):
+            rendered_dict = {}
+            for key, value in template_part.items():
+                rendered_dict[key] = self._render_recursive(value, context)
+            return rendered_dict
+
+        # Case 3: 模板部分是列表 -> 递归渲染它的项
+        elif isinstance(template_part, list):
+            rendered_list = []
+            for item in template_part:
+                rendered_list.append(self._render_recursive(item, context))
+            return rendered_list
+
+        # Case 4: 其他类型 (int, bool, etc.) -> 按原样返回
+        else:
+            return template_part
