@@ -1,302 +1,204 @@
-import asyncpg
-from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime # [任务 2] 添加导入
-# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
-from Phoenix_project.monitor.logging import get_logger
+from typing import List, Dict, Any, Optional
+import duckdb
+from phoenix_project.monitor.logging import get_logger
 
-logger = get_logger(__name__)
+log = get_logger("TabularDBClient")
+
 
 class TabularDBClient:
     """
-    Client for interacting with a tabular database (e.g., PostgreSQL).
-    Used for storing and retrieving structured financial data (e.g., fundamentals).
+    用于与结构化表格数据库（如 DuckDB）交互的客户端。
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initializes the TabularDBClient.
+    def __init__(self, db_path: str, config: Dict[str, Any]):
+        self.db_path = db_path
+        self.config = config
+        self.db_conn = duckdb.connect(database=self.db_path, read_only=True)
+        self.tables = self._discover_tables()
         
-        Args:
-            config (Dict[str, Any]): Configuration dict, expects 'tabular_db'
-                                      with 'dsn' (Database Source Name).
-        """
-        # [蓝图 2 修复]：配置现在是 config['tabular_db']
-        db_config = config # 假设 config 已经是 config['tabular_db']
-        self.dsn = db_config.get('dsn') # e.g., "postgresql://user:pass@host:port/db"
-        if not self.dsn:
-            logger.error("TabularDB 'dsn' not configured.")
-            raise ValueError("TabularDB 'dsn' is required.")
-            
-        self.pool = None
-        logger.info("TabularDBClient initialized.")
+        # [✅ 优化] 从配置中获取是否使用 SQL 代理
+        self.use_sql_agent = self.config.get("use_sql_agent", False)
+        self.sql_agent = None
+        
+        if self.use_sql_agent:
+            self._initialize_sql_agent()
 
-    async def connect(self):
-        """Creates the connection pool."""
-        if self.pool:
-            return
+    def _discover_tables(self) -> List[str]:
+        """发现数据库中的所有表。"""
         try:
-            self.pool = await asyncpg.create_pool(dsn=self.dsn, min_size=2, max_size=10)
-            logger.info("TabularDB connection pool created.")
+            tables = self.db_conn.execute("SHOW TABLES").fetchall()
+            table_names = [table[0] for table in tables]
+            log.info(f"Discovered tables: {table_names}")
+            return table_names
         except Exception as e:
-            logger.error(f"Failed to create TabularDB connection pool: {e}", exc_info=True)
-            raise
-
-    async def close(self):
-        """Closes the connection pool."""
-        if self.pool:
-            await self.pool.close()
-            self.pool = None
-            logger.info("TabularDB connection pool closed.")
-
-    # --- [任务 2 实现] ---
-    # 移除了模拟数据，实现了真实的 asyncpg 查询
-    async def query_metric(self, symbol: str, metric_name: str) -> Optional[Any]:
-        """
-        Fetches the latest value for a specific metric and symbol.
-        This implements the query capability described in RAG_ARCHITECTURE.md.
-        
-        Args:
-            symbol (str): The ticker symbol (e.g., 'AAPL').
-            metric_name (str): The metric name (e.g., 'Revenue', 'eps').
-            
-        Returns:
-            Optional[Any]: The value of the metric, or None if not found.
-        """
-        if not self.pool:
-            logger.error("Connection pool is not initialized. Call connect() first.")
-            await self.connect() # 尝试重新连接
-            if not self.pool:
-                 return None
-            
-        # 此查询基于 RAG_ARCHITECTURE.md 中的设计
-        # 它假设有一个包含 [symbol, metric_name, metric_value, report_date] 的表
-        query = """
-        SELECT metric_value FROM financial_metrics
-        WHERE symbol = $1 AND metric_name = $2
-        ORDER BY report_date DESC
-        LIMIT 1;
-        """
-        
-        try:
-            async with self.pool.acquire() as connection:
-                # fetchval() 直接获取第一行第一列的值
-                value = await connection.fetchval(query, symbol, metric_name)
-            
-            if value is not None:
-                logger.debug(f"Successfully fetched metric {metric_name} for {symbol}: {value}")
-                return value
-            else:
-                logger.debug(f"No metric '{metric_name}' found for symbol: {symbol}")
-                return None
-        except asyncpg.exceptions.UndefinedTableError:
-            logger.error("Query failed: 'financial_metrics' table does not exist.")
-            return None
-        except Exception as e:
-            logger.error(f"Error querying TabularDB for {symbol} metric {metric_name}: {e}", exc_info=True)
-            return None
-    # --- [任务 2 结束] ---
-
-    async def get_latest_financials(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Example query: Fetches the latest financial metrics for a given symbol.
-        
-        This assumes a table named 'financial_metrics' exists.
-        
-        Args:
-            symbol (str): The ticker symbol.
-            
-        Returns:
-            Optional[Dict[str, Any]]: A dictionary of metrics, or None.
-        """
-        if not self.pool:
-            logger.error("Connection pool is not initialized. Call connect() first.")
-            await self.connect() # 尝试重新连接
-            if not self.pool:
-                 return None
-            
-        query = """
-        SELECT * FROM financial_metrics
-        WHERE symbol = $1
-        ORDER BY report_date DESC
-        LIMIT 1;
-        """
-        
-        try:
-            async with self.pool.acquire() as connection:
-                record = await connection.fetchrow(query, symbol)
-            
-            if record:
-                # Convert asyncpg.Record to a plain dict
-                return dict(record)
-            else:
-                logger.debug(f"No financial metrics found for symbol: {symbol}")
-                return None
-        except asyncpg.exceptions.UndefinedTableError:
-            logger.error("Query failed: 'financial_metrics' table does not exist.")
-            return None
-        except Exception as e:
-            logger.error(f"Error querying TabularDB for {symbol}: {e}", exc_info=True)
-            return None
-
-    # --- [蓝图 2] 新增 RAG 搜索方法 ---
-    async def search_financials(
-        self, 
-        query: str, 
-        symbols: List[str], 
-        limit: int = 10
-    ) -> List[Tuple[Dict[str, Any], float]]:
-        """
-        Searches financial metrics relevant to a query and symbols.
-        For RRF, we need a list of (doc, score).
-        We will return matching rows and assign a static score (e.g., 1.0)
-        as relevance is binary (it's a structured fact).
-        
-        Args:
-            query (str): The search query (used to find matching metric_names).
-            symbols (List[str]): List of ticker symbols.
-            limit (int): Max number of rows to return.
-            
-        Returns:
-            List[Tuple[Dict[str, Any], float]]: List of (row_dict, score) tuples.
-        """
-        if not self.pool:
-            logger.error("Connection pool is not initialized. Call connect() first.")
-            await self.connect() # 尝试重新连接
-            if not self.pool:
-                 return []
-            
-        # [✅ 优化] FIXME: 这是一个基于 ILIKE 的简化搜索。
-        # 一个更高级的系统应该使用 LLM (query_to_sql_agent) 或
-        # 针对 metric_name 和 description 列的向量嵌入来动态构建 SQL 查询。
-        # 当前实现无法处理复杂的自然语言查询 (例如 "revenue growth > 10%")。
-        logger.warning(
-            "FIXME: search_financials 正在使用简化的 ILIKE 搜索，而不是 query_to_sql_agent。"
-        )
-        
-        # 简化：假设查询是 "revenue" 或 "eps"
-        # 我们将在 financial_metrics 中搜索。
-        
-        # Psycopg (asyncpg) 不支持 'IN %s' 绑定。我们必须使用 ANY($1)
-        params = []
-        param_idx = 1
-        
-        symbol_query = ""
-        if symbols:
-            symbol_query = f"WHERE symbol = ANY(${param_idx})"
-            params.append(symbols)
-            param_idx += 1
-        
-        # 动态添加 LIKE 过滤器（如果 query 存在）
-        # 这很基础，但可以用于演示
-        like_query = ""
-        if query:
-            # 假设查询是单个词
-            query_param = f"%{query.lower().split()[0]}%"
-            like_query = f"AND metric_name ILIKE ${param_idx}"
-            params.append(query_param)
-            param_idx += 1
-            
-            # 如果没有符号，WHERE 子句需要调整
-            if not symbols:
-                 like_query = like_query.replace("AND", "WHERE")
-
-
-        # [蓝图 2] 假设的查询
-        sql_query = f"""
-        SELECT * FROM financial_metrics
-        {symbol_query}
-        {like_query}
-        ORDER BY report_date DESC
-        LIMIT {limit};
-        """
-        
-        try:
-            async with self.pool.acquire() as connection:
-                records = await connection.fetch(sql_query, *params)
-            
-            results = []
-            for record in records:
-                # 对于 RRF，我们返回 (文档, 分数)
-                # 表格事实是 100% 相关的
-                results.append((dict(record), 1.0))
-                
-            return results
-        except asyncpg.exceptions.UndefinedTableError:
-            logger.error("Query failed: 'financial_metrics' table does not exist.")
+            log.error(f"Failed to discover tables: {e}")
             return []
-        except Exception as e:
-            logger.error(f"Error searching financials for {symbols}: {e}", exc_info=True)
-            return []
-    # --- [蓝图 2 结束] ---
 
-    async def upsert_financials(self, symbol: str, metrics: Dict[str, Any]) -> bool:
+    def _initialize_sql_agent(self):
         """
-        Example upsert: Inserts or updates financial metrics for a symbol.
-        This is highly specific to the table schema.
-        
-        [任务 2 已修改] 此方法现在动态构建查询。
-        
-        Args:
-            symbol (str): The ticker symbol.
-            metrics (Dict[str, Any]): Dict of metrics (e.g., {"eps": 1.25, "pe_ratio": 20.5, "report_date": ...})
+        [✅ 优化] 初始化
+        Query-to-SQL 代理。
+        这需要额外的依赖 (如 LangChain, Ollama, OpenAI)。
+        """
+        log.info("Attempting to initialize Query-to-SQL agent...")
+        try:
+            # 
+            # 示例: (这需要 langchain 和一个 LLM)
+            # from langchain_community.agent_toolkits import create_sql_agent
+            # from langchain_community.utilities import SQLDatabase
+            # from langchain_openai import ChatOpenAI
+            # 
+            # db = SQLDatabase(self.db_conn) # 注意: LangChain 的 SQLDatabase 可能需要 SQLAlchemy URL
+            # llm = ChatOpenAI(model="gpt-4", temperature=0)
+            # self.sql_agent = create_sql_agent(llm, db=db, agent_type="openai-tools", verbose=True)
+            # log.info("Query-to-SQL agent initialized successfully.")
             
-        Returns:
-            bool: True on success, False on failure.
+            # 
+            log.warning("Query-to-SQL agent initialization is a placeholder. "
+                        "Full implementation requires LLM and LangChain setup.")
+            # 
+            self.sql_agent = self._mock_sql_agent # 
+            
+        except ImportError:
+            log.warning("LangChain or LLM dependencies not found. SQL agent disabled.")
+            self.use_sql_agent = False
+        except Exception as e:
+            log.error(f"Failed to initialize SQL agent: {e}")
+            self.use_sql_agent = False
+            
+    def _mock_sql_agent(self, query: str, symbol: str) -> str:
         """
-        if not self.pool:
-            logger.error("Connection pool is not initialized. Call connect() first.")
-            await self.connect() # 尝试重新连接
-            if not self.pool:
-                 return False
-
-        # --- [任务 2 已修改] ---
-        # 动态构建列和值
+        [✅ 优化] 模拟 SQL 代理的行为，用于演示。
+        在实际应用中，这将是一个 LLM 调用。
+        """
+        log.debug(f"Mock SQL Agent processing query: '{query}' for symbol '{symbol}'")
+        # 
+        # 
+        # 
         
-        # 1. 确保关键字段存在
-        metrics['symbol'] = symbol
-        if 'report_date' not in metrics:
-            # 假设如果未提供 report_date，则使用当前日期
-            metrics['report_date'] = datetime.utcnow().date()
-            logger.warning(f"Upsert for {symbol} missing 'report_date', using current date.")
-
-        # 2. 动态提取列和值 (保持顺序)
-        cols_to_insert = sorted(metrics.keys())
-        values = [metrics[col] for col in cols_to_insert]
-        
-        # 3. 动态生成占位符, e.g., ($1, $2, $3, $4)
-        placeholders = ", ".join([f"${i+1}" for i in range(len(cols_to_insert))])
-        
-        # 4. 动态生成 ON CONFLICT 更新集
-        # (假设 (symbol, report_date) 是唯一的复合键)
-        update_cols = [col for col in cols_to_insert if col not in ['symbol', 'report_date']]
-        
-        if not update_cols:
-            # 如果只有键，则什么都不做
-            logger.warning(f"Upsert for {symbol} only contains key columns. 'DO NOTHING' on conflict.")
-            update_set = "DO NOTHING"
-            query = f"""
-            INSERT INTO financial_metrics ({", ".join(cols_to_insert)})
-            VALUES ({placeholders})
-            ON CONFLICT (symbol, report_date) {update_set};
-            """
+        # 
+        # 
+        if "revenue" in query.lower() and "quarterly" in query.lower():
+            sql = f"SELECT period, revenue FROM financials_quarterly WHERE symbol = '{symbol}' ORDER BY period DESC LIMIT 5"
+        elif "net income" in query.lower():
+            sql = f"SELECT period, net_income FROM financials_annual WHERE symbol = '{symbol}' ORDER BY period DESC LIMIT 3"
         else:
-            # e.g., eps = EXCLUDED.eps, pe_ratio = EXCLUDED.pe_ratio ...
-            update_set = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_cols])
-            query = f"""
-            INSERT INTO financial_metrics ({", ".join(cols_to_insert)})
-            VALUES ({placeholders})
-            ON CONFLICT (symbol, report_date) DO UPDATE
-            SET {update_set};
-            """
-        # --- [任务 2 结束] ---
+            # 
+            log.warning(f"Mock SQL Agent could not generate specific SQL for query: '{query}'. Returning None.")
+            return None
         
+        log.info(f"Mock SQL Agent generated SQL: {sql}")
+        return sql
+
+    def _fallback_search(self, query: str, symbol: str) -> List[Dict[str, Any]]:
+        """
+        [✅ 优化] 
+        """
+        log.debug(f"Using fallback ILIKE search for query: '{query}' on symbol '{symbol}'")
+        results = []
+        
+        # 
+        if not self.tables:
+            log.warning("No tables found in database for fallback search.")
+            return []
+
+        # 
+        # 
+        search_table = "financials_quarterly" # 
+        if search_table not in self.tables:
+            # 
+            search_table = self.tables[0]
+            log.debug(f"'financials_quarterly' not found, falling back to first table: '{search_table}'")
+
         try:
-            async with self.pool.acquire() as connection:
-                await connection.execute(query, *values)
-            return True
-        except asyncpg.exceptions.UndefinedTableError:
-            logger.error("Query failed: 'financial_metrics' table does not exist.")
-            return False
+            # 
+            # 
+            columns_query = f"PRAGMA table_info('{search_table}')"
+            columns_info = self.db_conn.execute(columns_query).fetchall()
+            
+            # 
+            # 
+            text_columns = [col[1] for col in columns_info if "VARCHAR" in col[2].upper()]
+            
+            if not text_columns:
+                log.warning(f"No VARCHAR columns found in table '{search_table}' for ILIKE search.")
+                # 
+                # 
+                all_columns = [col[1] for col in columns_info]
+                if not all_columns:
+                    return [] # 
+                
+                # 
+                # 
+                query_sql = f"SELECT * FROM {search_table} WHERE symbol = ? LIMIT 10"
+                res = self.db_conn.execute(query_sql, [symbol]).fetch_all()
+            
+            else:
+                # 
+                where_clause = " OR ".join([f"{col} ILIKE ?" for col in text_columns])
+                # 
+                query_sql = f"SELECT * FROM {search_table} WHERE ({where_clause}) AND symbol = ?"
+                
+                # 
+                like_query = f"%{query}%"
+                params = [like_query] * len(text_columns) + [symbol]
+                
+                res = self.db_conn.execute(query_sql, params).fetch_all()
+            
+            # 
+            if res:
+                column_names = [col[0] for col in self.db_conn.description]
+                results = [dict(zip(column_names, row)) for row in res]
+                
         except Exception as e:
-            logger.error(f"Error upserting financials for {symbol}: {e}", exc_info=True)
-            return False
+            log.error(f"Fallback search failed: {e}")
+            
+        return results
+
+    def search_financials(self, query: str, symbol: str) -> List[Dict[str, Any]]:
+        """
+        使用自然语言查询搜索表格财务数据。
+        [✅ 优化] 优先使用 SQL 代理，失败或未配置时回退到 ILIKE 搜索。
+        """
+        results = []
+        sql_query = None
+
+        if self.use_sql_agent and self.sql_agent:
+            log.debug("Attempting search using SQL Agent.")
+            try:
+                # 
+                sql_query = self.sql_agent(query, symbol)
+                
+                if sql_query:
+                    # 
+                    res = self.db_conn.execute(sql_query).fetch_all()
+                    if res:
+                        column_names = [col[0] for col in self.db_conn.description]
+                        results = [dict(zip(column_names, row)) for row in res]
+                else:
+                    # 
+                    log.warning("SQL Agent returned no query, falling back.")
+                    results = self._fallback_search(query, symbol)
+
+            except Exception as e:
+                log.error(f"SQL Agent search failed: {e}. Falling back to ILIKE search.")
+                results = self._fallback_search(query, symbol)
+        else:
+            log.debug("SQL Agent not enabled. Using fallback ILIKE search.")
+            results = self._fallback_search(query, symbol)
+
+        return results
+
+    def query(self, sql_query: str) -> List[Dict[str, Any]]:
+        """
+        执行一个原始 SQL 查询。
+        """
+        try:
+            res = self.db_conn.execute(sql_query).fetch_all()
+            if res:
+                column_names = [col[0] for col in self.db_conn.description]
+                return [dict(zip(column_names, row)) for row in res]
+            return []
+        except Exception as e:
+            log.error(f"Raw SQL query failed: {e}")
+            return []
