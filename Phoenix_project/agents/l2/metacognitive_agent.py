@@ -1,139 +1,111 @@
-"""
-L2 Agent: Metacognitive Agent
-Refactored from ai/metacognitive_agent.py.
-Responsible for "Supervision" of L1/L2 agent reasoning (CoT).
-"""
-from typing import Any, List, Dict
+import asyncio
+from typing import List, Dict, Any
 
-from Phoenix_project.agents.l2.base import BaseL2Agent
-from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
-from Phoenix_project.core.schemas.supervision_result import SupervisionResult
-from Phoenix_project.api.gateway import APIGateway
-from Phoenix_project.monitor.logging import get_logger
+from .base import L2Agent
+from ...core.schemas.data_schema import Sentiment
+from ...core.schemas.supervision_result import SupervisionResult, Decision
+from ...monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
-class MetacognitiveAgent(BaseL2Agent):
+class MetacognitiveAgent(L2Agent):
     """
-    Implements the L2 Metacognitive agent.
-    This agent monitors the CoT of other agents to identify
-    divergence and potential hallucinations using an LLM.
-    """
+    元认知智能体 (Metacognitive Agent) 
     
-    def __init__(self, agent_id: str, api_gateway: APIGateway):
-        """
-        Initializes the MetacognitiveAgent.
-        
-        Args:
-            agent_id (str): The unique identifier for the agent.
-            api_gateway (APIGateway): The gateway for making LLM calls.
-        """
-        super().__init__(agent_id=agent_id, llm_client=api_gateway)
-        self.api_gateway = api_gateway
-        logger.info(f"MetacognitiveAgent (id='{self.agent_id}') initialized.")
+    L2
+    
+    它负责监督 L1 智能体的输出和 L2 智能体（如 Critic 和 Adversary）的决策。
+    它的目标是评估整个系统的推理过程，识别潜在的认知偏差、
+    循环逻辑或 L2 监督本身的问题。
+    """
 
-    # 签名已更新：接受 dependencies 而不是 evidence_items
-    async def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> SupervisionResult:
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.prompt = self.prompt_manager.get_prompt("l2_metacognitive") # 假设有一个特定的提示
+        logger.info(f"MetacognitiveAgent initialized with model: {self.model_name}")
+
+    # --- Refactor: 标记为 @staticmethod 并设为 public ---
+    # 将此方法标记为静态方法，并使其公开 (public)，
+    # 这样其他模块 (如 Arbitrator) 就可以导入并重用它，
+    # 从而消除了代码重复。
+    @staticmethod
+    def serialize_decisions_for_prompt(decisions: List[SupervisionResult]) -> str:
         """
-        Monitors the CoT (reasoning) of L1 EvidenceItems.
+        将一系列 SupervisionResult 决策序列化为用于 LLM 提示的字符串。
+        这是一个共享的工具函数。
+        """
+        if not decisions:
+            return "No supervision decisions were provided."
         
-        Args:
-            state (PipelineState): The current state, used to access CoT traces.
-            dependencies (Dict[str, Any]): The dictionary of outputs from dependent tasks
-                                         (expected to contain L1 EvidenceItems).
+        serialized = []
+        for i, res in enumerate(decisions):
+            dec_str = (
+                f"Decision {i+1} (from {res.source_agent}):\n"
+                f"- Action: {res.decision.action}\n"
+                f"- Sentiment: {res.decision.final_sentiment.value if res.decision.final_sentiment else 'N/A'}\n"
+                f"- Confidence: {res.decision.confidence:.2f}\n"
+                f"- Reason: {res.decision.reason}\n"
+            )
+            serialized.append(dec_str)
             
+        return "\n".join(serialized)
+    # --- End Refactor ---
+
+    async def run(self, 
+                l1_analyses: List[Dict[str, Any]], 
+                l2_decisions: List[SupervisionResult]) -> SupervisionResult:
+        """
+        执行元认知分析。
+
+        Args:
+            l1_analyses: L1 智能体的原始分析列表。
+            l2_decisions: L2 智能体（Critic, Adversary等）的决策列表。
+
         Returns:
-            SupervisionResult: A single result object summarizing the findings.
+            一个 SupervisionResult，评估整个 L1 和 L2 过程。
         """
+        logger.info(f"MetacognitiveAgent running analysis on {len(l1_analyses)} L1 analyses and {len(l2_decisions)} L2 decisions.")
         
-        # --- 新增逻辑：从 dependencies 提取 evidence_items ---
-        evidence_items: List[EvidenceItem] = []
-        for result in dependencies.values():
-            if isinstance(result, EvidenceItem):
-                evidence_items.append(result)
-            elif isinstance(result, list): # 处理 L1 agent 可能返回列表的情况
-                for item in result:
-                    if isinstance(item, EvidenceItem):
-                        evidence_items.append(item)
-        # --- 新增逻辑结束 ---
-        
-        target_agents = [item.agent_id for item in evidence_items]
-        
-        if not evidence_items:
-            return SupervisionResult(
-                agent_id=self.agent_id,
-                analysis_summary="No evidence items provided to supervise.",
-                target_agent_ids=target_agents,
-                flags=["NO_EVIDENCE"]
-            )
-
-        # 1. 遍历传入的 evidence_items，提取 reasoning
-        reasoning_context = ""
-        for i, item in enumerate(evidence_items):
-            # L1 EvidenceItem 将其 reasoning 存储在 'content' 字段中
-            reasoning_context += f"--- Evidence {i+1} (Agent: {item.agent_id}, Confidence: {item.confidence:.2f}) ---\n"
-            reasoning_context += f"{item.content}\n\n"
-
-        # 2. 构造一个 Prompt
-        prompt = f"""
-        You are a Metacognitive Supervisor AI. Your task is to analyze the reasoning (Chain of Thought) from a group of financial analyst AIs to identify flaws.
-        
-        Review the following evidence items provided by different L1 agents:
-        
-        {reasoning_context}
-        
-        Based on this input, perform the following two tasks:
-        1. Identify any direct contradictions or logical conflicts between the agents.
-        2. Assess if any agent's reasoning seems unsubstantiated, biased, or like a potential "hallucination" (making claims without sufficient evidence).
-        
-        Provide a concise, single-paragraph summary of your findings.
-        If you find specific issues, list the flags (e.g., "HALLUCINATION", "DIVERGENCE").
-        
-        Respond in the following format:
-        SUMMARY: [Your one-paragraph analysis]
-        FLAGS: [COMMA_SEPARATED_LIST_OF_FLAGS_OR_NONE]
-        """
-
         try:
-            # 3. 调用 self.api_gateway.send_request(...)
-            response_str = await self.api_gateway.send_request(
-                model_name="gemini-1.5-pro", # 需要一个强大的模型来进行元认知
-                prompt=prompt,
-                temperature=0.3,
-                max_tokens=512
+            # 序列化 L1 分析 (简化)
+            l1_summary = [f"Agent {d.get('agent_id', 'Unknown')}: {d.get('insight', 'No insight')[:100]}..." 
+                          for d in l1_analyses]
+            l1_summary_str = "\n".join(l1_summary)
+
+            # --- Refactor: 使用静态方法 ---
+            l2_decisions_str = self.serialize_decisions_for_prompt(l2_decisions)
+            # --- End Refactor ---
+
+            prompt_context = {
+                "l1_analyses_summary": l1_summary_str,
+                "l2_supervision_decisions": l2_decisions_str
+            }
+            
+            prompt = self.prompt_renderer.render(self.prompt, **prompt_context)
+            
+            response_json = await self.llm_client.run_chain_structured(
+                prompt,
+                model_name=self.model_name
             )
             
-            # 4. 将 LLM 的文本回复封装到 SupervisionResult 对象中
-            summary = "Failed to parse LLM response."
-            flags = ["PARSING_ERROR"]
+            # 假设 response_json 遵循 Decision Pydantic 模型的结构
+            decision = Decision(**response_json)
             
-            # 解析 LLM 回复
-            for line in response_str.split('\n'):
-                if line.upper().startswith("SUMMARY:"):
-                    summary = line[len("SUMMARY:"):].strip()
-                elif line.upper().startswith("FLAGS:"):
-                    flags_str = line[len("FLAGS:"):].strip()
-                    if flags_str.upper() != "NONE":
-                        flags = [f.strip() for f in flags_str.split(',')]
-                    else:
-                        flags = []
-                        
             return SupervisionResult(
-                agent_id=self.agent_id,
-                analysis_summary=summary,
-                target_agent_ids=target_agents,
-                flags=flags
+                source_agent=self.agent_id,
+                decision=decision,
+                timestamp=asyncio.get_event_loop().time()
             )
 
         except Exception as e:
-            logger.error(f"MetacognitiveAgent failed LLM call: {e}", exc_info=True)
+            logger.error(f"MetacognitiveAgent failed: {e}", exc_info=True)
             return SupervisionResult(
-                agent_id=self.agent_id,
-                analysis_summary=f"LLM call failed: {e}",
-                target_agent_ids=target_agents,
-                flags=["LLM_ERROR"]
+                source_agent=self.agent_id,
+                decision=Decision(
+                    action="FLAG_FOR_REVIEW",
+                    final_sentiment=None,
+                    confidence=0.9, # 对失败的置信度很高
+                    reason=f"Metacognitive analysis failed due to exception: {e}"
+                ),
+                timestamp=asyncio.get_event_loop().time()
             )
-
-    def __repr__(self) -> str:
-        return f"<MetacognitiveAgent(id='{self.agent_id}')>"
