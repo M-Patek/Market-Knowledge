@@ -1,5 +1,6 @@
 import asyncpg
 from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime # [任务 2] 添加导入
 # 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
 from Phoenix_project.monitor.logging import get_logger
 
@@ -229,9 +230,11 @@ class TabularDBClient:
         Example upsert: Inserts or updates financial metrics for a symbol.
         This is highly specific to the table schema.
         
+        [任务 2 已修改] 此方法现在动态构建查询。
+        
         Args:
             symbol (str): The ticker symbol.
-            metrics (Dict[str, Any]): Dict of metrics (e.g., {"eps": 1.25, "pe_ratio": 20.5, ...})
+            metrics (Dict[str, Any]): Dict of metrics (e.g., {"eps": 1.25, "pe_ratio": 20.5, "report_date": ...})
             
         Returns:
             bool: True on success, False on failure.
@@ -242,32 +245,46 @@ class TabularDBClient:
             if not self.pool:
                  return False
 
-        # This is a simplified example. A real query would be more robust.
-        # It assumes 'symbol' and 'report_date' is a composite key.
-        # This query is also vulnerable to schema mismatch.
+        # --- [任务 2 已修改] ---
+        # 动态构建列和值
         
-        # TODO: Dynamically build columns and values
-        # For this example, we'll assume a few fixed columns
-        cols_to_insert = ['symbol', 'report_date', 'eps', 'pe_ratio', 'metric_name', 'metric_value'] # 扩展
-        
-        # Ensure 'symbol' is in the dict
+        # 1. 确保关键字段存在
         metrics['symbol'] = symbol
+        if 'report_date' not in metrics:
+            # 假设如果未提供 report_date，则使用当前日期
+            metrics['report_date'] = datetime.utcnow().date()
+            logger.warning(f"Upsert for {symbol} missing 'report_date', using current date.")
+
+        # 2. 动态提取列和值 (保持顺序)
+        cols_to_insert = sorted(metrics.keys())
+        values = [metrics[col] for col in cols_to_insert]
         
-        # Prepare data, using None for missing keys
-        values = [metrics.get(col) for col in cols_to_insert]
-        
-        # e.g., ($1, $2, $3, $4, $5, $6)
+        # 3. 动态生成占位符, e.g., ($1, $2, $3, $4)
         placeholders = ", ".join([f"${i+1}" for i in range(len(cols_to_insert))])
         
-        # e.g., eps = EXCLUDED.eps, pe_ratio = EXCLUDED.pe_ratio ...
-        update_set = ", ".join([f"{col} = EXCLUDED.{col}" for col in cols_to_insert if col not in ['symbol', 'report_date']]) # 假设 (symbol, report_date) 是键
-
-        query = f"""
-        INSERT INTO financial_metrics ({", ".join(cols_to_insert)})
-        VALUES ({placeholders})
-        ON CONFLICT (symbol, report_date) DO UPDATE -- Assumes composite key
-        SET {update_set};
-        """
+        # 4. 动态生成 ON CONFLICT 更新集
+        # (假设 (symbol, report_date) 是唯一的复合键)
+        update_cols = [col for col in cols_to_insert if col not in ['symbol', 'report_date']]
+        
+        if not update_cols:
+            # 如果只有键，则什么都不做
+            logger.warning(f"Upsert for {symbol} only contains key columns. 'DO NOTHING' on conflict.")
+            update_set = "DO NOTHING"
+            query = f"""
+            INSERT INTO financial_metrics ({", ".join(cols_to_insert)})
+            VALUES ({placeholders})
+            ON CONFLICT (symbol, report_date) {update_set};
+            """
+        else:
+            # e.g., eps = EXCLUDED.eps, pe_ratio = EXCLUDED.pe_ratio ...
+            update_set = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+            query = f"""
+            INSERT INTO financial_metrics ({", ".join(cols_to_insert)})
+            VALUES ({placeholders})
+            ON CONFLICT (symbol, report_date) DO UPDATE
+            SET {update_set};
+            """
+        # --- [任务 2 结束] ---
         
         try:
             async with self.pool.acquire() as connection:
