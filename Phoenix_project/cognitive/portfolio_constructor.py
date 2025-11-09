@@ -1,221 +1,137 @@
-"""
-投资组合构造器 (Portfolio Constructor)
-将认知引擎的高级决策（FusionResult）转换为具体的、可执行的交易订单（Order）。
+import pandas as pd
+from typing import List, Dict, Any, Optional
 
-[主人喵的修复]
-添加了 Orchestrator 调用的 'construct' 方法的实现。
-"""
-from typing import List, Dict, Optional
-from datetime import datetime
-
-# FIX (E2, E3): 从统一的 data_schema 和 fusion_result 导入
-from Phoenix_project.core.schemas.data_schema import Signal, Order, PortfolioState, OrderStatus
-# [主人喵的修复] 导入 FusionResult 和新添加的 TargetPortfolio 模式
-from Phoenix_project.core.schemas.fusion_result import FusionResult, AgentDecision
-from Phoenix_project.core.schemas.data_schema import TargetPortfolio, TargetPosition
-
-# FIX (E8): 导入 IPositionSizer 接口 (原为 SizingMethod)
-from Phoenix_project.sizing.base import IPositionSizer
-
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.fusion_result import FusionResult
 from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.execution.signal_protocol import Signal
+from Phoenix_project.cognitive.risk_manager import RiskManager
+from Phoenix_project.sizing.base import IPositionSizer
+# [任务 B.1] 导入 Sizer 实现
+from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer
+from Phoenix_project.sizing.volatility_parity import VolatilityParitySizer
 
 logger = get_logger(__name__)
 
 class PortfolioConstructor:
     """
-    负责将 AI 决策（'BULLISH', 'BEARISH'）与仓位管理逻辑相结合，
-    以确定最终的订单数量和类型。
+    Generates desired target positions based on the L2 fusion signal
+    and the risk manager's constraints.
     """
-
-    def __init__(self, position_sizer: IPositionSizer):
-        self.position_sizer = position_sizer
-        self.log_prefix = "PortfolioConstructor:"
-        # [主人喵的修复] 增加一些简单的转换规则
-        self.decision_to_weight_map = {
-            "STRONG_BUY": 0.15,  # 15% 基础权重
-            "BUY": 0.10,
-            "BULLISH": 0.05,
-            "HOLD": 0.0,
-            "NEUTRAL": 0.0,
-            "BEARISH": -0.05,
-            "SELL": -0.10,
-            "STRONG_SELL": -0.15,
+    
+    def __init__(self, config: Dict[str, Any], risk_manager: RiskManager):
+        """
+        Initializes the PortfolioConstructor.
+        
+        Args:
+            config: The strategy configuration.
+            risk_manager: The system's risk manager.
+        """
+        self.config = {}
+        self.risk_manager = risk_manager
+        
+        # [任务 B.1] Sizer 注册表
+        self.sizer_registry: Dict[str, IPositionSizer] = {
+            "FixedFraction": FixedFractionSizer,
+            "VolatilityParity": VolatilityParitySizer,
         }
-        self.default_weight = 0.0
+        self.position_sizer: Optional[IPositionSizer] = None
+        self.set_config(config) # Apply initial config
+        
+        logger.info("PortfolioConstructor initialized.")
 
-    def construct(self, fusion_result: FusionResult, current_portfolio: PortfolioState) -> TargetPortfolio:
+    def set_config(self, config: Dict[str, Any]):
         """
-        [主人喵的修复]
-        实现 Orchestrator 调用的 'construct' 存根。
-        将 AI 的 FusionResult 转换为 TargetPortfolio (目标权重)。
+        Dynamically updates the component's configuration.
         """
-        logger.info(f"{self.log_prefix} Constructing portfolio from FusionResult {fusion_result.id}...")
+        self.config = config.get('portfolio_constructor', {})
+        logger.info(f"PortfolioConstructor config set: {self.config}")
         
-        target_positions = []
-        
-        # --- 核心逻辑：将 AI 决策转换为目标权重 ---
-        # 这是一个简化的实现，假设 FusionResult 针对单个符号。
-        # 一个更复杂的系统可能会处理 fusion_result.metadata 中的多个符号。
-        
-        symbol = fusion_result.target_symbol
-        decision = fusion_result.decision.upper()
-        confidence = fusion_result.confidence
-        
-        # 1. 从映射中获取基础权重
-        base_weight = self.decision_to_weight_map.get(decision, self.default_weight)
-        
-        # 2. 按置信度调整权重 (简单的线性缩放)
-        #    (注意：self.position_sizer 也可以在这里使用，
-        #     但 `construct` 的接口没有提供足够的信息给 sizer)
-        target_weight = base_weight * confidence
-        
-        reasoning = f"AI Decision: {decision} (Conf: {confidence:.2f}). Base Weight: {base_weight:.2%}. Final Weight: {target_weight:.2%}"
-        logger.info(f"{self.log_prefix} {symbol}: {reasoning}")
+        # [任务 B.1] 根据配置实例化仓位管理器
+        try:
+            sizer_type = self.config.get('position_sizer', 'FixedFraction')
+            SizerClass = self.sizer_registry.get(sizer_type)
+            
+            if SizerClass:
+                # 传递 sizer 特定的配置
+                sizer_config = self.config.get('sizer_config', {})
+                self.position_sizer = SizerClass(**sizer_config)
+                logger.info(f"PositionSizer '{sizer_type}' initialized.")
+            else:
+                logger.error(f"Unknown position sizer type: {sizer_type}. No sizer will be used.")
+                self.position_sizer = None
+        except Exception as e:
+            logger.error(f"Failed to initialize PositionSizer: {e}", exc_info=True)
+            self.position_sizer = None
 
-        if abs(target_weight) > 0.001: # 避免 0 权重
-            target_positions.append(
-                TargetPosition(
-                    symbol=symbol,
-                    target_weight=target_weight,
-                    reasoning=reasoning
-                )
+    def generate_orders(
+        self, 
+        fusion_result: FusionResult, 
+        pipeline_state: PipelineState
+    ) -> List[Signal]:
+        """
+        Generates trade signals based on the fusion result and risk constraints.
+        
+        [任务 B.1] MOCK logic has been replaced.
+        """
+        
+        symbol = fusion_result.symbol
+        
+        # 1. 获取当前状态
+        current_state = pipeline_state.get_current_state()
+        market_data = current_state.get_market_data(symbol)
+        current_price = market_data.get('close') if market_data else None
+        
+        if current_price is None or current_price <= 0:
+            logger.warning(f"No current price for {symbol} in state. Cannot calculate position size.")
+            return []
+
+        current_holdings = current_state.get_holdings(symbol)
+        current_balance = current_state.get_balance()
+        
+        # 计算当前总资产 (一个简化的计算，更复杂的 sizer 可能需要所有资产的价值)
+        total_portfolio_value = current_balance + (current_holdings * current_price)
+        
+        # 2. 检查 Sizer 是否存在
+        if not self.position_sizer:
+            logger.error("PositionSizer is not initialized. Cannot calculate order size.")
+            return []
+
+        # 3. [任务 B.1] 调用 IPositionSizer 接口替换 MOCK 逻辑
+        logger.info(f"Calling PositionSizer '{self.position_sizer.__class__.__name__}' for {symbol}...")
+        try:
+            target_quantity = self.position_sizer.calculate_target_position(
+                signal=fusion_result,
+                current_price=current_price,
+                current_holdings=current_holdings,
+                total_portfolio_value=total_portfolio_value
             )
+        except Exception as e:
+            logger.error(f"PositionSizer failed to calculate position: {e}", exc_info=True)
+            return []
+
+        # 4. 计算交易量
+        trade_qty = target_quantity - current_holdings
         
-        # 3. 创建目标投资组合对象
-        target_portfolio = TargetPortfolio(
-            timestamp=datetime.utcnow(),
-            positions=target_positions,
-            metadata={
-                "source_fusion_id": fusion_result.id,
-                "strategy_id": "phoenix_v1_core" # 示例
-            }
-        )
-        
-        return target_portfolio
+        logger.info(f"Sizing for {symbol}: Target Qty={target_quantity}, Current Qty={current_holdings}, Trade Qty={trade_qty}")
 
-    def translate_decision_to_signal(self, fusion_result: FusionResult) -> Optional[Signal]:
-        """
-        步骤1：将 FusionResult 转换为标准化的 Signal。
-        (这是代码库中的遗留方法，Orchestrator 目前不调用它)
-        """
-        
-        # 这是一个占位符。
-        # FIX (E3): 之前的 'AgentDecision' 导入会失败。现在已修复。
-        # // This will fail: fusion_result.agent_decisions 
-        # (现在不会失败了)
-        
-        # [主人喵的修复] 检查 'fusion_result' 是否有 'agent_decisions' 属性
-        if not hasattr(fusion_result, 'agent_decisions') or not fusion_result.agent_decisions:
-            logger.warning(f"{self.log_prefix} FusionResult {fusion_result.id} has no agent decisions.")
-            # return None # 原始逻辑
-        
-        # [主人喵的修复] 检查 'fusion_result' 是否有 'metadata' 属性
-        if not hasattr(fusion_result, 'metadata'):
-             logger.error(f"{self.log_prefix} FusionResult {fusion_result.id} missing 'metadata' attribute.")
-             return None
-             
-        # 假设元数据中包含目标符号
-        target_symbol = fusion_result.metadata.get("target_symbol")
-        if not target_symbol:
-            # [主人喵的修复] 尝试从 'target_symbol' 属性获取
-            if hasattr(fusion_result, 'target_symbol') and fusion_result.target_symbol:
-                 target_symbol = fusion_result.target_symbol
-            else:
-                logger.error(f"{self.log_prefix} FusionResult {fusion_result.id} missing 'target_symbol' in metadata and attributes.")
-                return None
-            
-        # 简化的转换逻辑
-        decision = fusion_result.decision.upper()
-        signal_type = "HOLD" # 默认
-        
-        if decision in ("STRONG_BUY", "BULLISH", "BUY"):
-            signal_type = "BUY"
-        elif decision in ("STRONG_SELL", "BEARISH", "SELL"):
-            signal_type = "SELL"
-        elif decision == "NEUTRAL":
-            signal_type = "HOLD"
-            
-        logger.info(f"{self.log_prefix} Translated decision {decision} to signal {signal_type} for {target_symbol}")
+        # 5. (可选) 风控覆盖
+        # TBD: RiskManager can veto or modify the trade_qty here.
+        # trade_qty = self.risk_manager.apply_trade_limits(symbol, trade_qty)
 
-        # FIX (E2): 使用 Signal 模式
-        return Signal(
-            symbol=target_symbol,
-            timestamp=fusion_result.timestamp,
-            signal_type=signal_type,
-            strength=fusion_result.confidence, # [主人喵的修复] 确保 'confidence' 存在
-            metadata={"fusion_id": fusion_result.id}
-        )
-
-    def generate_orders(self, signals: List[Signal], portfolio_state: PortfolioState) -> List[Order]:
-        """
-        步骤2：将 Signal 列表和当前投资组合状态转换为 Order 列表。
-        (这是代码库中的遗留方法，Orchestrator 目前不调用它)
-        """
-        orders = []
-        if not signals:
-            return orders
-            
-        current_positions = portfolio_state.positions
-
-        for signal in signals:
-            if signal.signal_type == "HOLD":
-                continue
-
-            # 使用仓位管理模块 (IPositionSizer) 计算目标仓位
-            # FIX (E8): self.position_sizer 现在是 IPositionSizer
-            
-            # [主人喵的修复] IPositionSizer.calculate_target_quantity 不存在。
-            # 真实接口是 size_positions(candidates, max_total_allocation)
-            # 这是一个接口不匹配，我们将模拟逻辑：
-            logger.warning(f"{self.log_prefix} generate_orders is using MOCK sizing logic due to interface mismatch.")
-            # 模拟 sizer
-            mock_candidates = [{
-                "ticker": signal.symbol, 
-                "confidence": signal.strength, 
-                "signal_type": signal.signal_type
-            }]
-            # 假设 sizer 返回 [{ "ticker": "AAPL", "capital_allocation_pct": 0.05 }]
-            sized_plan = self.position_sizer.size_positions(mock_candidates, max_total_allocation=1.0) 
-            
-            if not sized_plan:
-                continue
-                
-            target_alloc_pct = sized_plan[0]["capital_allocation_pct"]
-            target_dollar_value = portfolio_state.total_value * target_alloc_pct
-            
-            # [主人喵的修复] 获取价格以计算数量
-            current_pos = current_positions.get(signal.symbol)
-            price = 150.0 # 默认模拟价格
-            if current_pos and current_pos.quantity != 0:
-                price = current_pos.market_value / current_pos.quantity
-            elif current_pos and current_pos.average_price != 0:
-                price = current_pos.average_price
-            else:
-                 logger.warning(f"{self.log_prefix} No price for {signal.symbol}, using MOCK $150.0 in generate_orders")
-                 
-            target_quantity = target_dollar_value / price
-            if signal.signal_type == "SELL":
-                target_quantity = -abs(target_quantity)
-
-            # 计算订单数量 (与当前持仓对比)
-            current_quantity = current_positions.get(signal.symbol, None)
-            current_qty_val = current_quantity.quantity if current_quantity else 0.0
-            
-            order_quantity = target_quantity - current_qty_val
-
-            if abs(order_quantity) > 1e-6: # 避免浮点数0
-                logger.info(f"{self.log_prefix} Generating order for {signal.symbol}: "
-                            f"Target={target_quantity}, Current={current_qty_val}, OrderQty={order_quantity}")
-                            
-                # FIX (E2): 使用 Order 模式
-                new_order = Order(
-                    id=f"order_{signal.symbol}_{signal.timestamp.isoformat()}", # 实际应由UUID生成
-                    symbol=signal.symbol,
-                    quantity=order_quantity,
-                    order_type="MARKET", # 默认为市价单
-                    status=OrderStatus.NEW,
-                    metadata={"signal_strength": signal.strength, "fusion_id": signal.metadata.get("fusion_id")}
-                )
-                orders.append(new_order)
-
-        return orders
+        # 6. 生成信号
+        if abs(trade_qty) > 1e-6: # 仅在有意义的交易时生成
+            signal_obj = Signal(
+                symbol=symbol,
+                quantity=trade_qty,
+                price_target=current_price, # (可改进为使用 L1/L2 的目标价)
+                signal_type="TARGET_WEIGHT", # (表示这是基于仓位目标的)
+                source_event_id=fusion_result.source_event_id,
+                confidence=fusion_result.confidence_score,
+                timestamp=pd.Timestamp.now(tz='UTC')
+            )
+            logger.info(f"Generated Signal for {symbol}: Qty={trade_qty}")
+            return [signal_obj]
+        else:
+            logger.info(f"Trade quantity for {symbol} is negligible. No signal generated.")
+            return []
