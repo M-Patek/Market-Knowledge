@@ -6,6 +6,10 @@ import asyncio # <-- [新] 添加 asyncio
 from typing import List, Dict, Any
 from datetime import datetime # [阶段 4 变更] 导入 datetime
 
+# (主人喵的清洁计划 5.1) [新] 导入 Pydantic 验证
+from pydantic import ValidationError
+from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
+
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.core.exceptions import CognitiveError # <-- [新] 导入异常
 from Phoenix_project.data_manager import DataManager
@@ -71,17 +75,53 @@ class Orchestrator:
         """
         [主人喵的修复 2]
         从 EventDistributor (Redis 队列) 批量拉取待处理事件。
+        (主人喵的清洁计划 5.1) [已修改] 
+        - 添加 Pydantic schema 验证。
         """
         try:
             # (默认拉取最多 100 个事件，以避免阻塞循环)
             pending_events = self.event_distributor.get_pending_events(max_events=100)
             
-            if pending_events:
-                logger.info(f"Retrieved {len(pending_events)} new events from EventDistributor.")
+            if not pending_events:
+                return []
                 
-            # (TODO: 在这里添加事件的初步验证或 Schema 检查)
+            logger.info(f"Retrieved {len(pending_events)} new events. Validating schema...")
+            validated_events = []
             
-            return pending_events
+            for event_data in pending_events:
+                try:
+                    # (主人喵的清洁计划 5.1) [新] 在此处添加 Pydantic 验证
+                    
+                    # 这是一个简化的示例。一个健壮的系统会有一个
+                    # 包含 'type' 和 'payload' 的包装器 (envelope) schema。
+                    # 这里我们根据内容进行猜测。
+                    
+                    if 'content' in event_data and 'source' in event_data:
+                        # 尝试验证为 NewsData
+                        NewsData.model_validate(event_data)
+                    elif 'symbol' in event_data and 'close' in event_data:
+                        # 尝试验证为 MarketData
+                        MarketData.model_validate(event_data)
+                    elif 'name' in event_data and 'value' in event_data:
+                        # 尝试验证为 EconomicIndicator
+                        EconomicIndicator.model_validate(event_data)
+                    else:
+                        # 无法识别，但通过（或使用一个基础 schema）
+                        logger.warning(f"Unknown event schema type for event, skipping validation: {str(event_data)[:100]}...")
+                    
+                    validated_events.append(event_data)
+                    
+                except ValidationError as e:
+                    # 记录第一个错误消息
+                    error_msg = e.errors()[0].get('msg', 'Unknown validation error')
+                    logger.warning(f"Event schema validation failed, discarding event. Error: {error_msg}... Data: {str(event_data)[:100]}...")
+                except Exception as e_generic:
+                    logger.error(f"Unexpected error during event validation: {e_generic}. Discarding event.", exc_info=True)
+
+            if pending_events and not validated_events:
+                logger.warning(f"All {len(pending_events)} retrieved events failed validation.")
+            
+            return validated_events
             
         except Exception as e:
             logger.error(f"Failed to check for events: {e}", exc_info=True)
