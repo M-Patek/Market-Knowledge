@@ -1,245 +1,204 @@
-import pandas as pd
-from typing import Dict, Any, Optional
+from typing import List, Dict, Any, Optional
+from phoenix_project.cognitive.engine import CognitiveEngine
+from phoenix_project.core.schemas.risk_schema import RiskSignal, RiskSignalType
+from phoenix_project.monitor.logging import get_logger
 
-from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.execution.signal_protocol import Signal
-from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.core.schemas.risk_schema import RiskDecision
+log = get_logger("RiskManager")
 
-logger = get_logger(__name__)
 
 class RiskManager:
     """
-    Applies pre-trade risk controls and circuit breakers.
+    认知风险管理器。
+    负责评估系统状态、投资组合和市场数据，以识别和量化风险。
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initializes the RiskManager.
+    def __init__(self, cognitive_engine: "CognitiveEngine"):
+        self.cognitive_engine = cognitive_engine
+        self.config = cognitive_engine.config.get("risk_manager", {})
         
-        Args:
-            config: The strategy configuration.
-        """
-        self.config = {}
-        self.set_config(config) # Apply initial config
-        
-        # 跟踪已触发的断路器
-        self.circuit_breakers_tripped: Dict[str, bool] = {}
-        
-        # [✅ 优化] 存储用于最大回撤的状态
-        self._peak_portfolio_value: float = -1.0
-        self._current_portfolio_value: float = 0.0
-        
-        logger.info("RiskManager initialized.")
+        # [✅ 优化] 从配置加载阈值
+        self.stop_loss_threshold = self.config.get("stop_loss_threshold", 0.05)  # 5% 止损
+        self.max_drawdown_threshold = self.config.get("max_drawdown_threshold", 0.15) # 15% 最大回撤
+        self.volatility_threshold = self.config.get("volatility_threshold", 0.03) # 3% 日波动率
+        self.concentration_threshold = self.config.get("concentration_threshold", 0.25) # 25% 集中度
 
-    def set_config(self, config: Dict[str, Any]):
-        """
-        Dynamically updates the component's configuration.
-        """
-        self.config = config.get('risk_manager', {})
-        logger.info(f"RiskManager config set: {self.config}")
+        # [✅ 优化] 持久化峰值权益
+        # 
+        # 
+        try:
+            initial_capital = self.cognitive_engine.pipeline_state.portfolio.initial_capital
+        except AttributeError:
+            log.warning("Could not find initial_capital in pipeline_state. Defaulting peak_equity to 0.")
+            initial_capital = 0.0
+            
+        self.peak_equity = initial_capital
+        
+        log.info(f"RiskManager initialized. StopLoss: {self.stop_loss_threshold}, "
+                   f"MaxDrawdown: {self.max_drawdown_threshold}, Initial Peak Equity: {self.peak_equity}")
 
-    def _get_current_portfolio_value(self, state: 'CurrentState') -> float:
-        """ 辅助方法：计算当前总权益 """
-        balance = state.get_balance()
-        all_holdings = state.get_all_holdings()
-        market_data = state.get_all_market_data()
-        
-        total_equity = balance
-        
-        for sym, qty in all_holdings.items():
-            price = market_data.get(sym, {}).get('close')
-            if price is not None and price > 0:
-                position_value = qty * price
-                total_equity += position_value
-        
-        return total_equity
-
-    def evaluate_and_adjust(
-        self, 
-        signal: Signal, 
-        pipeline_state: PipelineState
-    ) -> Signal:
+    def assess_risk(self) -> List[RiskSignal]:
         """
-        Evaluates a signal against risk rules and adjusts it (e.g., veto).
-        
-        [任务 C.3] TODO: Implement checks for total leverage/allocation.
+        运行所有风险检查并返回发现的风险信号。
         """
-        
-        # 如果任何断路器被触发，否决所有新信号
-        if any(self.circuit_breakers_tripped.values()):
-            logger.critical(f"CIRCUIT BREAKER TRIPPED. Rejecting all new signals. Breakers: {self.circuit_breakers_tripped}")
-            signal.quantity = 0.0
-            signal.metadata['risk_veto'] = "CircuitBreakerTripped"
-            return signal
-
-        symbol = signal.symbol
+        log.debug("Running risk assessment...")
+        signals = []
         
         try:
-            current_state = pipeline_state.get_current_state()
-            all_holdings = current_state.get_all_holdings()
-            balance = current_state.get_balance()
-            market_data = current_state.get_all_market_data()
+            portfolio = self.cognitive_engine.pipeline_state.portfolio
+            market_data = self.cognitive_engine.pipeline_state.latest_market_data
             
-            # (计算总权益)
-            self._current_portfolio_value = self._get_current_portfolio_value(current_state)
-            total_equity = self._current_portfolio_value
-            if total_equity <= 0:
-                logger.critical(f"Total equity is {total_equity:.2f}. Rejecting signal.")
-                signal.quantity = 0.0
-                signal.metadata['risk_veto'] = "ZeroOrNegativeEquity"
-                return signal
-                
-            # (计算总毛曝险和杠杆)
-            total_gross_exposure = 0.0
-            for sym, qty in all_holdings.items():
-                price = market_data.get(sym, {}).get('close')
-                if price is not None and price > 0:
-                    total_gross_exposure += abs(qty * price)
+            if not portfolio or not market_data:
+                log.warning("Portfolio or Market Data not available. Skipping risk assessment.")
+                return []
 
-            current_leverage = total_gross_exposure / total_equity
-            max_leverage = self.config.get('max_total_leverage', 3.0)
+            # 
+            current_equity = portfolio.total_equity
 
-            # 1. [任务 C.3] 检查总杠杆
-            if current_leverage > max_leverage:
-                logger.warning(
-                    f"Risk VETO check: Current leverage ({current_leverage:.2f}x) exceeds limit ({max_leverage}x)."
-                )
-                
-                # 杠杆已超限。否决任何 *增加* 风险的交易
-                current_qty = all_holdings.get(signal.symbol, 0.0)
-                current_price = market_data.get(signal.symbol, {}).get('close', 0)
-                new_qty = current_qty + signal.quantity
-                
-                # 检查信号是否在增加绝对仓位价值
-                if abs(new_qty * current_price) > abs(current_qty * current_price):
-                    logger.warning(
-                        f"Rejecting risk-increasing signal for {signal.symbol} due to max leverage breach."
-                    )
-                    signal.quantity = 0.0 # 否决
-                    signal.metadata['risk_veto'] = "MaxLeverageBreached"
-                    return signal # 提前返回
-
-        except Exception as e:
-            logger.error(f"Error during C.3 leverage check: {e}", exc_info=True)
-            # 安全起见，如果风险检查失败，否决交易
-            signal.quantity = 0.0
-            signal.metadata['risk_veto'] = "RiskCheckFailed"
-            return signal
-
-        # 2. [✅ 优化] 检查止损 (Stop-Loss)
-        # FIXME: 未实现。
-        # 要实现基于价格的止损，PipelineState 需要跟踪每个仓位的
-        # 平均入场价格 (average entry price)。
-        # 目前 `get_all_holdings()` 只有一个 `qty` 字典。
-        logger.warning("FIXME: Stop-Loss check not implemented (requires position entry price in PipelineState).")
-        
-        # 3. [✅ 优化] 检查最大仓位限制
-        try:
-            max_position_pct = self.config.get('max_position_pct', 0.10) # 占总权益的 10%
-            current_price = market_data.get(symbol, {}).get('close')
+            signals.extend(self.check_stop_loss(portfolio, market_data))
+            signals.extend(self.check_max_drawdown(current_equity))
+            signals.extend(self.check_concentration(portfolio))
+            signals.extend(self.check_volatility(market_data))
             
-            if current_price is not None and current_price > 0:
-                current_qty = all_holdings.get(symbol, 0.0)
-                new_qty = current_qty + signal.quantity
-                new_position_value = abs(new_qty * current_price)
-                
-                position_limit_value = total_equity * max_position_pct
-                
-                if new_position_value > position_limit_value:
-                    logger.warning(
-                        f"Risk VETO check: New position value for {symbol} ({new_position_value:.2f}) "
-                        f"exceeds limit ({position_limit_value:.2f} / {max_position_pct*100}% of equity)."
-                    )
-                    
-                    # 调整信号大小以匹配限制，而不是完全否决
-                    allowed_qty_abs = position_limit_value / current_price
-                    # 保持信号方向
-                    allowed_qty = allowed_qty_abs if new_qty > 0 else -allowed_qty_abs
-                    
-                    # 计算调整后的信号数量
-                    adjusted_signal_qty = allowed_qty - current_qty
-                    
-                    # 确保我们不会因为调整而翻转方向
-                    if (signal.quantity > 0 and adjusted_signal_qty < 0) or \
-                       (signal.quantity < 0 and adjusted_signal_qty > 0):
-                        signal.quantity = 0.0 # 不允许增加仓位
-                    else:
-                        signal.quantity = adjusted_signal_qty
-                        
-                    signal.metadata['risk_veto'] = "MaxPositionSizeBreached"
-                    logger.info(f"Signal for {symbol} quantity adjusted to {signal.quantity:.4f} to respect max position size.")
-                    
+            if signals:
+                log.warning(f"Risk assessment generated {len(signals)} signals.")
             else:
-                logger.warning(f"Cannot perform max position check for {symbol}: No price data.")
+                log.debug("Risk assessment complete. No immediate risks detected.")
 
         except Exception as e:
-            logger.error(f"Error during Max Position check: {e}", exc_info=True)
-            signal.quantity = 0.0
-            signal.metadata['risk_veto'] = "RiskCheckFailed"
-            return signal
-
-
-        logger.debug(f"Signal for {symbol} (Qty: {signal.quantity}) passed risk evaluation.")
-        return signal
-
-    def check_circuit_breakers(self, pipeline_state: PipelineState) -> Optional[RiskDecision]:
-        """
-        Checks for portfolio-level circuit breakers (e.g., max drawdown).
-        """
-        
-        # [✅ 优化] 检查最大回撤 (Max Drawdown)
-        # FIXME: 这是一个简化的实现。
-        # 'pipeline_state' 应该在每个周期结束时调用此方法来更新 PnL。
-        # 峰值权益应该被持久化 (e.g., in Redis or DB) 以便在重启后幸存。
-        
-        try:
-            # 1. 更新当前权益 (已在 evaluate_and_adjust 中计算, 但这里再次计算以保持独立)
-            current_state = pipeline_state.get_current_state()
-            self._current_portfolio_value = self._get_current_portfolio_value(current_state)
-            
-            # 2. 更新峰值权益
-            if self._current_portfolio_value > self._peak_portfolio_value:
-                self._peak_portfolio_value = self._current_portfolio_value
-                logger.info(f"New peak portfolio value reached: {self._peak_portfolio_value:.2f}")
-
-            # 3. 检查回撤
-            max_drawdown_limit = self.config.get('max_drawdown_pct', 0.20) # 20%
-            
-            if self._peak_portfolio_value > 0: # 避免在开始时除以零
-                current_drawdown = (self._peak_portfolio_value - self._current_portfolio_value) / self._peak_portfolio_value
-                
-                if current_drawdown > max_drawdown_limit:
-                    logger.critical(
-                        f"CIRCUIT BREAKER: Max drawdown {current_drawdown*100:.2f}% breached limit {max_drawdown_limit*100:.2f}%. "
-                        f"(Peak: {self._peak_portfolio_value:.2f}, Current: {self._current_portfolio_value:.2f})"
-                    )
-                    self.circuit_breakers_tripped['max_drawdown'] = True
-                    return RiskDecision(
-                        decision="HALT_TRADING",
-                        reason=f"Max drawdown breached: {current_drawdown*100:.2f}%"
-                    )
-            
-        except Exception as e:
-            logger.error(f"Error during Max Drawdown check: {e}", exc_info=True)
-            # 安全起见，触发断路器
-            self.circuit_breakers_tripped['drawdown_check_failed'] = True
-            return RiskDecision(
-                decision="HALT_TRADING",
-                reason=f"Failed to check max drawdown: {e}"
+            log.error(f"Error during risk assessment: {e}", exc_info=True)
+            signals.append(
+                RiskSignal(
+                    type=RiskSignalType.SYSTEM_ERROR,
+                    message=f"Risk assessment failed: {e}",
+                    level=10,
+                )
             )
             
-        return None
+        return signals
 
-    async def trip_system_circuit_breaker(self, reason: str):
+    def check_stop_loss(self, portfolio: Any, market_data: Dict[str, Any]) -> List[RiskSignal]:
         """
-        [✅ 新增] 由 ErrorHandler 调用的外部触发器，用于停止系统。
+        [✅ 优化] 检查止损 (Stop-Loss)。
+        遍历所有持仓，检查是否达到了止损阈值。
         """
-        if not self.circuit_breakers_tripped.get('system_error'):
-            logger.critical(f"SYSTEM CIRCUIT BREAKER TRIPPED by ErrorHandler: {reason}")
-            self.circuit_breakers_tripped['system_error'] = True
-            # 在真实的系统中，这会：
-            # 1. 向 ContextBus 广播 "HALT_TRADING" 事件
-            # 2. 触发 Execution (OrderManager) 清算所有仓位
-            # 3. 停止 LoopManager
-            # 目前，我们只设置标志并记录。
+        signals = []
+        if not hasattr(portfolio, 'positions') or not portfolio.positions:
+            return signals
+
+        log.debug(f"Checking stop-loss for {len(portfolio.positions)} positions...")
+        
+        for position in portfolio.positions:
+            try:
+                symbol = position.symbol
+                
+                # 
+                if not hasattr(position, 'entry_price') or position.entry_price <= 0:
+                    log.warning(f"Position {symbol} missing valid entry_price. Skipping stop-loss check.")
+                    continue
+                    
+                if symbol not in market_data or 'price' not in market_data[symbol]:
+                    log.warning(f"No current market price for {symbol}. Skipping stop-loss check.")
+                    continue
+
+                current_price = market_data[symbol]['price']
+                entry_price = position.entry_price
+                
+                # 
+                loss_percent = (entry_price - current_price) / entry_price
+                
+                # 
+                if loss_percent > self.stop_loss_threshold:
+                    log.warning(f"STOP-LOSS triggered for {symbol}. Loss: {loss_percent:.2%}")
+                    signals.append(
+                        RiskSignal(
+                            type=RiskSignalType.STOP_LOSS,
+                            message=f"Stop-loss triggered for {symbol}. "
+                                    f"Current Loss: {loss_percent:.2%} "
+                                    f"(Entry: {entry_price}, Current: {current_price})",
+                            level=8,
+                            affected_symbols=[symbol],
+                        )
+                    )
+            except Exception as e:
+                log.error(f"Error checking stop-loss for position {getattr(position, 'symbol', 'UNKNOWN')}: {e}")
+
+        return signals
+
+
+    def check_max_drawdown(self, current_equity: float) -> List[RiskSignal]:
+        """
+        [✅ 优化] 检查最大回撤 (Max Drawdown)。
+        使用持久化的 peak_equity。
+        """
+        signals = []
+        
+        # 
+        self.peak_equity = max(self.peak_equity, current_equity)
+        
+        if self.peak_equity == 0:
+             log.debug("Peak equity is 0, skipping drawdown check.")
+             return signals # 
+
+        drawdown = (self.peak_equity - current_equity) / self.peak_equity
+        log.debug(f"Drawdown check: Current={current_equity}, Peak={self.peak_equity}, Drawdown={drawdown:.2%}")
+
+        if drawdown > self.max_drawdown_threshold:
+            log.critical(f"MAX DRAWDOWN breached. Drawdown: {drawdown:.2%}")
+            signals.append(
+                RiskSignal(
+                    type=RiskSignalType.MAX_DRAWDOWN,
+                    message=f"Max drawdown threshold breached. "
+                            f"Current Drawdown: {drawdown:.2%} "
+                            f"(Peak Equity: {self.peak_equity}, Current Equity: {current_equity})",
+                    level=10, # 
+                )
+            )
+        return signals
+
+    def check_concentration(self, portfolio: Any) -> List[RiskSignal]:
+        """
+        检查投资组合集中度。
+        """
+        signals = []
+        if not hasattr(portfolio, 'positions_value') or not portfolio.positions_value:
+            return signals
+
+        total_value = portfolio.total_equity
+        if total_value == 0:
+            return signals
+
+        for symbol, value in portfolio.positions_value.items():
+            concentration = value / total_value
+            if concentration > self.concentration_threshold:
+                log.warning(f"High concentration risk for {symbol}. Concentration: {concentration:.2%}")
+                signals.append(
+                    RiskSignal(
+                        type=RiskSignalType.CONCENTRATION,
+                        message=f"High portfolio concentration in {symbol}. "
+                                f"Concentration: {concentration:.2%}",
+                        level=6,
+                        affected_symbols=[symbol],
+                    )
+                )
+        return signals
+
+    def check_volatility(self, market_data: Dict[str, Any]) -> List[RiskSignal]:
+        """
+        检查市场波动性 (简化)。
+        """
+        # 
+        # 
+        signals = []
+        for symbol, data in market_data.items():
+            if "change_pct" in data and abs(data["change_pct"]) > self.volatility_threshold:
+                log.warning(f"High volatility detected for {symbol}. Change: {data['change_pct']:.2%}")
+                signals.append(
+                    RiskSignal(
+                        type=RiskSignalType.VOLATILITY,
+                        message=f"High volatility detected in {symbol}. "
+                                f"Daily Change: {data['change_pct']:.2%}",
+                        level=5,
+                        affected_symbols=[symbol],
+                    )
+                )
+        return signals
