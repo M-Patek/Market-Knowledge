@@ -1,110 +1,114 @@
-import json
-import logging
-from typing import List, Any, Generator, AsyncGenerator
-import time
+from typing import Dict, Any, List
+from Phoenix_project.agents.l1.base import L1BaseAgent
+from Phoenix_project.core.schemas.data_schema import MarketEvent
+from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
+from Phoenix_project.ai.prompt_renderer import PromptRenderer
+from Phoenix_project.reasoning.compressor import ContextCompressor
+from Phoenix_project.monitor.logging import get_logger
 
-from Phoenix_project.agents.l1.base import L1Agent
-from Phoenix_project.core.schemas.task_schema import Task
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
+logger = get_logger(__name__)
 
-# 获取日志记录器
-logger = logging.getLogger(__name__)
-
-class FundamentalAnalystAgent(L1Agent):
+class FundamentalAnalystAgent(L1BaseAgent):
     """
-    L1 智能体：基本面分析师
-    评估目标资产的内在价值、财务健康状况和盈利增长。
+    L1 Agent specializing in fundamental analysis based on news,
+    filings, and earnings reports.
     """
+
     def __init__(
         self,
         agent_id: str,
-        llm_client: Any,
-        data_manager: Any,
+        config: Dict[str, Any],
+        reasoning_ensemble: ReasoningEnsemble,
+        prompt_renderer: PromptRenderer,
+        compressor: ContextCompressor
     ):
         """
-        初始化 FundamentalAnalystAgent。
-        
-        参数:
-            agent_id (str): 智能体的唯一标识符。
-            llm_client (Any): 用于与 LLM API 交互的客户端 (例如 EnsembleClient)。
-            data_manager (Any): 用于检索数据的 DataManager。
+        Initializes the FundamentalAnalystAgent.
         """
-        super().__init__(
-            agent_id=agent_id,
-            llm_client=llm_client,
-            data_manager=data_manager
-        )
-        logger.info(f"[{self.agent_id}] FundamentalAnalystAgent initialized.")
+        super().__init__(agent_id, config, reasoning_ensemble, prompt_renderer)
+        self.compressor = compressor
+        self.prompt_name = "l1_fundamental_analyst"
+        logger.info(f"FundamentalAnalystAgent (ID: {agent_id}) initialized.")
 
-    async def run(self, task: Task, context: List[Any]) -> AsyncGenerator[EvidenceItem, None]:
+    async def run(self, event: MarketEvent, context_window: List[MarketEvent]) -> Dict[str, Any]:
         """
-        异步运行智能体以执行基本面分析。
+        Processes a single market event (e.g., news) and generates
+        a fundamental analysis.
         
-        参数:
-            task (Task): 分配给智能体的任务。
-            context (List[Any]): 智能体运行所需的附加上下文（例如，原始文档）。
-
-        收益:
-            AsyncGenerator[EvidenceItem, None]: 异步生成一个或多个 EvidenceItem。
+        [任务 C.2] TODO: Optimize context compression.
         """
-        logger.info(f"[{self.agent_id}] Running fundamental analysis for task: {task.task_id} on symbols: {task.symbols}")
-
-        if not task.symbols:
-            logger.warning(f"[{self.agent_id}] Task {task.task_id} has no symbols. Skipping.")
-            return
-
-        # 1. 准备 Prompt 的上下文
-        # 我们假设任务只针对一个主要符号，或者我们将为第一个符号执行分析
-        symbol = task.symbols[0]
         
-        # 将上下文（可能是 Document 对象）转换为字符串
-        # TODO: 优化上下文压缩
-        context_str = "\n---\n".join([doc.content for doc in context if hasattr(doc, 'content')])
+        symbol = event.get('symbol', 'N/A')
+        logger.debug(f"{self.agent_id} processing event for {symbol}...")
         
-        if not context_str:
-            logger.warning(f"[{self.agent_id}] No string content found in context for task {task.task_id}. Skipping.")
-            return
+        # [任务 C.2] 已实现：优化上下文压缩
+        try:
+            # 1. 将上下文窗口转换为单个文本块
+            context_text = " ".join([
+                f"Event: {evt.get('summary', str(evt.get('data', '')))} @ {evt.get('timestamp')}" 
+                for evt in context_window
+                if evt.get('summary') or evt.get('data') # 确保有内容
+            ])
+            
+            if context_text:
+                # 2. 压缩文本块
+                compressed_context = self.compressor.compress_text(context_text, max_tokens=1000)
+            else:
+                compressed_context = "No relevant historical context found."
+                
+        except Exception as e:
+            logger.warning(f"Failed to compress context window: {e}. Using raw event data.")
+            # 回退：仅使用当前事件的摘要
+            compressed_context = event.get('summary') or str(event.get('data', ''))
 
-        context_map = {
+        # 2. 准备 Prompt 上下文
+        render_context = {
             "symbol": symbol,
-            "context": context_str
+            "summary": event.get('summary', 'No summary provided.'),
+            "source": event.get('source', 'Unknown source'),
+            "historical_context": compressed_context # [任务 C.2] 使用压缩后的上下文
         }
         
-        agent_prompt_name = "l1_fundamental_analyst" # 对应于 l1_fundamental_analyst.json
-
+        # 3. 渲染 Prompt
         try:
-            # 2. 异步调用 LLM
-            # 我们假设 llm_client 有一个 'run_llm_task' 方法
-            logger.debug(f"[{self.agent_id}] Calling LLM with prompt: {agent_prompt_name} for symbol: {symbol}")
+            rendered_prompt = self.prompt_renderer.render(
+                self.prompt_name,
+                render_context
+            )
+        except Exception as e:
+            logger.error(f"Failed to render prompt {self.prompt_name}: {e}", exc_info=True)
+            return self.generate_error_response(f"Prompt rendering failed: {e}")
             
-            response_str = await self.llm_client.run_llm_task(
-                agent_prompt_name=agent_prompt_name,
-                context_map=context_map
+        # 4. 调用推理
+        try:
+            # 假设 reasoning_ensemble.invoke 接受渲染后的 prompt
+            analysis = await self.reasoning_ensemble.invoke(
+                agent_id=self.agent_id,
+                prompt=rendered_prompt
             )
             
-            if not response_str:
-                logger.warning(f"[{self.agent_id}] LLM returned no response for task {task.task_id}.")
-                return
+            # 5. 格式化输出
+            analysis['agent_name'] = self.agent_id
+            analysis['symbol'] = symbol
+            analysis['source_event_id'] = event.get('id')
+            
+            logger.info(f"{self.agent_id} generated analysis for {symbol}.")
+            return analysis
 
-            # 3. 解析和验证 JSON 输出
-            logger.debug(f"[{self.agent_id}] Received LLM response (raw): {response_str[:200]}...")
-            response_data = json.loads(response_str)
-            
-            # 4. 验证并生成 EvidenceItem
-            # Pydantic 模型的 model_validate 会自动验证 schema
-            evidence = EvidenceItem.model_validate(response_data)
-            
-            # 确保 agent_id 被正确设置
-            evidence.agent_id = self.agent_id
-            
-            logger.info(f"[{self.agent_id}] Successfully generated evidence for {symbol} with confidence {evidence.confidence}")
-            yield evidence
-
-        except json.JSONDecodeError as e:
-            logger.error(f"[{self.agent_id}] Failed to decode LLM JSON response for task {task.task_id}. Error: {e}")
-            logger.debug(f"[{self.agent_id}] Faulty JSON string: {response_str}")
-            return
         except Exception as e:
-            # 捕获其他潜在错误（例如 Pydantic 验证错误, API 调用失败）
-            logger.error(f"[{self.agent_id}] An error occurred during agent run for task {task.task_id}. Error: {e}")
-            return
+            logger.error(f"{self.agent_id} failed during reasoning: {e}", exc_info=True)
+            return self.generate_error_response(f"Reasoning ensemble failed: {e}")
+
+    def generate_error_response(self, error_msg: str) -> Dict[str, Any]:
+        """
+        Creates a standardized error response.
+        """
+        return {
+            "agent_name": self.agent_id,
+            "error": error_msg,
+            "sentiment_label": "NEUTRAL",
+            "sentiment_score": 0.5,
+            "confidence": 0.0,
+            "key_drivers": [],
+            "key_risks": []
+        }
