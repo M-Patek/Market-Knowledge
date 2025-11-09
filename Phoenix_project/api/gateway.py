@@ -14,7 +14,10 @@ class APIGateway:
     Uses GeminiPoolManager for concurrent requests.
     """
 
+    # [任务 5 已修改] __init__
     def __init__(self, config_loader: ConfigLoader, pool_size: int = 10):
+        # api_key 是单数, 用于 genai.configure。
+        # PoolManager 将从 os.environ 加载 API_KEYS (复数)。
         api_key = config_loader.get_secret("GEMINI_API_KEY")
         if not api_key:
             logger.error("GEMINI_API_KEY not found in environment.")
@@ -22,20 +25,36 @@ class APIGateway:
         
         genai.configure(api_key=api_key)
         
-        # MODIFICATION: 传递 config 字典以匹配 PoolManager 的 __init__
-        # TODO: 从 config_loader 加载 QPM limits
+        # --- [任务 5 已实现] ---
+        # 1. 从 config_loader 加载 system.yaml
+        system_config = config_loader.load_config('system.yaml')
+        if not system_config:
+             logger.warning("api/gateway.py: 无法加载 system.yaml。将使用默认 QPM 限制。")
+             system_config = {}
+
+        # 2. 从 system.yaml (或回退) 中提取 QPM 限制
+        # (注意: 'gemini_qpm_limits' 在 system.yaml 中不存在,
+        # 所以 qpm_limits_from_config 将是一个空字典,
+        # PoolManager 将使用其内部的 DEFAULT_QPM_LIMITS)
+        qpm_limits_from_config = system_config.get("ai", {}).get("gemini_qpm_limits", {})
+        if not qpm_limits_from_config:
+             logger.warning("在 system.yaml 的 'ai.gemini_qpm_limits' 中未找到 QPM 限制。")
+
         gemini_config = {
-            "gemini_qpm_limits": config_loader.get("gemini_qpm_limits", {})
+            "gemini_qpm_limits": qpm_limits_from_config
+            # (pool_size 似乎没有被 PoolManager 使用, 将其移除)
         }
 
+        # 3. 修复 PoolManager 的实例化
+        # (它只接受 'config', 不接受 'api_key' 或 'pool_size')
         self.pool_manager = GeminiPoolManager(
-            api_key=api_key,
-            config=gemini_config, # 传递 config 字典
-            pool_size=pool_size   # 传递 pool_size
+            config=gemini_config # 传递 config 字典
         )
+        # --- [任务 5 结束] ---
         
-        # 从 config_loader 加载安全设置和生成配置
-        self.default_safety_settings = config_loader.get(
+        
+        # [任务 5 修复] 从 system_config 加载, 而不是 config_loader
+        self.default_safety_settings = system_config.get(
             "gemini_safety_settings",
             [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -45,7 +64,8 @@ class APIGateway:
             ]
         )
         
-        self.default_generation_config = config_loader.get(
+        # [任务 5 修复] 从 system_config 加载
+        self.default_generation_config = system_config.get(
             "gemini_generation_config",
             {
                 "candidate_count": 1,
@@ -56,7 +76,7 @@ class APIGateway:
             }
         )
         
-        logger.info(f"APIGateway initialized with pool size {pool_size}.")
+        logger.info(f"APIGateway initialized.") # 移除了 pool_size
 
     async def send_request(
         self,
@@ -201,6 +221,16 @@ if __name__ == "__main__":
                     if key == "gemini_qpm_limits":
                         return {} # Use defaults
                     return default
+                
+                # [任务 5 修复] 添加 load_config
+                def load_config(self, filename):
+                    if filename == 'system.yaml':
+                        return {
+                            "ai": {
+                                # "gemini_qpm_limits": {"gemini-pro": 1} # (测试 QPM)
+                            }
+                        }
+                    return {}
 
             
             config_loader = MockConfigLoader()
