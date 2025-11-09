@@ -1,7 +1,12 @@
 import asyncio
 import httpx  # [✅ 修复] 阶段 5 添加
 import os     # [✅ 修复] 阶段 5 添加
+from typing import Optional, TYPE_CHECKING # [✅ 优化] 添加导入
 from Phoenix_project.monitor.logging import get_logger
+
+# [✅ 优化] 避免循环导入，仅用于类型提示
+if TYPE_CHECKING:
+    from Phoenix_project.cognitive.risk_manager import RiskManager
 
 logger = get_logger(__name__)
 
@@ -34,9 +39,8 @@ class ErrorHandler:
         error: Exception,
         component: str,
         context: dict,
-        # We need a way to trigger actions, e.g., via the orchestrator
-        # or event distributor, passed during init.
-        # For simplicity, we'll just log and suggest actions.
+        # [✅ 优化] 添加 risk_manager 参数以触发断路器
+        risk_manager: Optional['RiskManager'] = None
     ):
         """
         Main error handling entry point.
@@ -45,6 +49,7 @@ class ErrorHandler:
             error (Exception): The exception that occurred.
             component (str): Name of the component that failed (e.g., "CognitiveEngine").
             context (dict): Context about what was happening (e.g., "decision_id").
+            risk_manager (Optional[RiskManager]): RiskManager 实例以触发断路器。
         """
         
         decision_id = context.get("decision_id", "N/A")
@@ -62,16 +67,25 @@ class ErrorHandler:
         # This is complex; the *caller* usually manages its own retries.
         # This handler is more for *unrecoverable* errors.
         
-        # 2. Check for circuit breaker
+        # 2. [✅ 优化] 检查并触发断路器
         if self.failure_counts[component] > self.max_retries:
+            reason = f"Component '{component}' has failed {self.failure_counts[component]} consecutive times."
             logger.critical(
-                f"Component '{component}' has failed {self.failure_counts[component]} consecutive times. "
-                "This may require a circuit breaker!"
+                f"{reason} Triggering system circuit breaker!"
             )
-            # In a real system:
-            # await self.risk_manager.trip_circuit_breaker(
-            #     f"Component '{component}' failed repeatedly."
-            # )
+            
+            # [✅ 优化] 实施断路器触发
+            if risk_manager:
+                try:
+                    await risk_manager.trip_system_circuit_breaker(reason)
+                    logger.info(f"Successfully requested circuit breaker trip via RiskManager for component {component}.")
+                except Exception as trip_e:
+                    logger.critical(f"Failed to trip circuit breaker! Error: {trip_e}", exc_info=True)
+            else:
+                logger.error(
+                    "RiskManager was not provided to ErrorHandler. "
+                    "Cannot trip circuit breaker programmatically!"
+                )
             
         # 3. Send notification (e.g., to Sentry, PagerDuty)
         await self.send_alert(error, component, context)
