@@ -1,174 +1,207 @@
-import os
 import asyncio
-import json
-import logging
-from kafka import KafkaProducer
-import alpaca_trade_api as tradeapi
-from alpaca_trade_api.stream import Stream
-from alpaca_trade_api.common import URL
-from datetime import datetime
+import random
+from typing import Callable, Coroutine, Any, Dict
 
-# 假设的配置加载器和数据模式
-# 在实际应用中，您会从您的项目中导入这些
-try:
-    from Phoenix_project.config.loader import ConfigLoader
-    from Phoenix_project.core.schemas.data_schema import MarketData, NewsData
-except ImportError:
-    logging.warning("无法导入 Phoenix_project 组件。将使用基本的 dict。")
-    # --- Fallback Schemas (用于独立运行) ---
-    from pydantic import BaseModel # 假设 pydantic 可用
-    class ConfigLoader:
-        def __init__(self, path):
-            self.config_path = path
-        def load_config(self, name):
-            # 模拟加载，在实际部署中会从 system.yaml 读取
-            logging.info(f"模拟加载配置: {name}")
-            return {
-                "system": {"environment": "production"},
-                "broker": {"base_url": "https://paper-api.alpaca.markets"}
-            }
-    class MarketData(BaseModel):
-        symbol: str
-        timestamp: datetime
-        open: float
-        high: float
-        low: float
-        close: float
-        volume: float
-    class NewsData(BaseModel):
-        id: str
-        source: str
-        timestamp: datetime
-        symbols: list
-        content: str
-        headline: str
-        metadata: dict = {}
+from .core.schemas.data_schema import TradeData, QuoteData, MarketData, MarketDataSource
+from .monitor.logging import get_logger
 
-# --- 日志设置 ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [DataProducer] - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# --- Kafka 主题 ---
-TOPIC_MARKET_DATA = "phoenix_market_data"
-TOPIC_NEWS_EVENTS = "phoenix_news_events"
-
-# --- Kafka 生产者 ---
-def get_kafka_producer():
-    kafka_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'kafka:29092')
-    logger.info(f"正在连接到 Kafka: {kafka_servers}")
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=kafka_servers.split(','),
-            value_serializer=lambda v: json.dumps(v, default=str).encode('utf-8')
-        )
-        logger.info("Kafka 生产者连接成功。")
-        return producer
-    except Exception as e:
-        logger.critical(f"无法连接到 Kafka: {e}", exc_info=True)
-        return None
-
-# --- Alpaca 回调 ---
-
-async def on_trade(trade):
+class DataProducer:
     """
-    处理实时行情数据 (trade)。
-    按照计划，我们将一个 trade 转换为 MarketData 模式。
+    模拟来自数据源（如交易所）的实时市场数据流。
+    这个类用于测试和演示，模拟生成数据并将其推送到事件流。
     """
-    global producer # 确保回调可以访问全局生产者
-    logger.debug(f"收到 Trade: {trade}")
-    try:
-        # 关键逻辑：将 Trade 映射到 MarketData (OHLCV)
-        # 这是一个模拟，因为 trade 只有一个价格点。
-        market_data_obj = MarketData(
-            symbol=trade.symbol,
-            timestamp=trade.timestamp.to_pydatetime(), # 转换为 Pydantic 兼容的 datetime
-            open=trade.price,
-            high=trade.price,
-            low=trade.price,
-            close=trade.price,
-            volume=trade.size
-        )
-        # .model_dump() 是 Pydantic v2+ 的方法
-        # .dict() 是 v1 的方法
-        market_data_dict = market_data_obj.dict() if hasattr(market_data_obj, 'dict') else market_data_obj.model_dump()
-
-        producer.send(TOPIC_MARKET_DATA, market_data_dict)
-        logger.info(f"已发送 MarketData (来自 Trade) 到 Kafka: {trade.symbol} @ {trade.price}")
-    except Exception as e:
-        logger.error(f"处理 Trade 失败: {e}", exc_info=True)
-
-async def on_news(news):
-    """
-    处理实时新闻数据。
-    """
-    global producer # 确保回调可以访问全局生产者
-    logger.debug(f"收到 News: {news.headline}")
-    try:
-        # NewsData 模式与 Alpaca news 对象的字段匹配
-        news_data_obj = NewsData(
-            id=str(news.id), # 确保 ID 是字符串
-            source=news.source,
-            timestamp=news.created_at.to_pydatetime(), # 转换
-            symbols=news.symbols,
-            content=news.content,
-            headline=news.headline
-        )
-        # .model_dump() 是 Pydantic v2+ 的方法
-        # .dict() 是 v1 的方法
-        news_data_dict = news_data_obj.dict() if hasattr(news_data_obj, 'dict') else news_data_obj.model_dump()
-        
-        producer.send(TOPIC_NEWS_EVENTS, news_data_dict)
-        logger.info(f"已发送 News 到 Kafka: {news.headline[:50]}...")
-    except Exception as e:
-        logger.error(f"处理 News 失败: {e}", exc_info=True)
-
-
-async def main():
-    logger.info("启动数据生产者服务...")
     
-    # 1. 加载配置 (用于 Alpaca base_url)
-    config_loader = ConfigLoader(os.environ.get('PHOENIX_CONFIG_PATH', 'config'))
-    system_config = config_loader.load_config('system.yaml')
-    
-    # 2. 获取 Alpaca 凭证
-    api_key = os.environ.get('ALPACA_API_KEY')
-    api_secret = os.environ.get('ALPACA_API_SECRET')
-    
-    if not api_key or not api_secret:
-        logger.critical("未找到 ALPACA_API_KEY 或 ALPACA_API_SECRET 环境变量。正在退出。")
-        return
+    def __init__(self, 
+                 event_callback: Callable[[MarketData], Coroutine[Any, Any, None]],
+                 data_source: MarketDataSource = MarketDataSource.SIMULATED):
+        """
+        初始化 DataProducer。
 
-    # 3. 确定 base_url (纸上交易或真实交易)
-    base_url = system_config.get("broker", {}).get("base_url", "https://paper-api.alpaca.markets")
-    logger.info(f"使用 Alpaca base_url: {base_url}")
-    
-    # 4. 初始化 Alpaca Stream
-    stream = Stream(
-        api_key,
-        api_secret,
-        base_url=URL(base_url),
-        data_feed='iex' # 'iex' 或 'sip' 取决于订阅
-    )
+        Args:
+            event_callback: 一个异步回调函数，用于处理生成的 MarketData 事件。
+            data_source: 数据源标识。
+        """
+        self.event_callback = event_callback
+        self.data_source = data_source
+        self._running = False
+        self._demo_task = None
+        self.last_prices: Dict[str, float] = {}
+        logger.info(f"DataProducer initialized with data source: {self.data_source}")
 
-    # 5. 订阅流
-    # (按照计划订阅 AAPL 和 MSFT 的行情，以及所有新闻)
-    logger.info("正在订阅 Alpaca topics...")
-    stream.subscribe_trades(on_trade, "AAPL", "MSFT")
-    stream.subscribe_news(on_news, "*")
+    async def on_trade(self, trade: TradeData):
+        """
+        处理传入的 TradeData 并将其转换为 MarketData (OHLCV) 事件。
 
-    logger.info("Alpaca Stream 订阅完成。正在运行...")
-    await stream.run()
-
-if __name__ == "__main__":
-    producer = get_kafka_producer() # 将生产者设为全局变量
-    if producer:
+        备注：这是一个更真实的模拟。在真实的系统中，
+        这个生产者可能会聚合一分钟内的多次交易来构建一个K线 (bar)，
+        或者直接从数据源接收K线。
+        为了进行合理的模拟，我们基于当前交易价格和最后价格来估算一个OHLCV K线。
+        """
         try:
-            asyncio.run(main())
-        except (KeyboardInterrupt, SystemExit):
-            logger.info("数据生产者正在关闭...")
-        finally:
-            producer.flush()
-            producer.close()
-            logger.info("Kafka 生产者已关闭。")
-    else:
-        logger.critical("无法初始化 Kafka 生产者。服务未启动。")
+            symbol = trade.symbol
+            price = trade.price
+            
+            # 从缓存中获取最后的价格，如果不存在则使用当前价格
+            open_price = self.last_prices.get(symbol, price)
+            
+            # 模拟高点和低点
+            # 假设高点是开盘价和收盘价中的较高者，再加一点随机波动
+            # 假设低点是开盘价和收盘价中的较低者，再减一点随机波动
+            high_price = max(open_price, price) + (price * random.uniform(0.0001, 0.0005))
+            low_price = min(open_price, price) - (price * random.uniform(0.0001, 0.0005))
+            
+            # 确保 H >= L
+            if low_price > high_price:
+                low_price, high_price = high_price, low_price
+            
+            # 确保价格在 [L, H] 范围内
+            open_price = max(low_price, min(high_price, open_price))
+            close_price = max(low_price, min(high_price, price)) # close price is the trade price
+            
+            # 模拟交易量
+            simulated_volume = (trade.volume or 1.0) * random.uniform(1.0, 5.0)
+            
+            market_data = MarketData(
+                symbol=symbol,
+                timestamp=trade.timestamp,
+                open=open_price,
+                high=high_price,
+                low=low_price,
+                close=close_price,
+                volume=simulated_volume,
+                source=self.data_source,
+                data_type='trade_derived_bar'
+            )
+            
+            # 更新最后的价格
+            self.last_prices[symbol] = price
+            
+            await self.event_callback(market_data)
+            logger.debug(f"Processed simulated bar for trade: {market_data}")
+            
+        except Exception as e:
+            logger.error(f"Error in on_trade: {e}", exc_info=True)
+
+    async def on_quote(self, quote: QuoteData):
+        """
+        处理传入的 QuoteData 并将其转换为 MarketData (OHLCV) 事件。
+
+        备注：报价数据 (bid/ask) 通常不直接生成K线。
+        这个模拟使用中间价 (mid-price) 来估算一个OHLCV K线。
+        """
+        try:
+            symbol = quote.symbol
+            if quote.bid_price <= 0 or quote.ask_price <= 0:
+                logger.warning(f"Skipping quote with invalid prices: {quote}")
+                return
+                
+            mid_price = (quote.bid_price + quote.ask_price) / 2.0
+            
+            # 从缓存中获取最后的价格，如果不存在则使用中间价
+            open_price = self.last_prices.get(symbol, mid_price)
+            
+            # 模拟高点和低点
+            spread = (quote.ask_price - quote.bid_price)
+            high_price = max(open_price, mid_price) + (spread * random.uniform(0.1, 0.5))
+            low_price = min(open_price, mid_price) - (spread * random.uniform(0.1, 0.5))
+            
+            if low_price > high_price:
+                low_price, high_price = high_price, low_price
+            
+            open_price = max(low_price, min(high_price, open_price))
+            close_price = max(low_price, min(high_price, mid_price))
+            
+            # 模拟交易量 (基于报价大小)
+            volume = (quote.bid_size + quote.ask_size) * random.uniform(0.05, 0.1)
+
+            market_data = MarketData(
+                symbol=symbol,
+                timestamp=quote.timestamp,
+                open=open_price,
+                high=high_price,
+                low=low_price,
+                close=close_price,
+                volume=volume,
+                source=self.data_source,
+                data_type='quote_derived_bar'
+            )
+            
+            # 更新最后的价格
+            self.last_prices[symbol] = mid_price
+            
+            await self.event_callback(market_data)
+            logger.debug(f"Processed simulated bar for quote: {market_data}")
+
+        except Exception as e:
+            logger.error(f"Error in on_quote: {e}", exc_info=True)
+
+    async def _run_demo_feed(self):
+        """
+        一个内部循环，用于在演示模式下生成模拟数据。
+        """
+        logger.info("Starting demo data feed...")
+        self._running = True
+        
+        symbols = ["BTC/USD", "ETH/USD"]
+        base_prices = {"BTC/USD": 60000.0, "ETH/USD": 3000.0}
+        
+        while self._running:
+            try:
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+                
+                symbol = random.choice(symbols)
+                base_price = base_prices[symbol]
+                
+                # 生成模拟交易
+                trade_price = base_price + random.uniform(-100, 100)
+                trade_volume = random.uniform(0.1, 5.0)
+                trade = TradeData(
+                    symbol=symbol,
+                    price=trade_price,
+                    volume=trade_volume,
+                    timestamp=asyncio.get_event_loop().time()
+                )
+                await self.on_trade(trade)
+                
+                # 更新基准价格以模拟市场波动
+                base_prices[symbol] = trade_price
+                
+                # 生成模拟报价 (偶尔)
+                if random.random() < 0.3:
+                    bid_price = trade_price - random.uniform(1, 5)
+                    ask_price = trade_price + random.uniform(1, 5)
+                    quote = QuoteData(
+                        symbol=symbol,
+                        bid_price=bid_price,
+                        ask_price=ask_price,
+                        bid_size=random.uniform(1, 10),
+                        ask_size=random.uniform(1, 10),
+                        timestamp=asyncio.get_event_loop().time()
+                    )
+                    await self.on_quote(quote)
+
+            except asyncio.CancelledError:
+                logger.info("Demo data feed cancelled.")
+                self._running = False
+            except Exception as e:
+                logger.error(f"Error in demo feed loop: {e}", exc_info=True)
+                await asyncio.sleep(5) # 发生错误时稍作等待
+
+    def start_demo(self):
+        """启动模拟数据流。"""
+        if not self._running:
+            self._demo_task = asyncio.create_task(self._run_demo_feed())
+            logger.info("Demo data producer started.")
+        else:
+            logger.warning("Demo data producer is already running.")
+
+    def stop_demo(self):
+        """停止模拟数据流。"""
+        if self._running and self._demo_task:
+            self._demo_task.cancel()
+            self._running = False
+            logger.info("Demo data producer stopped.")
+        else:
+            logger.warning("Demo data producer is not running.")
