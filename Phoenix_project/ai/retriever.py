@@ -1,333 +1,234 @@
 import asyncio
-from typing import List, Dict, Any, Optional, Tuple
-from sentence_transformers import CrossEncoder
-import json
-
-from Phoenix_project.ai.embedding_client import EmbeddingClient
-from Phoenix_project.memory.vector_store import BaseVectorStore, Document
-from Phoenix_project.memory.cot_database import CoTDatabase
-from Phoenix_project.knowledge_graph_service import KnowledgeGraphService
-from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.config.loader import ConfigLoader
-from Phoenix_project.ai.temporal_db_client import TemporalDBClient
-from Phoenix_project.ai.tabular_db_client import TabularDBClient
-
-logger = get_logger(__name__)
+from typing import List, Dict, Any, Optional
+from langchain_core.documents import Document
+from sentence_transformers import CrossEncoder # type: ignore
+from monitor.logging import logger
+from memory.vector_store import VectorStore
+from ai.graph_db_client import GraphDBClient
+from ai.tabular_db_client import TabularDBClient
+from ai.temporal_db_client import TemporalDBClient
+from core.exceptions import RetrievalError
 
 class Retriever:
     """
-    [蓝图 2 已更新]
-    执行先进的混合检索流程 (Hybrid Retrieval)。
-    1. 并行从 VectorStore, TemporalDB, 和 TabularDB 检索。
-    2. 使用 RRF (Reciprocal Rank Fusion) 融合排名。
-    3. 使用 Cross-Encoder (重排模型) 对融合后的列表进行重排。
-    4. 格式化 Top-N 结果以供 LLM 使用。
+    从多个数据源（向量、图形、表格、时间序列）检索信息。
     """
-
     def __init__(
         self,
-        config_loader: ConfigLoader, # <--- [蓝图 2] 添加
-        vector_store: BaseVectorStore, # <--- [蓝图 2] 更改为 BaseVectorStore
-        cot_database: CoTDatabase,
-        embedding_client: EmbeddingClient,
-        knowledge_graph_service: KnowledgeGraphService,
-        temporal_client: TemporalDBClient, # <--- [蓝图 2] 添加
-        tabular_client: TabularDBClient  # <--- [蓝图 2] 添加
+        vector_store: VectorStore,
+        graph_db: GraphDBClient,
+        tabular_db: TabularDBClient,
+        temporal_db: TemporalDBClient,
+        cross_encoder_model_name: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
     ):
         self.vector_store = vector_store
-        self.cot_database = cot_database
-        self.embedding_client = embedding_client
-        self.knowledge_graph_service = knowledge_graph_service
-        self.temporal_client = temporal_client
-        self.tabular_client = tabular_client
-        
-        # [蓝图 2] 加载配置和重排模型
-        try:
-            system_config = config_loader.load_config('config/system.yaml')
-            retriever_config = system_config.get("ai", {}).get("retriever", {})
-            rerank_config = retriever_config.get("rerank", {})
-            
-            rerank_model_name = rerank_config.get("model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-            self.reranker = CrossEncoder(rerank_model_name)
-            
-            self.rerank_top_n = rerank_config.get("top_n", 10)
-            self.rrf_k = retriever_config.get("rrf_k", 60)
-            
-            logger.info(f"Retriever (Advanced RAG) initialized. Reranker model: {rerank_model_name}")
-        except Exception as e:
-            logger.error(f"Failed to load CrossEncoder model, using fallback. Error: {e}", exc_info=True)
-            # 提供一个回退的 reranker，以防模型加载失败
-            self.reranker = None
-            self.rerank_top_n = 10
-            self.rrf_k = 60
+        self.graph_db = graph_db
+        self.tabular_db = tabular_db
+        self.temporal_db = temporal_db
+        self.reranker = self._load_reranker(cross_encoder_model_name)
+        logger.info("Retriever initialized with all data sources.")
 
+    def _load_reranker(self, model_name: str) -> Optional[CrossEncoder]:
+        """
+        加载 CrossEncoder reranker 模型。
+        """
+        try:
+            # TODO: Add model loading retry logic and caching
+            model = CrossEncoder(model_name)
+            logger.info(f"CrossEncoder model '{model_name}' loaded successfully.")
+            return model
+        except Exception as e:
+            logger.warning(f"Failed to load CrossEncoder model '{model_name}': {e}. Reranking will be disabled.")
+            return None
 
     async def retrieve(
-        self,
-        query: str,
-        target_symbols: List[str] = None,
-        top_k_vector: int = 10,
-        top_k_temporal: int = 10,
-        top_k_tabular: int = 10
-    ) -> Dict[str, List[Any]]:
-        """
-        [蓝图 2 已重构]
-        从所有来源并行检索带分数的文档列表。
-        (替换了旧的 retrieve 方法)
-        """
-        logger.info(f"Retrieving context for query: {query[:50]}... Symbols: {target_symbols}")
-        
-        metadata_filter = None
-        if target_symbols:
-            metadata_filter = {"symbol": {"$in": target_symbols}} 
-
-        # 1. 并行检索任务
-        tasks = []
-        
-        # a. 向量存储 (语义搜索)
-        tasks.append(self.vector_store.asimilarity_search(
-            query=query,
-            k=top_k_vector,
-            filter=metadata_filter # 假设 pinecone/mock store 支持 'filter'
-        ))
-        
-        # b. 时序存储 (关键字/时间搜索)
-        tasks.append(self.temporal_client.search_events(
-            symbols=target_symbols,
-            query_string=query,
-            size=top_k_temporal
-        ))
-        
-        # c. 表格存储 (结构化搜索)
-        tasks.append(self.tabular_client.search_financials(
-            query=query,
-            symbols=target_symbols,
-            limit=top_k_tabular
-        ))
-
-        # 2. 执行所有检索
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            vector_results_scored = results[0] if not isinstance(results[0], Exception) else []
-            temporal_results_scored = results[1] if not isinstance(results[1], Exception) else []
-            tabular_results_scored = results[2] if not isinstance(results[2], Exception) else []
-
-            if isinstance(results[0], Exception):
-                logger.error(f"Vector search failed: {results[0]}", exc_info=results[0])
-            if isinstance(results[1], Exception):
-                logger.error(f"Temporal search failed: {results[1]}", exc_info=results[1])
-            if isinstance(results[2], Exception):
-                logger.error(f"Tabular search failed: {results[2]}", exc_info=results[2])
-
-            logger.info(f"Retrieved: {len(vector_results_scored)} vector, "
-                        f"{len(temporal_results_scored)} temporal, "
-                        f"{len(tabular_results_scored)} tabular docs.")
-
-        except Exception as e:
-            logger.error(f"Error during parallel retrieval: {e}", exc_info=True)
-            vector_results_scored, temporal_results_scored, tabular_results_scored = [], [], []
-
-        # 3. [蓝图 2] 返回带分数的文档列表以供 RRF 使用
-        # (我们保留旧的 CoT 和 KG 查询，以防 format_context 仍在使用它们，
-        # 尽管新的 RAG 流程不使用它们)
-        try:
-            cot_traces = await self.cot_database.search_traces(keywords=query.split(), limit=3)
-        except Exception: cot_traces = []
-        
-        try:
-            kg_results = await self.knowledge_graph_service.query(query)
-        except Exception: kg_results = []
-        
-
-        return {
-            "vector_chunks_scored": vector_results_scored,
-            "temporal_chunks_scored": temporal_results_scored,
-            "tabular_chunks_scored": tabular_results_scored,
-            "cot_traces": cot_traces, # 保留以实现向后兼容
-            "kg_results": kg_results  # 保留以实现向后兼容
-        }
-
-    def _reciprocal_rank_fusion(
         self, 
-        ranked_lists: List[List[Tuple[Any, float]]], 
-        k: int = 60
-    ) -> List[Tuple[Any, float]]:
+        query: str, 
+        top_k: int = 10, 
+        tickers: Optional[List[str]] = None,
+        data_types: Optional[List[str]] = None
+    ) -> List[Document]:
         """
-        [蓝图 2]
-        执行 RRF (Reciprocal Rank Fusion)。
+        从所有相关源异步检索和重排文档。
         
         Args:
-            ranked_lists: [ [ (doc_A, score1), (doc_B, score2) ], [ (doc_B, score3), (doc_C, score4) ] ]
-                          文档对象 (Any) 可以是 Document、dict 等。
-            k (int): RRF 使用的 k 常量。
+            query: 用户的自然语言查询。
+            top_k: 最终返回的文档数量。
+            tickers: 资产负债表（例如 ["AAPL", "GOOG"]）。
+            data_types: 要查询的数据源类型 (例如 ["news", "financials"])。
 
         Returns:
-            List[Tuple[Any, float]]: 按 RRF 分数排序的 (doc, rrf_score) 元组列表。
+            一个经过重排和去重的文档列表。
         """
-        if not ranked_lists:
+        if data_types is None:
+            data_types = ["vector", "graph", "financials", "market_data"]
+        
+        logger.info(f"Starting retrieval for query: '{query}' with data_types: {data_types}")
+
+        tasks = []
+        if "vector" in data_types:
+            tasks.append(self.search_vector_store(query, k=top_k * 2))
+        
+        if "graph" in data_types and tickers:
+            tasks.append(self.search_graph_db(tickers))
+            
+        if "financials" in data_types and tickers:
+            tasks.append(self.search_financials(tickers, query))
+            
+        if "market_data" in data_types and tickers:
+            tasks.append(self.search_temporal_db(tickers, query))
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"Error during parallel retrieval: {e}")
+            raise RetrievalError(f"Parallel retrieval failed: {e}")
+
+        all_documents = []
+        for res in results:
+            if isinstance(res, Exception):
+                logger.warning(f"Retrieval task failed: {res}")
+            elif res:
+                all_documents.extend(res)
+
+        logger.info(f"Retrieved {len(all_documents)} raw documents before reranking.")
+
+        # 去重和重排
+        unique_documents = self._deduplicate(all_documents)
+        reranked_documents = self.rerank(query, unique_documents, top_k=top_k)
+
+        logger.info(f"Returning {len(reranked_documents)} reranked documents.")
+        return reranked_documents
+
+    async def search_vector_store(self, query: str, k: int) -> List[Document]:
+        """
+        从向量存储中检索文档。
+        """
+        try:
+            logger.debug(f"Querying Vector Store: {query}")
+            return await self.vector_store.similarity_search(query, k=k)
+        except Exception as e:
+            logger.error(f"Vector store search failed: {e}")
             return []
-            
-        # 1. 规范化分数并计算 RRF
-        # 我们需要一个唯一的方式来标识文档 (例如，id 或内容的哈希值)
-        def get_doc_id(doc):
-            if isinstance(doc, Document):
-                # 尝试 'id'，如果不存在则回退到哈希内容
-                doc_id = doc.metadata.get("id")
-                if doc_id:
-                    return doc_id
-                return hash(doc.page_content)
-            if isinstance(doc, dict):
-                # 尝试 'id'，如果不存在则回退到哈希 JSON
-                doc_id = doc.get("id")
-                if doc_id:
-                    return doc_id
-                try:
-                    return hash(json.dumps(doc, sort_keys=True))
-                except TypeError:
-                    # 如果字典包含不可哈希的类型，则回退到 str
-                    return hash(str(doc))
-            return hash(doc) # 回退
 
-        rrf_scores = {}
-        doc_store = {} # 存储 doc_id -> doc 对象的映射
-
-        for doc_list in ranked_lists:
-            # 确保我们有分数
-            if not doc_list or not isinstance(doc_list[0], (list, tuple)) or len(doc_list[0]) < 2:
-                logger.warning(f"RRF skipping invalid or empty list: {str(doc_list)[:100]}...")
-                continue
-
-            # (可选) 重新排序（如果列表未排序）
-            # sorted_list = sorted(doc_list, key=lambda x: x[1], reverse=True)
-            sorted_list = doc_list # 假设已排序
-
-            for rank, (doc, score) in enumerate(sorted_list):
-                if score is None or score <= 0: # RRF 忽略 0、None 或负分
-                    continue
-                    
-                doc_id = get_doc_id(doc)
-                if doc_id not in doc_store:
-                    doc_store[doc_id] = doc
-                
-                # RRF 公式
-                rank_score = 1.0 / (k + rank + 1)
-                
-                if doc_id not in rrf_scores:
-                    rrf_scores[doc_id] = 0.0
-                rrf_scores[doc_id] += rank_score
-
-        # 2. 转换为排序列表
-        fused_results = []
-        for doc_id, score in rrf_scores.items():
-            fused_results.append((doc_store[doc_id], score))
-            
-        fused_results.sort(key=lambda x: x[1], reverse=True)
-        
-        return fused_results
-
-    def _doc_to_string(self, doc: Any) -> str:
-        """辅助函数：将任何检索到的文档转换为用于重排的字符串。"""
-        if isinstance(doc, Document):
-            return doc.page_content
-        if isinstance(doc, dict):
-            # 适用于时序数据 (dict) 或表格数据 (dict)
-            try:
-                return json.dumps(doc)
-            except TypeError:
-                return str(doc) # 回退
-        return str(doc)
-
-    def format_context(
-        self, 
-        query: str, # <--- [蓝图 2] 需要 query
-        retrieved_data: Dict[str, List[Any]], 
-        max_tokens: int = 8192 # (合理的默认值)
-    ) -> str:
+    async def search_graph_db(self, tickers: List[str]) -> List[Document]:
         """
-        [蓝图 2 已重构]
-        替换“简单上下文组装”。
-        执行 RRF、Cross-Encoder 重排，并格式化最终的 Top-N 上下文。
+        从图数据库中检索实体和关系。
         """
-        
-        # 1. 从检索到的数据中提取带分数的列表
-        vector_list = retrieved_data.get("vector_chunks_scored", [])
-        temporal_list = retrieved_data.get("temporal_chunks_scored", [])
-        tabular_list = retrieved_data.get("tabular_chunks_scored", [])
+        try:
+            logger.debug(f"Querying Graph DB for tickers: {tickers}")
+            graph_data = await self.graph_db.get_subgraph_for_tickers(tickers)
+            if not graph_data:
+                return []
+            
+            # 将图数据转换为 Document 对象
+            content = f"Graph data for {', '.join(tickers)}: {graph_data}"
+            return [Document(page_content=content, metadata={"source": "graph_db", "tickers": tickers})]
+        except Exception as e:
+            logger.error(f"Graph DB search failed: {e}")
+            return []
 
-        # 2. [蓝图 2] 融合 (RRF)
-        fused_results = self._reciprocal_rank_fusion(
-            [vector_list, temporal_list, tabular_list],
-            k=self.rrf_k
-        )
+    async def search_financials(self, tickers: List[str], query: str) -> List[Document]:
+        """
+        从表格数据库中检索财务数据。
+        """
+        # FIXME: 简化的搜索。更高级的系统会使用 query_to_sql_agent
+        # 将自然语言 'query' 转换为 SQL 查询。
+        # 目前，我们将为给定的 tickers 抓取最近的数据。
         
-        if not fused_results:
-            logger.warning("RRF returned no results. Context will be empty.")
-            return "--- Relevant Knowledge ---\n\nNo relevant documents found.\n"
-
-        # 3. [蓝图 2] 重排 (Cross-Encoder)
-        if self.reranker:
+        all_results = []
+        for ticker in tickers:
             try:
-                # 准备用于重排的 (query, doc_string) 对
-                # 我们只重排 RRF 后的 Top-K (例如 Top 50)
-                rerank_candidates = [doc for doc, score in fused_results[:50]]
+                # 假设一个表结构，并且 'query' 是一个提示，
+                # 但我们只是在抓取常规数据。
+                # 一个真正的实现会解析 'query' 来获取指标。
+                query_params = {"ticker": ticker, "limit": 5} # 抓取 5 个最近的条目
+                # 假设一个表名，例如 'financial_metrics'
+                results = await self.tabular_db.query("financial_metrics", query_params)
                 
-                sentence_pairs = [
-                    (query, self._doc_to_string(doc)) for doc in rerank_candidates
-                ]
-                
-                if sentence_pairs:
-                    logger.info(f"Reranking {len(sentence_pairs)} candidates with CrossEncoder...")
-                    # 计算分数
-                    cross_scores = self.reranker.predict(sentence_pairs)
-                    
-                    # 组合
-                    reranked_results = list(zip(rerank_candidates, cross_scores))
-                    # 按 cross_scores 降序排序
-                    reranked_results.sort(key=lambda x: x[1], reverse=True)
-                else:
-                    reranked_results = []
-                    
+                for res in results:
+                    all_results.append(Document(
+                        page_content=str(res),
+                        metadata={"source": "financials_db", "ticker": ticker}
+                    ))
             except Exception as e:
-                logger.error(f"Cross-encoder reranking failed: {e}. Falling back to RRF order.", exc_info=True)
-                # 回退：使用 RRF 结果
-                reranked_results = fused_results 
-        else:
-            logger.warning("No Reranker loaded. Using RRF order.")
-            reranked_results = fused_results
-
-        # 4. [蓝图 2] 格式化 Top-N
-        final_docs = [doc for doc, score in reranked_results[:self.rerank_top_n]]
-        
-        formatted_context = "--- Relevant Knowledge (Ranked) ---\n\n"
-        current_len = 0
-        
-        for i, doc in enumerate(final_docs):
-            doc_str = self._doc_to_string(doc)
-            
-            # (从 Document 或 dict 中提取来源)
-            source = "Unknown"
-            if isinstance(doc, Document):
-                source = doc.metadata.get("source", "VectorDB")
-            elif isinstance(doc, dict):
-                # 尝试从时序或表格数据中获取来源
-                source = doc.get("source", doc.get("metric_name", "TabularDB"))
-                if source == "TabularDB" and "metric_name" in doc:
-                     source = f"TabularDB (Metric: {doc.get('metric_name')}, Symbol: {doc.get('symbol')})"
-                elif "headline" in doc:
-                     source = f"TemporalDB (Event: {doc.get('headline', 'N/A')[:30]}...)"
-
-
-            doc_text = f"--- Document {i+1} (Source: {source}) ---\n"
-            doc_text += doc_str + "\n\n"
-            
-            # (使用简单的字符长度检查来估算 token)
-            if current_len + len(doc_text) > max_tokens:
-                formatted_context += "... [Truncated due to token limit]\n"
-                break
+                logger.warning(f"Failed to query tabular data for {ticker}: {e}")
                 
-            formatted_context += doc_text
-            current_len += len(doc_text)
+        return all_results
 
-        logger.info(f"Assembled advanced context window of {current_len} chars ({len(final_docs)} docs).")
-        return formatted_context
+    async def search_temporal_db(self, tickers: List[str], query: str) -> List[Document]:
+        """
+        从时间序列数据库检索市场数据。
+        """
+        try:
+            logger.debug(f"Querying Temporal DB for tickers: {tickers}")
+            # FIXME: 'query' 没有被用来确定时间范围或指标
+            # 简化：获取过去7天的数据
+            results = await self.temporal_db.get_recent_data(tickers, days=7)
+            docs = []
+            for ticker, data in results.items():
+                if not data.empty:
+                    content = f"Recent market data for {ticker}:\n{data.to_string()}"
+                    docs.append(Document(page_content=content, metadata={"source": "temporal_db", "ticker": ticker}))
+            return docs
+        except Exception as e:
+            logger.error(f"Temporal DB search failed: {e}")
+            return []
+
+    def rerank(self, query: str, documents: List[Document], top_k: int) -> List[Document]:
+        """
+        使用 CrossEncoder 模型对检索到的文档进行重排。
+        """
+        if not self.reranker:
+            logger.warning("Reranker model not loaded. Returning top_k documents without reranking.")
+            return documents[:top_k]
+            
+        if not documents:
+            return []
+
+        try:
+            logger.debug(f"Reranking {len(documents)} documents for query: {query}")
+            pairs = [(query, doc.page_content) for doc in documents]
+            scores = self.reranker.predict(pairs) # type: ignore
+            
+            # 将分数与文档配对并排序
+            scored_docs = list(zip(scores, documents))
+            scored_docs.sort(key=lambda x: x[0], reverse=True)
+            
+            # 返回 top_k 文档
+            return [doc for score, doc in scored_docs[:top_k]]
+            
+        except Exception as e:
+            return self._fallback_reranker(query, documents, top_k, e)
+
+    def _fallback_reranker(self, query: str, documents: List[Document], top_k: int, e: Exception) -> List[Document]:
+        """
+        在 CrossEncoder 失败时使用的基于关键字的回退重排器。
+        """
+        # 如果 CrossEncoder 模型加载失败，则回退到基于关键字的重排器。
+        # 未来的增强可以实现更健壮的本地模型加载或重试逻辑。
+        logger.warning(f"CrossEncoder reranking failed: {e}. Using fallback keyword reranker.")
+        
+        # 简单的基于关键字的重排器作为回退
+        query_terms = set(query.lower().split())
+        
+        def keyword_score(doc: Document) -> int:
+            content = doc.page_content.lower()
+            return sum(1 for term in query_terms if term in content)
+            
+        scored_docs = [(keyword_score(doc), doc) for doc in documents]
+        scored_docs.sort(key=lambda x: x[0], reverse=True)
+        
+        return [doc for score, doc in scored_docs[:top_k]]
+
+    def _deduplicate(self, documents: List[Document]) -> List[Document]:
+        """
+        基于页面内容对文档进行去重。
+        """
+        seen_content = set()
+        unique_docs = []
+        for doc in documents:
+            if doc.page_content not in seen_content:
+                unique_docs.append(doc)
+                seen_content.add(doc.page_content)
+        return unique_docs
