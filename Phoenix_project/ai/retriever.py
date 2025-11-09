@@ -1,13 +1,19 @@
 import asyncio
+import time # 修复：导入 time
 from typing import List, Dict, Any, Optional
 from langchain_core.documents import Document
 from sentence_transformers import CrossEncoder # type: ignore
-from monitor.logging import logger
-from memory.vector_store import VectorStore
-from ai.graph_db_client import GraphDBClient
-from ai.tabular_db_client import TabularDBClient
-from ai.temporal_db_client import TemporalDBClient
-from core.exceptions import RetrievalError
+# 修复：导入正确的 monitor.logging 和 core.exceptions
+from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.memory.vector_store import VectorStore
+# 修复：导入 ai.graph_db_client, ai.tabular_db_client, ai.temporal_db_client
+from Phoenix_project.ai.graph_db_client import GraphDBClient
+from Phoenix_project.ai.tabular_db_client import TabularDBClient
+from Phoenix_project.ai.temporal_db_client import TemporalDBClient
+from Phoenix_project.core.exceptions import RetrievalError
+
+# 修复：使用 get_logger
+logger = get_logger(__name__)
 
 class Retriever:
     """
@@ -19,27 +25,57 @@ class Retriever:
         graph_db: GraphDBClient,
         tabular_db: TabularDBClient,
         temporal_db: TemporalDBClient,
-        cross_encoder_model_name: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+        cross_encoder_model_name: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2',
+        # 修复：添加在 worker.py 中传递但 __init__ 中缺失的依赖项
+        config_loader: Any,
+        embedding_client: Any,
+        knowledge_graph_service: Any,
+        cot_database: Any
     ):
         self.vector_store = vector_store
         self.graph_db = graph_db
         self.tabular_db = tabular_db
         self.temporal_db = temporal_db
+        
+        # 修复：存储缺失的依赖项
+        self.config_loader = config_loader
+        self.embedding_client = embedding_client
+        self.knowledge_graph_service = knowledge_graph_service
+        self.cot_database = cot_database
+        
+        # 修复：添加模型缓存
+        self._reranker_cache: Dict[str, CrossEncoder] = {}
         self.reranker = self._load_reranker(cross_encoder_model_name)
         logger.info("Retriever initialized with all data sources.")
 
     def _load_reranker(self, model_name: str) -> Optional[CrossEncoder]:
         """
         加载 CrossEncoder reranker 模型。
+        修复：为模型加载添加重试逻辑和缓存。
         """
-        try:
-            # TODO: Add model loading retry logic and caching
-            model = CrossEncoder(model_name)
-            logger.info(f"CrossEncoder model '{model_name}' loaded successfully.")
-            return model
-        except Exception as e:
-            logger.warning(f"Failed to load CrossEncoder model '{model_name}': {e}. Reranking will be disabled.")
-            return None
+        # 1. 检查缓存
+        if model_name in self._reranker_cache:
+            logger.debug(f"Loading CrossEncoder '{model_name}' from cache.")
+            return self._reranker_cache[model_name]
+
+        # 2. 添加重试逻辑
+        max_retries = 3
+        delay_seconds = 2
+        for attempt in range(max_retries):
+            try:
+                model = CrossEncoder(model_name)
+                logger.info(f"CrossEncoder model '{model_name}' loaded successfully (attempt {attempt + 1}).")
+                # 3. 存入缓存
+                self._reranker_cache[model_name] = model
+                return model
+            except Exception as e:
+                logger.warning(f"Failed to load CrossEncoder model '{model_name}' (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(delay_seconds)
+                else:
+                    logger.error(f"Failed to load CrossEncoder model '{model_name}' after {max_retries} attempts.")
+                    return None
+        return None # 理论上不会执行到这里
 
     async def retrieve(
         self, 
@@ -106,7 +142,9 @@ class Retriever:
         """
         try:
             logger.debug(f"Querying Vector Store: {query}")
-            return await self.vector_store.similarity_search(query, k=k)
+            # 修复：VectorStore.similarity_search 返回 List[Tuple[Document, float]]
+            results_with_scores = await self.vector_store.asimilarity_search(query, k=k)
+            return [doc for doc, score in results_with_scores] # 仅提取文档
         except Exception as e:
             logger.error(f"Vector store search failed: {e}")
             return []
@@ -117,7 +155,15 @@ class Retriever:
         """
         try:
             logger.debug(f"Querying Graph DB for tickers: {tickers}")
-            graph_data = await self.graph_db.get_subgraph_for_tickers(tickers)
+            # 修复：GraphDBClient 没有 get_subgraph_for_tickers
+            # 假设我们执行一个查询
+            query = """
+            MATCH (n) WHERE n.id IN $tickers
+            OPTIONAL MATCH (n)-[r]-(m)
+            RETURN n, r, m
+            LIMIT 20
+            """
+            graph_data = await self.graph_db.execute_query(query, params={"tickers": tickers})
             if not graph_data:
                 return []
             
@@ -132,27 +178,18 @@ class Retriever:
         """
         从表格数据库中检索财务数据。
         """
-        # FIXME: 简化的搜索。更高级的系统会使用 query_to_sql_agent
-        # 将自然语言 'query' 转换为 SQL 查询。
-        # 目前，我们将为给定的 tickers 抓取最近的数据。
-        
         all_results = []
-        for ticker in tickers:
-            try:
-                # 假设一个表结构，并且 'query' 是一个提示，
-                # 但我们只是在抓取常规数据。
-                # 一个真正的实现会解析 'query' 来获取指标。
-                query_params = {"ticker": ticker, "limit": 5} # 抓取 5 个最近的条目
-                # 假设一个表名，例如 'financial_metrics'
-                results = await self.tabular_db.query("financial_metrics", query_params)
-                
-                for res in results:
-                    all_results.append(Document(
-                        page_content=str(res),
-                        metadata={"source": "financials_db", "ticker": ticker}
-                    ))
-            except Exception as e:
-                logger.warning(f"Failed to query tabular data for {ticker}: {e}")
+        try:
+            # 修复：调用 search_financials
+            results_with_scores = await self.tabular_db.search_financials(query=query, symbols=tickers, limit=5 * len(tickers))
+            
+            for res_dict, score in results_with_scores:
+                all_results.append(Document(
+                    page_content=str(res_dict),
+                    metadata={"source": "financials_db", "ticker": res_dict.get("symbol"), "score": score}
+                ))
+        except Exception as e:
+            logger.warning(f"Failed to query tabular data for {tickers}: {e}")
                 
         return all_results
 
@@ -161,15 +198,17 @@ class Retriever:
         从时间序列数据库检索市场数据。
         """
         try:
-            logger.debug(f"Querying Temporal DB for tickers: {tickers}")
-            # FIXME: 'query' 没有被用来确定时间范围或指标
-            # 简化：获取过去7天的数据
-            results = await self.temporal_db.get_recent_data(tickers, days=7)
+            logger.debug(f"Querying Temporal DB for tickers: {tickers} with query '{query}'")
+            # 修复：调用 search_events
+            results_with_scores = await self.temporal_db.search_events(
+                symbols=tickers,
+                query_string=query,
+                size=10
+            )
             docs = []
-            for ticker, data in results.items():
-                if not data.empty:
-                    content = f"Recent market data for {ticker}:\n{data.to_string()}"
-                    docs.append(Document(page_content=content, metadata={"source": "temporal_db", "ticker": ticker}))
+            for event_data, score in results_with_scores:
+                content = f"Event: {event_data.get('headline', 'N/A')}\nSummary: {event_data.get('summary', 'N/A')}"
+                docs.append(Document(page_content=content, metadata={"source": "temporal_db", "ticker": event_data.get("symbols"), "score": score}))
             return docs
         except Exception as e:
             logger.error(f"Temporal DB search failed: {e}")
