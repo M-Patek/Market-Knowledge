@@ -1,5 +1,6 @@
 import json
 # import aiofiles # [主人喵的清洁计划 1.2] 移除
+import logging # 修复：导入 logging 模块
 from datetime import datetime
 from typing import Dict, Any, Optional
 # from Phoenix_project.config.loader import ConfigLoader # [主人喵的清洁计划 1.2] 移除
@@ -64,6 +65,49 @@ class AuditLogger:
             system_logger.error(f"Failed to initialize Elasticsearch for AuditLogger: {e}", exc_info=True)
             self.es_client = None
             self.async_es_client = None
+
+    def _log_to_es(self, level: str, message: str, extra: Optional[Dict[str, Any]] = None):
+        """(占位符) 将日志发送到 Elasticsearch。"""
+        # 修复：实现占位符
+        if not self.es_client:
+            # 使用 print 而不是 logger 来避免循环
+            print(f"CRITICAL: (ES Logger) ES client not initialized. Cannot log: {message}")
+            return
+            
+        try:
+            doc = {
+                "@timestamp": datetime.utcnow().isoformat(),
+                "level": level.upper(),
+                "logger_name": "ESLogger (DEPRECATED - use log_event)", # 标记此方法为旧版
+                "message": message,
+                **(extra or {})
+            }
+            # 使用同步客户端进行此旧版方法的简单实现
+            self.es_client.index(index=self.index_name, document=doc)
+        except Exception as e:
+            # 不要在 ES 日志失败时再次调用 self.logger.error，
+            # 因为这会触发另一次 _log_to_es 调用，导致无限循环。
+            print(f"CRITICAL: Failed to send log to Elasticsearch: {e}")
+        # pass # 修复：移除 pass
+
+    def log(self, level: int, message: str, extra: Optional[Dict[str, Any]] = None):
+        """
+        记录一条通用日志消息。
+        
+        Args:
+            level (int): 日志级别 (e.g., logging.INFO)。
+            message (str): 日志消息。
+            extra (Optional[Dict[str, Any]]): 附加的结构化数据。
+        """
+        # 转发到标准日志记录器
+        # 我们将 extra 传递给 'extra' 参数，以便 Formatter 可以使用它
+        # 修复：此方法似乎已被 monitor.logging.ESLogger 中的同名方法弃用。
+        # 我们将实现 _log_to_es，但保留此方法不变，以防万一。
+        # self.logger.log(level, message, extra=extra) # 假设 self.logger 存在
+        
+        # (可选) 转发到 ES
+        # 修复：取消注释并调用已实现的 _log_to_es
+        self._log_to_es(logging.getLevelName(level), message, extra)
 
     async def log_event(
         self,
