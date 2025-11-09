@@ -1,221 +1,121 @@
-"""
-推理集成 (Reasoning Ensemble)
-协调 EnsembleClient, MetacognitiveAgent, 和 Arbitrator。
-这是认知引擎的核心协调器。
-"""
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-import uuid
-import asyncio # [主人喵的修复 2.1] 确保导入 asyncio
-
-from Phoenix_project.core.pipeline_state import PipelineState 
-from Phoenix_project.core.schemas.fusion_result import AgentDecision, FusionResult
-from Phoenix_project.ai.ensemble_client import EnsembleClient
-# [主人喵的修复 1] 修复 MetacognitiveAgent 错误的导入路径
-from Phoenix_project.agents.l2.metacognitive_agent import MetacognitiveAgent 
-from Phoenix_project.evaluation.arbitrator import Arbitrator
-from Phoenix_project.evaluation.fact_checker import FactChecker
-from Phoenix_project.ai.retriever import Retriever
-from Phoenix_project.monitor.logging import get_logger
-
-logger = get_logger(__name__)
+import asyncio
+from typing import Any, Dict, List
+from monitor.logging import logger
+from core.pipeline_state import PipelineState
+from ai.prompt_manager import PromptManager
+from api.gemini_pool_manager import GeminiPoolManager
+from evaluation.voter import Voter
+from evaluation.arbitrator import Arbitrator
+from evaluation.fact_checker import FactChecker
+from core.schemas.fusion_result import FusionResult
 
 class ReasoningEnsemble:
     """
-    执行完整的 "RAG -> Multi-Agent -> Arbitrate" 流程。
-    
-    这个类协调 V1 (异步/提示) 和 V2 (同步/Python) 智能体流。
+    协调多个L2/L3智能体，融合它们的见解，并进行最终决策。
     """
-    
+
     def __init__(
         self,
-        retriever: Retriever,
-        ensemble_client: EnsembleClient,
-        metacognitive_agent: MetacognitiveAgent,
+        prompt_manager: PromptManager,
+        gemini_pool: GeminiPoolManager,
+        voter: Voter,
         arbitrator: Arbitrator,
-        fact_checker: FactChecker,
-        run_v2_agents: bool = False # 切换 V1/V2
+        fact_checker: FactChecker
     ):
-        """
-        初始化 ReasoningEnsemble。
-        
-        参数:
-            retriever (Retriever): [主人喵的修复 1] (现在是混合检索器)
-            ensemble_client (EnsembleClient): 用于运行 L1 智能体。
-            metacognitive_agent (MetacognitiveAgent): L2 元认知/监督智能体。
-            arbitrator (Arbitrator): L2 仲裁器。
-            fact_checker (FactChecker): 事实检查服务。
-            run_v2_agents (bool): 如果为 True，则运行 V2 智能体流；否则运行 V1。
-        """
-        self.retriever = retriever
-        self.ensemble_client = ensemble_client
-        self.metacognitive_agent = metacognitive_agent
+        self.prompt_manager = prompt_manager
+        self.gemini_pool = gemini_pool
+        self.voter = voter
         self.arbitrator = arbitrator
         self.fact_checker = fact_checker
-        self.run_v2_agents = run_v2_agents
-        self.log_prefix = f"ReasoningEnsemble (V{'2' if run_v2_agents else '1'}):"
+        self.fusion_agent = None  # L2 Fusion Agent
+        self.alpha_agent = None   # L3 Alpha Agent
+        logger.info("ReasoningEnsemble initialized.")
 
-    async def reason(self, pipeline_state: PipelineState) -> Optional[FusionResult]:
+    def set_agents(self, fusion_agent: Any, alpha_agent: Any):
         """
-        执行完整的推理链。
-        根据 self.run_v2_agents 标志，此方法将
-        要么异步运行 V1，要么同步运行 V2 (在 asyncio.to_thread 中)。
+        设置L2和L3智能体。
         """
+        self.fusion_agent = fusion_agent
+        self.alpha_agent = alpha_agent
+        logger.info("L2 Fusion and L3 Alpha agents set in ReasoningEnsemble.")
+
+    async def run_ensemble(
+        self, 
+        state: PipelineState, 
+        agent_insights: Dict[str, Any],
+        target_assets: List[str]
+    ) -> Dict[str, Any]:
+        """
+        执行推理流程：融合 -> 事实核查 -> 投票 -> 仲裁 -> 最终决策。
         
-        # 0. 从状态中提取基本信息
+        Args:
+            state: 当前的流水线状态。
+            agent_insights: L1智能体产生的见解。
+            target_assets: 需要分析的目标资产列表 (例如: ["AAPL", "GOOG"])。
+
+        Returns:
+            包含最终决策和置信度的字典。
+        """
+        if not self.fusion_agent or not self.alpha_agent:
+            logger.error("Agents not set in ReasoningEnsemble. Call set_agents() first.")
+            return {"error": "Agents not configured."}
+
+        logger.info(f"Reasoning ensemble starting for assets: {target_assets}")
+
+        # 1. L2 融合 (Fusion)
+        # L2 Fusion Agent 接收 L1 见解
+        logger.debug("Running L2 Fusion Agent...")
         try:
-            query = pipeline_state.get_current_query()
-            if not query:
-                logger.error(f"{self.log_prefix} No query found in pipeline state.")
-                return None
-            
-            target_symbols = pipeline_state.get_current_symbols()
-            if not target_symbols:
-                target_symbols = [] # 允许没有特定符号的查询
-            
-            logger.info(f"{self.log_prefix} Starting reasoning for query: '{query}'")
-
-            # 1. RAG - 检索
-            # [蓝图 2] 调用 retriever.retrieve (它现在执行混合检索)
-            retrieved_data = await self.retriever.retrieve(query, target_symbols)
-            # [蓝图 2] 调用 retriever.format_context (它现在执行 RRF+Rerank)
-            context = self.retriever.format_context(query, retrieved_data)
-            
-            pipeline_state.add_context(context)
-            
-            # --- 分支：V1 (Async) vs V2 (Sync) ---
-            
-            if self.run_v2_agents:
-                # --- V2 (同步) 流程 ---
-                # 在一个单独的线程中运行同步的 V2 流程，以避免阻塞事件循环
-                logger.debug(f"{self.log_prefix} Running V2 (sync) flow in thread...")
-                fusion_result = await asyncio.to_thread(
-                    self._reason_v2_sync, pipeline_state, context, target_symbols
-                )
-            else:
-                # --- V1 (异步) 流程 ---
-                logger.debug(f"{self.log_prefix} Running V1 (async) flow...")
-                fusion_result = await self._reason_v1_async(pipeline_state, context, target_symbols)
-
-            # --- 流程结束 ---
-
+            fusion_result: FusionResult = await self.fusion_agent.run(state, agent_insights, target_assets)
             if not fusion_result:
-                logger.error(f"{self.log_prefix} Reasoning chain returned no result.")
-                return None
+                logger.warning("L2 Fusion Agent returned no result.")
+                return {"error": "Fusion agent failed to produce a result."}
+        except Exception as e:
+            logger.error(f"Error during L2 Fusion: {e}")
+            return {"error": f"Fusion agent exception: {e}"}
+
+        # 2. 事实核查 (Fact-Checking)
+        logger.debug("Running Fact-Checker...")
+        fact_check_report = await self.fact_checker.check(fusion_result.insights)
+        state.add_fact_check_report(fact_check_report)
+
+        # 3. 投票 (Voting)
+        # L1智能体（作为投票者）对融合后的见解进行投票
+        logger.debug("Running Voter...")
+        # TODO: L1 智能体应该被动态地用作投票者
+        votes = await self.voter.collect_votes(fusion_result.insights)
+        
+        # 4. 仲裁 (Arbitration)
+        logger.debug("Running Arbitrator...")
+        arbitrated_insights = await self.arbitrator.arbitrate(fusion_result.insights, votes, fact_check_report)
+
+        # 5. L3 决策 (Alpha Generation)
+        # L3 Alpha Agent 接收经过仲裁的L2见解
+        logger.debug("Running L3 Alpha Agent...")
+        try:
+            # stocks_to_analyze = ["AAPL", "GOOG"]  # FIXME: This is hardcoded and needs to be dynamic based on the query or context
+            stocks_to_analyze = target_assets
+            logger.info(f"Alpha Agent analyzing stocks: {stocks_to_analyze}")
+
+            decision = await self.alpha_agent.run(state, arbitrated_insights, stocks_to_analyze)
             
-            # 5. Metacognition (L2 监督) - 总是异步的
-            supervision = await self.metacognitive_agent.supervise(
-                state=pipeline_state,
-                decisions=[d for d in fusion_result.agent_decisions if d],
-                final_decision=fusion_result.final_decision
-            )
+            logger.info(f"L3 Alpha Agent decision: {decision}")
             
-            # 附加元数据
-            fusion_result.request_id = pipeline_state.request_id or str(uuid.uuid4())
-            fusion_result.timestamp = datetime.now()
-            fusion_result.supervision = supervision
-            fusion_result.context_used = context
+            # 最终决策
+            final_decision = {
+                "asset_insights": decision.asset_insights,
+                "portfolio_implications": decision.portfolio_implications,
+                "confidence": decision.confidence,
+                "rational": decision.rational,
+                "arbitration_report": arbitrated_insights,
+                "fact_check_report": fact_check_report
+            }
             
-            logger.info(f"{self.log_prefix} Reasoning complete. Final Decision: {fusion_result.final_decision.decision}")
+            # 更新状态
+            state.add_final_decision(final_decision)
             
-            return fusion_result
+            return final_decision
 
         except Exception as e:
-            logger.error(f"{self.log_prefix} Reasoning chain failed: {e}", exc_info=True)
-            return None
-
-    async def _reason_v1_async(
-        self, 
-        pipeline_state: PipelineState, 
-        context: str, 
-        target_symbols: List[str]
-    ) -> Optional[FusionResult]:
-        """ (V1) 异步多智能体 -> 事实检查 -> 仲裁 """
-        
-        # 2. Multi-Agent (V1) - 并行执行分析师 (异步)
-        decisions: List[AgentDecision] = await self.ensemble_client.execute_ensemble(
-            context=context,
-            target_symbols=target_symbols
-        )
-
-        if not decisions:
-            logger.error(f"{self.log_prefix} V1: No agent decisions returned from ensemble.")
-            return None
-
-        # 3. Fact Checking (V1) - 事实检查 (异步)
-        verified_decisions = []
-        for dec in decisions:
-            
-            # --- (FIX 2.1) 修复 V1 流程中的异步/同步冲突 ---
-            # (旧的 Bug)
-            # is_valid, report = self.fact_checker.check(dec.reasoning, context)
-            
-            # (新的修复)
-            # 调用正确的异步方法并等待
-            fact_check_report = await self.fact_checker.check_facts(dec.reasoning)
-            
-            # 解析字典响应
-            support_status = fact_check_report.get("overall_support", "Unknown")
-            is_valid = (support_status == "Supported" or support_status == "Partial")
-            report = fact_check_report.get("error", "No error")
-            # --- (FIX 2.1 结束) ---
-
-            if is_valid:
-                verified_decisions.append(dec)
-            else:
-                logger.warning(f"{self.log_prefix} V1: Agent {dec.agent_name} decision failed fact check: {support_status} (Report: {report})")
-        
-        if not verified_decisions:
-            logger.error(f"{self.log_prefix} V1: All agent decisions failed fact-checking.")
-            return None
-
-        # 4. Arbitration (V1) - 仲裁 (同步)
-        # [蓝图 2 修复]：仲裁器 arbitrate 不是异步的
-        fusion_result: FusionResult = self.arbitrator.arbitrate(
-            decisions=verified_decisions,
-            context=context
-        )
-        return fusion_result
-
-    def _reason_v2_sync(
-        self, 
-        pipeline_state: PipelineState, 
-        context: str, 
-        target_symbols: List[str]
-    ) -> Optional[FusionResult]:
-        """ (V2) 同步多智能体 -> 事实检查 -> 仲裁 """
-        
-        # 2. Multi-Agent (V2) - (同步)
-        decisions: List[AgentDecision] = self.ensemble_client.execute_ensemble_v2(
-            state=pipeline_state
-        )
-
-        if not decisions:
-            logger.error(f"{self.log_prefix} V2: No agent decisions returned from ensemble.")
-            return None
-
-        # 3. Fact Checking (V2) - (同步)
-        # 注意: V2 流程假设 FactChecker 也有一个 *同步* 方法 'check'。
-        # 这是原始设计，我们在这里保留它，以区分 V1/V2 路径。
-        verified_decisions = []
-        for dec in decisions:
-            
-            # V2 流程使用 'check' (同步)
-            # (这里没有 Bug，这是 V2 的预期行为)
-            is_valid, report = self.fact_checker.check(dec.reasoning, context)
-
-            if is_valid:
-                verified_decisions.append(dec)
-            else:
-                logger.warning(f"{self.log_prefix} V2: Agent {dec.agent_name} decision failed fact check. Report: {report}")
-        
-        if not verified_decisions:
-            logger.error(f"{self.log_prefix} V2: All agent decisions failed fact-checking.")
-            return None
-
-        # 4. Arbitration (V2) - 仲裁 (同步)
-        fusion_result: FusionResult = self.arbitrator.arbitrate(
-            decisions=verified_decisions,
-            context=context
-        )
-        return fusion_result
+            logger.error(f"Error during L3 Alpha Generation: {e}")
+            return {"error": f"Alpha agent exception: {e}"}
