@@ -1,22 +1,23 @@
 # tests/test_cognitive_engine_properties.py
 import pytest
-import asyncio # 任务 3: 导入 asyncio
-from unittest.mock import MagicMock, AsyncMock # 任务 3: 需要 AsyncMock
+import asyncio # [任务 2 修复] 导入 asyncio
+from unittest.mock import MagicMock, AsyncMock # [任务 2 修复] 需要 AsyncMock
 
 # --- [修复] ---
 # 修复：将 'cognitive.engine' 转换为 'Phoenix_project.cognitive.engine'
-from Phoenix_project.cognitive.engine import CognitiveEngine, CognitiveError # 导入 CognitiveError
+from Phoenix_project.cognitive.engine import CognitiveEngine, CognitiveError # [任务 2 修复] 导入 CognitiveError
 # 修复：将 'core.pipeline_state' 转换为 'Phoenix_project.core.pipeline_state'
 from Phoenix_project.core.pipeline_state import PipelineState
 # 修复：将 'core.schemas.fusion_result' 转换为 'Phoenix_project.core.schemas.fusion_result'
 from Phoenix_project.core.schemas.fusion_result import FusionResult
-# [任务 3] 导入 (模拟) 依赖项
+# [任务 2 修复] 导入 (模拟) 依赖项
 from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
 from Phoenix_project.evaluation.fact_checker import FactChecker
 from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
 from Phoenix_project.evaluation.voter import Voter
+# --- [修复结束] ---
 
-# 标记所有测试为 asyncio
+# [任务 2 修复] 标记所有测试为 asyncio
 pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
@@ -27,7 +28,7 @@ def mock_dependencies():
     mock_uncertainty_guard = MagicMock(spec=UncertaintyGuard)
     mock_voter = MagicMock(spec=Voter)
     
-    # [任务 3] 模拟 async 方法
+    # [任务 2 修复] 模拟 async 方法
     mock_reasoning_ensemble.reason = AsyncMock()
     mock_fact_checker.check_facts = AsyncMock()
     # uncertainty_guard.apply_guardrail 是同步的 (根据 engine.py)
@@ -57,16 +58,18 @@ def cognitive_engine(mock_dependencies):
     )
     return engine
 
-# 任务 3: 重构测试 1
-async def test_cognitive_engine_runs_cycle(cognitive_engine, mock_dependencies):
+@pytest.fixture
+def state():
+    """Provides a clean PipelineState."""
+    # [任务 2 修复] 传入一个最小的 initial_state
+    return PipelineState(initial_state={"main_task_query": {"description": "Test"}}, max_history=10)
+
+# [任务 2 修复] 重构测试 1 (现在是 async)
+async def test_cognitive_engine_runs_cycle(cognitive_engine, mock_dependencies, state):
     """
     Tests the main `process_cognitive_cycle` workflow.
-    (替换 test_cognitive_engine_generates_signals)
     """
-    # 1. 创建一个 PipelineState
-    state = PipelineState(initial_state={"main_task_query": {"description": "Test"}}, max_history=10)
-    
-    # 2. 模拟依赖项的返回值
+    # 1. 模拟依赖项的返回值
     mock_fusion_result = MagicMock(spec=FusionResult)
     mock_fusion_result.confidence = 0.9 # 高于 0.7 的 fact_check_threshold
     mock_fusion_result.reasoning = "Test reasoning"
@@ -79,15 +82,14 @@ async def test_cognitive_engine_runs_cycle(cognitive_engine, mock_dependencies):
     mock_dependencies["fact_checker"].check_facts.return_value = mock_fact_check_report
     
     # 模拟 UncertaintyGuard (它返回修改后的 fusion_result)
-    # 在这个测试中，我们让 guard 返回一个新对象，以确认它被调用了
     mock_guarded_result = MagicMock(spec=FusionResult)
     mock_guarded_result.final_decision = "BUY" # 未更改
     mock_dependencies["uncertainty_guard"].apply_guardrail.return_value = mock_guarded_result
 
-    # 3. 运行引擎的认知周期
+    # 2. 运行引擎的认知周期
     cognitive_result = await cognitive_engine.process_cognitive_cycle(state)
 
-    # 4. 验证结果
+    # 3. 验证结果
     
     # 检查是否调用了 reason
     mock_dependencies["reasoning_ensemble"].reason.assert_called_once_with(state)
@@ -102,23 +104,52 @@ async def test_cognitive_engine_runs_cycle(cognitive_engine, mock_dependencies):
     assert isinstance(cognitive_result, dict)
     assert cognitive_result["final_decision"] == mock_guarded_result
     assert cognitive_result["fact_check_report"] == mock_fact_check_report
+    # [任务 2 修复] 检查状态是否已更新
     assert state.get_value("last_fusion_result") == mock_fusion_result
 
-# 任务 3: 重构测试 2
-async def test_cognitive_engine_handles_reasoning_failure(cognitive_engine, mock_dependencies):
+# [任务 2 修复] 重构测试 2 (现在是 async)
+async def test_cognitive_engine_handles_reasoning_failure(cognitive_engine, mock_dependencies, state):
     """
     Tests that the engine raises a CognitiveError if reasoning fails.
-    (替换 test_cognitive_engine_handles_no_candidates)
     """
-    state = PipelineState(initial_state={"main_task_query": {"description": "Test"}}, max_history=10)
-    
-    # 模拟 reasoning_ensemble.reason 抛出异常
+    # 1. 模拟 reasoning_ensemble.reason 抛出异常
     mock_dependencies["reasoning_ensemble"].reason.side_effect = ValueError("LLM API failed")
     
-    # 运行并断言
+    # 2. 运行并断言
     with pytest.raises(CognitiveError, match="ReasoningEnsemble failed: LLM API failed"):
         await cognitive_engine.process_cognitive_cycle(state)
     
-    # 确保 fact_checker 和 guard 未被调用
+    # 3. 确保 fact_checker 和 guard 未被调用
     mock_dependencies["fact_checker"].check_facts.assert_not_called()
     mock_dependencies["uncertainty_guard"].apply_guardrail.assert_not_called()
+
+# [任务 2 修复] 新增测试：跳过 fact-check
+async def test_cognitive_engine_skips_fact_check_on_low_confidence(cognitive_engine, mock_dependencies, state):
+    """
+    Tests that fact-checking is skipped if confidence is below the threshold.
+    """
+    # 1. 模拟返回值
+    mock_fusion_result = MagicMock(spec=FusionResult)
+    mock_fusion_result.confidence = 0.5 # 低于 0.7 的 threshold
+    mock_fusion_result.reasoning = "Low confidence reasoning"
+    mock_fusion_result.final_decision = "HOLD"
+    
+    mock_dependencies["reasoning_ensemble"].reason.return_value = mock_fusion_result
+    
+    mock_guarded_result = MagicMock(spec=FusionResult)
+    mock_dependencies["uncertainty_guard"].apply_guardrail.return_value = mock_guarded_result
+
+    # 2. 运行周期
+    cognitive_result = await cognitive_engine.process_cognitive_cycle(state)
+
+    # 3. 验证
+    mock_dependencies["reasoning_ensemble"].reason.assert_called_once_with(state)
+    
+    # [关键] 检查 fact_checker *未* 被调用
+    mock_dependencies["fact_checker"].check_facts.assert_not_called()
+    
+    # 检查 guard *仍* 被调用
+    mock_dependencies["uncertainty_guard"].apply_guardrail.assert_called_once()
+    
+    assert cognitive_result["final_decision"] == mock_guarded_result
+    assert cognitive_result["fact_check_report"] is None
