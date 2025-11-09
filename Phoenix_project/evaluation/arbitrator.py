@@ -1,129 +1,124 @@
-"""
-仲裁者 (Arbitrator)
-负责在多个 AI 智能体之间存在分歧时，做出最终决策。
-"""
 from typing import List, Dict, Any
-from datetime import datetime
-import uuid
-# 恢复原有逻辑所需的新增导入
-import json
-from pydantic import ValidationError
 
+from ..ai.ensemble_client import EnsembleClient
+from ..ai.prompt_manager import PromptManager
+from ..ai.prompt_renderer import PromptRenderer
+from ..core.schemas.supervision_result import SupervisionResult
+from ..core.schemas.fusion_result import FusionResult
+from ..core.schemas.data_schema import Sentiment
+from ..monitor.logging import get_logger
 
-# FIX (E3): 导入 AgentDecision 和 FusionResult (这个保留)
-from Phoenix_project.core.schemas.fusion_result import AgentDecision, FusionResult
-from Phoenix_project.ai.prompt_manager import PromptManager
-from Phoenix_project.api.gateway import IAPIGateway
-from Phoenix_project.monitor.logging import get_logger
+# Refactor: 导入共享的序列化函数，以消除代码重复
+from ..agents.l2.metacognitive_agent import MetacognitiveAgent
 
 logger = get_logger(__name__)
 
 class Arbitrator:
     """
-    使用一个专门的 "Arbitrator" LLM 提示，
-    来审查所有分析师的观点，并生成一个最终的 FusionResult。
+    Arbitrator (仲裁者) 负责在 L2 智能体的决策（例如来自 Critic 和 Adversary）
+    与 L1 智能体（Fusion）的原始输出之间进行最终决策。
+    它充当一个最终的、基于规则或模型的检查，以确保系统的一致性和安全性。
     """
 
-    def __init__(self, api_gateway: IAPIGateway, prompt_manager: PromptManager):
-        self.api_gateway = api_gateway
+    def __init__(self, 
+                 llm_client: EnsembleClient, 
+                 prompt_manager: PromptManager, 
+                 prompt_renderer: PromptRenderer):
+        self.llm_client = llm_client
         self.prompt_manager = prompt_manager
-        self.log_prefix = "Arbitrator:"
+        self.prompt_renderer = prompt_renderer
+        self.prompt = self.prompt_manager.get_prompt("arbitrator")
+        self.model_name = "gemini-1.5-pro-latest" # 假设使用一个强大的模型进行仲裁
+        logger.info("Arbitrator initialized.")
 
-    def arbitrate(self, decisions: List[AgentDecision], context: str) -> FusionResult:
+    async def arbitrate(
+        self, 
+        original_fusion: FusionResult, 
+        decisions: List[SupervisionResult]
+    ) -> SupervisionResult:
         """
-        执行仲裁过程。
-        """
-        logger.info(f"{self.log_prefix} Arbitrating {len(decisions)} decisions...")
-        
-        # 1. 序列化决策
-        serialized_decisions = self._serialize_decisions_for_prompt(decisions)
-        
-        # 2. 渲染仲裁者提示
-        prompt = self.prompt_manager.render_prompt(
-            "arbitrator", # 来自 prompts/arbitrator.json
-            context=context,
-            agent_decisions=serialized_decisions
-        )
-        
-        if not prompt:
-            logger.error(f"{self.log_prefix} Failed to render 'arbitrator' prompt.")
-            # 返回一个紧急停止的结果
-            return self._create_emergency_fusion_result(decisions, "Prompt rendering failed")
+        根据 L2 智能体的监督决策和原始的 L1 融合结果，做出最终裁决。
 
-        # 3. 调用 LLM 并期望结构化输出
+        Args:
+            original_fusion: L1 融合智能体的原始输出。
+            decisions: L2 智能体（如 Critic, Adversary）的 SupervisionResult 列表。
+
+        Returns:
+            一个最终的 SupervisionResult，代表仲裁后的决策。
+        """
+        logger.info(f"Arbitrating {len(decisions)} decisions for symbol {original_fusion.symbol}...")
+        
+        # --- Refactor: 使用从 MetacognitiveAgent 导入的共享静态方法 ---
+        # 移除了本地重复的 _serialize_decisions_for_prompt 方法
+        serialized_decisions = MetacognitiveAgent.serialize_decisions_for_prompt(decisions)
+        # --- End Refactor ---
+
+        prompt_context = {
+            "original_sentiment": original_fusion.sentiment.value,
+            "original_confidence": original_fusion.confidence,
+            "supervision_decisions": serialized_decisions
+        }
+        
         try:
-            # --- 恢复原有逻辑 ---
-            # 1. 调用 LLM (假设返回文本)
-            response_text = self.api_gateway.generate(
-                prompt=prompt,
-                model_id="gemini-1.5-pro" # 仲裁需要强大的模型
+            prompt = self.prompt_renderer.render(self.prompt, **prompt_context)
+            
+            response = await self.llm_client.run_chain(
+                prompt,
+                model_name=self.model_name,
+                # Arbitrator 通常不解析工具，除非它需要核查事实
             )
-
-            if not response_text:
-                logger.error(f"{self.log_prefix} Arbitration LLM call returned empty response.")
-                return self._create_emergency_fusion_result(decisions, "LLM returned empty response")
-
-            # 2. 将响应文本 (JSON) 解析为字典
-            try:
-                # 尝试找到json代码块
-                if "```json" in response_text:
-                    json_text = response_text.split("```json")[1].split("```")[0].strip()
-                else:
-                    json_text = response_text
-                
-                response_data = json.loads(json_text)
-            except json.JSONDecodeError:
-                logger.error(f"{self.log_prefix} Arbitration LLM returned non-JSON response: {response_text}")
-                return self._create_emergency_fusion_result(decisions, "LLM returned non-JSON response")
             
-            # 3. 验证字典并转换为 Pydantic 模型
-            try:
-                fusion_result = FusionResult(**response_data)
-            except ValidationError as e:
-                logger.error(f"{self.log_prefix} Arbitration LLM returned invalid JSON structure: {e}\nResponse: {response_data}")
-                return self._create_emergency_fusion_result(decisions, f"LLM returned invalid JSON structure: {e}")
+            # 解析 LLM 的仲裁响应
+            # 假设 LLM 返回一个类似于 SupervisionResult 的结构 (e.g., JSON)
+            # 在一个真实的实现中，这里会有健壮的 JSON 解析和验证
             
-            # --- 结束恢复原有逻辑 ---
+            # --- 模拟解析 ---
+            # 这是一个简化的解析逻辑。
+            # 假设LLM的文本输出是："decision: OVERRIDE, final_sentiment: NEGATIVE, confidence: 0.85, reason: ..."
+            # 我们将使用一个简化的逻辑：如果 L2 决策中存在强烈的反对意见，则进行否决。
             
-            # 4. 填充 LLM 可能遗漏的字段
-            fusion_result.agent_decisions = decisions # 确保原始决策被包括在内
-            fusion_result.timestamp = datetime.utcnow()
-            fusion_result.id = f"fusion_{uuid.uuid4()}"
-            
-            logger.info(f"{self.log_prefix} Arbitration complete. Final decision: {fusion_result.final_decision}")
-            return fusion_result
+            return self._rule_based_arbitration(original_fusion, decisions)
 
         except Exception as e:
-            logger.error(f"{self.log_prefix} Arbitration LLM call failed: {e}", exc_info=True)
-            return self._create_emergency_fusion_result(decisions, str(e))
+            logger.error(f"Error during LLM arbitration: {e}. Falling back to rule-based arbitration.", exc_info=True)
+            # 回退到基于规则的仲裁
+            return self._rule_based_arbitration(original_fusion, decisions)
 
-    def _serialize_decisions_for_prompt(self, decisions: List[AgentDecision]) -> str:
+    def _rule_based_arbitration(
+        self, 
+        original_fusion: FusionResult, 
+        decisions: List[SupervisionResult]
+    ) -> SupervisionResult:
         """
-        将 AgentDecision 列表转换为 LLM 提示符可读的格式。
-        (与 MetacognitiveAgent 中的方法重复，可以提取到工具类中)
+        一个基于规则的仲裁回退逻辑。
         """
-        prompt_text = ""
-        for i, decision in enumerate(decisions):
-            prompt_text += f"\n--- Decision {i+1}: Agent '{decision.agent_name}' ---\n"
-            prompt_text += f"Decision: {decision.decision} (Confidence: {decision.confidence*100:.0f}%)\n"
-            prompt_text += "Reasoning:\n"
-            prompt_text += decision.reasoning
-            prompt_text += "\n----------------------------------\n"
-        return prompt_text
-
-    def _create_emergency_fusion_result(self, decisions: List[AgentDecision], error_msg: str) -> FusionResult:
-        """
-        在仲裁失败时，返回一个“中立/暂停”的结果。
-        """
-        return FusionResult(
-            id=f"fusion_error_{uuid.uuid4()}",
-            timestamp=datetime.utcnow(),
-            agent_decisions=decisions,
-            final_decision="NEUTRAL",
-            final_confidence=0.5,
-            summary=f"Arbitration failed: {error_msg}. Defaulting to NEUTRAL.",
-            conflicts_identified=["Arbitration Failure"],
-            conflict_resolution=None,
-            uncertainty_score=1.0, # 最高不确定性
-            uncertainty_dimensions={"arbitration_failure": 1.0}
+        logger.info("Applying rule-based arbitration fallback...")
+        
+        # 寻找强烈的否决票 (e.g., Critic or Adversary 提出了高置信度的反对意见)
+        for decision in decisions:
+            if (decision.decision.action == "OVERRIDE" or 
+                decision.decision.action == "FLAG_FOR_REVIEW") and \
+               decision.decision.confidence > 0.75:
+                
+                # 如果有强烈的否决票，采取否决票的意见
+                final_decision = decision.decision
+                final_decision.reason = f"[Arbitrator_Rule] Overridden by {decision.source_agent}: {final_decision.reason}"
+                logger.warning(f"Rule-based arbitration: Overriding original fusion based on {decision.source_agent}.")
+                return SupervisionResult(
+                    source_agent="Arbitrator",
+                    decision=final_decision,
+                    timestamp=asyncio.get_event_loop().time()
+                )
+                
+        # 如果没有强烈的否决票，则维持 L1 的融合结果
+        logger.info("Rule-based arbitration: No strong objections found. Maintaining L1 fusion.")
+        return SupervisionResult(
+            source_agent="Arbitrator",
+            decision={
+                "action": "MAINTAIN",
+                "final_sentiment": original_fusion.sentiment,
+                "confidence": original_fusion.confidence,
+                "reason": "L1 fusion maintained. No strong L2 objections."
+            },
+            timestamp=asyncio.get_event_loop().time()
         )
