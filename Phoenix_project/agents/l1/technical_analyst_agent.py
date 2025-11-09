@@ -2,6 +2,7 @@ import json
 import logging
 from typing import List, Any, Generator, AsyncGenerator
 import time
+import pandas as pd # <-- [FIX] 添加 pandas 导入
 
 from Phoenix_project.agents.l1.base import L1Agent
 from Phoenix_project.core.schemas.task_schema import Task
@@ -55,12 +56,38 @@ class TechnicalAnalystAgent(L1Agent):
 
         # 1. 准备 Prompt 的上下文
         symbol = task.symbols[0]
-        context_str = "\n---\n".join([doc.content for doc in context if hasattr(doc, 'content')])
         
-        if not context_str:
-            # 技术分析可能依赖 data_manager 获取数据，这里暂时只依赖 context
-            logger.warning(f"[{self.agent_id}] No string content found in context for task {task.task_id}. Skipping.")
+        # [FIX] 从 DataManager 获取 K 线数据，而不是依赖 context
+        try:
+            # (我们需要为技术分析定义一个合理的时间范围)
+            # (暂时硬编码一个回溯期，例如 90 天。这应该来自配置。)
+            end_date = pd.Timestamp.now(tz='UTC')
+            start_date = end_date - pd.Timedelta(days=90)
+            
+            # get_market_data 返回 Dict[str, pd.DataFrame]
+            market_data_dfs = self.data_manager.get_market_data(
+                symbols=[symbol], 
+                start_date=start_date, 
+                end_date=end_date
+            )
+            
+            klines_df = market_data_dfs.get(symbol)
+            
+            if klines_df is None or klines_df.empty:
+                logger.warning(f"[{self.agent_id}] No kline data found for {symbol} from data_manager. Skipping.")
+                return
+            
+            # (将 DataFrame 转换为 LLM 可读的格式，例如 JSON)
+            # (只取几行数据，避免 prompt 过长)
+            context_str = klines_df.tail(30).to_json(orient="records")
+            
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Failed to get kline data for {symbol}. Error: {e}", exc_info=True)
             return
+
+        if not context_str:
+             logger.warning(f"[{self.agent_id}] Kline data for {symbol} was empty after processing. Skipping.")
+             return
 
         context_map = {
             "symbol": symbol,
