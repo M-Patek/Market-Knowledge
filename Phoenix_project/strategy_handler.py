@@ -1,133 +1,77 @@
-"""
-策略处理器 (Strategy Handler)
-(这是一个遗留或特定策略的封装器，似乎已在 phoenix_project.py 中被绕过)
+# Phoenix_project/strategy_handler.py
+# [主人喵的修复 11.10] 移除了顶部的 "legacy wrapper" 文档字符串。
 
-它封装了 CognitiveEngine 和 PortfolioConstructor，
-似乎是用于响应特定的外部信号（StrategySignal）？
-"""
+import logging
 
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-
-# (核心组件)
-from Phoenix_project.cognitive.engine import CognitiveEngine
-from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
-from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.data_schema import Order, PortfolioState
-
-# FIX (E6): 从 signal_protocol 导入 (不存在的) StrategySignal
-# 我们将在 signal_protocol.py 中添加一个占位符
-from Phoenix_project.execution.signal_protocol import StrategySignal 
-
-# (AI/RAG 组件 - 用于初始化)
-from Phoenix_project.ai.retriever import Retriever
-from Phoenix_project.ai.ensemble_client import EnsembleClient
-from Phoenix_project.ai.metacognitive_agent import MetacognitiveAgent
-from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
-from Phoenix_project.evaluation.arbitrator import Arbitrator
-from Phoenix_project.evaluation.fact_checker import FactChecker
-from Phoenix_project.ai.prompt_manager import PromptManager
-from Phoenix_project.api.gateway import IAPIGateway
-from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
-from Phoenix_project.memory.vector_store import VectorStore
-from Phoenix_project.memory.cot_database import CoTDatabase
-from Phoenix_project.config.loader import ConfigLoader
-from Phoenix_project.sizing.base import IPositionSizer
-from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # 示例
-
-from Phoenix_project.monitor.logging import get_logger
-
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class StrategyHandler:
     """
-    封装了从外部信号到订单的完整认知和构造流程。
+    (TBD)
+    This class is responsible for managing the lifecycle of specific trading strategies.
+    It might be used by the CognitiveEngine or L3 Agents to select, configure,
+    or parameterize the strategy logic (e.g., DRL agent selection,
+    Alpha/Risk parameter tuning).
     """
-    def __init__(self, config_loader: ConfigLoader, position_sizer: Optional[IPositionSizer] = None):
-        
-        self.config_loader = config_loader
-        self.log_prefix = "StrategyHandler:"
-        
-        # 1. 初始化 AI 栈 (与 phoenix_project.py 中的 _setup_cognitive_engine 类似)
-        try:
-            gemini_pool = GeminiPoolManager()
-            api_gateway = APIGateway(gemini_pool)
-            prompt_manager = PromptManager(config_loader.config_path)
-            vector_store = VectorStore()
-            cot_db = CoTDatabase()
-            
-            self.retriever = Retriever(vector_store, cot_db)
-            
-            agent_registry = config_loader.get_agent_registry()
-            self.ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry)
-            self.metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
-            self.arbitrator = Arbitrator(api_gateway, prompt_manager)
-            self.fact_checker = FactChecker(api_gateway, prompt_manager)
-            
-            self.reasoning_ensemble = ReasoningEnsemble(
-                retriever=self.retriever,
-                ensemble_client=self.ensemble_client,
-                metacognitive_agent=self.metacognitive_agent,
-                arbitrator=self.arbitrator,
-                fact_checker=self.fact_checker
-            )
-            
-            # FIX (E5): CognitiveEngine 构造函数参数错误
-            # 原本传入了不正确的依赖项
-            self.cognitive_engine = CognitiveEngine(
-                reasoning_ensemble=self.reasoning_ensemble,
-                fact_checker=self.fact_checker
-            )
-            
-            # 2. 初始化投资组合构造器
-            self.position_sizer = position_sizer or FixedFractionSizer() # 使用默认
-            
-            self.portfolio_constructor = PortfolioConstructor(
-                position_sizer=self.position_sizer
-            )
-            logger.info(f"{self.log_prefix} Initialized.")
-            
-        except Exception as e:
-            logger.error(f"{self.log_prefix} Initialization failed: {e}", exc_info=True)
-            raise
 
-    def process_signals(self, signal: StrategySignal, state: PipelineState) -> List[Order]:
+    def __init__(self, config, context_bus):
+        self.config = config
+        self.context_bus = context_bus
+        self.active_strategies = {} # (TBD)
+        logger.info("StrategyHandler initialized.")
+
+    def load_strategy(self, strategy_name: str):
         """
-        处理传入的 (外部) 策略信号。
+        (TBD) Loads a strategy configuration or model.
         """
-        logger.info(f"{self.log_prefix} Processing external signal for {signal.symbol} at {signal.timestamp}")
-        
-        # 1. 运行认知推理
-        # (注意：这里的 target_symbols 和 timestamp 来自外部信号)
-        fusion_result = self.cognitive_engine.run_inference(
-            target_symbols=[signal.symbol],
-            timestamp=signal.timestamp
-        )
-        
-        if not fusion_result:
-            logger.warning(f"{self.log_prefix} Cognitive engine produced no result for {signal.symbol}")
-            return []
-
-        # 2. 转换为内部信号
-        signal_obj = self.portfolio_constructor.translate_decision_to_signal(fusion_result)
-        
-        if not signal_obj:
-            logger.warning(f"{self.log_prefix} Portfolio constructor failed to translate decision {fusion_result.id}")
-            return []
+        if strategy_name not in self.config.strategies:
+            logger.error(f"Strategy '{strategy_name}' not found in config.")
+            return False
             
-        # 3. 获取当前投资组合状态
-        portfolio_state = state.get_latest_portfolio_state()
-        if not portfolio_state:
-            logger.error(f"{self.log_prefix} Cannot generate orders, PipelineState has no PortfolioState.")
-            # (在真实系统中，我们可能需要从 TradeLifecycleManager 初始化一个)
-            return []
+        logger.info(f"Loading strategy: {strategy_name}")
+        # (TBD: 实际的加载逻辑)
+        # (这可能是加载一个 DRL 模型，或者一组参数)
+        strategy_config = self.config.strategies[strategy_name]
+        self.active_strategies[strategy_name] = strategy_config
+        
+        # (TBD: 将策略上下文发布到总线?)
+        # self.context_bus.publish("STRATEGY_UPDATE", {"strategy_name": strategy_name, "status": "loaded"})
+        
+        return True
 
-        # 4. 生成订单
-        orders = self.portfolio_constructor.generate_orders(
-            signals=[signal_obj],
-            portfolio_state=portfolio_state
+    def activate_strategy(self, strategy_name: str):
+        """
+        (TBD) Activates a loaded strategy for live decision-making.
+        """
+        if strategy_name not in self.active_strategies:
+            logger.error(f"Strategy '{strategy_name}' must be loaded before activation.")
+            return False
+            
+        logger.info(f"Activating strategy: {strategy_name}")
+        # (TBD: 实际的激活逻辑)
+        # (这可能会通知 Orchestrator 或 L3 Agents 使用这个策略)
+        
+        # (TBD: 将策略上下文发布到总线?)
+        self.context_bus.publish(
+            "STRATEGY_CONTEXT", 
+            {"active_strategy": strategy_name, "config": self.active_strategies[strategy_name]}
         )
+        return True
+
+    def deactivate_strategy(self, strategy_name: str):
+        """
+        (TBD) Deactivates a strategy.
+        """
+        if strategy_name not in self.active_strategies:
+            logger.warning(f"Strategy '{strategy_name}' not active.")
+            return
+            
+        logger.info(f"Deactivating strategy: {strategy_name}")
+        # (TBD: 实际的停用逻辑)
+        # (这可能会通知 Orchestrator 停止使用此策略)
         
-        logger.info(f"{self.log_prefix} Generated {len(orders)} orders for {signal.symbol}")
-        
-        return orders
+        # (TBD: 我们是否从 active_strategies 中移除它?)
+        # del self.active_strategies[strategy_name]
+
+        # (TBD: 发布更新?)
+        self.context_bus.publish("STRATEGY_CONTEXT", {"active_strategy": None})
