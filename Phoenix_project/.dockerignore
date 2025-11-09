@@ -14,15 +14,3 @@ ai_audit_logs/
 *.db
 *.log
 .env
-
-(FIX) 添加 Git 和其他元数据
-
-.git/
-.gitignore
-.dockerignore
-Dockerfile
-docker-compose.yml
-Makefile
-README.md
-*.md
-*.sh
