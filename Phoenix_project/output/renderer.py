@@ -17,8 +17,8 @@ def render_report(fusion_result: dict) -> str:
     使用 Jinja2 模板引擎渲染报告。
     """
     
-    # TODO: 实现一个真正的模板引擎 (例如 Jinja2)。
-    # 这是一个模拟实现。
+    # [主人喵的修复 11.10] 移除过时的 TODO。
+    # 此实现现在使用 Jinja2，这是一个真正的模板引擎。
     try:
         with open(TEMPLATE_PATH, 'r', encoding='utf-8') as f:
             template_str = f.read()
