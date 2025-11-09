@@ -94,11 +94,13 @@ class CognitiveEngine:
 
                 elif support_status == "Refuted":
                     logger.warning("Fact-checker refuted reasoning! Overriding decision.")
-                    # This is a simple override. A better system might re-run
-                    # reasoning with the new info.
-                    fusion_result.final_decision = "HOLD"
-                    fusion_result.reasoning += "\n\n[OVERRIDE]: Original reasoning was refuted by fact-checker."
-                    fusion_result.confidence = 0.9 # High confidence in the HOLD
+                    # 修复：
+                    # This is a simple override. (这是用户指出的问题点)
+                    # 修复：不再硬编码 "HOLD"，而是使用 "NEUTRAL" 并将置信度设为 0.0，
+                    # 这样更安全，并允许 UncertaintyGuard 捕获它。
+                    fusion_result.final_decision = "NEUTRAL"
+                    fusion_result.reasoning += "\n\n[OVERRIDE]: Original reasoning was refuted by fact-checker. Decision neutralized, confidence set to 0.0."
+                    fusion_result.confidence = 0.0 # 修复：将置信度设为 0.0
             except Exception as e:
                 logger.error(f"Fact-checker failed: {e}", exc_info=True)
                 # Non-fatal, proceed with original decision
