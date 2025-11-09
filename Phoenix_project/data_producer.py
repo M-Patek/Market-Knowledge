@@ -1,207 +1,231 @@
-import asyncio
-import random
-from typing import Callable, Coroutine, Any, Dict
+"""
+Data Producer for Phoenix.
 
-from .core.schemas.data_schema import TradeData, QuoteData, MarketData, MarketDataSource
-from .monitor.logging import get_logger
+OPTIMIZED: This module is no longer a simulation.
+It connects to a real-time WebSocket feed (e.g., Polygon.io)
+and produces live market data into the Redis stream (or Kafka).
+This replaces the previous 'data_producer.py' simulation.
+"""
 
-logger = get_logger(__name__)
+import json
+import logging
+import os
+import threading
+import time
+from typing import Any, Dict
 
-class DataProducer:
+import redis  # type: ignore
+import websocket  # type: ignore  (需要 'pip install websocket-client')
+
+from .core.schemas.data_schema import MarketData
+from datetime import datetime
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class RealTimeDataProducer:
     """
-    模拟来自数据源（如交易所）的实时市场数据流。
-    这个类用于测试和演示，模拟生成数据并将其推送到事件流。
+    Connects to a real-time data provider (WebSocket) and streams
+    data into the system's message bus (Redis Streams).
     """
-    
-    def __init__(self, 
-                 event_callback: Callable[[MarketData], Coroutine[Any, Any, None]],
-                 data_source: MarketDataSource = MarketDataSource.SIMULATED):
+
+    def __init__(self, config: Dict[str, Any], redis_client: redis.Redis):
         """
-        初始化 DataProducer。
+        Initializes the RealTimeDataProducer.
 
         Args:
-            event_callback: 一个异步回调函数，用于处理生成的 MarketData 事件。
-            data_source: 数据源标识。
+            config: Configuration dictionary. Must contain 'data_producer'
+                    section with 'websocket_url' and 'api_key'.
+            redis_client: An initialized Redis client.
         """
-        self.event_callback = event_callback
-        self.data_source = data_source
-        self._running = False
-        self._demo_task = None
-        self.last_prices: Dict[str, float] = {}
-        logger.info(f"DataProducer initialized with data source: {self.data_source}")
+        self.config = config.get("data_producer", {})
+        self.redis_client = redis_client
 
-    async def on_trade(self, trade: TradeData):
-        """
-        处理传入的 TradeData 并将其转换为 MarketData (OHLCV) 事件。
-
-        备注：这是一个更真实的模拟。在真实的系统中，
-        这个生产者可能会聚合一分钟内的多次交易来构建一个K线 (bar)，
-        或者直接从数据源接收K线。
-        为了进行合理的模拟，我们基于当前交易价格和最后价格来估算一个OHLCV K线。
-        """
-        try:
-            symbol = trade.symbol
-            price = trade.price
-            
-            # 从缓存中获取最后的价格，如果不存在则使用当前价格
-            open_price = self.last_prices.get(symbol, price)
-            
-            # 模拟高点和低点
-            # 假设高点是开盘价和收盘价中的较高者，再加一点随机波动
-            # 假设低点是开盘价和收盘价中的较低者，再减一点随机波动
-            high_price = max(open_price, price) + (price * random.uniform(0.0001, 0.0005))
-            low_price = min(open_price, price) - (price * random.uniform(0.0001, 0.0005))
-            
-            # 确保 H >= L
-            if low_price > high_price:
-                low_price, high_price = high_price, low_price
-            
-            # 确保价格在 [L, H] 范围内
-            open_price = max(low_price, min(high_price, open_price))
-            close_price = max(low_price, min(high_price, price)) # close price is the trade price
-            
-            # 模拟交易量
-            simulated_volume = (trade.volume or 1.0) * random.uniform(1.0, 5.0)
-            
-            market_data = MarketData(
-                symbol=symbol,
-                timestamp=trade.timestamp,
-                open=open_price,
-                high=high_price,
-                low=low_price,
-                close=close_price,
-                volume=simulated_volume,
-                source=self.data_source,
-                data_type='trade_derived_bar'
-            )
-            
-            # 更新最后的价格
-            self.last_prices[symbol] = price
-            
-            await self.event_callback(market_data)
-            logger.debug(f"Processed simulated bar for trade: {market_data}")
-            
-        except Exception as e:
-            logger.error(f"Error in on_trade: {e}", exc_info=True)
-
-    async def on_quote(self, quote: QuoteData):
-        """
-        处理传入的 QuoteData 并将其转换为 MarketData (OHLCV) 事件。
-
-        备注：报价数据 (bid/ask) 通常不直接生成K线。
-        这个模拟使用中间价 (mid-price) 来估算一个OHLCV K线。
-        """
-        try:
-            symbol = quote.symbol
-            if quote.bid_price <= 0 or quote.ask_price <= 0:
-                logger.warning(f"Skipping quote with invalid prices: {quote}")
-                return
-                
-            mid_price = (quote.bid_price + quote.ask_price) / 2.0
-            
-            # 从缓存中获取最后的价格，如果不存在则使用中间价
-            open_price = self.last_prices.get(symbol, mid_price)
-            
-            # 模拟高点和低点
-            spread = (quote.ask_price - quote.bid_price)
-            high_price = max(open_price, mid_price) + (spread * random.uniform(0.1, 0.5))
-            low_price = min(open_price, mid_price) - (spread * random.uniform(0.1, 0.5))
-            
-            if low_price > high_price:
-                low_price, high_price = high_price, low_price
-            
-            open_price = max(low_price, min(high_price, open_price))
-            close_price = max(low_price, min(high_price, mid_price))
-            
-            # 模拟交易量 (基于报价大小)
-            volume = (quote.bid_size + quote.ask_size) * random.uniform(0.05, 0.1)
-
-            market_data = MarketData(
-                symbol=symbol,
-                timestamp=quote.timestamp,
-                open=open_price,
-                high=high_price,
-                low=low_price,
-                close=close_price,
-                volume=volume,
-                source=self.data_source,
-                data_type='quote_derived_bar'
-            )
-            
-            # 更新最后的价格
-            self.last_prices[symbol] = mid_price
-            
-            await self.event_callback(market_data)
-            logger.debug(f"Processed simulated bar for quote: {market_data}")
-
-        except Exception as e:
-            logger.error(f"Error in on_quote: {e}", exc_info=True)
-
-    async def _run_demo_feed(self):
-        """
-        一个内部循环，用于在演示模式下生成模拟数据。
-        """
-        logger.info("Starting demo data feed...")
-        self._running = True
+        # 从配置或环境变量中获取 WebSocket URL 和 API Key
+        self.ws_url = self.config.get("websocket_url")
+        self.api_key = self.config.get("api_key") or os.getenv("DATA_API_KEY")
+        self.symbols = self.config.get("symbols", ["T:SPY", "T:QQQ"]) # 示例: Polygon.io Tickers
         
-        symbols = ["BTC/USD", "ETH/USD"]
-        base_prices = {"BTC/USD": 60000.0, "ETH/USD": 3000.0}
-        
-        while self._running:
-            try:
-                await asyncio.sleep(random.uniform(0.5, 2.0))
-                
-                symbol = random.choice(symbols)
-                base_price = base_prices[symbol]
-                
-                # 生成模拟交易
-                trade_price = base_price + random.uniform(-100, 100)
-                trade_volume = random.uniform(0.1, 5.0)
-                trade = TradeData(
-                    symbol=symbol,
-                    price=trade_price,
-                    volume=trade_volume,
-                    timestamp=asyncio.get_event_loop().time()
-                )
-                await self.on_trade(trade)
-                
-                # 更新基准价格以模拟市场波动
-                base_prices[symbol] = trade_price
-                
-                # 生成模拟报价 (偶尔)
-                if random.random() < 0.3:
-                    bid_price = trade_price - random.uniform(1, 5)
-                    ask_price = trade_price + random.uniform(1, 5)
-                    quote = QuoteData(
+        # Redis Stream 名称
+        self.stream_name = self.config.get("stream_name", "phoenix:stream:market_data")
+        # 用于存储最新价格的 Redis Key 前缀
+        self.live_key_prefix = "phoenix:market_data:live:"
+
+        if not self.ws_url or not self.api_key:
+            logger.error("WebSocket URL or API Key not configured. Producer cannot start.")
+            raise ValueError("Missing websocket_url or api_key in config")
+
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self._stop_event = threading.Event()
+
+    def _on_message(self, ws, message):
+        """Callback for handling incoming WebSocket messages."""
+        try:
+            data_list = json.loads(message)
+            
+            # 消息通常是列表
+            for data in data_list:
+                # --- 解析逻辑 (特定于 Polygon.io Tickers) ---
+                if data.get("ev") == "T": # 这是一个 Ticker
+                    symbol = data.get("sym")
+                    price = data.get("p")
+                    volume = data.get("s")
+                    # 纳秒时间戳 -> datetime
+                    timestamp = datetime.fromtimestamp(data.get("t") / 1000.0)
+
+                    if not all([symbol, price, volume, timestamp]):
+                        continue
+
+                    # 组装 MarketData 对象
+                    market_data = MarketData(
                         symbol=symbol,
-                        bid_price=bid_price,
-                        ask_price=ask_price,
-                        bid_size=random.uniform(1, 10),
-                        ask_size=random.uniform(1, 10),
-                        timestamp=asyncio.get_event_loop().time()
+                        price=float(price),
+                        volume=float(volume),
+                        timestamp=timestamp
                     )
-                    await self.on_quote(quote)
+                    
+                    self._produce_to_redis(market_data)
+                
+                elif data.get("ev") == "status":
+                    logger.info(f"WebSocket Status Update: {data.get('message')}")
 
-            except asyncio.CancelledError:
-                logger.info("Demo data feed cancelled.")
-                self._running = False
-            except Exception as e:
-                logger.error(f"Error in demo feed loop: {e}", exc_info=True)
-                await asyncio.sleep(5) # 发生错误时稍作等待
+        except json.JSONDecodeError:
+            logger.warning(f"Received non-JSON message: {message}")
+        except Exception as e:
+            logger.error(f"Error processing message: {e}\nMessage: {message}")
 
-    def start_demo(self):
-        """启动模拟数据流。"""
-        if not self._running:
-            self._demo_task = asyncio.create_task(self._run_demo_feed())
-            logger.info("Demo data producer started.")
-        else:
-            logger.warning("Demo data producer is already running.")
+    def _produce_to_redis(self, data: MarketData):
+        """Pushes data into Redis Stream and updates the 'live' key."""
+        try:
+            data_dict = data.model_dump(mode="json")
+            # model_dump(mode='json') 会将 datetime 转换为 isoformat 字符串
+            
+            # 1. 发布到 Stream
+            self.redis_client.xadd(self.stream_name, data_dict)
+            
+            # 2. 更新最新价格 (live key)
+            live_key = f"{self.live_key_prefix}{data.symbol}"
+            self.redis_client.set(live_key, json.dumps(data_dict))
+            
+            logger.debug(f"Produced to {self.stream_name}: {data.symbol} @ {data.price}")
 
-    def stop_demo(self):
-        """停止模拟数据流。"""
-        if self._running and self._demo_task:
-            self._demo_task.cancel()
-            self._running = False
-            logger.info("Demo data producer stopped.")
-        else:
-            logger.warning("Demo data producer is not running.")
+        except redis.RedisError as e:
+            logger.error(f"Redis error producing data: {e}")
+
+    def _on_error(self, ws, error):
+        """Callback for WebSocket errors."""
+        logger.error(f"WebSocket Error: {error}")
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        """Callback for WebSocket close."""
+        logger.info(f"WebSocket closed. Code: {close_status_code}, Msg: {close_msg}")
+        if not self._stop_event.is_set():
+            logger.info("Attempting to reconnect in 5 seconds...")
+            time.sleep(5)
+            self.run() # 尝试重连
+
+    def _on_open(self, ws):
+        """Callback for WebSocket open. Handles authentication and subscription."""
+        logger.info("WebSocket connection opened.")
+        try:
+            # 1. 认证
+            auth_data = {
+                "action": "auth",
+                "params": self.api_key
+            }
+            ws.send(json.dumps(auth_data))
+            
+            # 2. 订阅
+            subscribe_data = {
+                "action": "subscribe",
+                "params": ",".join(self.symbols) # 例如 "T:SPY,T:QQQ"
+            }
+            ws.send(json.dumps(subscribe_data))
+            logger.info(f"Subscribed to symbols: {self.symbols}")
+            
+        except Exception as e:
+            logger.error(f"Error during WebSocket auth/subscribe: {e}")
+
+    def run(self):
+        """
+        Starts the WebSocket client in a blocking loop.
+        """
+        if self._stop_event.is_set():
+            logger.info("Producer is marked as stopped. Will not start.")
+            return
+
+        logger.info(f"Starting real-time data producer. Connecting to {self.ws_url}...")
+        
+        # websocket.enableTrace(True) # 取消注释以进行详细调试
+        
+        self.ws = websocket.WebSocketApp(
+            self.ws_url,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close
+        )
+        
+        # run_forever() 是一个阻塞调用
+        self.ws.run_forever()
+
+    def stop(self):
+        """Stops the WebSocket client."""
+        logger.info("Stopping data producer...")
+        self._stop_event.set()
+        if self.ws:
+            self.ws.close()
+        logger.info("Data producer stopped.")
+
+
+# --- 用于独立运行的示例 ---
+def main():
+    """
+    Example of how to run the producer independently.
+    """
+    logger.info("Starting Data Producer (Standalone Mode)...")
+    
+    # 从环境变量加载配置
+    REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+    REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+    WEBSOCKET_URL = os.getenv("POLYGON_WS_URL", "wss://socket.polygon.io/stocks")
+    API_KEY = os.getenv("POLYGON_API_KEY")
+
+    if not API_KEY:
+        logger.critical("POLYGON_API_KEY environment variable not set. Exiting.")
+        return
+
+    try:
+        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
+        redis_client.ping()
+        logger.info(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+    except redis.RedisError as e:
+        logger.critical(f"Failed to connect to Redis: {e}. Exiting.")
+        return
+
+    config = {
+        "data_producer": {
+            "websocket_url": WEBSOCKET_URL,
+            "api_key": API_KEY,
+            "symbols": ["T:SPY", "T:QQQ", "T:AAPL", "T:MSFT"],
+            "stream_name": "phoenix:stream:market_data"
+        }
+    }
+
+    producer = RealTimeDataProducer(config, redis_client)
+    
+    try:
+        producer.run()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received.")
+    finally:
+        producer.stop()
+        logger.info("Data Producer shut down.")
+
+if __name__ == "__main__":
+    main()
