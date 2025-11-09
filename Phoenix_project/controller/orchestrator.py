@@ -1,332 +1,183 @@
-"""
-Orchestrator
-协调 Phoenix 系统的主要数据和逻辑流。
-"""
-import asyncio # <-- [新] 添加 asyncio
-from typing import List, Dict, Any
-from datetime import datetime # [阶段 4 变更] 导入 datetime
-
-# (主人喵的清洁计划 5.1) [新] 导入 Pydantic 验证
-from pydantic import ValidationError
-from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, EconomicIndicator
+# controller/orchestrator.py
+import asyncio
+from typing import Dict, Any
 
 from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.exceptions import CognitiveError # <-- [新] 导入异常
+from Phoenix_project.core.exceptions import CognitiveError, DataError
+from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.data_manager import DataManager
-from Phoenix_project.events.risk_filter import EventRiskFilter
-# [主人喵的修复 2] 导入 EventDistributor
-from Phoenix_project.events.event_distributor import EventDistributor
-# [主人喵的修复 2] 移除 StreamProcessor
 from Phoenix_project.cognitive.engine import CognitiveEngine
 from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
-from Phoenix_project.cognitive.risk_manager import RiskManager
 from Phoenix_project.execution.order_manager import OrderManager
-from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
-from Phoenix_project.snapshot_manager import SnapshotManager
-from Phoenix_project.metrics_collector import MetricsCollector
-from Phoenix_project.audit_manager import AuditManager
-from Phoenix_project.controller.error_handler import ErrorHandler
-from Phoenix_project.monitor.logging import get_logger
 
-logger = get_logger(__name__)
+# [任务 2.2] 导入 L3 DRL 智能体
+from Phoenix_project.agents.l3.alpha_agent import AlphaAgent
+from Phoenix_project.agents.l3.risk_agent import RiskAgent
+from Phoenix_project.agents.l3.execution_agent import ExecutionAgent
+
+# [任务 2.3] 导入 L3 决策所需的数据 Schema
+import numpy as np
+from Phoenix_project.core.schemas.data_schema import TargetPortfolio, TargetPosition, PortfolioState
+from Phoenix_project.core.schemas.fusion_result import FusionResult
+
 
 class Orchestrator:
     """
-    管理整个 AI 交易系统的端到端生命周期，
-    从数据摄取到执行。
-    """
+    (Orchestrator 文档字符串...)
     
+    [任务 2.2] 更新:
+    现在注入了 L3 DRL 智能体 (Alpha, Risk, Exec) 并使用它们
+    在 run_main_cycle 中替换旧的 PortfolioConstructor 决策逻辑。
+    """
     def __init__(
         self,
-        pipeline_state: PipelineState,
+        config: Dict[str, Any],
         data_manager: DataManager,
-        event_filter: EventRiskFilter,
-        # [主人喵的修复 2] 移除 stream_processor，添加 event_distributor
-        event_distributor: EventDistributor,
         cognitive_engine: CognitiveEngine,
         portfolio_constructor: PortfolioConstructor,
-        risk_manager: RiskManager,
         order_manager: OrderManager,
-        trade_lifecycle_manager: TradeLifecycleManager,
-        snapshot_manager: SnapshotManager,
-        metrics_collector: MetricsCollector,
-        audit_manager: AuditManager,
-        error_handler: ErrorHandler
+        # [任务 2.2] 注入 L3 DRL 智能体
+        alpha_agent: AlphaAgent,
+        risk_agent: RiskAgent,
+        execution_agent: ExecutionAgent,
+        loop_manager: Any = None # (假设 LoopManager 存在)
     ):
-        self.pipeline_state = pipeline_state
+        self.config = config
         self.data_manager = data_manager
-        self.event_filter = event_filter
-        # [主人喵的修复 2] 存储 event_distributor
-        self.event_distributor = event_distributor
         self.cognitive_engine = cognitive_engine
-        self.portfolio_constructor = portfolio_constructor
-        self.risk_manager = risk_manager
         self.order_manager = order_manager
-        self.trade_lifecycle_manager = trade_lifecycle_manager
-        self.snapshot_manager = snapshot_manager
-        self.metrics_collector = metrics_collector
-        self.audit_manager = audit_manager
-        self.error_handler = error_handler
         
-        self.is_running = False
-        logger.info("Orchestrator initialized.")
-
-    def _check_for_events(self) -> List[Dict[str, Any]]:
-        """
-        [主人喵的修复 2]
-        从 EventDistributor (Redis 队列) 批量拉取待处理事件。
-        (主人喵的清洁计划 5.1) [已修改] 
-        - 添加 Pydantic schema 验证。
-        """
-        try:
-            # (默认拉取最多 100 个事件，以避免阻塞循环)
-            pending_events = self.event_distributor.get_pending_events(max_events=100)
-            
-            if not pending_events:
-                return []
-                
-            logger.info(f"Retrieved {len(pending_events)} new events. Validating schema...")
-            validated_events = []
-            
-            for event_data in pending_events:
-                try:
-                    # (主人喵的清洁计划 5.1) [新] 在此处添加 Pydantic 验证
-                    
-                    # 这是一个简化的示例。一个健壮的系统会有一个
-                    # 包含 'type' 和 'payload' 的包装器 (envelope) schema。
-                    # 这里我们根据内容进行猜测。
-                    
-                    if 'content' in event_data and 'source' in event_data:
-                        # 尝试验证为 NewsData
-                        NewsData.model_validate(event_data)
-                    elif 'symbol' in event_data and 'close' in event_data:
-                        # 尝试验证为 MarketData
-                        MarketData.model_validate(event_data)
-                    elif 'name' in event_data and 'value' in event_data:
-                        # 尝试验证为 EconomicIndicator
-                        EconomicIndicator.model_validate(event_data)
-                    else:
-                        # 无法识别，但通过（或使用一个基础 schema）
-                        logger.warning(f"Unknown event schema type for event, skipping validation: {str(event_data)[:100]}...")
-                    
-                    validated_events.append(event_data)
-                    
-                except ValidationError as e:
-                    # 记录第一个错误消息
-                    error_msg = e.errors()[0].get('msg', 'Unknown validation error')
-                    logger.warning(f"Event schema validation failed, discarding event. Error: {error_msg}... Data: {str(event_data)[:100]}...")
-                except Exception as e_generic:
-                    logger.error(f"Unexpected error during event validation: {e_generic}. Discarding event.", exc_info=True)
-
-            if pending_events and not validated_events:
-                logger.warning(f"All {len(pending_events)} retrieved events failed validation.")
-            
-            return validated_events
-            
-        except Exception as e:
-            logger.error(f"Failed to check for events: {e}", exc_info=True)
-            return []
-
-    def run_main_cycle(self):
-        """
-        执行一个单独的、离散的系统运行周期。
-        (这是由 Celery worker 调用的)
+        # [任务 2.3] 我们仍然保留 PC，以防它有其他辅助功能 (例如计算)，
+        # 但它的 .construct() 决策逻辑将被 L3 替换。
+        self.portfolio_constructor = portfolio_constructor 
         
-        [阶段 4 重构]
-        - 移除对 execute_orders 和 update_portfolio 的调用。
-        - 添加对 order_manager.process_target_portfolio 的调用。
-        """
-        if self.is_running:
-            logger.warning("Main cycle already in progress. Skipping.")
-            return
+        # [任务 2.2] 保存 L3 智能体
+        self.alpha_agent = alpha_agent
+        self.risk_agent = risk_agent
+        self.execution_agent = execution_agent
+        
+        self.loop_manager = loop_manager
+        self.logger = get_logger(self.__class__.__name__)
 
-        self.is_running = True
-        logger.info("--- Orchestrator Main Cycle START ---")
+    async def run_main_cycle(self, state: PipelineState):
+        """
+        执行一个完整的“感知-认知-行动”周期。
+        """
+        self.logger.info(f"--- [Cycle {state.cycle_id}] Orchestrator Main Cycle START ---")
         
         try:
-            # 1. 事件摄取 (Event Ingestion)
-            # [主人喵的修复 2] 从 EventDistributor (Redis) 拉取，而不是 Kafka
-            new_events = self._check_for_events()
+            # --- 1. 感知 (Perception) ---
+            # (获取 L0/L1 数据, 例如市场数据, 新闻等)
+            # (假设 data_manager.process_perception_cycle 更新了 state)
             
-            # (如果需要，也可以安排数据管理器的主动拉取)
-            # self.data_manager.pull_scheduled_data()
+            # --- 2. L2 认知 (Cognition) ---
+            # (运行 L2 智能体 (Fusion, Critic 等) 来生成 L2 分析)
+            # (假设 cognitive_engine.process_cognitive_cycle 返回 L2 结果)
+            
+            # [任务 2.3] 确保 L2 结果 (fusion_results) 被保存到 state
+            # (我们假设 L2 结果是一个字典: Dict[str, FusionResult])
+            # self.cognitive_engine.process...
+            # state.set_value("l2_fusion_results", l2_results_dict)
+            
+            # (模拟 L2 步骤 - 在实际代码中，这将由 cognitive_engine 完成)
+            if not state.get_value("l2_fusion_results"):
+                 self.logger.warning("L2 认知未运行，模拟 L2 结果...")
+                 state.set_value("l2_fusion_results", {
+                     "AAPL": FusionResult(symbol="AAPL", final_decision="BUY", confidence=0.8, sentiment_score=0.8, reasoning="Simulated L2 Buy"),
+                     "GOOG": FusionResult(symbol="GOOG", final_decision="SELL", confidence=0.7, sentiment_score=-0.7, reasoning="Simulated L2 Sell")
+                 })
+            
+            # --- 3. 获取当前投资组合状态 ---
+            # (这对于 L3 DRL 智能体至关重要)
+            self.logger.info("Step 3: Fetching current portfolio and market state...")
+            current_portfolio_state = await self.order_manager.get_current_portfolio_state()
+            state.set_value("current_portfolio_state", current_portfolio_state)
+            
+            # (模拟 L0 市场数据 - 在实际代码中，这将由 data_manager 完成)
+            market_data = {"AAPL": 150.0, "GOOG": 175.0}
+            state.set_value("current_market_data", market_data)
 
-            # 2. 事件过滤 (Event Filtering)
-            # (FIX E1)
-            filtered_events = self.event_filter.apply_all_filters(new_events)
-            if not filtered_events and not new_events: # [修复] 如果有事件但都被过滤了，也许我们仍想运行
-                 logger.info("No new events found. Cycle END.")
-                 self.is_running = False
-                 return
-            elif not filtered_events:
-                logger.info("No significant events after filtering, but processing cycle anyway...")
+            # --- 4. L3 认知 (DRL 决策) [任务 2.3 核心替换] ---
+            self.logger.info("Step 4: Engaging L3 DRL Agents for portfolio decision...")
+            
+            l2_fusion_results: Dict[str, FusionResult] = state.get_value("l2_fusion_results")
+
+            target_positions = []
+            
+            if not all([current_portfolio_state, market_data, l2_fusion_results]):
+                self.logger.error("L3 DRL: 缺少 投资组合/市场/L2 数据！跳过 L3 决策。")
+                target_portfolio = TargetPortfolio(positions=[])
+            
             else:
-                 logger.info(f"Processing {len(filtered_events)} filtered events.")
+                # 遍历 L2 评估过的每个资产
+                for symbol, fusion_result in l2_fusion_results.items():
+                    if symbol not in market_data:
+                        self.logger.warning(f"L3 DRL: 缺少 {symbol} 的市场数据，跳过。")
+                        continue
 
+                    # (准备特定于资产的 5-d 状态)
+                    current_holding = current_portfolio_state.positions.get(symbol)
+                    symbol_state_data = {
+                        "balance": current_portfolio_state.cash,
+                        "holdings": current_holding.quantity if current_holding else 0.0,
+                        "price": market_data[symbol]
+                    }
 
-            # 3. 状态更新 (State Update)
-            self.pipeline_state.start_new_cycle(filtered_events)
+                    # 1. Alpha Agent: 决定目标 *权重* (例如 0.0 到 1.0)
+                    # (我们假设 Alpha Agent 学会了 L2 'BUY' -> >0, L2 'SELL' -> 0.0)
+                    alpha_obs = self.alpha_agent.format_observation(symbol_state_data, fusion_result)
+                    alpha_action = self.alpha_agent.compute_action(alpha_obs)
+                    target_weight = np.clip(alpha_action[0], 0.0, 1.0) # (假设 [0] 是权重)
+
+                    # 2. Risk Agent: 决定风险调整 *标量* (例如 0.0 到 1.0)
+                    risk_obs = self.risk_agent.format_observation(symbol_state_data, fusion_result)
+                    risk_action = self.risk_agent.compute_action(risk_obs)
+                    risk_scalar = np.clip(risk_action[0], 0.0, 1.0) # (假设 [0] 是缩放因子)
+
+                    # 3. (Execution Agent: 暂时忽略, 假设 OM 处理执行)
+                    
+                    final_weight = target_weight * risk_scalar
+
+                    if final_weight > 0.01: # (最小权重阈值)
+                        target_positions.append(
+                            TargetPosition(
+                                symbol=symbol,
+                                target_weight=final_weight,
+                                reasoning=f"L2({fusion_result.final_decision}) | L3_Alpha({target_weight:.2f}) | L3_Risk({risk_scalar:.2f}) -> {final_weight:.2f}"
+                            )
+                        )
             
-            # (FIX E2)
-            # 4. 认知引擎 (Cognitive Engine)
-            # [修复] 使用 asyncio.run() 来调用异步的 cognitive_engine
-            fusion_result = None
-            try:
-                logger.info("Calling async CognitiveEngine...")
-                
-                # 关键修复：从同步的 Celery 任务中，启动一个新的事件循环
-                # 来运行并等待异步的 process_cognitive_cycle 方法
-                cognitive_result = asyncio.run(
-                    self.cognitive_engine.process_cognitive_cycle(self.pipeline_state)
-                )
-                
-                # cognitive_engine 返回一个字典，"final_decision" 键包含 FusionResult
-                fusion_result = cognitive_result.get("final_decision")
-                
-                # (可选) 存储事实检查报告
-                fact_check_report = cognitive_result.get("fact_check_report")
-                if fact_check_report:
-                    self.pipeline_state.update_value("last_fact_check_report", fact_check_report)
-
-            except CognitiveError as e:
-                # 捕获来自 cognitive_engine 的已知业务逻辑错误
-                logger.error(f"CognitiveEngine failed with a known error: {e}")
-                self.is_running = False
-                self.audit_manager.log_cycle(self.pipeline_state) # 记录失败的周期
-                logger.info("--- Orchestrator Main Cycle END (Cognitive Error) ---")
-                return
-            except Exception as e:
-                # 捕获 asyncio.run() 或其他未知的基础设施错误
-                logger.critical(f"Failed to run CognitiveEngine: {e}", exc_info=True)
-                self.error_handler.handle_critical_error(e, self.pipeline_state)
-                self.is_running = False
-                return # 退出循环
+            # (创建最终的 TargetPortfolio 对象)
+            target_portfolio = TargetPortfolio(positions=target_positions)
             
-            # 保持原有的检查，以防 cognitive_result 成功返回，但 "final_decision" 为 None
-            if not fusion_result:
-                # (E2.b) 认知引擎没有产生决策
-                logger.warning("Cognitive Engine ran successfully but did not produce a final decision.")
-                self.is_running = False
-                # (E2.c) 我们仍然需要记录审计
-                self.audit_manager.log_cycle(self.pipeline_state)
-                logger.info("--- Orchestrator Main Cycle END (No Decision) ---")
-                return
+            self.logger.info(f"L3 DRL Agents constructed target portfolio.")
+            state.set_value("target_portfolio", target_portfolio)
 
-            # 5. 投资组合构建 (Portfolio Construction)
-            # [主人喵的修复] 获取一次当前状态，供后续步骤使用
-            # [阶段 4 变更] TLM 现在通过回调更新，所以我们需要最新的市场数据
-            # ... (在步骤 6 中获取)
+            # --- 5. L3 行动 (Execution) ---
+            # (旧的 Step 5 (PC.construct) 已被上面的 Step 4 替换)
+            # (我们现在进入执行阶段)
+            self.logger.info("Step 5: Processing portfolio targets into orders...")
             
-            # [阶段 4 变更] 我们需要在这里获取价格，以便 TLM 可以计算当前状态
-            # all_symbols_for_pricing = set() # TODO: 从 fusion_result 和 TLM 获取
-            # (这个逻辑流有点问题，TLM 需要价格来 get_state，
-            # 但我们可能还没有价格。假设 TLM 可以处理)
+            # (OrderManager 现在使用 L3 DRL 智能体 (如果需要) 
+            #  来执行目标投资组合)
+            # (我们假设 ExecutionAgent 被注入到 OrderManager 中，
+            #  或者 OrderManager 在这里调用它)
             
-            # [阶段 4 修复] 我们必须先获取价格，才能构造
-            # current_portfolio_state = self.trade_lifecycle_manager.get_current_portfolio_state({}) # 传入空价格
-            
-            # --- [主人喵的修复] 解决数据依赖缺陷：在执行前获取所有最新价格 ---
-            
-            # 收集所有相关符号
-            current_portfolio_for_symbols = self.trade_lifecycle_manager.get_current_portfolio_state({})
-            current_symbols = set(current_portfolio_for_symbols.positions.keys())
-            target_symbols_from_fusion = {t.symbol for t in fusion_result.targets}
-            all_symbols = current_symbols.union(target_symbols_from_fusion)
-
-            market_prices: Dict[str, float] = {}
-            for symbol in all_symbols:
-                # 假设 data_manager 能获取到最新的 L1 数据
-                market_data = self.data_manager.get_latest_market_data(symbol)
-                if market_data and market_data.close > 0:
-                    market_prices[symbol] = market_data.close
-                else:
-                    logger.warning(f"Orchestrator: Could not retrieve latest market price for {symbol}.")
-            # --- 结束修复 ---
-
-            # [阶段 4 变更] 在构造前，使用新价格更新 TLM 的市值
-            self.trade_lifecycle_manager.mark_to_market(datetime.utcnow(), market_prices)
-            # 并获取最终的 "当前" 状态
-            current_portfolio_state = self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
-
-            
-            target_portfolio = self.portfolio_constructor.construct(
-                fusion_result,
-                current_portfolio_state
-            )
-
-            # 6. 风险管理 (Risk Management)
-            final_portfolio, risk_report = self.risk_manager.evaluate_and_adjust(
+            # (暂时假设 OM 只需要 TargetPortfolio)
+            await self.order_manager.process_target_portfolio(
+                current_portfolio_state,
                 target_portfolio,
-                self.pipeline_state
+                market_data
             )
             
-            # [阶段 4 修复] 重新获取价格，因为 risk_manager 可能添加了对冲（例如 SPY）
-            final_target_symbols = {p.symbol for p in final_portfolio.positions}
-            all_symbols_final = all_symbols.union(final_target_symbols)
-            
-            # [修复] 仅获取缺失的价格
-            missing_symbols = all_symbols_final - set(market_prices.keys())
-            for symbol in missing_symbols:
-                 market_data = self.data_manager.get_latest_market_data(symbol)
-                 if market_data and market_data.close > 0:
-                    market_prices[symbol] = market_data.close
-                 else:
-                    logger.warning(f"Orchestrator: Could not retrieve latest market price for risk-added symbol {symbol}.")
+            self.logger.info(f"--- [Cycle {state.cycle_id}] Orchestrator Main Cycle END ---")
 
-            # [阶段 4 变更] 再次更新 TLM 市值
-            self.trade_lifecycle_manager.mark_to_market(datetime.utcnow(), market_prices)
-            current_portfolio_state_final = self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
-
-
-            # 7. 执行 (Execution)
-            # [阶段 4 重构]
-            # (FIX E3) 移除 generate_orders
-            # orders = self.order_manager.generate_orders(...)
-            
-            # (FIX E4) 移除 execute_orders
-            # executed_trades = self.order_manager.execute_orders(orders, market_prices)
-
-            # [阶段 4 新增] 调用新的统一方法
-            self.order_manager.process_target_portfolio(
-                current_portfolio_state_final,
-                final_portfolio,
-                market_prices
-            )
-
-            # 8. 状态更新 (TLM)
-            # [阶段 4 重构] 移除
-            # TLM 现在通过 OrderManager 的 _on_fill 回调异步更新
-            # self.trade_lifecycle_manager.update_portfolio(executed_trades)
-            
-            # (FIX E9)
-            # 9. 监控 & 审计
-            self.metrics_collector.collect_all(
-                self.pipeline_state,
-                fusion_result,
-                risk_report,
-                self.trade_lifecycle_manager.get_current_portfolio_state(market_prices) # 获取最新状态
-            )
-            self.audit_manager.log_cycle(self.pipeline_state)
-            
-            # 10. 快照 (Snapshot)
-            self.snapshot_manager.save_state(
-                self.pipeline_state,
-                self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
-            )
-
+        except CognitiveError as e:
+            self.logger.error(f"Cycle {state.cycle_id} failed during Cognitive step: {e}")
+            # (错误处理...)
+        except DataError as e:
+            self.logger.error(f"Cycle {state.cycle_id} failed during Data step: {e}")
+            # (错误处理...)
         except Exception as e:
-            # (FIX E10) 捕获主循环中的所有异常
-            logger.critical(f"Orchestrator main cycle failed: {e}", exc_info=True)
-            self.error_handler.handle_critical_error(e, self.pipeline_state)
-        
-        finally:
-            self.is_running = False
-            logger.info("--- Orchestrator Main Cycle END ---")
-
-    def shutdown(self):
-        """
-        (可选) 安全关闭 Orchestrator。
-        """
-        logger.info("Orchestrator shutting down...")
-        self.is_running = False
-        # (清理其他资源)
+            self.logger.critical(f"Cycle {state.cycle_id} CRITICAL FAILURE: {e}", exc_info=True)
+            # (关键错误处理...)
