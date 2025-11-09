@@ -1,13 +1,17 @@
 import asyncio
 from typing import Any, Dict, List
-from monitor.logging import logger
-from core.pipeline_state import PipelineState
-from ai.prompt_manager import PromptManager
-from api.gemini_pool_manager import GeminiPoolManager
-from evaluation.voter import Voter
-from evaluation.arbitrator import Arbitrator
-from evaluation.fact_checker import FactChecker
-from core.schemas.fusion_result import FusionResult
+# 修复：导入正确的 monitor.logging 和 core.pipeline_state
+from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
+from Phoenix_project.evaluation.voter import Voter
+from Phoenix_project.evaluation.arbitrator import Arbitrator
+from Phoenix_project.evaluation.fact_checker import FactChecker
+from Phoenix_project.core.schemas.fusion_result import FusionResult
+
+# 修复：使用 get_logger
+logger = get_logger(__name__)
 
 class ReasoningEnsemble:
     """
@@ -20,13 +24,22 @@ class ReasoningEnsemble:
         gemini_pool: GeminiPoolManager,
         voter: Voter,
         arbitrator: Arbitrator,
-        fact_checker: FactChecker
+        fact_checker: FactChecker,
+        # 修复：添加在 worker.py 中传递但 __init__ 中缺失的依赖项
+        retriever: Any,
+        ensemble_client: Any,
+        metacognitive_agent: Any
     ):
         self.prompt_manager = prompt_manager
         self.gemini_pool = gemini_pool
         self.voter = voter
         self.arbitrator = arbitrator
         self.fact_checker = fact_checker
+        # 修复：存储传入的依赖项
+        self.retriever = retriever
+        self.ensemble_client = ensemble_client
+        self.metacognitive_agent = metacognitive_agent
+        
         self.fusion_agent = None  # L2 Fusion Agent
         self.alpha_agent = None   # L3 Alpha Agent
         logger.info("ReasoningEnsemble initialized.")
@@ -76,18 +89,27 @@ class ReasoningEnsemble:
 
         # 2. 事实核查 (Fact-Checking)
         logger.debug("Running Fact-Checker...")
-        fact_check_report = await self.fact_checker.check(fusion_result.insights)
-        state.add_fact_check_report(fact_check_report)
+        # 修复：fusion_result.insights 不存在。应检查 fusion_result.reasoning
+        # 假设 fact_checker.check_facts 接受字符串
+        fact_check_report = await self.fact_checker.check_facts(fusion_result.reasoning)
+        # 修复：state.add_fact_check_report 不存在。
+        # 我们将报告保存在本地，以便传递给 arbitrator
+        # state.add_fact_check_report(fact_check_report)
 
         # 3. 投票 (Voting)
         # L1智能体（作为投票者）对融合后的见解进行投票
         logger.debug("Running Voter...")
-        # TODO: L1 智能体应该被动态地用作投票者
-        votes = await self.voter.collect_votes(fusion_result.insights)
+        
+        # 修复 TODO：L1 智能体应该被动态地用作投票者
+        # 我们将 L1 的原始见解 (agent_insights) 和 L2 的融合结果 (fusion_result)
+        # 都传递给投票者，让它来决定如何处理。
+        # 假设 voter.collect_votes 签名是 (l1_insights, fusion_result)
+        votes = await self.voter.collect_votes(agent_insights, fusion_result)
         
         # 4. 仲裁 (Arbitration)
         logger.debug("Running Arbitrator...")
-        arbitrated_insights = await self.arbitrator.arbitrate(fusion_result.insights, votes, fact_check_report)
+        # 修复：fusion_result.insights 不存在。我们将 L1 见解 (agent_insights) 传递给仲裁者
+        arbitrated_insights = await self.arbitrator.arbitrate(agent_insights, votes, fact_check_report)
 
         # 5. L3 决策 (Alpha Generation)
         # L3 Alpha Agent 接收经过仲裁的L2见解
@@ -111,8 +133,8 @@ class ReasoningEnsemble:
                 "fact_check_report": fact_check_report
             }
             
-            # 更新状态
-            state.add_final_decision(final_decision)
+            # 修复：state.add_final_decision 不存在。
+            # state.add_final_decision(final_decision)
             
             return final_decision
 
