@@ -1,283 +1,233 @@
-from typing import List, Dict, Any, Optional
-import duckdb
-import os # 修复：导入 os
-import asyncio # 修复：导入 asyncio
-# 修复：将 'monitor.logging' 转换为 'Phoenix_project.monitor.logging'
-from Phoenix_project.monitor.logging import get_logger
+"""
+Tabular DB Client for Phoenix.
 
-log = get_logger("TabularDBClient")
+This module provides a client for interacting with tabular (SQL) databases,
+including a text-to-SQL agent capability.
+"""
+
+import logging
+import re
+from typing import Any, List, Dict, Optional, Callable
+
+import sqlalchemy  # type: ignore
+from sqlalchemy import create_engine, inspect, text, Engine  # type: ignore
+from sqlalchemy.exc import SQLAlchemyError  # type: ignore
+
+# 这是一个 LangChain 的特定导入, 我们将尝试用一个
+# 适应项目自身 LLMClient 的自定义实现来替换它
+# from langchain_community.agent_toolkits import create_sql_agent
+# from langchain_community.utilities.sql_database import SQLDatabase
+
+from ..api.gemini_pool_manager import GeminiClient
+
+logger = logging.getLogger(__name__)
 
 
 class TabularDBClient:
     """
-    用于与结构化表格数据库（如 DuckDB）交互的客户端。
+    Client for interacting with a SQL database.
+    Manages connections, schema inspection, and text-to-SQL execution.
     """
 
-    # 修复：签名与 ai/tabular_db_client.py (新版) 不匹配
-    # def __init__(self, db_path: str, config: Dict[str, Any]):
-    def __init__(self, config: Dict[str, Any]):
-        
-        # 修复：从 config (system.yaml) 获取 db_path
-        self.config = config
-        self.db_path = self.config.get("db_path", ":memory:") # 默认为内存
-        
-        # 修复：DuckDB 连接在异步方法中可能存在问题
-        # 我们将在每个 async 方法中按需创建连接
-        self._db_conn = None 
-        # self.db_conn = duckdb.connect(database=self.db_path, read_only=True)
-        
-        self.tables = [] # 将在 connect_async 中填充
-        
-        # [✅ 优化] 从配置中获取是否使用 SQL 代理
-        self.use_sql_agent = self.config.get("use_sql_agent", False)
-        self.sql_agent = None
-        
-        if self.use_sql_agent:
-            # 修复：初始化是同步的，可以在 __init__ 中调用
-            self._initialize_sql_agent()
+    def __init__(
+        self, db_uri: str, llm_client: GeminiClient, config: Dict[str, Any]
+    ):
+        """
+        Initializes the TabularDBClient.
 
-    async def _get_connection(self):
-        """ 异步获取或创建 DuckDB 连接 """
-        # 警告：DuckDB 的 Python API 本质上是同步的。
-        # 在 async 方法中按需创建连接是更安全的方式。
+        Args:
+            db_uri: The SQLAlchemy connection string (e.g., "postgresql://user:pass@host/db").
+            llm_client: An instance of the GeminiClient.
+            config: Configuration dictionary.
+        """
+        self.db_uri = db_uri
+        self.llm_client = llm_client
+        self.config = config.get("tabular_db", {})
+        self.engine: Engine = self._create_db_engine()
+        self.schema: str = self._get_db_schema()
+
+        # 优化: 替换 _mock_sql_agent
+        self.sql_agent: Callable = self._initialize_sql_agent()
+
+    def _create_db_engine(self) -> Engine:
+        """Creates the SQLAlchemy engine."""
         try:
-            # 尝试连接
-            # read_only=True 假设 worker/API 是只读的
-            conn = await asyncio.to_thread(duckdb.connect, database=self.db_path, read_only=True)
-            return conn
-        except Exception as e:
-            log.error(f"Failed to connect to DuckDB at {self.db_path}: {e}")
-            return None
+            engine = create_engine(self.db_uri)
+            # 测试连接
+            with engine.connect() as connection:
+                logger.info(
+                    f"Successfully connected to tabular DB: {engine.url.database}"
+                )
+            return engine
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to connect to SQL database at {self.db_uri}: {e}")
+            raise
 
-    async def _discover_tables(self) -> List[str]:
-        """发现数据库中的所有表。"""
-        conn = await self._get_connection()
-        if not conn:
-            return []
-            
+    def _get_db_schema(self) -> str:
+        """Inspects the database and retrieves the schema as a string."""
         try:
-            # 修复：在线程中运行同步的 duckdb 调用
-            tables = await asyncio.to_thread(conn.execute("SHOW TABLES").fetchall)
-            table_names = [table[0] for table in tables]
-            log.info(f"Discovered tables: {table_names}")
-            self.tables = table_names # 缓存
-            return table_names
-        except Exception as e:
-            log.error(f"Failed to discover tables: {e}")
-            return []
-        finally:
-            if conn:
-                await asyncio.to_thread(conn.close)
+            inspector = inspect(self.engine)
+            schema_str_parts = []
+            tables = inspector.get_table_names()
+            for table in tables:
+                schema_str_parts.append(f"Table '{table}':")
+                columns = inspector.get_columns(table)
+                for col in columns:
+                    schema_str_parts.append(
+                        f"  - {col['name']} ({col['type']})"
+                    )
+            
+            schema_str = "\n".join(schema_str_parts)
+            logger.info(f"Retrieved DB schema:\n{schema_str}")
+            return schema_str
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to inspect DB schema: {e}")
+            return "Error: Could not retrieve schema."
 
-    def _initialize_sql_agent(self):
+    def _generate_sql_prompt(self, query: str) -> str:
+        """Generates a prompt for the LLM to convert text to SQL."""
+        # 优化：这个模板应该从 PromptManager 加载
+        # dialect.name 提供了 SQL 方言 (例如, postgresql)
+        return f"""
+        You are an expert {self.engine.dialect.name} SQL query generator.
+        Your task is to convert a natural language question into a SQL query
+        based on the provided database schema.
+
+        Database Schema:
+        {self.schema}
+
+        Rules:
+        1. Only generate the SQL query. No preamble, no explanation.
+        2. The query must be syntactically correct for {self.engine.dialect.name}.
+        3. Only query tables and columns present in the schema.
+        4. Be careful with data types (e.g., casting).
+        5. If the question is complex, break it down (e.g., using WITH clauses).
+        6. The query should be read-only (SELECT statements only).
+        7. Do NOT generate any INSERT, UPDATE, DELETE, or DROP statements.
+
+        Question:
+        "{query}"
+
+        SQL Query:
         """
-        [✅ 优化] 初始化
-        Query-to-SQL 代理。
-        这需要额外的依赖 (如 LangChain, Ollama, OpenAI)。
+
+    async def _run_sql_agent(self, query: str) -> Dict[str, Any]:
         """
-        log.info("Attempting to initialize Query-to-SQL agent...")
+        OPTIMIZED: This is the actual agent execution logic.
+        It generates SQL from text, executes it, and returns the result.
+        """
+        logger.info(f"SQL Agent processing query: {query}")
         try:
-            # 
-            # 示例: (这需要 langchain 和一个 LLM)
-            # from langchain_community.agent_toolkits import create_sql_agent
-            # from langchain_community.utilities import SQLDatabase
-            # from langchain_openai import ChatOpenAI
-            # 
-            # db = SQLDatabase(self.db_conn) # 注意: LangChain 的 SQLDatabase 可能需要 SQLAlchemy URL
-            # llm = ChatOpenAI(model="gpt-4", temperature=0)
-            # self.sql_agent = create_sql_agent(llm, db=db, agent_type="openai-tools", verbose=True)
-            # log.info("Query-to-SQL agent initialized successfully.")
-            
-            # 
-            log.warning("Query-to-SQL agent initialization is a placeholder. "
-                        "Full implementation requires LLM and LangChain setup.")
-            # 
-            self.sql_agent = self._mock_sql_agent # 
-            
-        except ImportError:
-            log.warning("LangChain or LLM dependencies not found. SQL agent disabled.")
-            self.use_sql_agent = False
-        except Exception as e:
-            log.error(f"Failed to initialize SQL agent: {e}")
-            self.use_sql_agent = False
-            
-    # 修复：这是一个同步函数 (LLM 调用可能是异步的，但 mock 是同步的)
-    # async def _mock_sql_agent(self, query: str, symbol: str) -> str:
-    def _mock_sql_agent(self, query: str, symbol: str) -> str:
-        """
-        [✅ 优化] 模拟 SQL 代理的行为，用于演示。
-        在实际应用中，这将是一个 LLM 调用。
-        """
-        log.debug(f"Mock SQL Agent processing query: '{query}' for symbol '{symbol}'")
-        # 
-        # 
-        # 
-        
-        # 
-        # 
-        if "revenue" in query.lower() and "quarterly" in query.lower():
-            sql = f"SELECT period, revenue FROM financials_quarterly WHERE symbol = '{symbol}' ORDER BY period DESC LIMIT 5"
-        elif "net income" in query.lower():
-            sql = f"SELECT period, net_income FROM financials_annual WHERE symbol = '{symbol}' ORDER BY period DESC LIMIT 3"
-        else:
-            # 
-            log.warning(f"Mock SQL Agent could not generate specific SQL for query: '{query}'. Returning None.")
-            return None
-        
-        log.info(f"Mock SQL Agent generated SQL: {sql}")
-        return sql
+            # 1. 生成 SQL
+            prompt = self._generate_sql_prompt(query)
+            # 假设 llm_client.generate_text 是一个异步方法
+            sql_query = await self.llm_client.generate_text(prompt)
 
-    async def _fallback_search(self, query: str, symbol: str) -> List[Dict[str, Any]]:
+            if not sql_query:
+                raise ValueError("LLM failed to generate SQL query.")
+
+            # 2. 清理和验证 SQL
+            sql_query = sql_query.strip().replace("```sql", "").replace("```", "").strip(";")
+            
+            if not re.match(r"^\s*SELECT", sql_query, re.IGNORECASE):
+                logger.error(f"Generated query is not a SELECT statement: {sql_query}")
+                raise ValueError("Generated query is not a SELECT statement.")
+
+            logger.info(f"Generated SQL: {sql_query}")
+
+            # 3. 执行 SQL
+            with self.engine.connect() as connection:
+                result = connection.execute(text(sql_query))
+                rows = [dict(row._mapping) for row in result.fetchall()]
+            
+            logger.info(f"SQL query returned {len(rows)} rows.")
+            
+            return {
+                "query": query,
+                "generated_sql": sql_query,
+                "results": rows,
+                "error": None
+            }
+
+        except Exception as e:
+            logger.error(f"Error in SQL Agent execution: {e}")
+            return {
+                "query": query,
+                "generated_sql": sql_query if 'sql_query' in locals() else None,
+                "results": [],
+                "error": str(e)
+            }
+
+
+    def _initialize_sql_agent(self) -> Callable:
         """
-        [✅ 优化] 
+        OPTIMIZED: Initializes the text-to-SQL agent.
+        This replaces the mock agent and the placeholder.
+        Instead of relying on LangChain's create_sql_agent (which requires
+        a compatible LLM object), we use our own LLM client and prompt.
         """
-        log.debug(f"Using fallback ILIKE search for query: '{query}' on symbol '{symbol}'")
+        logger.info("Initializing custom Text-to-SQL agent.")
+        # self._run_sql_agent 是我们上面定义的异步方法
+        return self._run_sql_agent
+
+    def _fallback_search(self, query: str) -> List[Dict[str, Any]]:
+        """
+        Fallback search using a simple ILIKE search across tables.
+        This is kept as a fallback if the agent fails spectacularly.
+        """
+        logger.warning(f"Using fallback ILIKE search for query: {query}")
         results = []
-        
-        conn = await self._get_connection()
-        if not conn:
+        try:
+            inspector = inspect(self.engine)
+            with self.engine.connect() as connection:
+                for table in inspector.get_table_names():
+                    for col in inspector.get_columns(table):
+                        # 仅在文本类型列上搜索
+                        if "VARCHAR" in str(col["type"]) or "TEXT" in str(col["type"]):
+                            sql = text(
+                                f'SELECT * FROM "{table}" WHERE "{col["name"]}" ILIKE :query LIMIT 5'
+                            )
+                            res = connection.execute(
+                                sql, {"query": f"%{query}%"}
+                            ).fetchall()
+                            if res:
+                                results.extend([dict(row._mapping) for row in res])
+            return results
+        except SQLAlchemyError as e:
+            logger.error(f"Error during fallback ILIKE search: {e}")
             return []
-            
-        if not self.tables:
-             await self._discover_tables() # 尝试填充
 
-        if not self.tables:
-            log.warning("No tables found in database for fallback search.")
-            await asyncio.to_thread(conn.close)
-            return []
-
-        # 
-        search_table = "financials_quarterly" # 
-        if search_table not in self.tables:
-            # 
-            search_table = self.tables[0]
-            log.debug(f"'financials_quarterly' not found, falling back to first table: '{search_table}'")
+    async def query(self, query: str) -> Dict[str, Any]:
+        """
+        Primary method to query the tabular database.
+        It uses the SQL agent by default.
+        """
+        if not self.sql_agent:
+            logger.error("SQL agent is not initialized. Cannot process query.")
+            return {"error": "SQL agent not initialized."}
 
         try:
-            # 
-            # 
-            columns_query = f"PRAGMA table_info('{search_table}')"
-            columns_info = await asyncio.to_thread(conn.execute(columns_query).fetchall)
+            # 异步调用我们的 SQL agent
+            result = await self.sql_agent(query)
             
-            # 
-            # 
-            text_columns = [col[1] for col in columns_info if "VARCHAR" in col[2].upper()]
+            # 如果 agent 返回错误, 我们可以选择性地触发回退
+            if result.get("error"):
+                logger.warning(f"SQL agent failed: {result['error']}. Considering fallback.")
+                # 可以在这里添加触发 fallback 的逻辑,
+                # 但目前我们只返回 agent 的错误
             
-            description = None # 用于存储列名
-            
-            if not text_columns:
-                log.warning(f"No VARCHAR columns found in table '{search_table}' for ILIKE search.")
-                # 
-                # 
-                all_columns = [col[1] for col in columns_info]
-                if not all_columns:
-                    await asyncio.to_thread(conn.close)
-                    return [] # 
-                
-                # 
-                # 
-                query_sql = f"SELECT * FROM {search_table} WHERE symbol = ? LIMIT 10"
-                
-                # 修复：在线程中运行
-                res_obj = await asyncio.to_thread(conn.execute, query_sql, [symbol])
-                res = await asyncio.to_thread(res_obj.fetchall)
-                description = res_obj.description
-            
-            else:
-                # 
-                where_clause = " OR ".join([f"{col} ILIKE ?" for col in text_columns])
-                # 
-                query_sql = f"SELECT * FROM {search_table} WHERE ({where_clause}) AND symbol = ?"
-                
-                # 
-                like_query = f"%{query}%"
-                params = [like_query] * len(text_columns) + [symbol]
-                
-                # 修复：在线程中运行
-                res_obj = await asyncio.to_thread(conn.execute, query_sql, params)
-                res = await asyncio.to_thread(res_obj.fetchall)
-                description = res_obj.description
-            
-            # 
-            if res:
-                column_names = [col[0] for col in description]
-                results = [dict(zip(column_names, row)) for row in res]
-                
+            return result
+
         except Exception as e:
-            log.error(f"Fallback search failed: {e}")
-        finally:
-            if conn:
-                await asyncio.to_thread(conn.close)
-            
-        return results
+            logger.error(f"Unhandled error during tabular query: {e}")
+            return {
+                "query": query,
+                "results": [],
+                "error": f"Unhandled exception: {e}"
+            }
 
-    async def search_financials(self, query: str, symbol: str) -> List[Dict[str, Any]]:
-        """
-        使用自然语言查询搜索表格财务数据。
-        [✅ 优化] 优先使用 SQL 代理，失败或未配置时回退到 ILIKE 搜索。
-        """
-        results = []
-        sql_query = None
-        conn = None # 修复：我们需要一个连接
-
-        try:
-            if self.use_sql_agent and self.sql_agent:
-                log.debug("Attempting search using SQL Agent.")
-                
-                # 修复：SQL Agent (mock) 是同步的
-                sql_query = await asyncio.to_thread(self.sql_agent, query, symbol)
-                    
-                if sql_query:
-                    # 
-                    conn = await self._get_connection()
-                    if not conn:
-                         raise ConnectionError("Failed to get DB connection for SQL Agent query")
-                         
-                    # 修复：在线程中运行
-                    res_obj = await asyncio.to_thread(conn.execute, sql_query)
-                    res = await asyncio.to_thread(res_obj.fetchall)
-                    
-                    if res:
-                        column_names = [col[0] for col in res_obj.description]
-                        results = [dict(zip(column_names, row)) for row in res]
-                else:
-                    # 
-                    log.warning("SQL Agent returned no query, falling back.")
-                    results = await self._fallback_search(query, symbol)
-
-            else:
-                log.debug("SQL Agent not enabled. Using fallback ILIKE search.")
-                results = await self._fallback_search(query, symbol)
-                
-        except Exception as e:
-            log.error(f"SQL Agent search failed: {e}. Falling back to ILIKE search.")
-            results = await self._fallback_search(query, symbol)
-        finally:
-             if conn:
-                await asyncio.to_thread(conn.close)
-
-        return results
-
-    async def query(self, sql_query: str) -> List[Dict[str, Any]]:
-        """
-        执行一个原始 SQL 查询。
-        """
-        conn = await self._get_connection()
-        if not conn:
-            return []
-            
-        try:
-            # 修复：在线程中运行
-            res_obj = await asyncio.to_thread(conn.execute, sql_query)
-            res = await asyncio.to_thread(res_obj.fetchall)
-            
-            if res:
-                column_names = [col[0] for col in res_obj.description]
-                return [dict(zip(column_names, row)) for row in res]
-            return []
-        except Exception as e:
-            log.error(f"Raw SQL query failed: {e}")
-            return []
-        finally:
-            if conn:
-                await asyncio.to_thread(conn.close)
+    def close(self):
+        """Closes the database engine connection pool."""
+        if self.engine:
+            self.engine.dispose()
+            logger.info("Tabular DB client connections closed.")
