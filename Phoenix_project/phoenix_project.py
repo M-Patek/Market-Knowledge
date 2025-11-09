@@ -1,343 +1,214 @@
-"""
-凤凰计划 (Phoenix Project) 主应用程序入口点。
-负责初始化和协调所有核心组件。
-"""
-import json
+import asyncio
 import os
-# FIX (E-PY-1): 从 'typing' 中导入 'List'，以修复 run_backtest 中的 NameError
-from typing import Dict, Any, List
+import argparse
+from typing import Dict, Any
+from datetime import datetime
+import json # [任务 C.4] 导入 json
 
+# --- 核心组件 ---
 from Phoenix_project.config.loader import ConfigLoader
+from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.data_manager import DataManager
-from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.events.event_distributor import EventDistributor
-from Phoenix_project.events.risk_filter import EventRiskFilter
-from Phoenix_project.events.stream_processor import StreamProcessor
-from Phoenix_project.cognitive.engine import CognitiveEngine
-from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
-from Phoenix_project.cognitive.risk_manager import RiskManager
-from Phoenix_project.execution.order_manager import OrderManager
-from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
-
-# [阶段 3] 导入所有适配器
-from Phoenix_project.execution.interfaces import IBrokerAdapter # [修复] 导入接口
-from Phoenix_project.execution.adapters import SimulatedBrokerAdapter, PaperTradingBrokerAdapter
+from Phoenix_project.data.data_iterator import DataIterator
 from Phoenix_project.controller.orchestrator import Orchestrator
-from Phoenix_project.controller.loop_manager import LoopManager
-from Phoenix_project.controller.error_handler import ErrorHandler
-from Phoenix_project.controller.scheduler import Scheduler
-from Phoenix_project.audit_manager import AuditManager
-from Phoenix_project.snapshot_manager import SnapshotManager
-from Phoenix_project.metrics_collector import MetricsCollector
-from Phoenix_project.monitor.logging import setup_logging, get_logger
+from Phoenix_project.cognitive.engine import CognitiveEngine
+from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
+from Phoenix_project.output.renderer import render_report
+from Phoenix_project.training.engine import BacktestingEngine
 
-# (AI/RAG components)
-# [修复] 导入 worker.py 中使用的更完整的 AI 栈
-from Phoenix_project.ai.retriever import Retriever
-from Phoenix_project.ai.ensemble_client import EnsembleClient
-from Phoenix_project.agents.l2.metacognitive_agent import MetacognitiveAgent # [修复]
-from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
-from Phoenix_project.evaluation.arbitrator import Arbitrator
-from Phoenix_project.evaluation.fact_checker import FactChecker
-from Phoenix_project.evaluation.voter import Voter
-from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
-from Phoenix_project.ai.prompt_manager import PromptManager
-from Phoenix_project.api.gateway import APIGateway
-from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
-from Phoenix_project.memory.vector_store import get_vector_store # [修复]
-from Phoenix_project.memory.cot_database import CoTDatabase
+# --- AI/L3 组件 (用于 DRL 回测) ---
+from Phoenix_project.features.store import FeatureStore
+from Phoenix_project.agents.l3.alpha_agent import AlphaAgent
+from Phoenix_project.agents.l3.risk_agent import RiskAgent
+from Phoenix_project.agents.l3.execution_agent import ExecutionAgent
 
-# [修复] 导入 GNN/KG 组件
-from Phoenix_project.ai.embedding_client import EmbeddingClient
-from Phoenix_project.ai.tabular_db_client import TabularDBClient
-from Phoenix_project.ai.temporal_db_client import TemporalDBClient
-from Phoenix_project.ai.relation_extractor import RelationExtractor
-from Phoenix_project.knowledge_graph_service import KnowledgeGraphService
+# (TBD: 导入其他组件，如 API 服务器, KG 服务等)
 
-# [修复] 导入动态加载 Sizer 所需的
-import importlib
-import pydash
-from Phoenix_project.sizing.base import IPositionSizer
-from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # 示例仓位管理器
-
-# [修复] 导入 registry
-try:
-    from Phoenix_project.registry import registry
-except ImportError:
-    # (日志记录器可能尚未设置)
-    print("Warning: Could not import 'registry' from 'Phoenix_project.registry'. Using empty dict.")
-    registry = {} # 回退
-
+logger = get_logger("PhoenixProject")
 
 class PhoenixProject:
     """
-    主应用程序类。
+    Main application class for the Phoenix Project.
+    Initializes and wires together all core components.
     """
-    def __init__(self, config_path: str = 'config'):
-        # 1. 配置与日志
-        setup_logging()
-        self.logger = get_logger(__name__)
-        self.logger.info("Phoenix Project V2.0 启动中...")
+
+    def __init__(self, config_path: str, run_mode: str = "backtest"):
+        """
+        Initializes the entire system.
         
+        Args:
+            config_path: Path to the main configuration directory.
+            run_mode: "backtest" or "live".
+        """
+        logger.info(f"--- Initializing Phoenix Project (Mode: {run_mode}) ---")
+        
+        # 1. 配置
         self.config_loader = ConfigLoader(config_path)
-        self.system_config = self.config_loader.load_config('system.yaml')
+        self.config = self.config_loader.load_config('system.yaml')
+        self.data_catalog = self.load_data_catalog()
         
-        # 2. 加载数据
-        catalog_path = self.system_config.get("data_catalog_path", "data_catalog.json")
-        self.data_catalog = self._load_data_catalog(catalog_path)
-        
-        # 3. 初始化核心组件
-        self.error_handler = ErrorHandler(config=self.system_config.get("error_handler", {}))
-        
-        # FIX (E5): DataManager 构造函数需要 ConfigLoader
+        # 2. 核心执行与状态
+        self.trade_lifecycle_manager = TradeLifecycleManager(self.config)
         self.data_manager = DataManager(self.config_loader, self.data_catalog)
+        self.data_iterator = DataIterator(self.config, self.data_manager)
         
-        # FIX (E5): PipelineState 构造函数
-        max_history = self.system_config.get("max_pipeline_history", 100)
-        self.pipeline_state = PipelineState(initial_state=None, max_history=max_history)
+        # 3. 认知 (AI 核心)
+        self.cognitive_engine = CognitiveEngine(self.config, self.data_manager)
         
-        self.audit_manager = AuditManager(self.config_loader)
-        self.snapshot_manager = SnapshotManager(self.config_loader)
-        
-        # 4. 初始化事件/数据流
-        self.event_distributor = EventDistributor()
-        self.event_filter = EventRiskFilter(self.config_loader)
-        # [修复] StreamProcessor 可能不再需要，但保留以防万一
-        self.stream_processor = StreamProcessor() 
-
-        # 5. 初始化券商 (Execution)
-        # [阶段 3 & 4] 依赖注入
-        self.broker = self._setup_broker() # <--- 依赖注入
-        
-        # 6. 初始化交易生命周期
-        initial_cash = self.system_config.get("trading", {}).get("initial_cash", 1000000)
-        self.trade_lifecycle_manager = TradeLifecycleManager(initial_cash=initial_cash)
-        
-        # [阶段 4] 注入 TLM
-        self.order_manager = OrderManager(self.broker, self.trade_lifecycle_manager)
-        
-        # 7. 初始化AI/认知 (Cognitive)
-        self.cognitive_engine = self._setup_cognitive_engine()
-        
-        # 8. 初始化投资组合
-        self.portfolio_constructor = self._setup_portfolio_constructor()
-        self.risk_manager = RiskManager(self.config_loader)
-
-        # 9. 监控
-        self.metrics_collector = MetricsCollector(self.config_loader)
-
-        # 10. 核心协调器 (Orchestrator)
+        # 4. 编排器 (大脑)
         self.orchestrator = Orchestrator(
-            # config_loader=self.config_loader, # [FIX] Orchestrator 不再需要 config_loader
-            pipeline_state=self.pipeline_state,
+            config=self.config,
             data_manager=self.data_manager,
-            event_filter=self.event_filter, # [FIX] 传入 event_filter
-            event_distributor=self.event_distributor, # FIX: Pass event_distributor
             cognitive_engine=self.cognitive_engine,
-            portfolio_constructor=self.portfolio_constructor,
-            risk_manager=self.risk_manager,
-            order_manager=self.order_manager,
-            # [阶段 4] 注入 TLM
-            trade_lifecycle_manager=self.trade_lifecycle_manager,
-            snapshot_manager=self.snapshot_manager,
-            metrics_collector=self.metrics_collector,
-            audit_manager=self.audit_manager,
-            error_handler=self.error_handler
+            trade_lifecycle_manager=self.trade_lifecycle_manager
         )
+        
+        # 5. 回测/训练引擎
+        self.backtest_engine = BacktestingEngine(
+            config=self.config,
+            data_iterator=self.data_iterator,
+            orchestrator=self.orchestrator,
+            trade_lifecycle_manager=self.trade_lifecycle_manager,
+            report_renderer_func=render_report # [FIX-15]
+        )
+        
+        # 6. DRL/L3 组件 (仅在 DRL 回测时需要)
+        # (延迟加载)
+        self.feature_store: Optional[FeatureStore] = None
+        self.l3_agents: Dict[str, Any] = {}
 
-        # 11. 循环与调度
-        self.loop_manager = LoopManager(self.orchestrator, self.data_manager)
-        self.scheduler = Scheduler(self.orchestrator, self.config_loader)
+        logger.info("--- Phoenix Project Initialized Successfully ---")
 
-        self.logger.info("Phoenix Project 初始化完成。")
-
-    def _load_data_catalog(self, catalog_path: str) -> Dict[str, Any]:
-        catalog_file_path = os.path.join(self.config_loader.config_path, catalog_path)
-        if not os.path.exists(catalog_file_path):
-            self.logger.error(f"Data catalog not found at {catalog_file_path}")
-            return {}
+    def load_data_catalog(self) -> Dict[str, Any]:
+        """ Helper to load the data catalog JSON. """
+        catalog_path = self.config.get("data_catalog_path", "data_catalog.json")
         try:
-            with open(catalog_file_path, 'r') as f:
+            # TBD: Use ConfigLoader's path logic
+            full_path = os.path.join(self.config_loader.config_path, catalog_path)
+            with open(full_path, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            self.logger.error(f"Failed to load data catalog: {e}", exc_info=True)
+            logger.error(f"Failed to load data catalog from {catalog_path}: {e}", exc_info=True)
             return {}
 
-    def _setup_broker(self) -> IBrokerAdapter:
+    async def run_event_backtest(self):
         """
-        [阶段 3 实现]
-        根据 config/system.yaml 中的 'system.environment' 来设置券商适配器。
+        Runs a full, event-driven backtest (L1/L2 Cognitive).
         """
-        # system_config = self.config_loader.get_system_config() # 已在 __init__ 中加载
-        env = self.system_config.get("system", {}).get("environment", "development")
-        broker_config = self.system_config.get("broker", {})
+        logger.info("--- Starting L1/L2 Cognitive Backtest ---")
+        await self.backtest_engine.run()
+        logger.info("--- L1/L2 Cognitive Backtest Complete ---")
         
-        if env == "production":
-            self.logger.info(f"Production environment detected. Attempting to load PaperTradingBrokerAdapter.")
-            if broker_config.get("type") == "alpaca":
-                api_key_env = broker_config.get("api_key_env")
-                api_secret_env = broker_config.get("api_secret_env")
-                
-                if not api_key_env or not api_secret_env:
-                     self.logger.critical("Broker config 'api_key_env' or 'api_secret_env' missing in system.yaml")
-                     raise ValueError("Missing broker API key env var names")
+    def run_drl_backtest(self):
+        """
+        Runs a DRL (L3) backtest.
+        
+        [任务 C.4] TODO: Add logic to print backtest results.
+        """
+        logger.info("--- Starting L3 DRL Backtest ---")
+        
+        # 1. (延迟) 加载 DRL 组件
+        if not self.feature_store:
+            fs_base_path = self.config.get("data_store", {}).get("local_base_path", "data")
+            self.feature_store = FeatureStore(base_path=fs_base_path)
+            
+        if not self.l3_agents:
+            # (TBD: 从 system.yaml 加载已训练模型的路径)
+            logger.warning("Loading DRL L3 agents with MOCK paths. Update system.yaml.")
+            self.l3_agents = {
+                'alpha': AlphaAgent(model_path="models/drl/alpha_agent_checkpoint"),
+                'risk': RiskAgent(model_path="models/drl/risk_agent_checkpoint"),
+                'exec': ExecutionAgent(model_path="models/drl/exec_agent_checkpoint")
+            }
+            
+        # 2. (TBD: 从 config 获取参数)
+        bt_params = {
+            "symbol": "AAPL",
+            "start_date": datetime(2023, 1, 1),
+            "end_date": datetime(2024, 1, 1),
+        }
 
-                api_key = os.environ.get(api_key_env)
-                api_secret = os.environ.get(api_secret_env)
-                
-                if not api_key or not api_secret:
-                    self.logger.critical(f"Environment variables {api_key_env} or {api_secret_env} not set.")
-                    raise ValueError("Missing Alpaca API credentials in environment")
-                    
-                broker = PaperTradingBrokerAdapter(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    paper_base_url=broker_config.get("base_url")
-                )
-                broker.connect() # 启动时连接
-                return broker
+        # 3. 运行 DRL 回测 (任务 A.2)
+        try:
+            results = self.backtest_engine.run_backtest(
+                data_manager=self.data_manager,
+                feature_store=self.feature_store,
+                alpha_agent=self.l3_agents['alpha'],
+                risk_agent=self.l3_agents['risk'],
+                execution_agent=self.l3_agents['exec'],
+                **bt_params
+            )
+            
+            # 4. [任务 C.4] 打印 DRL 回测结果
+            if results:
+                logger.info("--- DRL Backtest Results ---")
+                try:
+                    # 使用 json.dumps 美化输出
+                    results_str = json.dumps(results, indent=2)
+                    logger.info(results_str)
+                except Exception as e:
+                    logger.error(f"Could not serialize backtest results: {e}")
+                    logger.info(results) # 回退到
             else:
-                self.logger.critical("Production environment selected, but no valid 'alpaca' broker configured.")
-                raise ValueError("Production environment requires a valid broker configuration.")
+                logger.warning("DRL Backtest returned no results.")
+
+        except Exception as e:
+            logger.critical(f"DRL Backtest failed to run: {e}", exc_info=True)
+            logger.critical("Did you run DRL training (run_training.py) first?")
+            
+        logger.info("--- L3 DRL Backtest Complete ---")
+
+    async def run_live(self):
+        """
+        Starts the system in live trading mode.
+        """
+        logger.info("--- Starting Phoenix Project (Live Mode) ---")
+        # TBD:
+        # 1. Start API server
+        # 2. Start Orchestrator loop (e.g., orchestrator.start_live_processing())
+        # 3. Connect to live data streams
+        logger.warning("Live trading mode is not fully implemented.")
+        # Example: await self.orchestrator.start_live_processing()
+        pass
+
+# --- 命令行入口 ---
+
+async def main():
+    parser = argparse.ArgumentParser(description="Phoenix Project Trading System")
+    
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["backtest", "backtest-drl", "live"],
+        default="backtest",
+        help="The operational mode (default: backtest)."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config",
+        help="Path to the configuration directory (default: config/)."
+    )
+    
+    args = parser.parse_args()
+    
+    # (TBD: 设置环境变量, e.g., os.environ['PHOENIX_CONFIG_PATH'] = args.config)
+    
+    try:
+        app = PhoenixProject(config_path=args.config, run_mode=args.mode)
         
-        # 默认为 "development"
-        self.logger.info(f"Development environment detected. Loading SimulatedBrokerAdapter.")
-        # [阶段 1 变更] SimBroker 不再需要 DataManager
-        return SimulatedBrokerAdapter()
-
-    def _setup_cognitive_engine(self) -> CognitiveEngine:
-        """
-        [修复] 使其与 worker.py 中的 AI 栈设置保持一致。
-        """
-        self.logger.info("Initializing Cognitive Stack...")
-        try:
-            # 1. API & Prompts
-            gemini_pool = GeminiPoolManager()
-            api_gateway = APIGateway(gemini_pool)
-            prompt_manager = PromptManager(self.config_loader.config_path)
+        if args.mode == "backtest":
+            await app.run_event_backtest()
+        elif args.mode == "backtest-drl":
+            app.run_drl_backtest()
+        elif args.mode == "live":
+            await app.run_live()
             
-            # 2. AI/RAG 依赖
-            embedding_client = EmbeddingClient(model_name=self.system_config.get("ai",{}).get("embedding_client",{}).get("model", "text-embedding-004"))
-            tabular_client = TabularDBClient(config=self.system_config.get("tabular_db", {}))
-            temporal_client = TemporalDBClient(config=self.system_config.get("temporal_db", {}))
-            relation_extractor = RelationExtractor(api_gateway, prompt_manager)
-            
-            vector_store = get_vector_store(
-                config=self.system_config.get("ai", {}).get("vector_database", {}),
-                embedding_client=embedding_client,
-                logger=self.logger
-            )
-            cot_db = CoTDatabase(config=self.system_config.get("cot_database", {}), logger=self.logger)
-            knowledge_graph_service = KnowledgeGraphService(config=self.system_config.get("neo4j_db", {}))
-            
-            retriever = Retriever(
-                config_loader=self.config_loader,
-                vector_store=vector_store,
-                cot_database=cot_db,
-                embedding_client=embedding_client,
-                knowledge_graph_service=knowledge_graph_service,
-                temporal_client=temporal_client,
-                tabular_client=tabular_client
-            )
-            
-            # 4. Agents
-            agent_registry_config = self.config_loader.get_agent_registry()
-            ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry_config, registry) 
-            metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
-            arbitrator = Arbitrator(api_gateway, prompt_manager)
-            fact_checker = FactChecker(api_gateway, prompt_manager)
-            
-            # 5. Ensemble
-            reasoning_ensemble = ReasoningEnsemble(
-                retriever=retriever,
-                ensemble_client=ensemble_client,
-                metacognitive_agent=metacognitive_agent,
-                arbitrator=arbitrator,
-                fact_checker=fact_checker
-            )
-            
-            # 6. Cognitive Engine
-            uncertainty_guard = UncertaintyGuard()
-            voter = Voter()
-
-            cognitive_engine = CognitiveEngine(
-                reasoning_ensemble=reasoning_ensemble,
-                fact_checker=fact_checker,
-                uncertainty_guard=uncertainty_guard,
-                voter=voter,
-                config=self.system_config.get("cognitive_engine", {}) 
-            )
-            self.logger.info("Cognitive Stack Initialized.")
-            return cognitive_engine
-        except Exception as e:
-            self.logger.error(f"Failed to initialize cognitive stack: {e}", exc_info=True)
-            raise
-
-    def _setup_portfolio_constructor(self) -> PortfolioConstructor:
-        """
-        [修复] 使其与 worker.py 中的 Sizer 加载逻辑保持一致。
-        """
-        sizer_config = self.system_config.get("portfolio", {}).get("sizer", {})
-        sizer_type_name = sizer_config.get("type", "FixedFractionSizer")
-        sizer_params = sizer_config.get("params", {})
-        sizer: IPositionSizer
-        try:
-            module_name = pydash.snake_case(sizer_type_name.replace("Sizer", ""))
-            module = importlib.import_module(f"Phoenix_project.sizing.{module_name}")
-            SizerClass = getattr(module, sizer_type_name)
-            
-            if sizer_type_name == "FixedFractionSizer" and not sizer_params:
-                 sizer_params = {"fraction_per_position": 0.05}
-            elif sizer_type_name == "VolatilityParitySizer" and not sizer_params:
-                 sizer_params = {"volatility_period": 20}
-
-            sizer = SizerClass(**sizer_params)
-            self.logger.info(f"成功从配置加载 Sizer: {sizer_type_name} (Params: {sizer_params})")
-        except (ImportError, AttributeError, TypeError) as e:
-            self.logger.error(f"无法从配置加载 sizer '{sizer_type_name}' (Params: {sizer_params}): {e}。回退到 FixedFractionSizer。")
-            sizer = FixedFractionSizer(fraction_per_position=0.05)
-        
-        return PortfolioConstructor(position_sizer=sizer)
-
-
-    def run_backtest(self, start_date: str, end_date: str, symbols: List[str]):
-        """
-        运行回测。
-        """
-        self.logger.info(f"Running backtest from {start_date} to {end_date} for {symbols}")
-        try:
-            self.loop_manager.run_backtest(start_date, end_date, symbols)
-            self.logger.info("Backtest complete.")
-            # TODO: 打印回测结果
-            
-        except Exception as e:
-            self.logger.error(f"Backtest failed: {e}", exc_info=True)
-            self.error_handler.handle_critical_error(e, self.pipeline_state) # [修复]
-
-    def run_live(self):
-        """
-        以实时模式运行 (使用调度器)。
-        """
-        self.logger.info("Starting Phoenix Project in LIVE mode...")
-        try:
-            self.scheduler.start()
-        except (KeyboardInterrupt, SystemExit):
-            self.logger.info("Shutting down live mode...")
-            self.scheduler.stop()
-        except Exception as e:
-            self.logger.error("Live mode failed:", exc_info=True)
-            self.error_handler.handle_critical_error(e, self.pipeline_state) # [修复]
-            self.scheduler.stop()
+    except FileNotFoundError as e:
+        logger.critical(f"Configuration file not found. Path: {args.config}. Error: {e}")
+    except Exception as e:
+        logger.critical(f"Phoenix Project failed to run: {e}", exc_info=True)
 
 if __name__ == "__main__":
-    # (示例运行)
-    # 在真实部署中，这将通过 CLI (scripts/run_cli.py) 或 worker (worker.py) 启动
-    
-    app = PhoenixProject()
-    
-    # 示例: 运行回测
-    app.run_backtest(
-        start_date="2023-01-01T00:00:00Z",
-        end_date="2023-03-01T00:00:00Z",
-        symbols=["AAPL", "MSFT"]
-    )
+    # (TBD: Add uvloop for performance if desired)
+    asyncio.run(main())
