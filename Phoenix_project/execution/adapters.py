@@ -195,6 +195,7 @@ class AlpacaAdapter(IBrokerAdapter):
         # --- [第 2 步：修改 __init__] ---
         self.stream: Optional[Stream] = None
         self.stream_thread: Optional[Thread] = None
+        self._stream_running = False # [任务 4] 添加标志
         # --- [添加结束] ---
         
         logger.info(f"{self.log_prefix} Initialized.") # [旧] 移除了 "Async event loop started."
@@ -252,6 +253,7 @@ class AlpacaAdapter(IBrokerAdapter):
 
             # 将 self.stream.run() 放入一个单独的线程，因为它是一个阻塞操作
             # daemon=True 意味着如果主程序退出，这个线程也会退出
+            self._stream_running = True # [任务 4] 设置标志
             self.stream_thread = Thread(target=self._run_stream, daemon=True)
             self.stream_thread.start()
             
@@ -267,15 +269,44 @@ class AlpacaAdapter(IBrokerAdapter):
     def _run_stream(self) -> None:
         """
         [新] 在线程中运行流的辅助方法，包含错误处理。
+        [任务 4 已修改] 添加自动重连循环。
         """
-        try:
-            if self.stream:
-                logger.info(f"{self.log_prefix} WebSocket stream run() loop starting...")
-                self.stream.run()
-                logger.info(f"{self.log_prefix} WebSocket stream run() loop finished.")
-        except Exception as e:
-            logger.error(f"{self.log_prefix} Alpaca WebSocket stream crashed: {e}", exc_info=True)
-            # (TODO: 在这里添加自动重连逻辑，例如调用 self.connect())
+        # [任务 4] 循环，直到 _stream_running 为 False
+        while self._stream_running:
+            try:
+                if self.stream:
+                    logger.info(f"{self.log_prefix} WebSocket stream run() loop starting...")
+                    self.stream.run() # 这是阻塞的
+                    
+                    # 如果 run() 正常退出 (例如被 self.stream.stop() 调用)
+                    if not self._stream_running:
+                        logger.info(f"{self.log_prefix} WebSocket stream run() loop finished cleanly.")
+                        break # 退出 while 循环
+                    else:
+                        logger.warning(f"{self.log_prefix} WebSocket stream exited unexpectedly. Reconnecting...")
+                else:
+                    logger.error(f"{self.log_prefix} Stream object is None. Cannot run.")
+                    
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Alpaca WebSocket stream crashed: {e}", exc_info=True)
+            
+            if self._stream_running:
+                # [任务 4] 发生崩溃或意外退出，等待 5 秒后重试
+                logger.info(f"{self.log_prefix} Waiting 5 seconds before reconnecting WebSocket...")
+                time.sleep(5) 
+                
+                # [任务 4] 尝试重建流对象
+                try:
+                    logger.info(f"{self.log_prefix} Re-initializing stream...")
+                    self.stream = Stream(
+                        key_id=self.api_key,
+                        secret_key=self.api_secret,
+                        base_url=URL(self.base_url)
+                    )
+                    self.stream.subscribe_trade_updates(self._on_trade_update)
+                except Exception as e:
+                     logger.error(f"{self.log_prefix} Failed to re-initialize stream, retrying in 5s: {e}")
+                     time.sleep(5) # 再次睡眠
     # --- [第 3 步结束] ---
 
 
@@ -322,6 +353,7 @@ class AlpacaAdapter(IBrokerAdapter):
         
         # --- [第 4 步：实现 disconnect] ---
         try:
+            self._stream_running = False # [任务 4] 设置标志，停止 _run_stream 循环
             if self.stream:
                 logger.info(f"{self.log_prefix} Disconnecting Alpaca WebSocket stream...")
                 self.stream.stop() # 告诉 WebSocket 停止 (V1 API)
@@ -474,19 +506,59 @@ class AlpacaAdapter(IBrokerAdapter):
 
     # --- 接口的其余部分 (TODO: 实现) ---
     def cancel_order(self, order_id: str) -> bool:
-        logger.warning(f"{self.log_prefix} cancel_order() not implemented.")
-        # asyncio.run_coroutine_threadsafe(self.api.cancel_order(order_id), self.loop)
-        return False
+        # [任务 3 已实现]
+        if not self.api:
+            logger.error(f"{self.log_prefix} Cannot cancel order: API not connected.")
+            return False
+        
+        logger.info(f"{self.log_prefix} Attempting to cancel order {order_id}...")
+        try:
+            # 'order_id' 是我们的 client_order_id。
+            # 我们必须先获取 Alpaca 的 broker ID。
+            order_data = self.api.get_order_by_client_order_id(order_id)
+            broker_id = order_data.id
+            self.api.cancel_order(broker_id)
+            logger.info(f"{self.log_prefix} Cancel request for {order_id} (Broker ID: {broker_id}) successful.")
+            return True
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Failed to cancel order {order_id}: {e}", exc_info=True)
+            return False
 
     def get_order_status(self, order_id: str) -> Optional[Order]:
-        logger.warning(f"{self.log_prefix} get_order_status() not implemented.")
-        # order = self.api.get_order_by_client_order_id(order_id)
-        # return self._convert_alpaca_order_to_order(order)
-        return None
+        # [任务 3 已实现]
+        if not self.api:
+            logger.error(f"{self.log_prefix} Cannot get order status: API not connected.")
+            return None
+        
+        try:
+            # 'order_id' 是我们的 client_order_id
+            alpaca_order = self.api.get_order_by_client_order_id(order_id)
+            # alpaca_order 是一个 Httpx-Entity 对象, 将其转为 dict
+            return self._convert_alpaca_order_to_order(alpaca_order.__dict__)
+        except tradeapi.rest.APIError as e:
+            if "order not found" in str(e).lower():
+                logger.warning(f"{self.log_prefix} Order {order_id} not found via API.")
+            else:
+                logger.error(f"{self.log_prefix} API error getting order {order_id}: {e}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Failed to get order status for {order_id}: {e}", exc_info=True)
+            return None
 
     def get_all_open_orders(self) -> List[Order]:
-        logger.warning(f"{self.log_prefix} get_all_open_orders() not implemented.")
-        return []
+        # [任务 3 已实现]
+        if not self.api:
+            logger.error(f"{self.log_prefix} Cannot get open orders: API not connected.")
+            return []
+        
+        try:
+            alpaca_orders = self.api.list_orders(status='open')
+            orders = [self._convert_alpaca_order_to_order(o.__dict__) for o in alpaca_orders]
+            logger.info(f"{self.log_prefix} Fetched {len(orders)} open orders.")
+            return orders
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Failed to get all open orders: {e}", exc_info=True)
+            return []
 
     def get_portfolio_value(self) -> float:
         try:
