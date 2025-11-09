@@ -23,10 +23,16 @@ scipy>=1.11
 
 深度学习 & DRL (PyTorch)
 
-stable-baselines3[torch]>=2.3 # [MARL 重构] 不再需要，替换为 RLLib
+--- [DRL Heart Transplant] ---
 
-pettingzoo>=1.24.0 # [MARL 重构] 添加 PettingZoo API
-ray[rllib]>=2.9.0 # [MARL 重构] 添加 Ray RLLib
+stable-baselines3[torch]>=2.3.0 (REMOVED: Replaced by RLLib)
+
+pettingzoo>=1.24.0 (REMOVED: New Gym Env doesn't require it)
+
+ray[rllib]>=2.9.0 # ADDED: For new L3 DRL Agents (Alpha, Risk, Exec)
+
+--- [DRL Heart Transplant End] ---
+
 torch>=2.2
 
 AI / LLM (生成式 AI & NLP)
@@ -72,7 +78,7 @@ prometheus-fastapi-instrumentator
 rich>=13.7
 
 数据序列化 & 格式化
-jinja2>=3.1
+jinja2>=3.1 # (VERIFIED: Exists for renderer.py)
 jsonschema>=4.23
 pydantic>=2.6,<3
 pyyaml>=6.0
