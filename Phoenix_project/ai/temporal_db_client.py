@@ -40,8 +40,25 @@ class TemporalDBClient:
             # Ensure index exists
             if not await self.es.indices.exists(index=self.index_name):
                 logger.warning(f"Elasticsearch index '{self.index_name}' not found. Attempting to create.")
-                # TODO: Add index mapping definition
-                await self.es.indices.create(index=self.index_name)
+                
+                # --- [任务 1 已添加] ---
+                # 定义索引映射 (Index Mapping)
+                index_mapping = {
+                    "mappings": {
+                        "properties": {
+                            "timestamp": {"type": "date"},
+                            "symbols": {"type": "keyword"},
+                            "headline": {"type": "text", "analyzer": "standard"},
+                            "summary": {"type": "text", "analyzer": "standard"},
+                            "content": {"type": "text", "analyzer": "standard"},
+                            "tags": {"type": "keyword"},
+                            "source": {"type": "keyword"}
+                        }
+                    }
+                }
+                logger.info(f"Creating index '{self.index_name}' with mapping.")
+                await self.es.indices.create(index=self.index_name, body=index_mapping)
+                # --- [任务 1 结束] ---
                 
             logger.info("Elasticsearch connection successful.")
         except Exception as e:
