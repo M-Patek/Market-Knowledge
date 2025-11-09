@@ -104,6 +104,18 @@ ai:
         class: "ai.reasoning_ensemble.DeepForestReasoner"
         enabled: true
 
+# --- [任务 1: 新增 L3 DRL 智能体配置] ---
+# 为 RLLib "心脏移植" 添加配置
+l3_agents:
+  alpha_agent:
+    # 路径指向 RLLib 检查点目录, 而不是旧的 .zip 文件
+    model_path: "models/drl_agents_v1_rllib/alpha/checkpoint_000100"
+  risk_agent:
+    model_path: "models/drl_agents_v1_rllib/risk/checkpoint_000100"
+  execution_agent:
+    model_path: "models/drl_agents_v1_rllib/exec/checkpoint_000100"
+# --- [任务 1 结束] ---
+
 # [主人喵的清洁计划] 为 AuditLogger 添加专用配置 (Janitor 需要)
 audit_db:
   provider: "elasticsearch"
