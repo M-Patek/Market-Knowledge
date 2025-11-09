@@ -1,12 +1,21 @@
 import asyncio
 from typing import Dict, Any, List
-from monitor.logging import logger
-from core.pipeline_state import PipelineState
-from core.schemas.task_schema import Task
-from ai.reasoning_ensemble import ReasoningEnsemble
-from agents.executor import AgentExecutor
-from data_manager import DataManager
-from context_bus import ContextBus
+# 修复：导入 monitor.logging 和 core.pipeline_state 的路径
+from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.core.pipeline_state import PipelineState
+# 修复：导入 task_schema
+from Phoenix_project.core.schemas.task_schema import Task
+# 修复：导入 ai.reasoning_ensemble
+from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
+# 修复：导入 agents.executor
+from Phoenix_project.agents.executor import AgentExecutor
+# 修复：导入 data_manager
+from Phoenix_project.data_manager import DataManager
+# 修复：导入 context_bus
+from Phoenix_project.context_bus import ContextBus
+
+# 修复：使用 get_logger
+logger = get_logger(__name__)
 
 class Orchestrator:
     """
@@ -19,13 +28,16 @@ class Orchestrator:
         agent_executor: AgentExecutor,
         reasoning_ensemble: ReasoningEnsemble,
         data_manager: DataManager,
-        context_bus: ContextBus
+        context_bus: ContextBus,
+        config: Dict[str, Any] # 修复：接收 config
     ):
         self.state = state
         self.agent_executor = agent_executor
         self.reasoning_ensemble = reasoning_ensemble
         self.data_manager = data_manager
         self.context_bus = context_bus
+        # 修复：存储 config 以便访问 default_symbols
+        self.config = config
         logger.info("Orchestrator initialized.")
 
     async def process_task(self, task: Task) -> Dict[str, Any]:
@@ -38,11 +50,16 @@ class Orchestrator:
         self.state.set_current_task(task)
         
         # 2. 触发数据管理器
-        # Orchestrator 告诉 DataManager 需要什么数据
         # FIXME: 从任务中提取目标资产
-        # target_assets = self.extract_assets_from_task(task)
-        # 临时硬编码
-        target_assets = ["AAPL", "GOOG"] 
+        # 修复：不再硬编码。
+        # 尝试从任务中获取，如果任务中没有，则从 system.yaml 配置中获取
+        if task.symbols:
+            target_assets = task.symbols
+            logger.info(f"Using target assets from task: {target_assets}")
+        else:
+            # 从 config/system.yaml 中加载默认资产
+            target_assets = self.config.get("trading", {}).get("default_symbols", ["AAPL", "MSFT"])
+            logger.info(f"No assets in task, using default symbols: {target_assets}")
         
         try:
             market_data = await self.data_manager.fetch_market_data(target_assets)
@@ -60,33 +77,26 @@ class Orchestrator:
 
         # 3. 运行分析层
         try:
-            final_decision = await self.run_analysis_level(self.state)
+            # 修复：将 target_assets 传递给 analysis_level
+            final_decision = await self.run_analysis_level(self.state, target_assets)
             logger.info(f"Task {task.task_id} processed. Final decision: {final_decision.get('asset_insights')}")
             return final_decision
         except Exception as e:
             logger.error(f"Error during analysis level execution: {e}")
             return {"error": f"Analysis level failed: {e}"}
 
-    async def run_analysis_level(self, state: PipelineState) -> Dict[str, Any]:
+    async def run_analysis_level(self, state: PipelineState, target_assets: List[str]) -> Dict[str, Any]:
         """
         执行完整的 L1 -> L2 -> L3 分析流程。
         """
         logger.info("Running analysis level...")
 
-        # 从状态中获取目标资产
-        market_data = state.get_latest_market_data()
-        if not market_data:
-            logger.warning("No market data found in state. Analysis level cannot proceed.")
-            return {"error": "Missing market data."}
-            
-        # 从市场数据中提取资产（例如，["AAPL", "GOOG"]）
-        target_assets = list(market_data.keys())
+        # 修复：不再从 state 中获取资产，而是从 process_task 传入
         if not target_assets:
-            logger.warning("Market data is empty. No target assets to analyze.")
-            return {"error": "No target assets found in market data."}
+            logger.warning("No target assets to analyze.")
+            return {"error": "No target assets specified."}
             
         logger.info(f"Analysis level targeting assets: {target_assets}")
-
 
         # 1. 运行 L1 智能体
         logger.debug("Executing L1 agents...")
@@ -112,13 +122,18 @@ class Orchestrator:
             return {"error": f"L2 agent execution failed: {e}"}
         
         # TODO: L2 见解 (l2_supervision) 应该被传递给推理集合
-        # 目前，推理集合 (ReasoningEnsemble) 内部有自己的L2/L3智能体
+        # 修复：如下所示，将 l2_supervision 传递给 run_ensemble
         
         # 3. 运行推理集合 (L2 Fusion -> L3 Alpha)
         logger.debug("Executing Reasoning Ensemble...")
         try:
             # ReasoningEnsemble 协调 L2 Fusion 和 L3 Alpha 智能体
-            final_insights = await self.reasoning_ensemble.run_ensemble(state, l1_insights, target_assets)
+            final_insights = await self.reasoning_ensemble.run_ensemble(
+                state=state, 
+                l1_insights=l1_insights, 
+                l2_supervision=l2_supervision, # 修复：传递 L2 监督
+                target_assets=target_assets
+            )
             logger.info("Reasoning Ensemble completed.")
             return final_insights
         except Exception as e:
