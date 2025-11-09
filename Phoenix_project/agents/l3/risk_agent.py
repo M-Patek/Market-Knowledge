@@ -1,69 +1,59 @@
-from typing import Dict, Any
+from typing import Dict, Any, Optional # <-- [已修改]
 import numpy as np
-from .base import BaseL3Agent
+from .base import BaseDRLAgent # <-- [已修改]
 from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.core.schemas.fusion_result import FusionResult # <-- [已添加]
 
 logger = get_logger(__name__)
 
-class RiskAgent(BaseL3Agent):
+class RiskAgent(BaseDRLAgent): # <-- [已修改]
     """
     [MARL 重构]
     Risk 智能体，使用 RLLib 基类进行推理。
     负责决定 (批准/否决)。
+    
+    [主人喵的提示] 此文件已更新，以匹配 alpha_agent.py 的 5D 状态。
     """
-    def __init__(self, config: Dict[str, Any]):
+    
+    # [已移除] __init__ 和 execute 方法。
+    # 它现在继承 __init__ 和 compute_action from BaseDRLAgent。
+    
+    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray: # <-- [已修改]
         """
-        [重构]
-        初始化 RiskAgent。
-        """
-        # [关键] 传递 "risk_policy"
-        super().__init__(config, policy_id="risk_policy")
-
-    def execute(self, state_data: Dict[str, Any]) -> int:
-        """
-        [重构]
-        从 PipelineState 获取数据，格式化为观测值，并使用 RLLib predict。
-        """
-        # 1. 格式化观测数据
-        try:
-            obs = self._format_obs(state_data)
-        except Exception as e:
-            logger.error(f"RiskAgent: 状态格式化失败: {e}", exc_info=True)
-            return 0 # 返回安全动作 (批准)
-
-        # 2. 调用基类的 RLLib predict
-        action = self.predict(obs) 
+        [任务 2.1] 格式化观察值以匹配 TradingEnv 的新 (5-d) 状态空间。
         
-        # 0=批准, 1=否决
-        return action
+        Args:
+            state_data (dict): 包含 {'balance', 'holdings', 'price'} 的实时数据。
+            fusion_result (FusionResult): 来自 L2 认知引擎的分析结果。
 
-    def _format_obs(self, state_data: Dict[str, Any]) -> np.ndarray:
+        Returns:
+            np.ndarray: 匹配 TradingEnv.observation_space 的 5-d 状态向量。
         """
-        [新增]
-        将 PipelineState 字典转换为 TradingEnv 所需的 np.array 状态。
-        
-        [重要] 这必须与 PettingZoo TradingEnv 中的 _get_state() 方法完全一致。
-        (状态: [balance, shares_held, current_price])
-        
-        注意: 即使 RiskAgent 只关心风险，它也被训练为
-        查看与 Alpha 相同的状态。
-        """
-        try:
-            balance = float(state_data.get('current_balance', 10000.0))
-            shares_held = int(state_data.get('shares_held', 0))
-            current_price = float(state_data.get('current_price', 0.0))
+        # 1. 从 state_data 中提取市场状态
+        # [已修改] 使用 alpha_agent 的 .get() 键
+        balance = state_data.get('balance', 0.0)
+        holdings = state_data.get('holdings', 0.0)
+        price = state_data.get('price', 0.0)
 
-            if current_price == 0.0:
-                logger.warning("RiskAgent: 观测数据中当前价格为 0")
+        # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
+        if fusion_result and hasattr(fusion_result, 'sentiment_score'):
+            # [任务 1.1] 匹配 trading_env.py
+            # 假设 fusion_result 有一个数值情感得分 (例如 -1.0 到 1.0)
+            sentiment = fusion_result.sentiment_score 
+            confidence = fusion_result.confidence
+        else:
+            # 如果没有 L2 结果 (例如周期开始时)，提供默认值
+            sentiment = 0.0  # 中性情感
+            confidence = 0.5 # 中性信心
 
-            # 必须匹配 TradingEnv 的 DType (np.float32)
-            return np.array([
-                balance,
-                shares_held,
-                current_price
-            ], dtype=np.float32)
+        # 3. 构建与 TradingEnv._get_state() 完全匹配的状态向量
+        # 状态 (5-d): [balance, holdings, price, l2_sentiment, l2_confidence]
+        obs = np.array([
+            balance,
+            holdings,
+            price,
+            sentiment,
+            confidence
+        ], dtype=np.float32)
         
-        except Exception as e:
-            logger.error(f"RiskAgent: _format_obs 失败: {e}", exc_info=True)
-            # 返回一个安全的默认状态
-            return np.array([10000.0, 0, 0.0], dtype=np.float32)
+        return obs
