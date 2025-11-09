@@ -1,177 +1,166 @@
-import asyncio
-from typing import Dict, Any
-
-# [MARL 重构] 移除 SB3 导入
-# import gymnasium as gym
-# from stable_baselines3 import PPO
-# from stable_baselines3.common.vec_env import DummyVecEnv
-
-# [MARL 重构] 添加 Ray RLLib 和 PettingZoo 导入
+# training/drl/multi_agent_trainer.py
 import ray
+import pandas as pd
+import numpy as np
+from ray import tune
 from ray.rllib.algorithms.ppo import PPOConfig
-from ray.tune.registry import register_env
-from ray.rllib.policy.policy import PolicySpec
+from gymnasium import spaces # [任务 2] 导入 gym spaces
 
-# [MARL 重构] 导入 PettingZoo 版本的 TradingEnv
+# [任务 2] 导入我们新的 (已修复的) gym.Env
 from Phoenix_project.training.drl.trading_env import TradingEnv
-
-# (L3 智能体导入不再需要，因为模型是在这里训练的)
-# from Phoenix_project.agents.l3.alpha_agent import AlphaAgent
-# from Phoenix_project.agents.l3.risk_agent import RiskAgent
-
-# (ReplayBuffer 导入不再需要)
-# from Phoenix_project.utils.replay_buffer import ReplayBuffer
-
 from Phoenix_project.monitor.logging import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger("DRLMultiAgentTrainer")
 
-class MultiAgentTrainer:
+# --- [任务 1] 准备“营养液” (数据准备) ---
+def load_nutrition_data(data_path: str = "data/historical_l2_features.csv") -> pd.DataFrame:
     """
-    [MARL 重构]
-    使用 Ray RLLib 协调 DRL 智能体（AlphaAgent, RiskAgent, ExecutionAgent）的训练。
+    (模拟) 加载包含 L2 特征的训练数据。
+    
+    [任务 1] 主人喵！您必须用真实的加载逻辑替换这里。
+    您需要运行一次历史 L2 认知引擎，将价格数据与 L2 结果
+    (l2_sentiment, l2_confidence) 合并到这个 DataFrame 中。
     """
-
-    def __init__(self, config: Dict[str, Any]):
-        """
-        [MARL 重构]
-        初始化 Ray RLLib 训练器。
+    logger.info(f"正在尝试从 {data_path} 加载训练数据...")
+    try:
+        # 尝试加载真实数据 (如果存在)
+        df = pd.read_csv(data_path)
+        logger.info(f"成功加载了 {len(df)} 行真实训练数据。")
+        # [任务 1] 验证所需列
+        required_cols = ["price", "l2_sentiment", "l2_confidence"]
+        if not all(col in df.columns for col in required_cols):
+            logger.warning(f"数据中缺少所需列 (需要: {required_cols})。将退回使用模拟数据。")
+            raise FileNotFoundError # (跳转到 except 块)
+        return df
         
-        Args:
-            config (Dict[str, Any]): 包含 'drl_training' 和 'drl_env' 的配置字典。
-                                     'drl_env' 必须包含 'data', 'symbol' 等
-                                     以传递给 TradingEnv 构造函数。
-        """
-        self.config = config.get('drl_training', {})
-        self.env_config = config.get('drl_env', {}) # RLLib 将使用这个配置
-        
-        self.total_timesteps = self.config.get('total_timesteps', 1_000_000)
-        self.model_save_path = self.config.get('model_save_path', 'models/drl_agents_v1_rllib')
-        
-        # --- [MARL 重构] 移除 SB3 初始化 ---
-        # self.env = trading_env
-        # self.vec_env = DummyVecEnv([lambda: self.env])
-        # self.alpha_agent_model = PPO(...)
-
-        # --- [MARL 重构] 添加 RLLib 配置 ---
-        logger.info("初始化 Ray RLLib...")
-        if not ray.is_initialized():
-            ray.init(logging_level="ERROR", ignore_reinit_error=True)
-
-        # 1. 注册 PettingZoo 环境
-        #    这个 lambda 接收 'config' 字典 (即下面的 env_config)
-        #    并将其解包 (**) 传递给 TradingEnv 构造函数。
-        register_env("phoenix_marl_env", lambda cfg: TradingEnv(**cfg))
-
-        # 2. 定义策略 (每个智能体可以共享或拥有独立策略)
-        #    (我们也可以为所有智能体使用一个共享策略)
-        policies = {
-            "alpha_policy": PolicySpec(config={"gamma": 0.95}),
-            "risk_policy": PolicySpec(config={"gamma": 0.99}),
-            "execution_policy": PolicySpec(config={"gamma": 0.9}),
+    except FileNotFoundError:
+        logger.warning(f"未找到 {data_path}。正在创建模拟“营养液” (L2 数据)...")
+        # [任务 1] 如果找不到文件，则创建模拟数据
+        steps = 1000
+        data = {
+            "price": np.random.rand(steps) * 100 + 150,
+            # L2 情感 (例如 -1.0 到 1.0)
+            "l2_sentiment": np.random.randn(steps) * 0.5, 
+             # L2 信心 (例如 0.0 到 1.0)
+            "l2_confidence": np.random.rand(steps),
         }
+        df = pd.DataFrame(data)
+        df["l2_sentiment"] = np.clip(df["l2_sentiment"], -1.0, 1.0)
+        return df
 
-        # 3. 映射智能体到策略
-        def policy_mapping_fn(agent_id, episode, worker, **kwargs):
-            if agent_id.startswith("alpha_agent"):
-                return "alpha_policy"
-            elif agent_id.startswith("risk_agent"):
-                return "risk_policy"
-            else:
-                return "execution_policy"
+# --- [任务 2] 重构“起搏器” (新训练器) ---
 
-        # 4. 创建 RLLib 算法配置
-        algo_config = (
+def get_agent_action_space_config(agent_id: str) -> dict:
+    """
+    为每个 L3 智能体定义其独特的动作空间。
+    [任务 2] 这是必需的，因为 Alpha/Risk/Exec 有不同的输出。
+    """
+    if agent_id == "alpha_agent":
+        # Alpha: 决定目标 *权重* (连续值, 0.0 到 1.0)
+        return {"type": "continuous", "shape": (1,)}
+    
+    elif agent_id == "risk_agent":
+        # Risk: 决定风险 *标量* (连续值, 0.0 到 1.0)
+        return {"type": "continuous", "shape": (1,)}
+    
+    elif agent_id == "execution_agent":
+        # Exec: 决定执行 *风格* (离散值)
+        # 示例: 0=市价单 (Market), 1=限价单 (Limit), 2=TWAP
+        return {"type": "discrete", "n": 3}
+    
+    else:
+        raise ValueError(f"未知的 agent_id: {agent_id}")
+
+def run_training_session(
+    data_df: pd.DataFrame,
+    training_iterations: int = 100,
+    save_dir: str = "models/drl_agents_v2_rllib" # [任务 4.3] 新的输出目录
+):
+    """
+    [任务 2] 重构后的训练器。
+    它不再使用 PettingZoo，而是循环训练三个独立的 (Gym) PPO 模型。
+    """
+    
+    # (定义我们要训练的三个独立智能体)
+    agent_ids = ["alpha_agent", "risk_agent", "execution_agent"]
+    
+    results = {}
+
+    for agent_id in agent_ids:
+        logger.info(f"--- [任务 2] 开始为 {agent_id} 配置训练 ---")
+        
+        # 1. 获取该智能体特定的动作空间
+        action_config = get_agent_action_space_config(agent_id)
+        
+        # 2. 定义环境配置 (传递 L2 数据和智能体特定配置)
+        env_config = {
+            "df": data_df,
+            "agent_id": agent_id,
+            "initial_balance": 100000.0,
+            "action_space_config": action_config
+        }
+        
+        # 3. 配置 PPO (不再是 MultiAgent，只是标准的 PPO)
+        config = (
             PPOConfig()
             .environment(
-                env="phoenix_marl_env", 
-                env_config=self.env_config # 传递环境配置 (包含 'data', 'symbol' 等)
+                env=TradingEnv, # [任务 2] 使用我们新的 gym.Env
+                env_config=env_config
             )
             .framework("torch")
-            .resources(num_gpus=0) # 假设没有 GPU，如果可用则设为 1
-            .multi_agent(
-                policies=policies,
-                policy_mapping_fn=policy_mapping_fn
-            )
-            .training(
-                train_batch_size=4000 
-            )
-            # .rollouts(num_rollout_workers=1) # (可选)
+            .rollouts(num_rollout_workers=2)
+            # (可以添加更多 RLLib 特定配置, 例如 .training(), .resources() ...)
         )
 
-        # 5. 构建算法
-        self.algorithm = algo_config.build()
+        # 4. 使用 Ray Tune 运行训练器
+        logger.info(f"--- [任务 3] 正在为 {agent_id} 启动 Tuner ---")
+        tuner = tune.Tuner(
+            "PPO",
+            param_space=config.to_dict(),
+            run_config=ray.train.RunConfig(
+                stop={"training_iteration": training_iterations},
+                local_dir=f"{save_dir}/{agent_id}", # [任务 4.3] 保存到特定子目录
+                name=f"{agent_id}_training",
+            ),
+        )
         
-        logger.info("Ray RLLib (PPO) Multi-Agent 训练器已初始化。")
+        result_grid = tuner.fit()
+        
+        # 5. 获取最佳检查点
+        best_result = result_grid.get_best_result(metric="episode_reward_mean", mode="max")
+        best_checkpoint = best_result.checkpoint
+        logger.info(f"--- [任务 3] {agent_id} 训练完成 ---")
+        logger.info(f"最佳检查点保存在: {best_checkpoint.path}")
+        
+        results[agent_id] = best_checkpoint.path
 
-    async def train_agents(self):
-        """
-        [MARL 重构]
-        启动 RLLib 训练循环 (非阻塞)。
-        解决了 asyncio.to_thread 的 TODO。
-        """
-        logger.info("--- 开始 RLLib MARL 智能体训练 ---")
-
-        # 定义将在单独线程中运行的阻塞训练函数
-        def _blocking_training_loop():
-            try:
-                # 假设 self.total_timesteps 仍然在 config 中
-                timesteps_per_iter = self.algorithm.config.train_batch_size
-                if timesteps_per_iter == 0:
-                    logger.warning("train_batch_size 为 0，设置为 4000")
-                    timesteps_per_iter = 4000
-                    
-                num_iterations = self.total_timesteps // timesteps_per_iter
-                if num_iterations == 0:
-                    num_iterations = 1 # 至少运行一次
-
-                logger.info(f"将训练 {num_iterations} 次迭代 (总步数: {self.total_timesteps})")
-
-                for i in range(num_iterations):
-                    # RLLib 的 train() 是阻塞的
-                    result = self.algorithm.train()
-
-                    # (RLLib 的日志记录很详细，这里可以减少日志频率)
-                    if i % 10 == 0:
-                        reward_mean = result.get('episode_reward_mean', 'N/A')
-                        logger.info(f"迭代 {i}: 平均奖励 = {reward_mean}")
-                        
-                        # 保存检查点 (RLLib 方式)
-                        # RLLib 默认会保存检查点，这里是显式保存
-                        self.save_models(self.model_save_path)
-
-                logger.info("--- RLLib MARL 训练结束 ---")
-
-            except Exception as e:
-                logger.error(f"RLLib DRL 训练失败: {e}", exc_info=True)
-
-        # [修复] 使用 asyncio.to_thread 运行阻塞循环，避免阻塞主事件循环
-        await asyncio.to_thread(_blocking_training_loop)
-
-        # 确保最终模型被保存
-        self.save_models(self.model_save_path)
+    logger.info("--- [任务 3] 所有 L3 智能体训练已完成 ---")
+    logger.info(f"Alpha Agent Checkpoint: {results.get('alpha_agent')}")
+    logger.info(f"Risk Agent Checkpoint: {results.get('risk_agent')}")
+    logger.info(f"Execution Agent Checkpoint: {results.get('execution_agent')}")
+    logger.info(f"[任务 4.3] 主人喵！请将这些新路径更新到您的 system.yaml 中！")
+    
+    return results
 
 
-    def save_models(self, path_prefix: str):
-        """
-        [MARL 重构]
-        保存 RLLib 训练器检查点。
-        """
-        try:
-            checkpoint_dir = self.algorithm.save(path_prefix)
-            logger.info(f"RLLib 模型检查点已保存到: {checkpoint_dir}")
-        except Exception as e:
-            logger.error(f"保存 RLLib 模型失败: {e}", exc_info=True)
+if __name__ == "__main__":
+    logger.info("--- 启动 L3 DRL 训练 (已重构) ---")
+    
+    # (确保 Ray 已初始化)
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
 
+    # [任务 1] 加载“营养液”
+    training_data = load_nutrition_data(
+        data_path="data/historical_l2_features.csv" # (确保此文件存在)
+    )
 
-    def load_models(self, path_prefix: str):
-        """
-        [MARL 重构]
-        从检查点恢复 RLLib 训练器。
-        """
-        try:
-            # RLLib 通常在 build() 时从检查点恢复，或者使用 restore()
-            self.algorithm.restore(path_prefix)
-            logger.info(f"RLLib 模型已从: {path_prefix} 加载。")
-        except Exception as e:
-            logger.error(f"加载 RLLib 模型失败: {e}", exc_info=True)
+    # [任务 2 & 3] 运行新的训练流程
+    run_training_session(
+        data_df=training_data,
+        training_iterations=10, # (设为 10 次迭代用于测试, 生产中应更高)
+        save_dir="models/drl_agents_v2_rllib"
+    )
+
+    ray.shutdown()
+    logger.info("--- L3 DRL 训练已关闭 ---")
