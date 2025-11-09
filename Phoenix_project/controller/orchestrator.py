@@ -1,168 +1,158 @@
-import logging
-from typing import Dict, Any, Optional
 import asyncio
-
-from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.context_bus import ContextBus
-from Phoenix_project.controller.loop_manager import LoopManager
-from Phoenix_project.cognitive.engine import CognitiveEngine
-from Phoenix_project.execution.order_manager import OrderManager
-from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
-from Phoenix_project.agents.l3.alpha_agent import AlphaAgent
-from Phoenix_project.agents.l3.risk_agent import RiskAgent
-from Phoenix_project.agents.l3.execution_agent import ExecutionAgent
-from Phoenix_project.core.schemas.fusion_result import FusionResult
+from typing import Dict, Any, List
+from monitor.logging import logger
+from core.pipeline_state import PipelineState
+from core.schemas.task_schema import Task
+from ai.reasoning_ensemble import ReasoningEnsemble
+from agents.executor import AgentExecutor
+from data_manager import DataManager
+from context_bus import ContextBus
 
 class Orchestrator:
     """
-    (Controller) 系统的主要协调器。
-    
-    [RAG 架构]：
-    Orchestrator 是 "Control & Orchestration Layer" (控制与编排层) 的核心。
-    它不直接执行 RAG，但它协调依赖于 RAG (通过 L1/L2 智能体) 的智能体 (L3)。
-    
-    职责:
-    1. 启动和停止所有主要组件 (LoopManager, CognitiveEngine, OrderManager)。
-    2. 管理主要的认知-执行循环 (Cognitive-Execution Loop)。
-    3. 充当 L3 智能体 (Alpha, Risk, Execution) 的 "宿主" (Host)。
-    4. 协调 L3 智能体与 CognitiveEngine (L2) 和 OrderManager (执行) 之间的交互。
+    协调数据流、智能体执行和推理。
+    管理整个认知架构的端到端执行循环。
     """
-    
     def __init__(
         self,
-        config: Dict[str, Any],
-        context_bus: ContextBus,
-        loop_manager: LoopManager,
-        cognitive_engine: CognitiveEngine,
-        order_manager: OrderManager,
-        # (任务 2.3) L3 智能体现在被注入，而不是由 Orchestrator 创建
-        alpha_agent: AlphaAgent,
-        risk_agent: RiskAgent,
-        execution_agent: ExecutionAgent,
+        state: PipelineState,
+        agent_executor: AgentExecutor,
+        reasoning_ensemble: ReasoningEnsemble,
+        data_manager: DataManager,
+        context_bus: ContextBus
     ):
-        self.config = config
+        self.state = state
+        self.agent_executor = agent_executor
+        self.reasoning_ensemble = reasoning_ensemble
+        self.data_manager = data_manager
         self.context_bus = context_bus
-        
-        # (任务 2.3) 我们保留了对 L2 引擎的引用，以获取 L3 的输入
-        self.cognitive_engine = cognitive_engine
-        self.order_manager = order_manager
-        
-        # (任务 2.3) 我们仍然保留 PC，以防它有其他辅助功能 (例如计算)，
-        # 但它不再是 L3 循环的主要驱动力。
-        # (我们可能需要重构 PortfolioConstructor 或将其功能移至 L3 RiskAgent)
-        self.portfolio_constructor = PortfolioConstructor(config, order_manager)
-        
-        # (任务 2.3) 存储对 L3 智能体的引用
-        self.alpha_agent = alpha_agent
-        self.risk_agent = risk_agent
-        self.execution_agent = execution_agent
-        
-        # [FIX] Load default symbols from config
-        self.default_symbols = config.get("trading", {}).get("default_symbols", ["AAPL", "GOOG"])
-        
-        self.loop_manager = loop_manager
-        self.logger = get_logger(self.__class__.__name__)
-        self.is_running = False
+        logger.info("Orchestrator initialized.")
 
-    async def start(self):
+    async def process_task(self, task: Task) -> Dict[str, Any]:
         """
-        启动 Orchestrator 和所有受管组件。
+        处理单个任务（例如，用户查询）。
         """
-        if self.is_running:
-            self.logger.warning("Orchestrator is already running.")
-            return
+        logger.info(f"Processing task: {task.task_id} - {task.description}")
+        
+        # 1. 更新状态
+        self.state.set_current_task(task)
+        
+        # 2. 触发数据管理器
+        # Orchestrator 告诉 DataManager 需要什么数据
+        # FIXME: 从任务中提取目标资产
+        # target_assets = self.extract_assets_from_task(task)
+        # 临时硬编码
+        target_assets = ["AAPL", "GOOG"] 
+        
+        try:
+            market_data = await self.data_manager.fetch_market_data(target_assets)
+            news_data = await self.data_manager.fetch_news_data(target_assets)
             
-        self.logger.info("Starting Orchestrator...")
-        
-        # 1. 启动 L0 (数据) 和 L1/L2 (认知) 循环
-        # (这是由 LoopManager 管理的)
-        # (LoopManager 应该已经在 main.py 中启动了)
-        
-        # 2. 启动 L3 (决策) 循环
-        # (这是由 Orchestrator 管理的)
-        self.is_running = True
-        asyncio.create_task(self.run_main_loop())
-        
-        self.logger.info("Orchestrator started.")
-
-    async def stop(self):
-        """
-        停止 Orchestrator。
-        (注意：LoopManager 和其他组件的停止是在 main.py 中处理的)
-        """
-        self.logger.info("Stopping Orchestrator...")
-        self.is_running = False
-        # (循环将在下一次迭代时停止)
-        self.logger.info("Orchestrator stopped.")
-
-    async def run_main_loop(self):
-        """
-        (L3) 主要的认知-执行循环 (Cognitive-Execution Loop)。
-        
-        [任务 2.3] 此循环现在由 L3 智能体 (Alpha, Risk, Execution) 驱动。
-        """
-        self.logger.info("L3 Main Loop started.")
-        
-        # (定义 L3 循环的频率，例如每 5 分钟)
-        # (这应该来自配置)
-        l3_loop_frequency_seconds = self.config.get("controller", {}).get("l3_loop_frequency_sec", 300)
-
-        while self.is_running:
-            try:
-                self.logger.info("[L3 Loop] Starting new L3 cycle...")
-                
-                # 1. (L3 Alpha) - 生成交易信号
-                
-                # (L3 Alpha 需要 L2 的输出)
-                # (我们从 L2 Cognitive Engine 获取最新的融合决策)
-                final_decision_obj: Optional[FusionResult] = self.cognitive_engine.get_latest_fusion_result()
+            # 更新状态
+            self.state.add_market_data(market_data)
+            self.state.add_news_data(news_data)
             
-                if final_decision_obj and isinstance(final_decision_obj, FusionResult):
-                    # 这是一个临时修复，以解决设计不匹配的问题
-                    # (L2 (FusionResult) 是全局的/跨资产的)
-                    # (L3 (AlphaAgent) 可能是特定于资产的)
-                    
-                    # (我们需要知道要处理哪些符号，这应该来自 L0 或配置)
-                    # (暂时依赖 L3 循环中的模拟数据)
-                    # [FIX] Use default symbols from config instead of hardcoded list
-                    symbols_to_process = self.default_symbols
+            logger.info("Market data and news data fetched and added to state.")
+
+        except Exception as e:
+            logger.error(f"Failed to fetch data: {e}")
+            return {"error": f"Data fetching failed: {e}"}
+
+        # 3. 运行分析层
+        try:
+            final_decision = await self.run_analysis_level(self.state)
+            logger.info(f"Task {task.task_id} processed. Final decision: {final_decision.get('asset_insights')}")
+            return final_decision
+        except Exception as e:
+            logger.error(f"Error during analysis level execution: {e}")
+            return {"error": f"Analysis level failed: {e}"}
+
+    async def run_analysis_level(self, state: PipelineState) -> Dict[str, Any]:
+        """
+        执行完整的 L1 -> L2 -> L3 分析流程。
+        """
+        logger.info("Running analysis level...")
+
+        # 从状态中获取目标资产
+        market_data = state.get_latest_market_data()
+        if not market_data:
+            logger.warning("No market data found in state. Analysis level cannot proceed.")
+            return {"error": "Missing market data."}
             
-                    for symbol in symbols_to_process:
-                        symbol_fusion_result = final_decision_obj.model_copy(deep=True)
-                        symbol_fusion_result.symbol = symbol
-                        
-                        # (在 L3 AlphaAgent 中运行 L2 结果)
-                        alpha_signal = await self.alpha_agent.generate_signal(symbol_fusion_result)
-                        
-                        if alpha_signal:
-                            self.logger.info(f"[L3 Alpha] Generated signal for {symbol}: {alpha_signal.signal_type} @ {alpha_signal.confidence}")
-                            
-                            # 2. (L3 Risk) - 调整信号 (例如调整大小)
-                            # (RiskAgent 还需要 Portfolio 上下文)
-                            portfolio_context = self.portfolio_constructor.get_context()
-                            risk_adjusted_signal = await self.risk_agent.manage_risk(alpha_signal, portfolio_context)
-                            
-                            if risk_adjusted_signal:
-                                # 3. (L3 Execution) - 执行信号
-                                await self.execution_agent.execute_signal(risk_adjusted_signal)
-                            else:
-                                self.logger.info(f"[L3 Risk] Signal for {symbol} was vetoed by RiskAgent.")
-                        else:
-                            self.logger.info(f"[L3 Alpha] No signal generated for {symbol}.")
-                
-                else:
-                    self.logger.warning("[L3 Loop] No L2 FusionResult available yet. Skipping L3 cycle.")
+        # 从市场数据中提取资产（例如，["AAPL", "GOOG"]）
+        target_assets = list(market_data.keys())
+        if not target_assets:
+            logger.warning("Market data is empty. No target assets to analyze.")
+            return {"error": "No target assets found in market data."}
+            
+        logger.info(f"Analysis level targeting assets: {target_assets}")
 
-                # (等待下一个 L3 循环)
-                self.logger.info(f"[L3 Loop] L3 cycle finished. Waiting {l3_loop_frequency_seconds}s...")
-                await asyncio.sleep(l3_loop_frequency_seconds)
 
-            except asyncio.CancelledError:
-                self.logger.info("L3 Main Loop cancelled.")
-                break
-            except Exception as e:
-                self.logger.error(f"Error in L3 Main Loop: {e}", exc_info=True)
-                # (在非致命错误时继续)
-                await asyncio.sleep(l3_loop_frequency_seconds) # (发生错误时也等待)
-                
-        self.logger.info("L3 Main Loop stopped.")
+        # 1. 运行 L1 智能体
+        logger.debug("Executing L1 agents...")
+        try:
+            # L1 智能体并行运行
+            l1_insights = await self.agent_executor.run_l1_agents(state, target_assets)
+            if not l1_insights:
+                logger.warning("L1 agents produced no insights.")
+                return {"error": "L1 agents failed to produce insights."}
+            logger.info(f"L1 agents completed. {len(l1_insights)} insights generated.")
+        except Exception as e:
+            logger.error(f"Error executing L1 agents: {e}", exc_info=True)
+            return {"error": f"L1 agent execution failed: {e}"}
+
+        # 2. 运行 L2 智能体 (监督层)
+        logger.debug("Executing L2 agents...")
+        try:
+            # L2 智能体并行运行
+            l2_supervision = await self.agent_executor.run_l2_agents(state, l1_insights)
+            logger.info("L2 agents completed.")
+        except Exception as e:
+            logger.error(f"Error executing L2 agents: {e}", exc_info=True)
+            return {"error": f"L2 agent execution failed: {e}"}
+        
+        # TODO: L2 见解 (l2_supervision) 应该被传递给推理集合
+        # 目前，推理集合 (ReasoningEnsemble) 内部有自己的L2/L3智能体
+        
+        # 3. 运行推理集合 (L2 Fusion -> L3 Alpha)
+        logger.debug("Executing Reasoning Ensemble...")
+        try:
+            # ReasoningEnsemble 协调 L2 Fusion 和 L3 Alpha 智能体
+            final_insights = await self.reasoning_ensemble.run_ensemble(state, l1_insights, target_assets)
+            logger.info("Reasoning Ensemble completed.")
+            return final_insights
+        except Exception as e:
+            logger.error(f"Error executing Reasoning Ensemble: {e}", exc_info=True)
+            return {"error": f"Reasoning Ensemble failed: {e}"}
+
+    async def run_system_tick(self):
+        """
+        由 LoopManager 调用的常规系统“心跳”。
+        用于后台任务、数据摄取和监控。
+        """
+        logger.info("Orchestrator system tick running...")
+        
+        # 1. 触发数据管理器进行后台刷新
+        try:
+            await self.data_manager.refresh_data_sources()
+            logger.debug("Data sources refreshed.")
+        except Exception as e:
+            logger.warning(f"Failed to refresh data sources during system tick: {e}")
+
+        # 2. 运行监控/内省智能体 (如果需要)
+        # (例如, L2 MetacognitiveAgent)
+        try:
+            l2_meta_agent = self.agent_executor.get_agent("L2_MetacognitiveAgent")
+            if l2_meta_agent:
+                logger.debug("Running L2 MetacognitiveAgent on system tick...")
+                # 元认知智能体检查整个状态
+                await l2_meta_agent.run(self.state) 
+            
+        except Exception as e:
+            logger.warning(f"Failed to run metacognitive agent during system tick: {e}")
+
+        # 3. 向上下文总线广播系统状态更新
+        system_health = {"status": "OK", "timestamp": self.state.get_current_time()}
+        self.context_bus.publish("system_health", system_health)
+        
+        logger.info("Orchestrator system tick completed.")
