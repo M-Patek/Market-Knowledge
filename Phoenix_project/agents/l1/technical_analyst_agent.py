@@ -1,130 +1,168 @@
 import json
 import logging
-from typing import List, Any, Generator, AsyncGenerator
+from typing import List, Any, Generator, AsyncGenerator, Dict # [FIX] Add Dict
 import time
 import pandas as pd # <-- [FIX] 添加 pandas 导入
-
-from Phoenix_project.agents.l1.base import L1Agent
+from Phoenix_project.agents.l1.base import L1Agent, logger
 from Phoenix_project.core.schemas.task_schema import Task
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
-
-# 获取日志记录器
-logger = logging.getLogger(__name__)
+from Phoenix_project.core.schemas.data_schema import MarketData, EventData
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceSource
 
 class TechnicalAnalystAgent(L1Agent):
     """
-    L1 智能体：技术分析师
-    分析价格图表、交易量和技术指标。
+    L1 智能体，专注于技术分析。
+    分析 K 线数据、交易量、波动性等，以识别趋势、支撑/阻力位和技术形态。
     """
     def __init__(
         self,
         agent_id: str,
         llm_client: Any,
         data_manager: Any,
+        config: Dict[str, Any] = None # [FIX] Add config
     ):
         """
         初始化 TechnicalAnalystAgent。
-        
-        参数:
-            agent_id (str): 智能体的唯一标识符。
-            llm_client (Any): 用于与 LLM API 交互的客户端 (例如 EnsembleClient)。
-            data_manager (Any): 用于检索数据的 DataManager。
         """
         super().__init__(
             agent_id=agent_id,
+            role="Technical Analyst",
+            prompt_template_name="l1_technical_analyst",
             llm_client=llm_client,
             data_manager=data_manager
         )
-        logger.info(f"[{self.agent_id}] TechnicalAnalystAgent initialized.")
+        self.config = config or {} # [FIX] Store config
+        self.lookback_days = self.config.get('technical_lookback_days', 90) # [FIX] Get lookback from config
+        logger.info(f"[{self.agent_id}] TechnicalAnalystAgent initialized with lookback: {self.lookback_days} days.") # [FIX] Log config
 
     async def run(self, task: Task, context: List[Any]) -> AsyncGenerator[EvidenceItem, None]:
         """
-        异步运行智能体以执行技术分析。
-        
-        参数:
-            task (Task): 分配给智能体的任务。
-            context (List[Any]): 智能体运行所需的附加上下文（例如，原始文档）。
-
-        收益:
-            AsyncGenerator[EvidenceItem, None]: 异步生成一个或多个 EvidenceItem。
+        异步运行智能体以处理单个任务。
         """
-        logger.info(f"[{self.agent_id}] Running technical analysis for task: {task.task_id} on symbols: {task.symbols}")
-
-        if not task.symbols:
-            logger.warning(f"[{self.agent_id}] Task {task.task_id} has no symbols. Skipping.")
+        logger.info(f"[{self.agent_id}] Running task: {task.task_id} for event: {task.event_id}")
+        
+        # 1. (已修复) 从 DataManager 获取 K 线数据，而不是依赖 context
+        # 2. (已修复) 格式化数据以适应 LLM (例如，总结关键 TA 指标)
+        # 3. 生成提示
+        # 4. 调用 LLM
+        # 5. 解析响应并生成 EvidenceItem
+        
+        event = task.event
+        if not event or not event.symbol:
+            logger.warning(f"[{self.agent_id}] Task {task.task_id} has no valid event or symbol.")
             return
 
-        # 1. 准备 Prompt 的上下文
-        symbol = task.symbols[0]
+        symbol = event.symbol
         
         # [FIX] 从 DataManager 获取 K 线数据，而不是依赖 context
         try:
             # (我们需要为技术分析定义一个合理的时间范围)
-            # (暂时硬编码一个回溯期，例如 90 天。这应该来自配置。)
             end_date = pd.Timestamp.now(tz='UTC')
-            start_date = end_date - pd.Timedelta(days=90)
+            # [FIX] Use configured lookback period instead of 90
+            start_date = end_date - pd.Timedelta(days=self.lookback_days)
             
             # get_market_data 返回 Dict[str, pd.DataFrame]
-            market_data_dfs = self.data_manager.get_market_data(
-                symbols=[symbol], 
-                start_date=start_date, 
-                end_date=end_date
+            market_data_df_dict = await self.data_manager.get_market_data(
+                symbols=[symbol],
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat()
             )
             
-            klines_df = market_data_dfs.get(symbol)
+            market_data_df = market_data_df_dict.get(symbol)
             
-            if klines_df is None or klines_df.empty:
-                logger.warning(f"[{self.agent_id}] No kline data found for {symbol} from data_manager. Skipping.")
+            if market_data_df is None or market_data_df.empty:
+                logger.warning(f"[{self.agent_id}] No market data found for {symbol} from {start_date} to {end_date}.")
                 return
+
+            # (这是一个简化的数据准备步骤)
+            # (在实际应用中，我们会计算 TA 指标，如 MA, RSI, MACD)
+            # (目前，我们只传递原始 K 线数据的摘要)
             
-            # (将 DataFrame 转换为 LLM 可读的格式，例如 JSON)
-            # (只取几行数据，避免 prompt 过长)
-            context_str = klines_df.tail(30).to_json(orient="records")
+            data_summary = f"Technical data for {symbol} (last {self.lookback_days} days):\n"
+            data_summary += f"Data points: {len(market_data_df)}\n"
+            data_summary += f"Start: {market_data_df.index.min()}\n"
+            data_summary += f"End: {market_data_df.index.max()}\n"
+            data_summary += f"Latest Close: {market_data_df['close'].iloc[-1]:.2f}\n"
+            data_summary += f"{self.lookback_days}d High: {market_data_df['high'].max():.2f}\n"
+            data_summary += f"{self.lookback_days}d Low: {market_data_df['low'].min():.2f}\n"
+            data_summary += f"{self.lookback_days}d Avg Volume: {market_data_df['volume'].mean():.0f}\n"
             
+            # (此处可以添加更多指标)
+            # (例如：data_summary += f"RSI(14): {calculate_rsi(market_data_df, 14)}\n")
+
         except Exception as e:
-            logger.error(f"[{self.agent_id}] Failed to get kline data for {symbol}. Error: {e}", exc_info=True)
+            logger.error(f"[{self.agent_id}] Error retrieving or processing market data for {symbol}: {e}", exc_info=True)
             return
 
-        if not context_str:
-             logger.warning(f"[{self.agent_id}] Kline data for {symbol} was empty after processing. Skipping.")
-             return
-
-        context_map = {
+        # 3. 生成提示
+        prompt_data = {
             "symbol": symbol,
-            "context": context_str
+            "event_description": event.description,
+            "market_data_summary": data_summary
         }
         
-        # [关键] 设置此智能体对应的 Prompt 名称
-        agent_prompt_name = "l1_technical_analyst" 
-
         try:
-            # 2. 异步调用 LLM
-            logger.debug(f"[{self.agent_id}] Calling LLM with prompt: {agent_prompt_name} for symbol: {symbol}")
+            prompt = self.render_prompt(prompt_data)
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Error rendering prompt: {e}", exc_info=True)
+            return
+
+        # 4. 调用 LLM
+        try:
+            llm_response = await self.llm_client.generate(prompt)
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Error calling LLM: {e}", exc_info=True)
+            return
+
+        # 5. 解析响应并生成 EvidenceItem
+        # (假设 LLM 的响应是一个 JSON 字符串，包含 'analysis', 'sentiment', 'key_levels')
+        try:
+            # (这个解析逻辑非常简化)
+            response_json = json.loads(llm_response)
             
-            response_str = await self.llm_client.run_llm_task(
-                agent_prompt_name=agent_prompt_name,
-                context_map=context_map
+            analysis_text = response_json.get("analysis", "No analysis provided.")
+            sentiment = response_json.get("sentiment", "Neutral").capitalize()
+            key_levels = response_json.get("key_levels", {}) # e.g., {"support": [100], "resistance": [120]}
+
+            # (验证情感)
+            if sentiment not in ["Bullish", "Bearish", "Neutral"]:
+                sentiment = "Neutral"
+
+            content = (
+                f"**Technical Analysis ({sentiment}):** {analysis_text}\n"
+                f"**Key Levels:** Support: {key_levels.get('support', 'N/A')}, Resistance: {key_levels.get('resistance', 'N/A')}"
             )
             
-            if not response_str:
-                logger.warning(f"[{self.agent_id}] LLM returned no response for task {task.task_id}.")
-                return
-
-            # 3. 解析和验证 JSON 输出
-            logger.debug(f"[{self.agent_id}] Received LLM response (raw): {response_str[:200]}...")
-            response_data = json.loads(response_str)
+            evidence = EvidenceItem(
+                agent_id=self.agent_id,
+                task_id=task.task_id,
+                event_id=task.event_id,
+                symbol=symbol,
+                headline="Technical Analysis Report",
+                content=content,
+                data_source=EvidenceSource.AGENT_ANALYSIS,
+                timestamp=time.time(),
+                tags=["technical", "analysis", sentiment.lower()],
+                raw_data=response_json
+            )
             
-            # 4. 验证并生成 EvidenceItem
-            evidence = EvidenceItem.model_validate(response_data)
-            evidence.agent_id = self.agent_id
-            
-            logger.info(f"[{self.agent_id}] Successfully generated evidence for {symbol} with confidence {evidence.confidence}")
+            logger.info(f"[{self.agent_id}] Generated evidence for task {task.task_id}")
             yield evidence
 
-        except json.JSONDecodeError as e:
-            logger.error(f"[{self.agent_id}] Failed to decode LLM JSON response for task {task.task_id}. Error: {e}")
-            logger.debug(f"[{self.agent_id}] Faulty JSON string: {response_str}")
-            return
+        except json.JSONDecodeError:
+            logger.warning(f"[{self.agent_id}] Failed to decode LLM JSON response: {llm_response}")
+            # (如果 JSON 失败，我们将原始文本作为证据)
+            evidence = EvidenceItem(
+                agent_id=self.agent_id,
+                task_id=task.task_id,
+                event_id=task.event_id,
+                symbol=symbol,
+                headline="Technical Analysis (Raw)",
+                content=f"Raw LLM Output (JSON parse failed): {llm_response}",
+                data_source=EvidenceSource.AGENT_ANALYSIS,
+                timestamp=time.time(),
+                tags=["technical", "raw", "error"],
+                raw_data={"raw_text": llm_response}
+            )
+            yield evidence
         except Exception as e:
-            logger.error(f"[{self.agent_id}] An error occurred during agent run for task {task.task_id}. Error: {e}")
-            return
+            logger.error(f"[{self.agent_id}] Error parsing LLM response or creating evidence: {e}", exc_info=True)
