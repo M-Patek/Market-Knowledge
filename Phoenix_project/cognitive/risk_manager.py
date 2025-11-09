@@ -1,320 +1,386 @@
-from typing import List, Dict, Any, Optional
-# 修复：导入 cognitive.engine 在 worker.py 中导致循环依赖
-# from Phoenix_project.cognitive.engine import CognitiveEngine
-# 修复：改为导入 ConfigLoader (来自 worker.py)
-from Phoenix_project.config.loader import ConfigLoader
-# 修复：导入 RiskSignal (来自 a/r/p (新版))
-from Phoenix_project.core.schemas.risk_schema import RiskReport, RiskAdjustment
-# 修复：导入 Signal (来自 data_schema)
-from Phoenix_project.core.schemas.data_schema import Signal
-# 修复：导入 PipelineState (来自 a/r/p (新版))
-from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.monitor.logging import get_logger
-# 修复：导入 a/r/p (新版) 中使用的 Enum
-from enum import Enum
+"""
+Risk Manager for the Phoenix cognitive engine.
 
-log = get_logger("RiskManager")
+Monitors portfolio state, market conditions, and operational metrics
+to enforce risk controls and trigger circuit breakers.
+"""
 
-# 修复：定义 a/r/p (新版) 中使用的 RiskSignalType
-class RiskSignalType(str, Enum):
-    SYSTEM_ERROR = "SYSTEM_ERROR"
-    STOP_LOSS = "STOP_LOSS"
-    MAX_DRAWDOWN = "MAX_DRAWDOWN"
-    CONCENTRATION = "CONCENTRATION"
-    VOLATILITY = "VOLATILITY"
+import logging
+from typing import Any, Dict, Optional, List
+from collections import deque
+import numpy as np  # 确保 numpy 已在 requirements.txt 中
+import redis  # type: ignore
 
-# 修复：定义 a/r/p (新版) 中使用的 RiskSignal
-class RiskSignal:
-    def __init__(self, type: RiskSignalType, message: str, level: int, affected_symbols: List[str] = None):
-        self.type = type
-        self.message = message
-        self.level = level
-        self.affected_symbols = affected_symbols or []
+from ..core.schemas.data_schema import MarketData, Position, Portfolio
+from ..core.schemas.risk_schema import (
+    RiskSignal,
+    SignalType,
+    RiskParameter,
+    VolatilitySignal,
+    DrawdownSignal,
+    ConcentrationSignal,
+)
+from ..core.exceptions import RiskViolationError, CircuitBreakerError
+
+logger = logging.getLogger(__name__)
+
 
 class RiskManager:
     """
-    认知风险管理器。
-    负责评估系统状态、投资组合和市场数据，以识别和量化风险。
+    Manages risk for the trading system.
     """
 
-    # 修复：签名与 worker.py (ConfigLoader) 和 a/r/p (新版) (没有 cognitive_engine) 匹配
-    def __init__(self, config_loader: ConfigLoader):
-        # self.cognitive_engine = cognitive_engine # 修复：移除
-        self.config = config_loader.load_config('system.yaml').get("risk_manager", {})
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        redis_client: redis.Redis,
+        initial_capital: float = 100000.0,
+    ):
+        """
+        Initializes the RiskManager.
+
+        Args:
+            config: Configuration dictionary for risk parameters.
+            redis_client: Client for persistent state (e.g., peak_equity).
+            initial_capital: The starting capital for the portfolio.
+        """
+        self.config = config.get("risk_manager", {})
+        self.redis_client = redis_client
+        self.initial_capital = initial_capital
         
-        # [✅ 优化] 从配置加载阈值
-        self.stop_loss_threshold = self.config.get("stop_loss_threshold", 0.05)  # 5% 止损
-        self.max_drawdown_threshold = self.config.get("max_drawdown_threshold", 0.15) # 15% 最大回撤
-        self.volatility_threshold = self.config.get("volatility_threshold", 0.03) # 3% 日波动率
-        self.concentration_threshold = self.config.get("concentration_threshold", 0.25) # 25% 集中度
-
-        # [✅ 优化] 持久化峰值权益
-        # TODO: This should be loaded from a persistent store (e.g., Redis, DB)
-        # 修复：我们不能在 __init__ 中访问 pipeline_state。
-        # 我们必须从配置中获取初始资本。
-        try:
-            # 修复：从 system.yaml (通过 config_loader) 获取
-            system_config = config_loader.load_config('system.yaml')
-            initial_capital = system_config.get("trading", {}).get("initial_cash", 0.0)
-            if initial_capital == 0.0:
-                 log.warning("Could not find 'trading.initial_cash' in system.yaml. Defaulting peak_equity to 0.")
-        except AttributeError:
-            log.warning("Could not find initial_capital in config. Defaulting peak_equity to 0.")
-            initial_capital = 0.0
-            
-        self.peak_equity = initial_capital
-        
-        log.info(f"RiskManager initialized. StopLoss: {self.stop_loss_threshold}, "
-                   f"MaxDrawdown: {self.max_drawdown_threshold}, Initial Peak Equity: {self.peak_equity}")
-
-    # 修复：添加 a/r/p (新版) 中的 assess_risk
-    def assess_risk(self, pipeline_state: PipelineState) -> List[RiskSignal]:
-        """
-        运行所有风险检查并返回发现的风险信号。
-        """
-        log.debug("Running risk assessment...")
-        signals = []
-        
-        try:
-            # 修复：从 state 获取 portfolio 和 market_data
-            portfolio = pipeline_state.get_latest_portfolio_state()
-            # 修复：market_data 不在 state 顶层
-            # (这是一个困难的修复，因为 state 没有 'latest_market_data')
-            # (我们将模拟它)
-            market_data = {}
-            for md in pipeline_state.market_data_history:
-                 market_data[md.symbol] = {"price": md.close, "change_pct": 0.01} # 模拟
-            
-            if not portfolio or not market_data:
-                log.warning("Portfolio or Market Data not available. Skipping risk assessment.")
-                return []
-
-            # 
-            current_equity = portfolio.total_value # 修复：使用 Pydantic 模型的字段
-
-            signals.extend(self.check_stop_loss(portfolio, market_data))
-            signals.extend(self.check_max_drawdown(current_equity))
-            signals.extend(self.check_concentration(portfolio))
-            signals.extend(self.check_volatility(market_data))
-            
-            if signals:
-                log.warning(f"Risk assessment generated {len(signals)} signals.")
-            else:
-                log.debug("Risk assessment complete. No immediate risks detected.")
-
-        except Exception as e:
-            log.error(f"Error during risk assessment: {e}", exc_info=True)
-            signals.append(
-                RiskSignal(
-                    type=RiskSignalType.SYSTEM_ERROR,
-                    message=f"Risk assessment failed: {e}",
-                    level=10,
-                )
-            )
-            
-        return signals
-
-    # 修复：更新签名以匹配 a/r/p (新版)
-    def check_stop_loss(self, portfolio: Any, market_data: Dict[str, Any]) -> List[RiskSignal]:
-        """
-        [✅ 优化] 检查止损 (Stop-Loss)。
-        遍历所有持仓，检查是否达到了止损阈值。
-        """
-        signals = []
-        # 修复：使用 Pydantic 模型的 'positions'
-        if not portfolio.positions:
-            return signals
-
-        log.debug(f"Checking stop-loss for {len(portfolio.positions)} positions...")
-        
-        # 修复：迭代字典
-        for symbol, position in portfolio.positions.items():
-            try:
-                # 
-                # 修复：使用 Pydantic 模型的 'average_price'
-                if not hasattr(position, 'average_price') or position.average_price <= 0:
-                    log.warning(f"Position {symbol} missing valid average_price. Skipping stop-loss check.")
-                    continue
-                    
-                if symbol not in market_data or 'price' not in market_data[symbol]:
-                    log.warning(f"No current market price for {symbol}. Skipping stop-loss check.")
-                    continue
-
-                current_price = market_data[symbol]['price']
-                entry_price = position.average_price # 修复：使用 Pydantic 模型的字段
-                
-                # 
-                loss_percent = (entry_price - current_price) / entry_price
-                
-                # 
-                if loss_percent > self.stop_loss_threshold:
-                    log.warning(f"STOP-LOSS triggered for {symbol}. Loss: {loss_percent:.2%}")
-                    signals.append(
-                        RiskSignal(
-                            type=RiskSignalType.STOP_LOSS,
-                            message=f"Stop-loss triggered for {symbol}. "
-                                    f"Current Loss: {loss_percent:.2%} "
-                                    f"(Entry: {entry_price}, Current: {current_price})",
-                            level=8,
-                            affected_symbols=[symbol],
-                        )
-                    )
-            except Exception as e:
-                log.error(f"Error checking stop-loss for position {getattr(position, 'symbol', 'UNKNOWN')}: {e}")
-
-        return signals
-
-
-    def check_max_drawdown(self, current_equity: float) -> List[RiskSignal]:
-        """
-        [✅ 优化] 检查最大回撤 (Max Drawdown)。
-        使用持久化的 peak_equity。
-        """
-        signals = []
-        
-        # 
-        self.peak_equity = max(self.peak_equity, current_equity)
-        
-        if self.peak_equity == 0:
-             log.debug("Peak equity is 0, skipping drawdown check.")
-             return signals # 
-
-        drawdown = (self.peak_equity - current_equity) / self.peak_equity
-        log.debug(f"Drawdown check: Current={current_equity}, Peak={self.peak_equity}, Drawdown={drawdown:.2%}")
-
-        if drawdown > self.max_drawdown_threshold:
-            log.critical(f"MAX DRAWDOWN breached. Drawdown: {drawdown:.2%}")
-            signals.append(
-                RiskSignal(
-                    type=RiskSignalType.MAX_DRAWDOWN,
-                    message=f"Max drawdown threshold breached. "
-                            f"Current Drawdown: {drawdown:.2%} "
-                            f"(Peak Equity: {self.peak_equity}, Current Equity: {current_equity})",
-                    level=10, # 
-                )
-            )
-        return signals
-
-    # 修复：更新签名以匹配 a/r/p (新版)
-    def check_concentration(self, portfolio: Any) -> List[RiskSignal]:
-        """
-        检查投资组合集中度。
-        """
-        signals = []
-        # 修复：使用 Pydantic 模型的 'positions'
-        if not portfolio.positions:
-            return signals
-
-        total_value = portfolio.total_value # 修复：使用 Pydantic 模型的字段
-        if total_value == 0:
-            return signals
-
-        # 修复：迭代 Pydantic 模型的 'positions' 字典
-        for symbol, position in portfolio.positions.items():
-            value = position.market_value # 修复：使用 Pydantic 模型的字段
-            concentration = value / total_value
-            if concentration > self.concentration_threshold:
-                log.warning(f"High concentration risk for {symbol}. Concentration: {concentration:.2%}")
-                signals.append(
-                    RiskSignal(
-                        type=RiskSignalType.CONCENTRATION,
-                        message=f"High portfolio concentration in {symbol}. "
-                                f"Concentration: {concentration:.2%}",
-                        level=6,
-                        affected_symbols=[symbol],
-                    )
-                )
-        return signals
-
-    def check_volatility(self, market_data: Dict[str, Any]) -> List[RiskSignal]:
-        """
-        检查市场波动性 (简化)。
-        """
-        # 
-        # 
-        signals = []
-        for symbol, data in market_data.items():
-            if "change_pct" in data and abs(data["change_pct"]) > self.volatility_threshold:
-                log.warning(f"High volatility detected for {symbol}. Change: {data['change_pct']:.2%}")
-                signals.append(
-                    RiskSignal(
-                        type=RiskSignalType.VOLATILITY,
-                        message=f"High volatility detected in {symbol}. "
-                                f"Daily Change: {data['change_pct']:.2%}",
-                        level=5,
-                        affected_symbols=[symbol],
-                    )
-                )
-        return signals
-
-    # 修复：添加 PortfolioConstructor (旧版) 所需的 (但 a/r/p 中没有的) 方法
-    def evaluate_and_adjust(self, signal: Signal, state: PipelineState) -> Signal:
-        """
-        (旧版方法，被 PortfolioConstructor 调用)
-        评估一个信号并可能否决 (veto) 或调整 (adjust) 它。
-        """
-        log.debug(f"RiskManager evaluating signal for {signal.symbol} (Qty: {signal.quantity})")
-        
-        # 运行评估
-        risk_signals = self.assess_risk(state)
-        
-        adjustments_made = []
-        
-        for r_sig in risk_signals:
-            # 1. 检查系统级风险 (Max Drawdown)
-            if r_sig.type == RiskSignalType.MAX_DRAWDOWN:
-                log.critical(f"VETO: Max Drawdown breached. Vetoing signal for {signal.symbol}.")
-                adjustments_made.append(f"VETO (MAX_DRAWDOWN): {r_sig.message}")
-                signal.quantity = 0.0 # VETO
-                signal.metadata["risk_veto"] = r_sig.message
-                break # Max drawdown 停止所有交易
-                
-            # 2. 检查特定资产的风险 (Stop Loss, Volatility)
-            if signal.symbol in r_sig.affected_symbols:
-                if r_sig.type == RiskSignalType.STOP_LOSS and signal.quantity > 0:
-                     # 如果我们处于止损状态，不允许买入
-                     log.warning(f"VETO (STOP_LOSS): Attempted to BUY {signal.symbol} which is in stop-loss. Vetoing.")
-                     adjustments_made.append(f"VETO (STOP_LOSS): {r_sig.message}")
-                     signal.quantity = 0.0
-                     signal.metadata["risk_veto"] = r_sig.message
-                
-                elif r_sig.type == RiskSignalType.VOLATILITY and signal.quantity != 0:
-                     # 如果波动性过高，将交易量减半
-                     log.warning(f"ADJUST (VOLATILITY): High volatility for {signal.symbol}. Reducing trade size by 50%.")
-                     adjustments_made.append(f"ADJUST (VOLATILITY): {r_sig.message}")
-                     signal.quantity *= 0.5
-                     signal.metadata["risk_adjustment"] = "Reduced 50% (Volatility)"
-
-            # 3. 检查集中度 (Concentration)
-            if r_sig.type == RiskSignalType.CONCENTRATION and signal.quantity > 0 and signal.symbol in r_sig.affected_symbols:
-                 log.warning(f"ADJUST (CONCENTRATION): High concentration in {signal.symbol}. Vetoing further BUYS.")
-                 adjustments_made.append(f"ADJUST (CONCENTRATION): {r_sig.message}")
-                 signal.quantity = 0.0 # 不允许增加已集中的仓位
-                 signal.metadata["risk_adjustment"] = "Vetoed BUY (Concentration)"
-                 
-        # 记录一份报告 (PortfolioConstructor 旧版不需要)
-        report = RiskReport(
-            adjustments_made=adjustments_made,
-            passed=(signal.quantity != 0.0) # 简化
+        # 风险参数
+        self.max_drawdown_pct = self.config.get("max_drawdown_pct", 0.15)
+        self.max_position_concentration_pct = self.config.get(
+            "max_position_concentration_pct", 0.20
         )
-        
-        return signal
+        self.volatility_threshold = self.config.get("volatility_threshold", 0.05)
+        self.volatility_window = self.config.get("volatility_window", 30) # 用于计算标准差的窗口大小
 
-    # 修复：添加 ErrorHandler (旧版) 所需的 (但 a/r/p 中没有的) 方法
-    async def trip_system_circuit_breaker(self, reason: str):
+        # 内部状态
+        self.current_equity: float = initial_capital
+        self.circuit_breaker_tripped: bool = False
+        self.active_signals: List[RiskSignal] = []
+
+        # OPTIMIZED: 从 Redis 加载持久化的峰值权益 (peak_equity)
+        # 替换原有的 TODO
+        self.peak_equity: float = self._load_peak_equity()
+
+        # OPTIMIZED: 为波动性计算保留价格历史
+        # 使用 deque 实现一个高效的滚动窗口
+        self.price_history: Dict[str, deque] = {} # Key: symbol, Value: deque of prices
+
+        logger.info("RiskManager initialized.")
+        logger.info(f"Loaded Peak Equity: {self.peak_equity}")
+        logger.info(f"Max Drawdown: {self.max_drawdown_pct * 100}%")
+        logger.info(f"Max Concentration: {self.max_position_concentration_pct * 100}%")
+
+    def _load_peak_equity(self) -> float:
         """
-        (旧版方法，被 ErrorHandler 调用)
-        触发系统范围的熔断器。
+        OPTIMIZED: Loads the peak equity from persistent storage (Redis).
         """
-        log.critical(f"--- SYSTEM CIRCUIT BREAKER TRIPPED ---")
-        log.critical(f"REASON: {reason}")
-        log.critical("--- NO NEW ORDERS WILL BE PLACED ---")
+        try:
+            peak_equity_raw = self.redis_client.get("phoenix:risk:peak_equity")
+            if peak_equity_raw:
+                peak_equity = float(peak_equity_raw)
+                logger.info(f"Loaded peak_equity from Redis: {peak_equity}")
+                return max(peak_equity, self.initial_capital)
+            else:
+                logger.info("No peak_equity found in Redis. Using initial_capital.")
+                return self.initial_capital
+        except Exception as e:
+            logger.error(f"Failed to load peak_equity from Redis: {e}. Defaulting.")
+            return self.initial_capital
+
+    def _save_peak_equity(self):
+        """
+        OPTIMIZED: Saves the current peak equity to persistent storage (Redis).
+        """
+        try:
+            self.redis_client.set("phoenix:risk:peak_equity", self.peak_equity)
+        except Exception as e:
+            logger.error(f"Failed to save peak_equity to Redis: {e}")
+
+    def check_pre_trade(
+        self, proposed_position: Position, portfolio: Portfolio
+    ) -> List[RiskSignal]:
+        """
+        Checks risk before a new trade is executed.
+
+        Args:
+            proposed_position: The position being considered.
+            portfolio: The current state of the portfolio.
+
+        Returns:
+            A list of risk signals. If empty, the trade is compliant.
+        """
+        if self.circuit_breaker_tripped:
+            logger.error("CIRCUIT BREAKER TRIPPED. Pre-trade check failed.")
+            raise CircuitBreakerError(
+                "Risk circuit breaker is active. No new trades allowed."
+            )
+
+        signals = []
+
+        # 1. 检查集中度
+        conc_signal = self.check_concentration(proposed_position, portfolio)
+        if conc_signal:
+            signals.append(conc_signal)
+
+        # 可以在此处添加其他预交易检查 (例如流动性、杠杆等)
+
+        if signals:
+            logger.warning(
+                f"Pre-trade check failed for {proposed_position.symbol}: {signals}"
+            )
+            # 抛出异常以阻止交易
+            raise RiskViolationError(
+                f"Pre-trade risk violation: {signals[0].description}",
+                signals
+            )
+
+        logger.debug(f"Pre-trade check passed for {proposed_position.symbol}")
+        return signals
+
+    def check_post_trade(self, portfolio: Portfolio) -> List[RiskSignal]:
+        """
+        Checks risk after trades have been executed and the portfolio updated.
+
+        Args:
+            portfolio: The updated portfolio.
+
+        Returns:
+            A list of active risk signals.
+        """
+        if self.circuit_breaker_tripped:
+            return self.active_signals
+
+        self.active_signals = []
+
+        # 1. 更新权益并检查回撤
+        self.update_portfolio_value(portfolio.total_value)
+        drawdown_signal = self.check_drawdown()
+        if drawdown_signal:
+            self.active_signals.append(drawdown_signal)
+
+        # 2. 检查整体集中度 (以防万一)
+        # (这在 pre-trade 中更重要, 但在这里做个健全性检查)
         
-        # 在真实系统中，这会：
-        # 1. 设置一个 Redis 键 (e.g., "circuit_breaker:tripped")
-        # 2. OrderManager 会在 place_order 之前检查这个键
-        # 3. 可能会触发 PagerDuty 警报
+        # 3. 检查市场波动性 (在 on_market_data 中处理)
         
-        # (模拟)
-        await asyncio.sleep(0.01) # 模拟 async
-        pass
+        if self.active_signals:
+            logger.critical(
+                f"Post-trade risk violations detected: {self.active_signals}"
+            )
+            if any(s.triggers_circuit_breaker for s in self.active_signals):
+                self.trip_circuit_breaker(
+                    f"Violation: {self.active_signals[0].description}"
+                )
+
+        return self.active_signals
+
+    def on_market_data(self, market_data: MarketData) -> Optional[RiskSignal]:
+        """
+        Processes real-time market data to check for dynamic risks.
+
+        Args:
+            market_data: The latest market data for a symbol.
+
+        Returns:
+            A risk signal if a new risk is detected.
+        """
+        if self.circuit_breaker_tripped:
+            return None
+        
+        # 检查波动性
+        vol_signal = self.check_volatility(market_data)
+        if vol_signal:
+            logger.warning(f"High volatility detected: {vol_signal.description}")
+            # 可以在此处决定是否将波动性信号添加到 active_signals
+            # 或触发熔断
+            if vol_signal.triggers_circuit_breaker:
+                self.trip_circuit_breaker(vol_signal.description)
+            return vol_signal
+        
+        return None
+
+    def update_portfolio_value(self, new_equity: float):
+        """
+        Updates the current equity and peak equity.
+
+        Args:
+            new_equity: The new total value of the portfolio.
+        """
+        self.current_equity = new_equity
+        if self.current_equity > self.peak_equity:
+            self.peak_equity = self.current_equity
+            # OPTIMIZED: 持久化更新后的 peak_equity
+            self._save_peak_equity()
+        
+        logger.debug(
+            f"Equity updated: Current={self.current_equity}, Peak={self.peak_equity}"
+        )
+
+    def check_drawdown(self) -> Optional[DrawdownSignal]:
+        """
+        Checks for a violation of the maximum drawdown limit.
+        """
+        drawdown = (self.peak_equity - self.current_equity) / self.peak_equity
+        
+        if drawdown > self.max_drawdown_pct:
+            desc = (
+                f"Maximum drawdown exceeded: {drawdown*100:.2f}% "
+                f"(Limit: {self.max_drawdown_pct*100:.2f}%)"
+            )
+            logger.critical(desc)
+            return DrawdownSignal(
+                description=desc,
+                current_drawdown=drawdown,
+                max_drawdown=self.max_drawdown_pct,
+                triggers_circuit_breaker=True,
+            )
+        return None
+
+    def check_concentration(
+        self, proposed_position: Position, portfolio: Portfolio
+    ) -> Optional[ConcentrationSignal]:
+        """
+        Checks if a new position would violate concentration limits.
+        """
+        symbol = proposed_position.symbol
+        # 假设 proposed_position.market_value 是新头寸的名义价值
+        new_position_value = proposed_position.market_value
+        
+        # 查找现有头寸 (如果存在)
+        existing_value = 0.0
+        if symbol in portfolio.positions:
+            existing_value = portfolio.positions[symbol].market_value
+
+        # 计算新头寸之后的总价值
+        # (注意: 假设 'market_value' 为正)
+        final_position_value = existing_value + new_position_value
+        
+        # 假设投资组合总价值 *不会* 因为这个新头寸而立即改变
+        # (例如, 如果是现金购买, 总价值不变)
+        # 一个更精确的计算可能需要 'new_portfolio_total_value'
+        total_portfolio_value = portfolio.total_value
+
+        if total_portfolio_value == 0:
+            return None # 避免除以零
+
+        concentration = final_position_value / total_portfolio_value
+        
+        if concentration > self.max_position_concentration_pct:
+            desc = (
+                f"Position concentration limit exceeded for {symbol}: "
+                f"{concentration*100:.2f}% "
+                f"(Limit: {self.max_position_concentration_pct*100:.2f}%)"
+            )
+            logger.warning(desc)
+            return ConcentrationSignal(
+                description=desc,
+                symbol=symbol,
+                current_concentration=concentration,
+                max_concentration=self.max_position_concentration_pct,
+            )
+        return None
+
+    def check_volatility(self, market_data: MarketData) -> Optional[VolatilitySignal]:
+        """
+        OPTIMIZED: Checks for excessive market volatility using standard deviation
+        of returns, replacing the simplified implementation.
+        """
+        symbol = market_data.symbol
+        price = market_data.price
+
+        # 1. 获取该 symbol 的价格历史
+        if symbol not in self.price_history:
+            self.price_history[symbol] = deque(maxlen=self.volatility_window)
+        
+        history = self.price_history[symbol]
+        history.append(price)
+
+        # 2. 检查是否有足够的数据
+        if len(history) < history.maxlen:
+            # 数据不足以计算有意义的标准差
+            return None
+
+        try:
+            # 3. 计算收益率的标准差
+            prices = np.array(history)
+            
+            # 检查价格是否为零或负数
+            if np.any(prices <= 0):
+                logger.warning(f"Invalid prices in history for {symbol}, cannot calc returns.")
+                history.clear() # 清除坏数据
+                return None
+
+            # (prices[1:] - prices[:-1]) / prices[:-1]
+            log_returns = np.log(prices[1:] / prices[:-1])
+            
+            # 年化波动率 (假设数据是每日的)
+            # (这个假设可能不正确, 取决于 market_data 的频率)
+            # 为简单起见, 我们只使用原始的 stddev
+            current_volatility = np.std(log_returns)
+
+            # 4. 与阈值比较
+            if current_volatility > self.volatility_threshold:
+                desc = (
+                    f"High volatility detected for {symbol}: "
+                    f"StdDev({self.volatility_window} periods) = {current_volatility:.4f} "
+                    f"(Limit: {self.volatility_threshold:.4f})"
+                )
+                logger.warning(desc)
+                return VolatilitySignal(
+                    description=desc,
+                    symbol=symbol,
+                    current_volatility=current_volatility,
+                    volatility_threshold=self.volatility_threshold,
+                    # 可以配置波动性是否触发熔断
+                    triggers_circuit_breaker=self.config.get(
+                        "volatility_triggers_breaker", False
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"Error calculating volatility for {symbol}: {e}")
+        
+        return None
+
+    def trip_circuit_breaker(self, reason: str):
+        """
+        Trips the system-wide circuit breaker, halting new trades.
+        """
+        self.circuit_breaker_tripped = True
+        self.active_signals.append(
+            RiskSignal(
+                type=SignalType.CIRCUIT_BREAKER,
+                description=f"CIRCUIT BREAKER TRIPPED: {reason}",
+                triggers_circuit_breaker=True,
+            )
+        )
+        logger.critical(f"CIRCUIT BREAKER TRIPPED. Reason: {reason}")
+        # 可以在此处添加通知逻辑 (例如, 发送警报)
+
+    def reset_circuit_breaker(self):
+        """
+        Resets the circuit breaker (manual intervention usually required).
+        """
+        self.circuit_breaker_tripped = False
+        self.active_signals = [
+            s for s in self.active_signals if s.type != SignalType.CIRCUIT_BREAKER
+        ]
+        logger.info("RiskManager circuit breaker has been reset.")
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Returns the current status of the RiskManager.
+        """
+        return {
+            "circuit_breaker_tripped": self.circuit_breaker_tripped,
+            "current_equity": self.current_equity,
+            "peak_equity": self.peak_equity,
+            "current_drawdown": (self.peak_equity - self.current_equity)
+            / self.peak_equity
+            if self.peak_equity > 0
+            else 0,
+            "active_signals": [s.model_dump() for s in self.active_signals],
+        }
