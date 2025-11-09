@@ -22,7 +22,11 @@ scikit-learn>=1.5
 scipy>=1.11
 
 深度学习 & DRL (PyTorch)
-stable-baselines3[torch]>=2.3
+
+stable-baselines3[torch]>=2.3 # [MARL 重构] 不再需要，替换为 RLLib
+
+pettingzoo>=1.24.0 # [MARL 重构] 添加 PettingZoo API
+ray[rllib]>=2.9.0 # [MARL 重构] 添加 Ray RLLib
 torch>=2.2
 
 AI / LLM (生成式 AI & NLP)
