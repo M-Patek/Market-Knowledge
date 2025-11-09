@@ -1,95 +1,159 @@
-import logging
-from typing import List, Any, Dict, AsyncGenerator
+import asyncio
+from typing import Dict, Any
+import pandas as pd # [任务 C.1] 导入 pandas
+from Phoenix_project.agents.l1.base import L1BaseAgent
+from Phoenix_project.agents.l2.base import L2BaseAgent
+from Phoenix_project.agents.l3.base import L3BaseAgent
+from Phoenix_project.core.schemas.task_schema import AgentTask
+from Phoenix_project.monitor.logging import get_logger
 
-from Phoenix_project.agents.registry import AgentRegistry
-from Phoenix_project.core.schemas.task_schema import Task
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
-from Phoenix_project.agents.l1.base import L1Agent
-from Phoenix_project.agents.l2.base import L2Agent
-from Phoenix_project.agents.l3.base import L3Agent
+logger = get_logger(__name__)
 
-logger = logging.getLogger(__name__)
-
-class AgentExecutor:
+class Executor:
     """
-    负责执行单个智能体并处理其生命周期和错误。
+    Manages the execution queue and lifecycle for a specific agent.
     """
-    def __init__(self, agent_registry: AgentRegistry):
+    
+    def __init__(
+        self, 
+        agent_id: str, 
+        agent_registry: Dict[str, Any], 
+        max_queue_size: int = 100
+    ):
         """
-        初始化 AgentExecutor。
+        Initializes the Executor.
         
-        参数:
-            agent_registry (AgentRegistry): 存储所有已实例化智能体的注册表。
+        Args:
+            agent_id: The ID of the agent this executor manages.
+            agent_registry: A dictionary mapping agent IDs to agent instances.
+            max_queue_size: Maximum tasks allowed in the queue.
         """
+        self.agent_id = agent_id
         self.agent_registry = agent_registry
-        logger.info("AgentExecutor initialized.")
-
-    async def run_agent(self, agent_id: str, task: Task, context_data: List[Any]) -> List[EvidenceItem]:
-        """
-        异步执行单个智能体。
-        此方法现在是异步的，以支持异步的 agent.run() 方法。
+        self.task_queue = asyncio.Queue(maxsize=max_queue_size)
+        self.is_running = False
+        self._task = None
         
-        参数:
-            agent_id (str): 要执行的智能体的 ID。
-            task (Task): 要传递给智能体的任务。
-            context_data (List[Any]): 智能体所需的上下文数据。
+        # [任务 C.1] 丰富的状态跟踪
+        self.current_task_id: Optional[str] = None
+        self.last_processed_time: Optional[pd.Timestamp] = None
+        
+        logger.info(f"Executor for {agent_id} initialized.")
+
+    async def start(self):
+        """
+        Starts the executor's processing loop.
+        """
+        if self.is_running:
+            logger.warning(f"Executor for {agent_id} is already running.")
+            return
             
-        返回:
-            List[EvidenceItem]: 从智能体运行中收集到的 EvidenceItem 列表。
+        self.is_running = True
+        self._task = asyncio.create_task(self._run_loop())
+        logger.info(f"Executor for {agent_id} started.")
+
+    async def stop(self):
         """
-        logger.debug(f"AgentExecutor attempting to run agent: {agent_id} for task: {task.task_id}")
-        
-        agent = self.agent_registry.get(agent_id)
-        
-        if agent is None:
-            logger.error(f"Agent with ID '{agent_id}' not found in registry.")
-            return []
+        Stops the executor's processing loop.
+        """
+        if not self.is_running:
+            logger.info(f"Executor for {agent_id} is not running.")
+            return
+            
+        self.is_running = False
+        if self._task:
+            self.task_queue.put_nowait(None) # Sentinel value to stop loop
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                logger.info(f"Executor task for {agent_id} was cancelled.")
+        logger.info(f"Executor for {agent_id} stopped.")
 
-        if not isinstance(agent, (L1Agent, L2Agent, L3Agent)):
-             logger.warning(f"Agent {agent_id} is not of a recognized base type (L1, L2, L3).")
-             return []
-
-        evidence_list = []
+    async def submit_task(self, task: AgentTask) -> bool:
+        """
+        Submits a new task to the agent's queue.
+        
+        Args:
+            task: The AgentTask to be executed.
+            
+        Returns:
+            True if submitted, False if the queue is full.
+        """
+        if not self.is_running:
+            logger.error(f"Cannot submit task: Executor {self.agent_id} is not running.")
+            return False
+            
         try:
-            # 关键变更：
-            # 1. 使用 'async for' 来迭代异步生成器。
-            # 2. 'agent.run' 现在被假定为一个 'async def' 方法。
-            async for evidence in agent.run(task, context_data):
-                if isinstance(evidence, EvidenceItem):
-                    evidence.agent_id = agent.agent_id # 确保设置了 agent_id
-                    evidence_list.append(evidence)
-                    logger.debug(f"Agent {agent_id} produced evidence: {evidence.evidence_id}")
-                else:
-                    logger.warning(f"Agent {agent_id} yielded non-EvidenceItem: {type(evidence)}")
+            self.task_queue.put_nowait(task)
+            logger.debug(f"Task {task.task_id} submitted to {self.agent_id}")
+            return True
+        except asyncio.QueueFull:
+            logger.warning(f"Queue full for agent {self.agent_id}. Task {task.task_id} rejected.")
+            return False
+
+    async def _run_loop(self):
+        """
+        The main processing loop for the agent.
+        """
+        agent = self.agent_registry.get(self.agent_id)
+        if not agent:
+            logger.critical(f"Agent {self.agent_id} not found in registry. Executor shutting down.")
+            self.is_running = False
+            return
+
+        while self.is_running:
+            try:
+                task = await self.task_queue.get()
+                
+                if task is None: # Sentinel value
+                    logger.info(f"Shutdown signal received by {self.agent_id}.")
+                    break
+                
+                logger.info(f"Executor {self.agent_id} processing task {task.task_id}...")
+                
+                # [任务 C.1] 更新丰富的状态
+                self.current_task_id = task.task_id
+                
+                try:
+                    # TBD: Differentiate context/event passing based on agent level
+                    # This is a simplified call
+                    result = await agent.run(task.event, task.context_window)
                     
-            logger.info(f"Agent {agent_id} completed run for task {task.task_id}, produced {len(evidence_list)} items.")
+                    # TBD: Send result to the next step (e.g., L2 Agent or Bus)
+                    logger.info(f"Task {task.task_id} completed by {self.agent_id}.")
+                
+                except Exception as e:
+                    logger.error(f"Agent {self.agent_id} failed on task {task.task_id}: {e}", exc_info=True)
+                    # TBD: Error handling logic (e.g., send to error bus)
+                
+                finally:
+                    self.task_queue.task_done()
+                    # [任务 C.1] 更新丰富的状态
+                    self.current_task_id = None
+                    self.last_processed_time = pd.Timestamp.now(tz='UTC')
 
-        except NotImplementedError:
-            logger.error(f"Agent {agent_id} (Type: {type(agent).__name__}) has not implemented the 'run' method.")
-        except Exception as e:
-            logger.error(f"Error executing agent {agent_id} for task {task.task_id}: {e}", exc_info=True)
-            # 根据策略，这里可能需要重试或错误处理
-            
-        return evidence_list
+            except asyncio.CancelledError:
+                logger.info(f"Run loop for {self.agent_id} cancelled.")
+                break
+            except Exception as e:
+                logger.critical(f"Executor loop for {self.agent_id} encountered critical error: {e}", exc_info=True)
+                # TBD: Implement backoff/retry?
+                await asyncio.sleep(1) # Avoid tight loop on critical error
+                
+        self.is_running = False
+        logger.info(f"Executor loop for {self.agent_id} has exited.")
 
-    def get_agent_status(self, agent_id: str) -> Dict[str, Any]:
+    def get_agent_status(self) -> Dict[str, Any]:
         """
-        获取智能体的当前状态（模拟）。
+        Returns the current status of the agent.
         
-        参数:
-            agent_id (str): 智能体的 ID。
-            
-        返回:
-            Dict[str, Any]: 包含智能体状态信息的字典。
+        [任务 C.1] TODO: Implement richer status tracking.
         """
-        agent = self.agent_registry.get(agent_id)
-        if agent is None:
-            return {"error": "Agent not found"}
-        
-        # TODO: 实现更丰富的状态跟踪
+        # [任务 C.1] 已实现
         return {
-            "agent_id": agent_id,
-            "class": type(agent).__name__,
-            "status": "idle", # 假设状态，未来可以扩展
-            "processed_tasks": 0 # 模拟
+            "agent_id": self.agent_id,
+            "status": "IDLE" if self.current_task_id is None else "BUSY",
+            "queue_depth": self.task_queue.qsize(),
+            "current_task_id": self.current_task_id,
+            "last_processed_time": str(self.last_processed_time) if self.last_processed_time else None
         }
