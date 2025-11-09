@@ -1,145 +1,115 @@
+# agents/l3/base.py
+from abc import ABC, abstractmethod
 import numpy as np
-import ray
+from typing import Optional, Type
+
+# [任务 4.1] 导入 RLLib 核心组件
 from ray.rllib.algorithms.algorithm import Algorithm
-from typing import Optional, Dict, Any, Type
-
-# 移除旧的 SB3 导入
-# from stable_baselines3 import PPO
-
+from Phoenix_project.core.schemas.fusion_result import FusionResult
 from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
-class BaseL3Agent:
+class BaseDRLAgent(ABC):
     """
-    [MARL 重构]
-    L3 DRL 智能体的基类，使用 Ray RLLib 进行模型加载和推理。
-
-    它使用一个类变量 `_algorithm` 来确保 RLLib 检查点只被加载一次，
-    并由所有 L3 智能体实例（Alpha, Risk, Execution）共享。
+    L3 DRL 智能体的抽象基类。
+    
+    [任务 4.1] 更新:
+    - __init__ 现在存储加载的 RLLib Algorithm。
+    - 实现了 compute_action 方法。
     """
-
-    # [新增] 使用类变量来共享 RLLib 算法实例
-    _algorithm: Optional[Algorithm] = None
-    _model_path: Optional[str] = None
-    _algorithm_class: Type = Algorithm # 默认为 Algorithm，可以被覆盖
-
-    def __init__(self, config: Dict[str, Any], policy_id: str):
+    
+    def __init__(self, algorithm: Algorithm):
         """
-        [重构] __init__
-
-        Args:
-            config (Dict[str, Any]): 包含 'model_path' (RLLib 检查点目录) 的配置
-            policy_id (str): 此智能体应使用的策略 ID (例如 "alpha_policy")
+        [任务 4.1] 构造函数现在接收一个已加载的 RLLib 算法实例。
         """
-        self.config = config
-        self.policy_id = policy_id
+        if not isinstance(algorithm, Algorithm):
+            raise ValueError(f"Expected ray.rllib.algorithms.algorithm.Algorithm, got {type(algorithm)}")
+        self.algorithm = algorithm
+        self.logger = get_logger(self.__class__.__name__)
+        self.logger.info(f"DRL Agent ({self.__class__.__name__}) initialized with algorithm.")
 
-        # [重构] 确保模型已加载
-        # 'model_path' 现在应该是检查点目录
-        model_path = self.config.get('model_path')
-        if not model_path:
-            logger.error(f"Agent {self.policy_id} 未配置 'model_path'")
-            raise ValueError(f"Agent {self.policy_id} 未配置 'model_path'")
-
-        # 使用 self.__class__ 来调用类方法
-        self.__class__._load_rllib_model(model_path)
-
-        # 移除旧的 SB3 模型加载
-        # self.model = self.load_model(model_path)
-
-    @classmethod
-    def _load_rllib_model(cls, model_path: str):
+    @abstractmethod
+    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
         """
-        [新增] 
-        一个类方法，用于初始化 Ray 并从检查点加载 RLLib 算法。
-        这确保了它在所有 L3 智能体中只执行一次。
+        (抽象方法)
+        子类 (Alpha, Risk, Exec) 必须实现此方法。
+        它将 Phoenix 状态 转换为 匹配 TradingEnv 的 np.ndarray。
         """
-        # 如果模型已加载且路径相同，则跳过
-        if cls._algorithm and cls._model_path == model_path:
-            return
+        pass
 
-        logger.info(f"首次加载 RLLib 模型，路径: {model_path}...")
+    def format_observation(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
+        """
+        (公共包装器)
+        调用子类的 _format_obs 方法。
+        """
+        return self._format_obs(state_data, fusion_result)
 
-        # 1. 初始化 Ray (如果尚未初始化)
-        if not ray.is_initialized():
-            try:
-                ray.init(
-                    logging_level="ERROR", 
-                    ignore_reinit_error=True,
-                    # (可选) 确保为推理分配足够资源
-                    num_cpus=1 
-                )
-                logger.debug("Ray (for inference) initialized.")
-            except Exception as e:
-                logger.warning(f"Ray init failed (maybe already init?): {e}")
-
-
-        # 2. 从检查点恢复算法
+    def compute_action(self, observation: np.ndarray) -> np.ndarray:
+        """
+        [任务 4.1] 完成“神经连接”。
+        使用加载的 RLLib 算法计算确定性动作。
+        
+        (由 Orchestrator 在 [任务 2.3] 中调用)
+        """
         try:
-            # [关键] 我们使用 Algorithm.from_checkpoint
-            # 这将恢复完整的训练器状态（包括策略）
-            cls._algorithm = cls._algorithm_class.from_checkpoint(model_path)
-            cls._model_path = model_path
-            logger.info(f"RLLib 算法已从 {model_path} 成功恢复。")
+            # explore=False 确保我们在生产 (Inference) 模式下
+            # 获取确定性动作，而不是随机探索。
+            action = self.algorithm.compute_single_action(
+                observation,
+                explore=False
+            )
+            return action
+        
         except Exception as e:
-            logger.error(f"加载 RLLib 检查点失败: {e}", exc_info=True)
-            raise
+            self.logger.error(f"Error during compute_single_action: {e}", exc_info=True)
+            # (根据 agent 类型返回一个安全的默认动作)
+            return np.array([0.0]) # (例如 0.0 权重 / 0.0 风险 / 'Hold' 动作)
 
-    def predict(self, observation: np.ndarray) -> int:
+
+# [任务 4.1] DRLAgentLoader (由 registry.py 使用)
+class DRLAgentLoader:
+    """
+    一个静态类，负责从检查点路径加载 RLLib Algorithm
+    并将其封装到我们的 BaseDRLAgent 子类中。
+    """
+    
+    @staticmethod
+    def load_agent(
+        agent_class: Type[BaseDRLAgent], # (例如 AlphaAgent, RiskAgent)
+        checkpoint_path: str
+    ) -> Optional[BaseDRLAgent]:
         """
-        [重构] 
-        使用加载的 RLLib 算法执行推理。
-
+        [任务 4.1] 实现加载器。
+        (由 registry.py 在 [任务 2.2] 中调用)
+        
         Args:
-            observation (np.ndarray): 格式必须与 TradingEnv 中定义的一致
-                                      (例如 [balance, shares_held, current_price])
+            agent_class: 要实例化的智能体类 (例如 AlphaAgent)。
+            checkpoint_path: 指向 RLLib 检查点目录的路径 (来自 system.yaml)。
 
         Returns:
-            int: 动作 (例如 0, 1, 2)
+            一个已初始化的、准备好用于推理的 BaseDRLAgent 实例。
         """
-        if not self._algorithm:
-            logger.error(f"RLLib 算法未加载 (Policy: {self.policy_id})。")
-            raise RuntimeError("RLLib 算法未加载。请先调用 load_model。")
-
+        if not checkpoint_path:
+            logger.error(f"Cannot load {agent_class.__name__}: checkpoint_path is missing or empty.")
+            return None
+            
+        logger.info(f"Loading {agent_class.__name__} from checkpoint: {checkpoint_path}...")
+        
         try:
-            # [关键] 使用 compute_single_action
-            action = self._algorithm.compute_single_action(
-                observation=observation,
-                policy_id=self.policy_id,
-                # 禁用探索，确保确定性
-                explore=False 
-            )
-
-            # (RLLib 通常返回 numpy 类型，确保是 int)
-            return int(action)
-
+            # 1. (关键) 从 RLLib 检查点恢复算法
+            algo = Algorithm.from_checkpoint(checkpoint_path)
+            logger.info(f"RLLib Algorithm loaded successfully for {agent_class.__name__}.")
+            
+            # 2. 将加载的算法注入到我们的智能体包装器中
+            agent_instance = agent_class(algorithm=algo)
+            
+            logger.info(f"{agent_class.__name__} instance created and ready.")
+            return agent_instance
+            
+        except FileNotFoundError:
+            logger.error(f"FATAL: Checkpoint directory not found at: {checkpoint_path}")
         except Exception as e:
-            logger.error(f"RLLib 推理失败 (Policy: {self.policy_id}): {e}", exc_info=True)
-            # 失败时返回安全动作（例如 "持有"）
-            return 1 # 假设 1 是 "持有"
-
-    # [移除] 旧的 SB3 load_model
-    # def load_model(self, model_path: str):
-    #     if not model_path:
-    #         logger.warning(f"No model path provided for {self.__class__.__name__}.")
-    #         return None
-    #     try:
-    #         return PPO.load(model_path)
-    #     except Exception as e:
-    #         logger.error(f"Failed to load DRL model from {model_path}: {e}", exc_info=True)
-    #         return None
-
-    def execute(self, state_data: Dict[str, Any]) -> int:
-        """
-        [重构]
-        子类必须实现此方法以格式化 obs 并调用 self.predict()。
-        """
-        raise NotImplementedError("L3 智能体必须实现 execute 方法")
-
-    def _format_obs(self, state_data: Dict[str, Any]) -> np.ndarray:
-        """
-        [新增]
-        子类必须实现此方法以匹配 TradingEnv 的状态。
-        """
-        raise NotImplementedError("L3 智能体必须实现 _format_obs 方法")
+            logger.error(f"FATAL: Failed to load algorithm from checkpoint {checkpoint_path}. Error: {e}", exc_info=True)
+            
+        return None
