@@ -1,214 +1,318 @@
-import asyncio
-import os
-import argparse
-from typing import Dict, Any
-from datetime import datetime
-import json # [任务 C.4] 导入 json
+# Phoenix_project/phoenix_project.py
+import logging
+import time
+from omegaconf import DictConfig
+import hydra
 
-# --- 核心组件 ---
-from Phoenix_project.config.loader import ConfigLoader
-from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.data_manager import DataManager
-from Phoenix_project.data.data_iterator import DataIterator
-from Phoenix_project.controller.orchestrator import Orchestrator
-from Phoenix_project.cognitive.engine import CognitiveEngine
-from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
-from Phoenix_project.output.renderer import render_report
-from Phoenix_project.training.engine import BacktestingEngine
+from registry import Registry
+from data_manager import DataManager
+from data.data_iterator import DataIterator
+from training.engine import TrainingEngine
 
-# --- AI/L3 组件 (用于 DRL 回测) ---
-from Phoenix_project.features.store import FeatureStore
-from Phoenix_project.agents.l3.alpha_agent import AlphaAgent
-from Phoenix_project.agents.l3.risk_agent import RiskAgent
-from Phoenix_project.agents.l3.execution_agent import ExecutionAgent
+# (主人喵的清洁计划 5.3) [新]
+from agents.l3.alpha_agent import AlphaAgent
+from agents.l3.risk_agent import RiskAgent
+from agents.l3.execution_agent import ExecutionAgent
+from training.drl.trading_env import TradingEnv
+from training.drl.multi_agent_trainer import MultiAgentDRLTrainer
 
-# (TBD: 导入其他组件，如 API 服务器, KG 服务等)
 
-logger = get_logger("PhoenixProject")
+logger = logging.getLogger(__name__)
 
 class PhoenixProject:
     """
     Main application class for the Phoenix Project.
-    Initializes and wires together all core components.
     """
+    def __init__(self, config: DictConfig):
+        self.config = config
+        self.registry = Registry(config)
+        self.system = None # Lazily initialized
 
-    def __init__(self, config_path: str, run_mode: str = "backtest"):
-        """
-        Initializes the entire system.
-        
-        Args:
-            config_path: Path to the main configuration directory.
-            run_mode: "backtest" or "live".
-        """
-        logger.info(f"--- Initializing Phoenix Project (Mode: {run_mode}) ---")
-        
-        # 1. 配置
-        self.config_loader = ConfigLoader(config_path)
-        self.config = self.config_loader.load_config('system.yaml')
-        self.data_catalog = self.load_data_catalog()
-        
-        # 2. 核心执行与状态
-        self.trade_lifecycle_manager = TradeLifecycleManager(self.config)
-        self.data_manager = DataManager(self.config_loader, self.data_catalog)
-        self.data_iterator = DataIterator(self.config, self.data_manager)
-        
-        # 3. 认知 (AI 核心)
-        self.cognitive_engine = CognitiveEngine(self.config, self.data_manager)
-        
-        # 4. 编排器 (大脑)
-        self.orchestrator = Orchestrator(
-            config=self.config,
-            data_manager=self.data_manager,
-            cognitive_engine=self.cognitive_engine,
-            trade_lifecycle_manager=self.trade_lifecycle_manager
-        )
-        
-        # 5. 回测/训练引擎
-        self.backtest_engine = BacktestingEngine(
-            config=self.config,
-            data_iterator=self.data_iterator,
-            orchestrator=self.orchestrator,
-            trade_lifecycle_manager=self.trade_lifecycle_manager,
-            report_renderer_func=render_report # [FIX-15]
-        )
-        
-        # 6. DRL/L3 组件 (仅在 DRL 回测时需要)
-        # (延迟加载)
-        self.feature_store: Optional[FeatureStore] = None
-        self.l3_agents: Dict[str, Any] = {}
+    def setup(self):
+        """Initializes all core components."""
+        logger.info("Setting up Phoenix system...")
+        self.system = self.registry.build_system(self.config)
+        logger.info("System setup complete.")
 
-        logger.info("--- Phoenix Project Initialized Successfully ---")
+    def run_backtest(self):
+        """Runs the system in backtesting mode."""
+        if not self.system:
+            self.setup()
+            
+        logger.info("Starting Phoenix system in BACKTEST mode...")
+        
+        # 1. Get the data iterator from the registry (which gets it from DataManager)
+        data_iterator = self.system.data_iterator
+        if not data_iterator:
+            logger.error("Failed to get DataIterator. Aborting backtest.")
+            return
 
-    def load_data_catalog(self) -> Dict[str, Any]:
-        """ Helper to load the data catalog JSON. """
-        catalog_path = self.config.get("data_catalog_path", "data_catalog.json")
+        # 2. Get the main orchestrator
+        orchestrator = self.system.orchestrator
+
+        # 3. Loop through data and run pipeline
         try:
-            # TBD: Use ConfigLoader's path logic
-            full_path = os.path.join(self.config_loader.config_path, catalog_path)
-            with open(full_path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load data catalog from {catalog_path}: {e}", exc_info=True)
-            return {}
+            for timestamp, data_batch in data_iterator:
+                logger.debug(f"Processing data for timestamp: {timestamp}")
+                
+                # The orchestrator runs the full L1-L2-L3 pipeline
+                pipeline_state = orchestrator.run_pipeline(timestamp, data_batch)
+                
+                # TBD: What to do with the final state? Log, store, etc.
+                if pipeline_state.final_decision:
+                    logger.info(f"Final decision at {timestamp}: {pipeline_state.final_decision.action}")
+                
+                # (主人喵的清洁计划 5.3) [旧]
+                # (TBD: 这只是一个高级别的流程。
+                # 我们需要将 L3 Agent (Alpha, Risk, Execution) 的输出
+                # 连接到 PortfolioConstructor 和 OrderManager。)
+                # [主人喵的清洁计划 5.3] [新]
+                # 假设: Orchestrator.run_pipeline(...) 内部
+                # 已经调用了 L3、PortfolioConstructor 和 OrderManager。
+                # L3 Agent (Execution) 会将信号发送到 OrderManager。
+                # OrderManager 会更新 ContextBus 上的投资组合状态。
+                # PipelineState 会反映这个最终结果。
 
-    async def run_event_backtest(self):
-        """
-        Runs a full, event-driven backtest (L1/L2 Cognitive).
-        """
-        logger.info("--- Starting L1/L2 Cognitive Backtest ---")
-        await self.backtest_engine.run()
-        logger.info("--- L1/L2 Cognitive Backtest Complete ---")
-        
+        except Exception as e:
+            logger.critical(f"Unhandled exception during backtest: {e}", exc_info=True)
+        finally:
+            logger.info("Backtest finished.")
+
     def run_drl_backtest(self):
         """
-        Runs a DRL (L3) backtest.
-        
-        [任务 C.4] TODO: Add logic to print backtest results.
+        (主人喵的清洁计划 5.3) [新]
+        Runs the system in DRL backtesting mode.
         """
-        logger.info("--- Starting L3 DRL Backtest ---")
+        if not self.system:
+            self.setup()
         
-        # 1. (延迟) 加载 DRL 组件
-        if not self.feature_store:
-            fs_base_path = self.config.get("data_store", {}).get("local_base_path", "data")
-            self.feature_store = FeatureStore(base_path=fs_base_path)
-            
-        if not self.l3_agents:
-            # (TBD: 从 system.yaml 加载已训练模型的路径)
-            logger.warning("Loading DRL L3 agents with MOCK paths. Update system.yaml.")
-            self.l3_agents = {
-                'alpha': AlphaAgent(model_path="models/drl/alpha_agent_checkpoint"),
-                'risk': RiskAgent(model_path="models/drl/risk_agent_checkpoint"),
-                'exec': ExecutionAgent(model_path="models/drl/exec_agent_checkpoint")
-            }
-            
-        # 2. (TBD: 从 config 获取参数)
-        bt_params = {
-            "symbol": "AAPL",
-            "start_date": datetime(2023, 1, 1),
-            "end_date": datetime(2024, 1, 1),
-        }
+        logger.info("Starting Phoenix system in DRL BACKTEST mode...")
+        
+        data_iterator = self.system.data_iterator
+        if not data_iterator:
+            logger.error("Failed to get DataIterator. Aborting DRL backtest.")
+            return
 
-        # 3. 运行 DRL 回测 (任务 A.2)
-        try:
-            results = self.backtest_engine.run_backtest(
-                data_manager=self.data_manager,
-                feature_store=self.feature_store,
-                alpha_agent=self.l3_agents['alpha'],
-                risk_agent=self.l3_agents['risk'],
-                execution_agent=self.l3_agents['exec'],
-                **bt_params
+        # [主人喵的修复 11.10] 从配置中加载 DRL 模型路径，而不是使用模拟路径
+        checkpoint_paths = self.config.get("drl_models", {}).get("checkpoint_paths")
+        
+        if not checkpoint_paths:
+            logger.warning(
+                "DRL model checkpoint_paths not found in config. "
+                "Falling back to MOCK paths. Please define 'drl_models.checkpoint_paths' in your config."
             )
-            
-            # 4. [任务 C.4] 打印 DRL 回测结果
-            if results:
-                logger.info("--- DRL Backtest Results ---")
-                try:
-                    # 使用 json.dumps 美化输出
-                    results_str = json.dumps(results, indent=2)
-                    logger.info(results_str)
-                except Exception as e:
-                    logger.error(f"Could not serialize backtest results: {e}")
-                    logger.info(results) # 回退到
-            else:
-                logger.warning("DRL Backtest returned no results.")
+            checkpoint_paths = {
+                "alpha_agent": "models/drl/mock_alpha_agent.pth",
+                "risk_agent": "models/drl/mock_risk_agent.pth",
+                "execution_agent": "models/drl/mock_execution_agent.pth"
+            }
+        else:
+            logger.info(f"Loading DRL L3 agents from config paths: {checkpoint_paths}")
 
-        except Exception as e:
-            logger.critical(f"DRL Backtest failed to run: {e}", exc_info=True)
-            logger.critical("Did you run DRL training (run_training.py) first?")
-            
-        logger.info("--- L3 DRL Backtest Complete ---")
-
-    async def run_live(self):
-        """
-        Starts the system in live trading mode.
-        """
-        logger.info("--- Starting Phoenix Project (Live Mode) ---")
-        # TBD:
-        # 1. Start API server
-        # 2. Start Orchestrator loop (e.g., orchestrator.start_live_processing())
-        # 3. Connect to live data streams
-        logger.warning("Live trading mode is not fully implemented.")
-        # Example: await self.orchestrator.start_live_processing()
-        pass
-
-# --- 命令行入口 ---
-
-async def main():
-    parser = argparse.ArgumentParser(description="Phoenix Project Trading System")
-    
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["backtest", "backtest-drl", "live"],
-        default="backtest",
-        help="The operational mode (default: backtest)."
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config",
-        help="Path to the configuration directory (default: config/)."
-    )
-    
-    args = parser.parse_args()
-    
-    # (TBD: 设置环境变量, e.g., os.environ['PHOENIX_CONFIG_PATH'] = args.config)
-    
-    try:
-        app = PhoenixProject(config_path=args.config, run_mode=args.mode)
+        # 1. 加载 L3 DRL 智能体
+        # TBD: 我们需要一种方法来 '加载' DRL 智能体 (例如，加载权重)
+        # 现在，我们只是实例化它们
         
-        if args.mode == "backtest":
-            await app.run_event_backtest()
-        elif args.mode == "backtest-drl":
-            app.run_drl_backtest()
-        elif args.mode == "live":
-            await app.run_live()
+        # (假设 AlphaAgent, RiskAgent, ExecutionAgent 
+        # 可以用 'weights_path' 或 'checkpoint_path' 之类的参数初始化)
+        # (为了演示，我们假设它们在 registry.py 中被正确初始化)
+        l3_alpha_agent = self.system.l3_agents["alpha"]
+        l3_risk_agent = self.system.l3_agents["risk"]
+        l3_execution_agent = self.system.l3_agents["execution"]
+        
+        # [TBD]: 这是加载权重的地方吗?
+        # l3_alpha_agent.load_model(checkpoint_paths["alpha_agent"])
+        # l3_risk_agent.load_model(checkpoint_paths["risk_agent"])
+        # l3_execution_agent.load_model(checkpoint_paths["execution_agent"])
+        
+        logger.info("DRL L3 Agents loaded (MOCK load).")
+
+        # 2. 设置 DRL 训练环境
+        # (这很复杂。TradingEnv 需要 L1/L2 的输出作为其 'state' 的一部分)
+        # (我们需要一种 '模拟' L1/L2 管道的方法，或者在 DRL 循环中运行它)
+        
+        # 简化: 我们假设 DRL L3 智能体直接与 Orchestrator 交互
+        # 或者 DRL 环境在内部运行 Orchestrator
+        
+        # 让我们假设 TradingEnv 接受 L1/L2 管道 (Orchestrator)
+        # 和数据
+        
+        # (这个架构 TBD，DRL 训练循环如何与 L1/L2 管道集成?)
+        # 选项 A: L1/L2 离线运行，DRL 智能体使用预先计算的特征。
+        # 选项 B: L1/L2 在线运行，作为 DRL 状态的一部分。 (计算成本高)
+        
+        # 假设选项 B (在线)
+        trading_env = TradingEnv(
+            data_iterator=data_iterator,
+            orchestrator=self.system.orchestrator,
+            context_bus=self.system.context_bus
+            # TBD: 奖励函数，状态定义等
+        )
+        
+        logger.info("TradingEnv initialized.")
+
+        # 3. 设置 DRL 训练器
+        drl_trainer = MultiAgentDRLTrainer(
+            env=trading_env,
+            agents={
+                "alpha": l3_alpha_agent,
+                "risk": l3_risk_agent,
+                "execution": l3_execution_agent
+            },
+            config=self.config.training.drl_trainer
+        )
+        
+        logger.info("MultiAgentDRLTrainer initialized. Starting DRL backtest/run...")
+
+        # 4. 运行 DRL 循环 (这可能是评估，而不是训练)
+        try:
+            drl_trainer.run() # 假设 .run() 是评估循环
+        except Exception as e:
+            logger.critical(f"Unhandled exception during DRL run: {e}", exc_info=True)
+        finally:
+            logger.info("DRL run finished.")
+
+
+    def run_live(self):
+        """
+        Initializes and runs the system in live trading mode.
+        [主人喵的修复 11.10] 实现了 TBD
+        """
+        if not self.system:
+            self.setup()
             
-    except FileNotFoundError as e:
-        logger.critical(f"Configuration file not found. Path: {args.config}. Error: {e}")
-    except Exception as e:
-        logger.critical(f"Phoenix Project failed to run: {e}", exc_info=True)
+        logger.info("Starting Phoenix system in LIVE mode...")
+        
+        # [主人喵的修复 11.10] 启动事件分发器
+        try:
+            # TBD: Connect to execution gateway
+            # (假设 execution_gateway 已在 build_system 中初始化并对 order_manager 可用)
+            logger.info("Connecting to execution gateway...")
+            # self.system.order_manager.connect_live() # 假设有这样一个方法
+            
+            logger.info("Starting live event distributor...")
+            # 假设 self.system.event_distributor.start() 是一个阻塞调用
+            # 它会启动消费者 (例如 Kafka) 并开始处理消息
+            self.system.event_distributor.start() 
+
+            # 如果 event_distributor.start() 不是阻塞的，我们可能需要一个主循环
+            logger.info("System is live. Waiting for events... (Press Ctrl+C to stop)")
+            while True:
+                time.sleep(1)
+
+        except KeyboardInterrupt:
+            logger.info("Shutdown signal received. Stopping system...")
+            if self.system and hasattr(self.system, 'event_distributor'):
+                self.system.event_distributor.stop()
+            # if self.system and hasattr(self.system, 'order_manager'):
+                # self.system.order_manager.disconnect() # 假设
+        except Exception as e:
+            logger.critical(f"Critical error in live run: {e}", exc_info=True)
+        finally:
+            logger.info("Phoenix system shut down.")
+
+
+    def run_training(self):
+        """Initializes and runs the training engine."""
+        logger.info("Starting Phoenix system in TRAINING mode...")
+        # (TBD: 这是否与 DRL 训练重叠?)
+        # (假设这是用于 L1/L2 或其他非 DRL 模型的训练)
+        
+        if not self.system:
+            self.setup()
+
+        # 1. (TBD) 获取训练数据
+        # data_manager = self.system.data_manager
+        # training_data = data_manager.load_training_data("L1_L2_training")
+
+        # 2. (TBD) 初始化训练引擎
+        # training_engine = TrainingEngine(self.config.training, self.system)
+        
+        # 3. (TBD) 运行训练
+        # training_engine.run(training_data)
+        
+        logger.warning("run_training() is not fully implemented. TBD.")
+        
+        # (主人喵的清洁计划 5.3) [新]
+        # 让我们假设 'training' 模式是指 DRL 训练
+        logger.info("Delegating to DRL Trainer for training...")
+        self.run_drl_training()
+
+
+    # (主人喵的清洁计划 5.3) [新]
+    def run_drl_training(self):
+        """Runs the DRL training pipeline."""
+        if not self.system:
+            self.setup()
+        
+        logger.info("Starting DRL TRAINING run...")
+        
+        data_iterator = self.system.data_iterator
+        if not data_iterator:
+            logger.error("Failed to get DataIterator. Aborting DRL training.")
+            return
+
+        l3_alpha_agent = self.system.l3_agents["alpha"]
+        l3_risk_agent = self.system.l3_agents["risk"]
+        l3_execution_agent = self.system.l3_agents["execution"]
+
+        trading_env = TradingEnv(
+            data_iterator=data_iterator,
+            orchestrator=self.system.orchestrator,
+            context_bus=self.system.context_bus,
+            # (TBD) 确保 env.reset() 能正确重置 data_iterator
+        )
+        
+        logger.info("TradingEnv initialized for training.")
+
+        drl_trainer = MultiAgentDRLTrainer(
+            env=trading_env,
+            agents={
+                "alpha": l3_alpha_agent,
+                "risk": l3_risk_agent,
+                "execution": l3_execution_agent
+            },
+            config=self.config.training.drl_trainer
+        )
+        
+        logger.info("MultiAgentDRLTrainer initialized. Starting training...")
+
+        try:
+            drl_trainer.train() # 假设 .train() 是训练循环
+        except Exception as e:
+            logger.critical(f"Unhandled exception during DRL training: {e}", exc_info=True)
+        finally:
+            logger.info("DRL training finished.")
+            # (TBD) 保存模型
+            drl_trainer.save_models(self.config.model_output_path)
+
+
+@hydra.main(config_path="config", config_name="system", version_base=None)
+def main(cfg: DictConfig):
+    """Main entry point managed by Hydra."""
+    logger.info("Initializing Phoenix Project...")
+    
+    # (TBD: Hydra 会覆盖日志配置。我们需要确保它与我们的 monitor.logging 兼容)
+    
+    app = PhoenixProject(cfg)
+    
+    # (TBD: 我们需要一个 CLI 参数或配置来决定运行哪个模式)
+    # (为了演示，我们使用一个配置标志)
+    
+    mode = cfg.get("run_mode", "backtest")
+    
+    if mode == "backtest":
+        app.run_backtest()
+    elif mode == "live":
+        app.run_live()
+    elif mode == "train":
+        # (主人喵的清洁计划 5.3) [修改]
+        app.run_drl_training()
+    elif mode == "drl_backtest":
+        # (主人喵的清洁计划 5.3) [新]
+        app.run_drl_backtest()
+    else:
+        logger.error(f"Unknown run_mode: {mode}")
 
 if __name__ == "__main__":
-    # (TBD: Add uvloop for performance if desired)
-    asyncio.run(main())
+    main()
