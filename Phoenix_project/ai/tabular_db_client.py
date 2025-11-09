@@ -165,9 +165,13 @@ class TabularDBClient:
             if not self.pool:
                  return []
             
-        # 这是一个简化的搜索。我们将在查询中搜索 metric_name。
-        # 一个更高级的系统会使用 query_to_sql_agent 或 embedding on metric names。
-        # 我们还按符号过滤。
+        # [✅ 优化] FIXME: 这是一个基于 ILIKE 的简化搜索。
+        # 一个更高级的系统应该使用 LLM (query_to_sql_agent) 或
+        # 针对 metric_name 和 description 列的向量嵌入来动态构建 SQL 查询。
+        # 当前实现无法处理复杂的自然语言查询 (例如 "revenue growth > 10%")。
+        logger.warning(
+            "FIXME: search_financials 正在使用简化的 ILIKE 搜索，而不是 query_to_sql_agent。"
+        )
         
         # 简化：假设查询是 "revenue" 或 "eps"
         # 我们将在 financial_metrics 中搜索。
