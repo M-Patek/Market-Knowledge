@@ -13,12 +13,10 @@ import sqlalchemy  # type: ignore
 from sqlalchemy import create_engine, inspect, text, Engine  # type: ignore
 from sqlalchemy.exc import SQLAlchemyError  # type: ignore
 
-# 这是一个 LangChain 的特定导入, 我们将尝试用一个
-# 适应项目自身 LLMClient 的自定义实现来替换它
-# from langchain_community.agent_toolkits import create_sql_agent
-# from langchain_community.utilities.sql_database import SQLDatabase
-
 from ..api.gemini_pool_manager import GeminiClient
+# [Task 4] 导入 PromptManager 和 PromptRenderer
+from ..ai.prompt_manager import PromptManager
+from ..ai.prompt_renderer import PromptRenderer
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +28,13 @@ class TabularDBClient:
     """
 
     def __init__(
-        self, db_uri: str, llm_client: GeminiClient, config: Dict[str, Any]
+        self, 
+        db_uri: str, 
+        llm_client: GeminiClient, 
+        config: Dict[str, Any],
+        # [Task 4] 假设这些是由 Registry.py 注入的
+        prompt_manager: PromptManager,
+        prompt_renderer: PromptRenderer
     ):
         """
         Initializes the TabularDBClient.
@@ -39,12 +43,18 @@ class TabularDBClient:
             db_uri: The SQLAlchemy connection string (e.g., "postgresql://user:pass@host/db").
             llm_client: An instance of the GeminiClient.
             config: Configuration dictionary.
+            prompt_manager: [Task 4] Injected PromptManager.
+            prompt_renderer: [Task 4] Injected PromptRenderer.
         """
         self.db_uri = db_uri
         self.llm_client = llm_client
         self.config = config.get("tabular_db", {})
         self.engine: Engine = self._create_db_engine()
         self.schema: str = self._get_db_schema()
+
+        # [Task 4] 存储注入的依赖
+        self.prompt_manager = prompt_manager
+        self.prompt_renderer = prompt_renderer
 
         # 优化: 替换 _mock_sql_agent
         self.sql_agent: Callable = self._initialize_sql_agent()
@@ -85,31 +95,56 @@ class TabularDBClient:
             return "Error: Could not retrieve schema."
 
     def _generate_sql_prompt(self, query: str) -> str:
-        """Generates a prompt for the LLM to convert text to SQL."""
-        # 优化：这个模板应该从 PromptManager 加载
-        # dialect.name 提供了 SQL 方言 (例如, postgresql)
-        return f"""
-        You are an expert {self.engine.dialect.name} SQL query generator.
-        Your task is to convert a natural language question into a SQL query
-        based on the provided database schema.
+        """[Task 4] 重构：使用 PromptRenderer 生成 SQL 提示。"""
+        # 优化：[Task 4] 这个模板现在从 PromptManager 加载
+        logger.debug("Rendering text_to_sql prompt...")
+        
+        try:
+            context = {
+                "dialect": self.engine.dialect.name,
+                "schema": self.schema,
+                "query": query
+            }
+            
+            # 1. 渲染整个模板结构
+            # (PromptRenderer.render 会调用 prompt_manager.get_prompt)
+            # [Task 4] get_prompt 应该返回原始 dict
+            rendered_data = self.prompt_renderer.render("text_to_sql", context)
+            
+            # 2. 提取最终的提示字符串
+            # (基于我们的 text_to_sql.json 结构)
+            prompt_str = rendered_data.get("full_prompt_template")
+            if not prompt_str:
+                 raise ValueError("'full_prompt_template' key not found in rendered prompt.")
+            
+            return prompt_str
+            
+        except Exception as e:
+            logger.error(f"Failed to render text_to_sql prompt: {e}. Using fallback.", exc_info=True)
+            # [Task 4] 回退到旧的硬编码逻辑
+            dialect_name = self.engine.dialect.name
+            return f"""
+            You are an expert {dialect_name} SQL query generator.
+            Your task is to convert a natural language question into a SQL query
+            based on the provided database schema.
 
-        Database Schema:
-        {self.schema}
+            Database Schema:
+            {self.schema}
 
-        Rules:
-        1. Only generate the SQL query. No preamble, no explanation.
-        2. The query must be syntactically correct for {self.engine.dialect.name}.
-        3. Only query tables and columns present in the schema.
-        4. Be careful with data types (e.g., casting).
-        5. If the question is complex, break it down (e.g., using WITH clauses).
-        6. The query should be read-only (SELECT statements only).
-        7. Do NOT generate any INSERT, UPDATE, DELETE, or DROP statements.
+            Rules:
+            1. Only generate the SQL query. No preamble, no explanation.
+            2. The query must be syntactically correct for {dialect_name}.
+            3. Only query tables and columns present in the schema.
+            4. Be careful with data types (e.g., casting).
+            5. If the question is complex, break it down (e.g., using WITH clauses).
+            6. The query should be read-only (SELECT statements only).
+            7. Do NOT generate any INSERT, UPDATE, DELETE, or DROP statements.
 
-        Question:
-        "{query}"
+            Question:
+            "{query}"
 
-        SQL Query:
-        """
+            SQL Query:
+            """
 
     async def _run_sql_agent(self, query: str) -> Dict[str, Any]:
         """
@@ -117,17 +152,18 @@ class TabularDBClient:
         It generates SQL from text, executes it, and returns the result.
         """
         logger.info(f"SQL Agent processing query: {query}")
+        sql_query_generated = None
         try:
             # 1. 生成 SQL
             prompt = self._generate_sql_prompt(query)
             # 假设 llm_client.generate_text 是一个异步方法
-            sql_query = await self.llm_client.generate_text(prompt)
+            sql_query_generated = await self.llm_client.generate_text(prompt)
 
-            if not sql_query:
+            if not sql_query_generated:
                 raise ValueError("LLM failed to generate SQL query.")
 
             # 2. 清理和验证 SQL
-            sql_query = sql_query.strip().replace("```sql", "").replace("```", "").strip(";")
+            sql_query = sql_query_generated.strip().replace("```sql", "").replace("```", "").strip(";")
             
             if not re.match(r"^\s*SELECT", sql_query, re.IGNORECASE):
                 logger.error(f"Generated query is not a SELECT statement: {sql_query}")
@@ -153,7 +189,7 @@ class TabularDBClient:
             logger.error(f"Error in SQL Agent execution: {e}")
             return {
                 "query": query,
-                "generated_sql": sql_query if 'sql_query' in locals() else None,
+                "generated_sql": sql_query_generated,
                 "results": [],
                 "error": str(e)
             }
@@ -162,12 +198,8 @@ class TabularDBClient:
     def _initialize_sql_agent(self) -> Callable:
         """
         OPTIMIZED: Initializes the text-to-SQL agent.
-        This replaces the mock agent and the placeholder.
-        Instead of relying on LangChain's create_sql_agent (which requires
-        a compatible LLM object), we use our own LLM client and prompt.
         """
         logger.info("Initializing custom Text-to-SQL agent.")
-        # self._run_sql_agent 是我们上面定义的异步方法
         return self._run_sql_agent
 
     def _fallback_search(self, query: str) -> List[Dict[str, Any]]:
@@ -210,11 +242,8 @@ class TabularDBClient:
             # 异步调用我们的 SQL agent
             result = await self.sql_agent(query)
             
-            # 如果 agent 返回错误, 我们可以选择性地触发回退
             if result.get("error"):
                 logger.warning(f"SQL agent failed: {result['error']}. Considering fallback.")
-                # 可以在这里添加触发 fallback 的逻辑,
-                # 但目前我们只返回 agent 的错误
             
             return result
 
@@ -225,6 +254,64 @@ class TabularDBClient:
                 "results": [],
                 "error": f"Unhandled exception: {e}"
             }
+
+    async def upsert_data(self, table_name: str, data: Dict[str, Any], unique_key: str) -> bool:
+        """
+        [Task 2] 插入或更新 (Upsert) 一行数据到指定的表格。
+        
+        Args:
+            table_name (str): 目标表名 (例如 'fundamentals')。
+            data (Dict[str, Any]): 要插入的数据 (列名 -> 值)。
+            unique_key (str): 用于冲突判断的主键 (例如 'symbol')。
+        """
+        if not self.engine:
+            logger.error(f"Upsert failed: DB engine not initialized.")
+            return False
+        
+        if not data or not unique_key or not table_name:
+            logger.error("Upsert failed: table_name, data, and unique_key are required.")
+            return False
+        
+        # (这特定于 PostgreSQL。MySQL/SQLite 使用 'REPLACE' 或 'ON CONFLICT DO UPDATE')
+        if self.engine.dialect.name != "postgresql":
+            logger.error(f"Upsert logic is only implemented for PostgreSQL, not {self.engine.dialect.name}.")
+            return False
+        
+        # 1. 准备列名和占位符
+        columns = data.keys()
+        column_names = ", ".join([f'"{c}"' for c in columns])
+        placeholders = ", ".join([f":{c}" for c in columns])
+        
+        # 2. 准备 ON CONFLICT 更新部分
+        update_set_parts = [f'"{c}" = EXCLUDED."{c}"' for c in columns if c != unique_key]
+        
+        if not update_set_parts: # (如果只有 unique_key)
+            update_set = "DO NOTHING"
+        else:
+            update_set = f"DO UPDATE SET {', '.join(update_set_parts)}"
+            
+        # 3. 构建查询
+        sql = text(f"""
+            INSERT INTO "{table_name}" ({column_names})
+            VALUES ({placeholders})
+            ON CONFLICT ("{unique_key}")
+            {update_set};
+        """)
+        
+        try:
+            # Upsert 是一个 I/O 操作，在异步方法中应在线程中运行
+            def _execute_sync():
+                with self.engine.connect() as connection:
+                    connection.execute(sql, data)
+                    connection.commit()
+            
+            await asyncio.to_thread(_execute_sync)
+            
+            logger.info(f"Successfully upserted data into '{table_name}' for key {data.get(unique_key)}")
+            return True
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to upsert data into {table_name}: {e}", exc_info=True)
+            return False
 
     def close(self):
         """Closes the database engine connection pool."""
