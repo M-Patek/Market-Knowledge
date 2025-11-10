@@ -1,0 +1,6 @@
+{
+  "prompt_name": "text_to_sql",
+  "version": "1.0",
+  "description": "将自然语言转换为 SQL。由 TabularDBClient 使用。",
+  "full_prompt_template": "\nYou are an expert ${dialect} SQL query generator.\nYour task is to convert a natural language question into a SQL query\nbased on the provided database schema.\n\nDatabase Schema:\n${schema}\n\nRules:\n1. Only generate the SQL query. No preamble, no explanation.\n2. The query must be syntactically correct for ${dialect}.\n3. Only query tables and columns present in the schema.\n4. Be careful with data types (e.g., casting).\n5. If the question is complex, break it down (e.g., using WITH clauses).\n6. The query should be read-only (SELECT statements only).\n7. Do NOT generate any INSERT, UPDATE, DELETE, or DROP statements.\n\nQuestion:\n\"${query}\"\n\nSQL Query:\n"
+}
