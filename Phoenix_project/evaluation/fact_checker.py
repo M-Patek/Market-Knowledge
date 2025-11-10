@@ -14,7 +14,7 @@ class FactChecker:
     事实核查器 (FactChecker) 负责验证由 L1 智能体
     生成的分析中的具体、可核查的声明。
     
-    它使用搜索工具来查找支持或反驳的证据。
+    它现在使用 L2 Critic 提示来执行此操作，以确保与核心智能体一致。
     """
 
     def __init__(self, 
@@ -46,9 +46,17 @@ class FactChecker:
             }
         }
         
-        self.prompt = self.prompt_manager.get_prompt("fact_checker")
+        # --- 优化：更新提示 ---
+        # 加载 'l2_critic' 提示，与核心 L2 CriticAgent 保持一致
+        # 旧值: "fact_checker"
+        self.prompt = self.prompt_manager.get_prompt("l2_critic")
+        # --- 结束优化 ---
         
-        # --- 优化：移除 HACK，在初始化时强化系统提示 ---
+        if not self.prompt:
+             logger.error("Failed to load 'l2_critic' prompt for FactChecker. Check prompts directory.", exc_info=True)
+             raise FileNotFoundError("FactChecker prompt 'l2_critic' not found.")
+        
+        # --- 优化：保留系统提示强化 ---
         # 我们在初始化时修改加载的系统提示，
         # 明确指示模型必须使用搜索工具。
         # 这比在运行时动态修改用户提示更清晰、更健壮。
@@ -68,7 +76,7 @@ class FactChecker:
         else:
             self.prompt["system"] = search_instruction.strip()
             
-        logger.info("FactChecker initialized and system prompt modified to enforce search tool usage.")
+        logger.info("FactChecker initialized with 'l2_critic' prompt and modified to enforce search tool usage.")
         # --- 结束优化 ---
 
     async def check_facts(self, claims: List[str]) -> List[FactCheckResult]:
@@ -84,13 +92,20 @@ class FactChecker:
         if not claims:
             return []
             
-        logger.info(f"Fact-checking {len(claims)} claims...")
+        logger.info(f"Fact-checking {len(claims)} claims using 'l2_critic' prompt...")
         
         claims_str = "\n".join([f"- {claim}" for claim in claims])
         
         try:
+            # 'l2_critic' 提示可能需要不同的上下文
+            # 我们将 'claims' 映射到 'evidence_items' 字段（或 'l2_critic' 提示期望的字段）
+            prompt_context = {
+                "evidence_items": claims_str, # 假设 'l2_critic' 提示期望一个名为 'evidence_items' 的字段
+                "symbol": "N/A" # 'l2_critic' 提示可能需要一个 symbol
+            }
+            
             prompt = self.prompt_renderer.render(
-                self.prompt, claims=claims_str
+                self.prompt, **prompt_context
             )
             
             # --- 优化：移除了 HACK ---
