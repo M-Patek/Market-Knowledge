@@ -8,6 +8,7 @@ by the cognitive engine and agents (e.g., market data, news, fundamentals).
 import logging
 import json
 import requests
+import os # [Task 2] 导入 os
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 import pandas as pd  # type: ignore
@@ -104,10 +105,10 @@ class DataManager:
             # (例如, Pydantic 模型需要 .model_dump())
             if hasattr(data, 'model_dump_json'):
                 data_json = data.model_dump_json()
-            elif isinstance(data, list) and hasattr(data[0], 'model_dump'):
+            elif isinstance(data, list) and data and hasattr(data[0], 'model_dump'):
                  data_json = json.dumps([d.model_dump() for d in data])
             else:
-                data_json = json.dumps(data)
+                data_json = json.dumps(data, default=str) # [Task 2] 添加 default=str
                 
             self.redis_client.setex(
                 key, self.cache_ttl_sec, data_json
@@ -351,39 +352,75 @@ class DataManager:
 
     async def _fetch_and_store_fundamentals(self, config: Dict[str, Any]):
         """
-        Helper: Fetches fundamental data and stores it in TabularDB.
+        [Task 2] 已实现
+        Helper: Fetches fundamental data from Alpha Vantage and stores it in TabularDB.
         """
         symbol = config.get("symbol")
         if not symbol or not self.tabular_db:
+            logger.warning(f"Skipping fundamentals: Symbol ({symbol}) or TabularDB ({self.tabular_db}) missing.")
             return
 
         logger.info(f"Refreshing fundamental data for {symbol}...")
         
-        # 1. 从 API 获取数据 (此处为模拟, 实际应调用API)
-        # try:
-        #    api_data = fetch_fundamental_api(symbol)
-        # except ...
+        # 1. 从 API 获取数据 (Alpha Vantage)
+        api_key = self.api_keys.get("alpha_vantage") # 假设 'api_keys' 是从 config 加载的
+        if not api_key:
+            # [Task 2] 尝试从 env.example 定义的环境变量回退
+            api_key = os.environ.get("ALPHA_VANTAGE_API_KEY")
+
+        if not api_key:
+            logger.error("Alpha Vantage API key not found in config (api_keys.alpha_vantage) or env (ALPHA_VANTAGE_API_KEY).")
+            return
         
-        # 模拟 API 数据
-        api_data = {
-            "market_cap": 2.5e12,
-            "pe_ratio": 30.5,
-            "sector": "Technology"
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "OVERVIEW",
+            "symbol": symbol,
+            "apikey": api_key
         }
-        
-        # 2. 存入 TabularDB
-        # (这很棘手, 因为我们通常不希望 DataManager
-        # 具有 SQL 写入权限。一个更好的模式是写入 Kafka,
-        # 由另一个服务消费并存入 SQL)
-        
-        # 简化的实现：直接调用（不推荐用于生产）
-        logger.warning(f"Simulating write of fundamentals for {symbol} to TabularDB.")
-        # try:
-        #   self.tabular_db.execute_write(
-        #       f"UPDATE fundamentals SET ... WHERE symbol = '{symbol}'"
-        #   )
-        # except Exception as e:
-        #   logger.error(f"Failed to write fundamentals to DB: {e}")
+
+        try:
+            # (同步的 requests 调用在 async 方法中不是最佳选择，但为了简单起见...)
+            # (在生产环境中，我们会使用 httpx.AsyncClient)
+            response = await asyncio.to_thread(requests.get, url, params=params, timeout=10)
+            response.raise_for_status()
+            api_data = response.json()
+            
+            if not api_data or "Symbol" not in api_data or api_data.get("Symbol") is None:
+                logger.warning(f"Alpha Vantage returned no data or invalid data for {symbol}: {api_data.get('Information')}")
+                return
+
+            # 2. 准备要写入的数据
+            # (我们将 Alpha Vantage 键 映射到 我们的数据库列)
+            data_to_store = {
+                "symbol": api_data.get("Symbol"),
+                "timestamp": datetime.now(), # 记录我们获取数据的时间
+                "market_cap": float(api_data.get("MarketCapitalization", 0)),
+                "pe_ratio": float(api_data.get("PERatio", 0) if api_data.get("PERatio") != "None" else 0),
+                "sector": api_data.get("Sector"),
+                "industry": api_data.get("Industry"),
+                "dividend_yield": float(api_data.get("DividendYield", 0) if api_data.get("DividendYield") != "None" else 0),
+                "eps": float(api_data.get("EPS", 0) if api_data.get("EPS") != "None" else 0),
+                "beta": float(api_data.get("Beta", 0) if api_data.get("Beta") != "None" else 0)
+            }
+
+            # 3. 存入 TabularDB
+            # (我们假设表名为 'fundamentals'，主键为 'symbol')
+            success = await self.tabular_db.upsert_data(
+                table_name="fundamentals",
+                data=data_to_store,
+                unique_key="symbol"
+            )
+            
+            if success:
+                logger.info(f"Successfully refreshed and stored fundamentals for {symbol}")
+            else:
+                logger.error(f"Failed to store fundamentals for {symbol} in TabularDB.")
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch fundamentals from Alpha Vantage for {symbol}: {e}")
+        except Exception as e:
+            logger.error(f"Error processing/storing fundamentals for {symbol}: {e}", exc_info=True)
 
 
     async def refresh_data_sources(self):
@@ -399,7 +436,8 @@ class DataManager:
             try:
                 if source_type == "market_data_api":
                     # (同步)
-                    self._fetch_and_store_market_data(config)
+                    # [Task 2] 这应该是异步的
+                    await asyncio.to_thread(self._fetch_and_store_market_data, config)
                     
                 elif source_type == "news_api":
                     # (异步)
