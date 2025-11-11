@@ -1,6 +1,7 @@
 # Phoenix_project/strategy_handler.py
 # [主人喵的修复 11.10] 移除了顶部的 "legacy wrapper" 文档字符串。
 # [主人喵的实现 11.11] 实现了 TBD 功能，用于 DRL 策略加载和生命周期管理。
+# [主人喵的修复 11.12] 实现了参数化策略加载 (TBD-1) 和停用逻辑 (TBD-2)。
 
 import logging
 from omegaconf import DictConfig
@@ -91,8 +92,34 @@ class StrategyHandler:
                     return False
 
             elif strategy_type == "Parametric":
-                # (TBD: 这里是处理参数化策略（例如调整 Alpha/Risk 参数）的地方)
-                logger.warning(f"Parametric strategy loading for '{strategy_name}' is TBD.")
+                # [主人喵的修复 11.12] 实现了参数化策略加载 (TBD-1)
+                logger.info(f"Loading Parametric strategy: {strategy_name}")
+                params = strategy_config.get("params")
+                if not params:
+                    logger.warning(f"Parametric strategy {strategy_name} has no 'params' defined in config. No parameters applied.")
+                    # 即使没有参数，也可能算加载成功，只是激活时无效果
+                
+                # 假设参数是为 L3 智能体准备的
+                # 示例：将参数应用到 L3 智能体
+                applied_at_least_one = False
+                if "alpha" in self.l3_agents and "alpha" in params:
+                    if hasattr(self.l3_agents["alpha"], "set_parameters"):
+                        self.l3_agents["alpha"].set_parameters(params["alpha"])
+                        logger.info(f"Applied alpha parameters for {strategy_name}.")
+                        applied_at_least_one = True
+                    else:
+                        logger.warning(f"AlphaAgent has no 'set_parameters' method.")
+                
+                if "risk" in self.l3_agents and "risk" in params:
+                    if hasattr(self.l3_agents["risk"], "set_parameters"):
+                        self.l3_agents["risk"].set_parameters(params["risk"])
+                        logger.info(f"Applied risk parameters for {strategy_name}.")
+                        applied_at_least_one = True
+                    else:
+                        logger.warning(f"RiskAgent has no 'set_parameters' method.")
+                
+                if not applied_at_least_one and params:
+                    logger.warning(f"No parameters were applied for Parametric strategy '{strategy_name}'. Check config and L3 agents.")
             
             else:
                 logger.warning(f"Unknown strategy type for '{strategy_name}': {strategy_type}")
@@ -143,10 +170,12 @@ class StrategyHandler:
             
         logger.info(f"Deactivating strategy: {strategy_name}")
         
-        # [实现] 这会通知 Orchestrator 停止使用此策略
-        # (TBD: 我们是否从 active_strategies 中移除它?)
-        # 最好保留它 (del self.active_strategies[strategy_name])，以便快速重新激活。
-        # 如果需要卸载模型，则可以在此处添加 del。
+        # [主人喵的修复 11.12] TBD 解决 (TBD-2):
+        # 决定在停用时从 active_strategies 中移除（卸载）策略，
+        # 以确保状态清晰并释放资源。
+        if strategy_name in self.active_strategies:
+            del self.active_strategies[strategy_name]
+            logger.info(f"Strategy {strategy_name} unloaded from active list.")
 
         # [实现] 发布一个空上下文，通知系统恢复默认行为
         self.context_bus.publish("STRATEGY_CONTEXT", {"active_strategy": None, "config": {}})
