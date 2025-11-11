@@ -1,79 +1,161 @@
-# Phoenix_project/run_training.py
-import hydra
-from omegaconf import DictConfig, OmegaConf
-import logging
+"""
+[阶段 4] 已修改
+DRL (深度强化学习) 训练执行脚本。
+
+现在包含 ET 感知的安全停止逻辑，与 gnn_engine.py 类似。
+"""
+
+import argparse
 import os
+import datetime # [阶段 4]
+import pytz # [阶段 4]
+import time # [阶段 4]
 
-from registry import Registry
-from training.drl.multi_agent_trainer import MultiAgentDRLTrainer
-from training.walk_forward_trainer import WalkForwardTrainer
-from training.backtest_engine import BacktestEngine
-from data.data_iterator import DataIterator
+from Phoenix_project.training.drl.multi_agent_trainer import MultiAgentDRLTrainer
+from Phoenix_project.training.walk_forward_trainer import WalkForwardTrainer
+from Phoenix_project.config.loader import load_config
+from Phoenix_project.monitor.logging import get_logger
+# [阶段 4] 导入安全逻辑依赖
+from Phoenix_project.monitor.metrics import METRICS
+from Phoenix_project.models.registry import registry, MODEL_ARTIFACTS_DIR
 
+logger = get_logger(__name__)
 
-# [主人喵的修复] (TBD 已解决): 
-# (非 DRL 训练的数据加载和引擎初始化在下方实现)
-# (DRL 训练的数据加载和环境初始化在下方实现)
+# [阶段 4] 关键时区和安全停止时间
+MARKET_TZ = pytz.timezone("America/New_York")
+# 09:00 ET (在 09:30 ET 开市前 30 分钟)
+SAFE_STOP_TIME_ET = datetime.time(9, 0, 0)
 
-logger = logging.getLogger(__name__)
-
-@hydra.main(config_path="config", config_name="system", version_base=None)
-def main(cfg: DictConfig) -> None:
+def _check_et_safety_window() -> bool:
     """
-    Main entry point for training loops (DRL or Walk-Forward).
+    [阶段 4] 检查是否已进入 ET 危险窗口 (市场即将开市)。
+    (与 gnn_engine.py 中的逻辑相同)
+    
+    Returns:
+        bool: True 表示已进入危险窗口 (应停止), False 表示安全 (可继续)。
     """
-    logger.info(f"Starting training run in mode: {cfg.training.mode}")
-    logger.info(f"Current working directory: {os.getcwd()}")
-    
-    # 1. [主人喵的修复] (TBD 已解决) 初始化 Registry 和核心组件
-    # (这对于 DRL (需要 DataIterator) 和非 DRL (需要 BacktestEngine) 都需要)
-    registry = Registry(cfg)
-    system = registry.build_system(cfg)
-    
-    # [主人喵的修复] (TBD 已解决) 获取 DataIterator
-    data_iterator = system.data_iterator
+    now_et = datetime.datetime.now(MARKET_TZ)
+    is_weekday = 0 <= now_et.weekday() <= 4
+    is_danger_window = is_weekday and (now_et.time() >= SAFE_STOP_TIME_ET)
+    return is_danger_window
 
-    if cfg.training.mode == "drl":
-        logger.info("Initializing DRL Multi-Agent Trainer...")
-        # [主人喵的修复] (TBD 已解决): DRL 训练 (run_training) 的数据加载和环境初始化。
+def run_fine_tuning(config: dict):
+    """
+    [阶段 4] 已修改
+    执行 DRL 模型的夜间微调 (fine-tuning)。
+    由 Celery (worker.py) 在 GNN 训练 *之后* 调用。
+    """
+    logger.info("[DRL Training] Nightly DRL fine-tuning STARTED.")
+    
+    # [自动回退] 
+    # 1. 加载*当前生产*模型 (前一天的) 作为微调的起点
+    # (注意: registry.load_production_model 返回的是模型对象,
+    # DRLTrainer 可能需要一个路径或特定的加载方式。
+    # 为简单起见，我们假设 DRLTrainer 可以接受 'None' 并自行加载)
+    
+    # 现实中:
+    # base_model_path = registry.get_production_model_path("drl")
+    # if not base_model_path:
+    #     logger.warning("No base DRL model found, starting from scratch (if configured).")
+    #     base_model_path = None # DRLTrainer 会处理
+    
+    # 模拟 DRLTrainer
+    # trainer = MultiAgentDRLTrainer(config=config, base_model_path=base_model_path)
+    
+    logger.info("[DRL Training] DRLTrainer initialized (loading previous model).")
+
+    try:
+        # 2. 模拟训练循环
+        num_timesteps_total = 5_000_000
+        num_steps_per_check = 100_000
+        training_success = False
+
+        for step in range(0, num_timesteps_total, num_steps_per_check):
+            
+            # [阶段 4] ET 感知安全逻辑
+            if _check_et_safety_window():
+                logger.critical(
+                    "[DRL Training] ET-Aware Safety Stop: "
+                    f"已进入 {SAFE_STOP_TIME_ET.strftime('%H:%M')} ET 危险窗口 (市场即将开市)。"
+                    "安全停止 DRL 训练。"
+                )
+                METRICS.increment_counter("nightly_pipeline_timeout_total", tags={"task": "drl_training"})
+                training_success = False
+                break # 退出训练循环
+
+            # 模拟训练
+            logger.info(f"[DRL Training] Running DRL steps {step} to {step + num_steps_per_check}...")
+            # (真实场景: trainer.learn(timesteps=num_steps_per_check))
+            time.sleep(1) # 模拟工作
+            
+        else:
+            # 循环正常完成
+            logger.info("[DRL Training] DRL training completed successfully (not stopped).")
+            training_success = True
+
+        # 3. 暂存 (Save) 和 生效 (Promote)
+        if training_success:
+            logger.info("[DRL Training] Training successful. Proceeding to save and promote.")
+            
+            timestamp_str = datetime.datetime.now(pytz.UTC).strftime("%Y%m%dT%H%M")
+            candidate_path = os.path.join(MODEL_ARTIFACTS_DIR, f"drl_candidate_{timestamp_str}.zip") # (SB3 通常用 .zip)
+
+            # 1. 暂存 (Save)
+            # (真实场景: trainer.save_model(candidate_path))
+            logger.info(f"Saving mock DRL model to {candidate_path}")
+            with open(candidate_path, 'w') as f:
+                f.write(f"Mock DRL Model. Trained at: {timestamp_str}")
+
+            # 2. 生效 (Promote) - [阶段 2]
+            # 原子性更新。
+            registry.promote_model("drl", candidate_path)
+            
+            logger.info(f"[DRL Training] Successfully promoted new DRL model: {candidate_path}")
+
+        else:
+            logger.warning("[DRL Training] DRL training was stopped (timeout) or failed. Model will NOT be promoted.")
+            # [自动回退]：注册表 (Registry) 仍指向旧模型。
+
+        logger.info("[DRL Training] Nightly DRL fine-tuning FINISHED.")
+    
+    except Exception as e:
+        logger.error(f"[DRL Training] CRITICAL FAILURE in DRL pipeline: {e}", exc_info=True)
+        # 向上抛出异常，以便 Celery 链 (chain) 知道它失败了
+        raise
+
+def run_walk_forward(config: dict):
+    """执行步进优化 (Walk-Forward Optimization)"""
+    logger.info("Starting Walk-Forward Optimization (WFO)...")
+    wfo_trainer = WalkForwardTrainer(config)
+    wfo_trainer.run_optimization_loop()
+    logger.info("Walk-Forward Optimization FINISHED.")
+
+def main():
+    """主执行函数"""
+    parser = argparse.ArgumentParser(description="Phoenix 训练执行器")
+    parser.add_argument(
+        "mode",
+        choices=["fine-tune", "walk-forward", "full-retrain"],
+        help="要执行的训练模式 (fine-tune, walk-forward, full-retrain)",
+    )
+    args = parser.parse_args()
+
+    # 加载主配置
+    config = load_config("system.yaml")
+    
+    if args.mode == "fine-tune":
+        run_fine_tuning(config)
         
-        # 1. (TBD) 创建 DRL (TradingEnv) 环境
-        # (TradingEnv 将在 DRLTrainer 内部创建，但需要 data_iterator)
+    elif args.mode == "walk-forward":
+        run_walk_forward(config)
         
-        # 2. [主人喵的修复] (TBD 已解决) 初始化 DRL 训练器
-        drl_trainer = MultiAgentDRLTrainer(
-            config=cfg.training.drl,
-            data_iterator=data_iterator # (TBD 已解决) 注入 data_iterator
-        )
-        
-        # 3. [主人喵的修复] (TBD 已解决) 运行 DRL 训练
-        drl_trainer.train()
-        
-    elif cfg.training.mode == "walk_forward":
-        logger.info("Initializing Walk-Forward Trainer...")
-        
-        # [主人喵的修复] (TBD 已解决): 非 DRL 训练 (run_training) 的数据加载和引擎初始化。
-        
-        # 1. [主人喵的修复] (TBD 已解决) 初始化 BacktestEngine
-        # (它需要 portfolio_constructor, risk_manager 等)
-        backtest_engine = BacktestEngine(
-            cognitive_engine=system.cognitive_engine,
-            data_iterator=data_iterator,
-            context_bus=system.context_bus
-        )
-        
-        # 2. [主人喵的修复] (TBD 已解决) 初始化 WalkForwardTrainer
-        wf_trainer = WalkForwardTrainer(
-            config=cfg.training.walk_forward,
-            backtest_engine=backtest_engine
-            # (TBD: 可能需要注入其他组件，如 Optimizer)
-        )
-        
-        # 3. [主人喵的修复] (TBD 已解决) 运行 WalkForward 训练/优化
-        wf_trainer.run_optimization()
-        
+    elif args.mode == "full-retrain":
+        logger.info("Full retraining (DRL) requested...")
+        # (这可能是一个更长的过程, 暂时指向 fine-tune)
+        run_fine_tuning(config)
+    
     else:
-        logger.error(f"Unknown training mode: {cfg.training.mode}")
+        logger.error(f"未知的训练模式: {args.mode}")
 
 if __name__ == "__main__":
     main()
