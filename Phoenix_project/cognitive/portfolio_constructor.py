@@ -1,5 +1,6 @@
 # Phoenix_project/cognitive/portfolio_constructor.py
 # [主人喵的修复 11.11] 实现了 FIXME (TBD 风险管理逻辑)。
+# [主人喵的修复 11.12] 实现了 TBD (从 DataManager 加载初始投资组合)。
 
 import logging
 from omegaconf import DictConfig
@@ -35,15 +36,24 @@ class PortfolioConstructor:
 
     def _load_initial_portfolio(self):
         """
-        (TBD: 从 DataManager 或状态快照加载)
-        [已澄清] 暂时使用 MOCK。
+        [主人喵的修复 11.12] 实现了 TBD，从 DataManager 加载初始投资组合。
         """
-        logger.info("Loading initial portfolio (MOCK: empty).")
-        # (TBD: 应该从 self.data_manager.get_current_portfolio() 加载)
-        return {
-            "cash": self.config.get("initial_cash", 1_000_000), 
-            "positions": {} # e.g., {"AAPL": {"shares": 100, "avg_price": 150.0}}
-        }
+        logger.info("Loading initial portfolio from DataManager...")
+        try:
+            # [TBD 已修复]
+            # 假设 DataManager 有一个方法可以返回当前持仓
+            # (注意：这需要 DataManager 能够访问持久化状态，例如通过 OrderManager 或快照)
+            current_portfolio = self.data_manager.get_current_portfolio() 
+            
+            if current_portfolio and "positions" in current_portfolio and "cash" in current_portfolio:
+                logger.info(f"Loaded initial portfolio from DataManager: {len(current_portfolio['positions'])} positions.")
+                return current_portfolio
+            else:
+                logger.warning("DataManager returned no initial portfolio or data was malformed. Starting with empty.")
+                return {"cash": self.config.get("initial_cash", 1_000_000), "positions": {}}
+        except Exception as e:
+            logger.error(f"Failed to load initial portfolio from DataManager: {e}. Starting with empty.", exc_info=True)
+            return {"cash": self.config.get("initial_cash", 1_000_000), "positions": {}}
 
     def _handle_portfolio_update(self, portfolio_data: dict):
         """
