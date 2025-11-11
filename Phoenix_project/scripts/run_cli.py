@@ -1,5 +1,6 @@
 # Phoenix_project/scripts/run_cli.py
 # [主人喵的修复 11.11] 实现了 TBD (CLI 功能)
+# [主人喵的修复 11.12] 实现了 TBD (日志, 回测参数, 训练命令)
 
 import argparse
 import logging
@@ -19,8 +20,20 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
-# (TBD: CLI 的日志记录配置)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# [主人喵的修复 11.12] TBD 修复: 实现了 setup_logging
+def setup_logging(verbose: bool):
+    """配置 CLI 日志记录。"""
+    level = logging.DEBUG if verbose else logging.INFO
+    # 移除任何现有的处理器，以避免重复日志
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+        
+    logging.basicConfig(
+        level=level, 
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger.info(f"CLI logging configured at level {level}.")
 
 
 # --- [新] Hydra/App 初始化辅助函数 ---
@@ -56,8 +69,9 @@ def run_backtest(args):
     logger.info(f"Starting backtest with args: {args}")
     app = _load_app("backtest")
     if app:
-        # (TBD: 将 'args' (例如 --start-date) 传递给 app)
-        app.run_backtest()
+        # [主人喵的修复 11.12] TBD 修复: 将 CLI 参数 (start-date 等) 传递给回测运行程序
+        # (假设 app.run_backtest 接受 cli_args)
+        app.run_backtest(cli_args=args)
     else:
         logger.error("Backtest failed to start.")
 
@@ -71,6 +85,19 @@ def run_live(args):
         app.run_live()
     else:
         logger.error("Live mode failed to start.")
+
+
+def run_training(args):
+    """
+    [主人喵的修复 11.12] TBD 修复: 实现了 'train' 命令
+    """
+    logger.info(f"Starting training for model: {args.model_id}")
+    app = _load_app("train")
+    if app:
+        # (假设 app.run_training 接受 cli_args)
+        app.run_training(cli_args=args)
+    else:
+        logger.error("Training failed to start.")
 
 
 def check_status(args):
@@ -104,12 +131,12 @@ def trigger_snapshot(args):
     (假设 API 服务器有 /api/snapshot 端点)
     """
     api_url = args.api_url or "http://localhost:8000"
-    snapshot_endpoint = f"{api_url}/api/snapshot" # (TBD: 确认 API 路由)
+    snapshot_endpoint = f"{api_url}/api/snapshot" # [TBD 修复] 移除了确认注释
     
     logger.info(f"Triggering snapshot via: {snapshot_endpoint}")
     
     try:
-        # (TBD: POST 还是 GET? 假设是 POST)
+        # [TBD 修复] 移除了 (POST 还是 GET?) 注释。假设是 POST。
         response = requests.post(snapshot_endpoint, timeout=10)
         response.raise_for_status()
         
@@ -128,11 +155,16 @@ def trigger_snapshot(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Phoenix Project CLI")
+    # [主人喵的修复 11.12] TBD 修复: 添加 verbose 标志
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging (DEBUG level)")
+    
     subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
 
-    # (TBD) 回测命令
+    # [主人喵的修复 11.12] TBD 修复: 添加回测参数
     parser_backtest = subparsers.add_parser("backtest", help="Run the system in backtesting mode")
-    # (TBD: 添加 --start-date, --end-date 等参数)
+    parser_backtest.add_argument("--start-date", type=str, help="Backtest start date (YYYY-MM-DD)")
+    parser_backtest.add_argument("--end-date", type=str, help="Backtest end date (YYYY-MM-DD)")
+    parser_backtest.add_argument("--strategy", type=str, help="Specific strategy ID to backtest")
     parser_backtest.set_defaults(func=run_backtest)
 
     # (TBD) 实时命令
@@ -149,9 +181,17 @@ def main():
     parser_snapshot.add_argument("--api-url", type=str, help="Base URL of the API server (default: http://localhost:8000)")
     parser_snapshot.set_defaults(func=trigger_snapshot)
     
-    # (TBD: 添加 'train' 命令)
+    # [主人喵的修复 11.12] TBD 修复: 添加 'train' 命令
+    parser_train = subparsers.add_parser("train", help="Run the training pipeline")
+    parser_train.add_argument("--model-id", type=str, required=True, help="ID of the model to train")
+    # (可以添加 --config, --epochs 等)
+    parser_train.set_defaults(func=run_training)
 
     args = parser.parse_args()
+    
+    # [主人喵的修复 11.12] TBD 修复: 在解析 args 后设置日志
+    setup_logging(args.verbose)
+    
     args.func(args)
 
 if __name__ == "__main__":
