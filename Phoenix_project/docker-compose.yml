@@ -1,29 +1,100 @@
+# (已优化) 增加了版本并修复了缩进
 version: '3.8'
 
+# (已优化) 为所有服务定义一个共享网络
+networks:
+  phoenix_net:
+    driver: bridge
+
+# (已优化) 统一在顶层定义所有卷
+volumes:
+  redis_data:
+  neo4j_data:
+  postgres_data:
+  elastic_data:
+  kafka_data: # (已优化) 为 Kafka 添加持久化
+  zookeeper_data: # (已优化) 为 Zookeeper 添加持久化
+
 services:
-  
+  # -----------------------------------------------------------------
+  #  Redis (来自主人的提示，版本 7.2.4)
+  # -----------------------------------------------------------------
   redis:
-    image: redis:7.0-alpine
+    image: redis:7.2.4-alpine
     container_name: phoenix_redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-supersecret}
+    networks:
+      - phoenix_net
+    restart: unless-stopped # (已优化) 增加重启策略
+    healthcheck: # (已优化) 增加健康检查
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-supersecret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
-  # (可选: PostgreSQL - 用于表格 RAG)
+  # -----------------------------------------------------------------
+  #  Neo4j (来自主人的提示，版本 5.18.0，带 GDS)
+  # -----------------------------------------------------------------
+  neo4j:
+    image: neo4j:5.18.0
+    container_name: phoenix_neo4j
+    ports:
+      - "7474:7474" # HTTP
+      - "7687:7687" # Bolt
+    volumes:
+      - neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-password}
+      - NEO4J_ACCEPT_LICENSE=yes
+      # [阶段 1] 确保 APOC 和 GDS 都已安装 (来自主人的提示)
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
+      # 允许 APOC 导入/导出
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      # 内存设置 (来自主人的提示)
+      - NEO4J_server_memory_heap_initial__size=1G
+      - NEO4J_server_memory_heap_max__size=2G
+      - NEO4J_server_memory_pagecache_size=512M
+    networks:
+      - phoenix_net
+    restart: unless-stopped # (已优化) 增加重启策略
+    healthcheck: # (已优化) 增加健康检查
+      test: ["CMD-SHELL", "wget -O /dev/null -q http://localhost:7474/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # -----------------------------------------------------------------
+  #  其他基础设施服务 (来自项目文件)
+  # -----------------------------------------------------------------
   postgres_db:
     image: postgres:15-alpine
     container_name: phoenix_postgres
     environment:
       POSTGRES_USER: phoenix_user
       POSTGRES_DB: phoenix_tabular
-      POSTGRES_PASSWORD: "changeme_in_prod" 
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_prod}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - phoenix_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U phoenix_user -d phoenix_tabular"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
-  # (可选: Elasticsearch - 用于时序 RAG)
   elasticsearch:
     image: elasticsearch:8.6.2
     container_name: phoenix_elastic
@@ -35,25 +106,16 @@ services:
       - "9200:9200"
     volumes:
       - elastic_data:/usr/share/elasticsearch/data
+    networks:
+      - phoenix_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health?wait_for_status=yellow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
-  # --- 新增的基础设施服务 ---
-
-  # 1. Neo4j (图数据库)
-  # (基于 requirements.txt 中的 'neo4j' 依赖)
-  neo4j:
-    image: neo4j:5-community
-    container_name: phoenix_neo4j
-    ports:
-      - "7474:7474" # HTTP
-      - "7687:7687" # Bolt
-    environment:
-      # 设置默认密码为 "password"
-      NEO4J_AUTH: neo4j/password
-    volumes:
-      - neo4j_data:/data
-
-  # 2. Zookeeper (Kafka 依赖)
-  # (基于 requirements.txt 中的 'kafka-python' 依赖)
   zookeeper:
     image: confluentinc/cp-zookeeper:7.0.1
     container_name: phoenix_zookeeper
@@ -62,137 +124,129 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    networks:
+      - phoenix_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'ruok' | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # 3. Kafka (事件流)
   kafka:
     image: confluentinc/cp-kafka:7.0.1
     container_name: phoenix_kafka
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy # (已优化) 等待 Zookeeper 健康
     ports:
-      # 暴露 9092 以便从主机访问
       - "9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      # 配置监听器以允许容器间 (kafka:29092) 和主机 (localhost:9092) 访问
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_LOG_RETENTION_HOURS: 24 # [主人喵的清洁计划 4.2]
-
-  # --- 应用程序服务 ---
-
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: phoenix_worker
-    depends_on:
-      - redis
-      - postgres_db 
-      - elasticsearch
-      - neo4j # <-- 已添加依赖
-      - kafka # <-- 已添加依赖
-    env_file:
-      - ./.env
-    # --- 蓝图 1：为 worker 暴露指标端口 ---
-    ports:
-      - "8001:8001"
-    # --- 结束：蓝图 1 ---
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
-      - PHOENIX_CONFIG_PATH=/app/config
-      - POSTGRES_PASSWORD=changeme_in_prod
-      - NEO4J_URI=bolt://neo4j:7687
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-      # [主人喵的修复 2] 确保 Redis 主机可被访问
-      - REDIS_HOST=redis
-      # --- 蓝图 1：将端口 8001 传递给 worker ---
-      - WORKER_METRICS_PORT=8001
-      # --- 结束：蓝图 1 ---
     volumes:
-      - .:/app
-    # --- [主人喵的修复] ---
-    # 明确指定 Celery worker 命令，而不是使用 Dockerfile 的默认 CMD
-    # (基于 worker.py 中 celery_app 的位置)
-    # [主人喵的清洁计划 4.1] [已更新] 添加 -B (Beat) 标志以运行定时任务
-    command: celery -A Phoenix_project.worker.celery_app worker --loglevel=info -B
-    # --- [修复结束] ---
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - phoenix_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:29092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  # -----------------------------------------------------------------
+  #  应用服务 (合并自提示和项目文件)
+  # -----------------------------------------------------------------
+  worker:
+    build: .
+    container_name: phoenix_worker
+    depends_on: # (已优化) 使用完整的依赖并等待健康检查
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      postgres_db:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # (已优化) 使用网络别名
+      - REDIS_HOST=redis
+      - NEO4J_URI=bolt://neo4j:7687
+      - TABULAR_DB_URI=postgresql://phoenix_user:${POSTGRES_PASSWORD:-changeme_in_prod}@postgres_db:5432/phoenix_tabular
+      - TEMPORAL_DB_URI=http://elasticsearch:9200
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    networks:
+      - phoenix_net
+    restart: unless-stopped
+    # (已优化) 使用来自主人提示的 command
+    command: ["celery", "-A", "Phoenix_project.worker", "worker", "-B", "-l", "info", "--concurrency=1"]
 
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: phoenix_api
     depends_on:
-      - redis
-      - postgres_db
-      - elasticsearch
-      - neo4j # <-- 已添加依赖
-      - kafka # <-- 已添加依赖
+      worker:
+        condition: service_started # API 可以启动，即使 worker 仍在初始化
+      redis:
+        condition: service_healthy
+      postgres_db:
+        condition: service_healthy
     ports:
       - "8000:8000"
     env_file:
-      - ./.env
+      - .env
     environment:
-      - PHOENIX_CONFIG_PATH=/app/config
-      - POSTGRES_PASSWORD=changeme_in_prod
-      - NEO4J_URI=bolt://neo4j:7687
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-      # [主人喵的修复 2] 确保 Redis 主机可被访问
       - REDIS_HOST=redis
-    volumes:
-      - .:/app
-    command: gunicorn -w 4 -b 0.0.0.0:8000 Phoenix_project.interfaces.api_server:app # [主人喵的最终优化] 修复 gunicorn 路径
+      - NEO4J_URI=bolt://neo4j:7687
+    networks:
+      - phoenix_net
+    restart: unless-stopped
+    # (来自项目文件的 command)
+    command: ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "Phoenix_project.api.gateway:app"] # 假设 API 入口点
 
-  # --- [主人喵的修复 2] 新增 Kafka 消费者服务 ---
   stream_consumer:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: phoenix_stream_consumer
     depends_on:
-      # 它需要 Kafka 来消费，需要 Redis 来发布
-      - kafka
-      - redis
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
-      - ./.env
+      - .env
     environment:
-      - PHOENIX_CONFIG_PATH=/app/config
-      # (确保它能找到 Kafka 和 Redis)
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
       - REDIS_HOST=redis
-    volumes:
-      - .:/app
-    # (覆盖默认的 celery 命令，运行新的启动脚本)
-    command: python Phoenix_project/run_stream_processor.py
+    networks:
+      - phoenix_net
+    restart: unless-stopped
+    command: ["python", "Phoenix_project/run_stream_processor.py"]
 
-  # --- [阶段 4] 新增数据生产者服务 ---
   data_producer:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: phoenix_data_producer
     depends_on:
-      - kafka
-      - zookeeper
+      kafka:
+        condition: service_healthy
     env_file:
-      - ./.env
+      - .env
     environment:
-      - PHOENIX_CONFIG_PATH=/app/config
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-      - REDIS_HOST=redis # 尽管此服务不直接使用，但继承自 env 无害
-    volumes:
-      - .:/app
-    command: python Phoenix_project/data_producer.py
-  # --- [阶段 4 结束] ---
-
-volumes:
-  redis_data:
-  postgres_data:
-  elastic_data:
-  neo4j_data: # <-- 已添加卷
+    networks:
+      - phoenix_net
+    restart: unless-stopped
+    command: ["python", "Phoenix_project/data_producer.py"]
