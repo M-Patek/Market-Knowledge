@@ -1,114 +1,93 @@
-from typing import Dict, Any, List
-from Phoenix_project.agents.l1.base import L1BaseAgent
-from Phoenix_project.core.schemas.data_schema import MarketEvent
-from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
-from Phoenix_project.ai.prompt_renderer import PromptRenderer
-from Phoenix_project.reasoning.compressor import ContextCompressor
-from Phoenix_project.monitor.logging import get_logger
+# Phoenix_project/agents/l1/fundamental_analyst_agent.py
+# [主人喵的修复 11.11] 实现了 C.2 (上下文压缩)
 
-logger = get_logger(__name__)
+import logging
+import asyncio
+from agents.l1.base import L1BaseAgent
+from ai.prompt_manager import PromptManager
+from api.gateway import APIGateway
+from ai.retriever import Retriever
+from reasoning.compressor import ContextCompressor # [新] 假设压缩器在这里
+
+logger = logging.getLogger(__name__)
 
 class FundamentalAnalystAgent(L1BaseAgent):
     """
-    L1 Agent specializing in fundamental analysis based on news,
-    filings, and earnings reports.
+    L1 智能体：基本面分析师
+    - 专注于分析 SEC 文件、财报、收益电话会议记录。
+    - 评估公司的财务健康、增长前景、估值和管理效率。
+    - 输出结构化的基本面见解。
     """
 
-    def __init__(
-        self,
-        agent_id: str,
-        config: Dict[str, Any],
-        reasoning_ensemble: ReasoningEnsemble,
-        prompt_renderer: PromptRenderer,
-        compressor: ContextCompressor
-    ):
-        """
-        Initializes the FundamentalAnalystAgent.
-        """
-        super().__init__(agent_id, config, reasoning_ensemble, prompt_renderer)
-        self.compressor = compressor
-        self.prompt_name = "l1_fundamental_analyst"
-        logger.info(f"FundamentalAnalystAgent (ID: {agent_id}) initialized.")
+    def __init__(self, agent_name: str, config: dict, prompt_manager: PromptManager, api_gateway: APIGateway, retriever: Retriever, context_compressor: ContextCompressor):
+        super().__init__(agent_name, config, prompt_manager, api_gateway, retriever, context_compressor)
+        self.prompt_template_name = "l1_fundamental_analyst"
 
-    async def run(self, event: MarketEvent, context_window: List[MarketEvent]) -> Dict[str, Any]:
+    async def _prepare_context(self, task_content: dict) -> str:
         """
-        Processes a single market event (e.g., news) and generates
-        a fundamental analysis.
-        
-        [任务 C.2] TODO: Optimize context compression.
+        [已实现] 准备基本面分析所需的上下文。
+        - 检索相关的财务文件 (10-K, 10-Q) 和收益记录。
+        - [任务 C.2] TODO: Optimize context compression
         """
+        logger.debug(f"{self.agent_name}: Preparing context for task...")
         
-        symbol = event.get('symbol', 'N/A')
-        logger.debug(f"{self.agent_id} processing event for {symbol}...")
+        # [任务 C.2 已实现]: 优化上下文压缩
         
-        # [任务 C.2] 已实现：优化上下文压缩
+        # 1. 检索
         try:
-            # 1. 将上下文窗口转换为单个文本块
-            context_text = " ".join([
-                f"Event: {evt.get('summary', str(evt.get('data', '')))} @ {evt.get('timestamp')}" 
-                for evt in context_window
-                if evt.get('summary') or evt.get('data') # 确保有内容
-            ])
-            
-            if context_text:
-                # 2. 压缩文本块
-                compressed_context = self.compressor.compress_text(context_text, max_tokens=1000)
-            else:
-                compressed_context = "No relevant historical context found."
-                
-        except Exception as e:
-            logger.warning(f"Failed to compress context window: {e}. Using raw event data.")
-            # 回退：仅使用当前事件的摘要
-            compressed_context = event.get('summary') or str(event.get('data', ''))
-
-        # 2. 准备 Prompt 上下文
-        render_context = {
-            "symbol": symbol,
-            "summary": event.get('summary', 'No summary provided.'),
-            "source": event.get('source', 'Unknown source'),
-            "historical_context": compressed_context # [任务 C.2] 使用压缩后的上下文
-        }
-        
-        # 3. 渲染 Prompt
-        try:
-            rendered_prompt = self.prompt_renderer.render(
-                self.prompt_name,
-                render_context
+            evidence_list = await self.retriever.retrieve_relevant_context(
+                query=task_content.get("query"),
+                tickers=task_content.get("tickers", []),
+                # 专门针对基本面分析的数据源
+                source_types=["10-K", "10-Q", "EarningsCall", "AnalystReport"],
+                top_k=self.config.get("retriever_top_k", 10)
             )
         except Exception as e:
-            logger.error(f"Failed to render prompt {self.prompt_name}: {e}", exc_info=True)
-            return self.generate_error_response(f"Prompt rendering failed: {e}")
-            
-        # 4. 调用推理
+            logger.error(f"{self.agent_name}: Failed to retrieve context: {e}", exc_info=True)
+            return "Context retrieval failed."
+
+        if not evidence_list:
+             logger.warning(f"{self.agent_name}: No evidence found for query, skipping compression.")
+             return "No relevant context found."
+
+        # [新] 2. 压缩
+        # (ContextCompressor 在 L1BaseAgent 中被注入)
         try:
-            # 假设 reasoning_ensemble.invoke 接受渲染后的 prompt
-            analysis = await self.reasoning_ensemble.invoke(
-                agent_id=self.agent_id,
-                prompt=rendered_prompt
+            # 假设 compressor 接受证据列表并返回一个新的、经过压缩/过滤的证据列表
+            compressed_evidence_list = await self.context_compressor.compress(
+                evidence_list=evidence_list,
+                query=task_content.get("query"),
+                max_tokens=self.config.get("compression_max_tokens", 4096) # 添加一个配置
             )
+            logger.debug(f"{self.agent_name}: Context compressed successfully. {len(evidence_list)} -> {len(compressed_evidence_list)} items.")
             
-            # 5. 格式化输出
-            analysis['agent_name'] = self.agent_id
-            analysis['symbol'] = symbol
-            analysis['source_event_id'] = event.get('id')
-            
-            logger.info(f"{self.agent_id} generated analysis for {symbol}.")
-            return analysis
+            # 3. 格式化
+            formatted_context = self.retriever.format_context_for_prompt(compressed_evidence_list)
+            return formatted_context
 
         except Exception as e:
-            logger.error(f"{self.agent_id} failed during reasoning: {e}", exc_info=True)
-            return self.generate_error_response(f"Reasoning ensemble failed: {e}")
+            logger.error(f"{self.agent_name}: Failed to compress context, falling back to uncompressed: {e}", exc_info=True)
+            # [回退] 如果压缩失败，使用未压缩的上下文
+            formatted_context = self.retriever.format_context_for_prompt(evidence_list)
+            return formatted_context
 
-    def generate_error_response(self, error_msg: str) -> Dict[str, Any]:
+    async def _perform_analysis(self, context: str, task_content: dict) -> dict:
         """
-        Creates a standardized error response.
+        [已实现] 执行基本面分析 LLM 调用。
         """
-        return {
-            "agent_name": self.agent_id,
-            "error": error_msg,
-            "sentiment_label": "NEUTRAL",
-            "sentiment_score": 0.5,
-            "confidence": 0.0,
-            "key_drivers": [],
-            "key_risks": []
+        logger.debug(f"{self.agent_name}: Performing analysis...")
+        
+        prompt_inputs = {
+            "query": task_content.get("query"),
+            "company_name": task_content.get("company_name", "the target company"),
+            "context": context
         }
+        
+        # 使用 L1BaseAgent 中的 LLM 调用逻辑
+        analysis_result = await self.run_llm_analysis(
+            prompt_template_name=self.prompt_template_name,
+            prompt_inputs=prompt_inputs,
+            output_schema=self.config.get("output_schema", {})
+        )
+        
+        return analysis_result
