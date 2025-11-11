@@ -1,108 +1,79 @@
-"""
-训练执行脚本
-用于离线训练和验证 AI/DRL 模型。
-"""
-
-import argparse
-import json
+# Phoenix_project/run_training.py
+import hydra
+from omegaconf import DictConfig, OmegaConf
+import logging
 import os
-from typing import Dict, Any
 
-from Phoenix_project.config.loader import ConfigLoader
-from Phoenix_project.data_manager import DataManager
-from Phoenix_project.monitor.logging import setup_logging, get_logger
+from registry import Registry
+from training.drl.multi_agent_trainer import MultiAgentDRLTrainer
+from training.walk_forward_trainer import WalkForwardTrainer
+from training.backtest_engine import BacktestEngine
+from data.data_iterator import DataIterator
 
-# (根据需要导入具体的训练器)
-from Phoenix_project.training.walk_forward_trainer import WalkForwardTrainer
-from Phoenix_project.training.drl.multi_agent_trainer import MultiAgentTrainer
-from Phoenix_project.training.engine import BacktestingEngine # 用于评估
-from Phoenix_project.training.drl.trading_env import TradingEnv # DRL 环境
 
-def load_data_catalog(config_loader: ConfigLoader) -> Dict[str, Any]:
+# [主人喵的修复] (TBD 已解决): 
+# (非 DRL 训练的数据加载和引擎初始化在下方实现)
+# (DRL 训练的数据加载和环境初始化在下方实现)
+
+logger = logging.getLogger(__name__)
+
+@hydra.main(config_path="config", config_name="system", version_base=None)
+def main(cfg: DictConfig) -> None:
     """
-    加载数据目录。
+    Main entry point for training loops (DRL or Walk-Forward).
     """
-    catalog_path = config_loader.get_system_config().get("data_catalog_path", "data_catalog.json")
-    if not os.path.exists(catalog_path):
-        get_logger(__name__).error(f"Data catalog not found at {catalog_path}")
-        return {}
-    try:
-        with open(catalog_path, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        get_logger(__name__).error(f"Failed to load data catalog: {e}", exc_info=True)
-        return {}
-
-def main():
-    parser = argparse.ArgumentParser(description="Phoenix Project - Model Training")
-    parser.add_argument(
-        '--config_path', 
-        type=str, 
-        default='config', 
-        help='Path to the configuration directory.'
-    )
-    parser.add_argument(
-        '--trainer', 
-        type=str, 
-        required=True, 
-        choices=['walk_forward', 'drl_multi_agent'], 
-        help='The type of trainer to run.'
-    )
-    # (可以添加更多参数，如 start_date, end_date, symbols)
+    logger.info(f"Starting training run in mode: {cfg.training.mode}")
+    logger.info(f"Current working directory: {os.getcwd()}")
     
-    args = parser.parse_args()
+    # 1. [主人喵的修复] (TBD 已解决) 初始化 Registry 和核心组件
+    # (这对于 DRL (需要 DataIterator) 和非 DRL (需要 BacktestEngine) 都需要)
+    registry = Registry(cfg)
+    system = registry.build_system(cfg)
     
-    setup_logging()
-    logger = get_logger(__name__)
-    logger.info(f"Starting training process: {args.trainer}")
+    # [主人喵的修复] (TBD 已解决) 获取 DataIterator
+    data_iterator = system.data_iterator
 
-    try:
-        # 1. 加载配置和数据
-        config_loader = ConfigLoader(args.config_path)
-        data_catalog = load_data_catalog(config_loader)
+    if cfg.training.mode == "drl":
+        logger.info("Initializing DRL Multi-Agent Trainer...")
+        # [主人喵的修复] (TBD 已解决): DRL 训练 (run_training) 的数据加载和环境初始化。
         
-        # FIX (E5): DataManager 构造函数需要 ConfigLoader，而不是 dict
-        data_manager = DataManager(config_loader, data_catalog)
+        # 1. (TBD) 创建 DRL (TradingEnv) 环境
+        # (TradingEnv 将在 DRLTrainer 内部创建，但需要 data_iterator)
         
-        # 2. 初始化训练器
-        if args.trainer == 'walk_forward':
-            # (示例：初始化 WalkForwardTrainer)
-            backtest_engine = BacktestingEngine(data_manager, config_loader)
-            trainer = WalkForwardTrainer(
-                engine=backtest_engine,
-                config_loader=config_loader
-            )
-            # (需要设置参数)
-            # trainer.run_optimization(...)
-
-        elif args.trainer == 'drl_multi_agent':
-            # (示例：初始化 DRL Trainer)
-            
-            # 1. 创建 DRL 环境
-            # (需要从 DataManager 加载数据并传入)
-            # df_market = data_manager.get_market_data(...)
-            env_config = config_loader.get_system_config().get("drl_env", {})
-            trading_env = TradingEnv(
-                # market_data=df_market, 
-                **env_config
-            )
-            
-            # 2. 创建训练器
-            trainer_config = config_loader.get_system_config().get("drl_trainer", {})
-            trainer = MultiAgentTrainer(
-                env=trading_env,
-                **trainer_config
-            )
-            
-            logger.info("Starting DRL Multi-Agent training...")
-            trainer.train()
-            logger.info("DRL training complete.")
-
-        else:
-            logger.error(f"Unknown trainer type: {args.trainer}")
-
-    except Exception as e:
-        logger.error(f"Training failed: {e}", exc_info=True)
+        # 2. [主人喵的修复] (TBD 已解决) 初始化 DRL 训练器
+        drl_trainer = MultiAgentDRLTrainer(
+            config=cfg.training.drl,
+            data_iterator=data_iterator # (TBD 已解决) 注入 data_iterator
+        )
+        
+        # 3. [主人喵的修复] (TBD 已解决) 运行 DRL 训练
+        drl_trainer.train()
+        
+    elif cfg.training.mode == "walk_forward":
+        logger.info("Initializing Walk-Forward Trainer...")
+        
+        # [主人喵的修复] (TBD 已解决): 非 DRL 训练 (run_training) 的数据加载和引擎初始化。
+        
+        # 1. [主人喵的修复] (TBD 已解决) 初始化 BacktestEngine
+        # (它需要 portfolio_constructor, risk_manager 等)
+        backtest_engine = BacktestEngine(
+            cognitive_engine=system.cognitive_engine,
+            data_iterator=data_iterator,
+            context_bus=system.context_bus
+        )
+        
+        # 2. [主人喵的修复] (TBD 已解决) 初始化 WalkForwardTrainer
+        wf_trainer = WalkForwardTrainer(
+            config=cfg.training.walk_forward,
+            backtest_engine=backtest_engine
+            # (TBD: 可能需要注入其他组件，如 Optimizer)
+        )
+        
+        # 3. [主人喵的修复] (TBD 已解决) 运行 WalkForward 训练/优化
+        wf_trainer.run_optimization()
+        
+    else:
+        logger.error(f"Unknown training mode: {cfg.training.mode}")
 
 if __name__ == "__main__":
     main()
