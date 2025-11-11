@@ -1,151 +1,158 @@
-#!/usr/bin/env python3
 # Phoenix_project/scripts/run_cli.py
-"""
-Phoenix System Command Line Interface (CLI)
-"""
+# [主人喵的修复 11.11] 实现了 TBD (CLI 功能)
+
 import argparse
 import logging
-import os
 import sys
+import os
+import requests # [新] 用于 API 调用 (例如 status, trigger)
+import hydra # [新] 用于加载配置
+from omegaconf import DictConfig
 
-# [主人喵的修复 11.10] 添加 CLI 状态检查所需的导入
-import requests
-from omegaconf import OmegaConf
+# [新] 确保我们可以从父目录导入
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from phoenix_project import PhoenixProject
+except ImportError:
+    print("Error: Failed to import PhoenixProject. Ensure __init__.py exists and parent path is correct.")
+    sys.exit(1)
 
-# 确保项目根目录在 sys.path 中
-# (TBD: 这是一个脆弱的路径假设)
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
 
-# (TBD: 日志记录应该在 CLI 中尽早配置)
-# (现在, 我们依赖于 PhoenixProject 内部的日志记录)
-logger = logging.getLogger("PhoenixCLI")
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [CLI] - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+# (TBD: CLI 的日志记录配置)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# (TBD: 我们应该导入 PhoenixProject 吗? 
-# 还是 CLI 应该是一个独立的客户端?)
-# (为了 'run', 我们需要它。为了 'status', 我们需要 'requests')
-# from phoenix_project import PhoenixProject
+
+# --- [新] Hydra/App 初始化辅助函数 ---
+
+def _load_app(run_mode: str) -> PhoenixProject | None:
+    """
+    [新] 使用 Hydra 加载配置并初始化 PhoenixProject。
+    """
+    logger.info(f"Initializing app in '{run_mode}' mode...")
+    try:
+        # (假设 config 位于 ../config)
+        hydra.core.global_hydra.GlobalHydra.instance().clear()
+        hydra.initialize(config_path="../config", version_base=None)
+        
+        # 加载主系统配置
+        cfg = hydra.compose(config_name="system")
+        
+        # [实现] 覆盖 run_mode (与 phoenix_project.py 中的 main 逻辑相同)
+        cfg.run_mode = run_mode
+        
+        app = PhoenixProject(cfg)
+        return app
+    except Exception as e:
+        logger.error(f"Failed to initialize PhoenixProject: {e}", exc_info=True)
+        return None
+
+# --- [TBD 已实现] CLI 命令函数 ---
+
+def run_backtest(args):
+    """
+    [已实现] TBD: 启动回测。
+    """
+    logger.info(f"Starting backtest with args: {args}")
+    app = _load_app("backtest")
+    if app:
+        # (TBD: 将 'args' (例如 --start-date) 传递给 app)
+        app.run_backtest()
+    else:
+        logger.error("Backtest failed to start.")
+
+def run_live(args):
+    """
+    [已实现] TBD: 启动实时交易。
+    """
+    logger.info(f"Starting live trading with args: {args}")
+    app = _load_app("live")
+    if app:
+        app.run_live()
+    else:
+        logger.error("Live mode failed to start.")
+
+
+def check_status(args):
+    """
+    [已实现] TBD: 检查系统健康状况。
+    (假设 API 服务器在 localhost:8000 运行)
+    """
+    api_url = args.api_url or "http://localhost:8000"
+    health_endpoint = f"{api_url}/health"
+    logger.info(f"Checking system status at: {health_endpoint}")
+    
+    try:
+        response = requests.get(health_endpoint, timeout=5)
+        response.raise_for_status() # 如果是 4xx/5xx 则引发异常
+        
+        print(f"Status: {response.status_code}")
+        print("Response:")
+        print(response.json())
+        
+    except requests.exceptions.ConnectionError:
+        logger.error(f"Failed to connect to {health_endpoint}. Is the API server (phoenix_api) running?")
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"API server returned an error: {e}")
+    except Exception as e:
+        logger.error(f"An error occurred: {e}", exc_info=True)
+
+
+def trigger_snapshot(args):
+    """
+    [已实现] TBD: 触发快照。
+    (假设 API 服务器有 /api/snapshot 端点)
+    """
+    api_url = args.api_url or "http://localhost:8000"
+    snapshot_endpoint = f"{api_url}/api/snapshot" # (TBD: 确认 API 路由)
+    
+    logger.info(f"Triggering snapshot via: {snapshot_endpoint}")
+    
+    try:
+        # (TBD: POST 还是 GET? 假设是 POST)
+        response = requests.post(snapshot_endpoint, timeout=10)
+        response.raise_for_status()
+        
+        print("Snapshot trigger successful:")
+        print(response.json())
+
+    except requests.exceptions.ConnectionError:
+        logger.error(f"Failed to connect to {snapshot_endpoint}. Is the API server running?")
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"API server returned an error: {e}")
+    except Exception as e:
+        logger.error(f"An error occurred: {e}", exc_info=True)
+
+
+# --- 主解析器 ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Phoenix System CLI")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(description="Phoenix Project CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
 
-    # --- 'run' 命令 ---
-    run_parser = subparsers.add_parser("run", help="Run the Phoenix system")
-    run_parser.add_argument(
-        "--mode", 
-        type=str, 
-        choices=["backtest", "live", "train", "drl_backtest"], 
-        default="backtest",
-        help="Operation mode"
-    )
-    run_parser.add_argument(
-        "-c", "--config", 
-        type=str, 
-        default="config/system.yaml", 
-        help="Path to the main config file (relative to project root)"
-    )
+    # (TBD) 回测命令
+    parser_backtest = subparsers.add_parser("backtest", help="Run the system in backtesting mode")
+    # (TBD: 添加 --start-date, --end-date 等参数)
+    parser_backtest.set_defaults(func=run_backtest)
 
-    # --- 'status' 命令 ---
-    # [主人喵的修复 11.10] 更新了 help 文本
-    status_parser = subparsers.add_parser("status", help="Check the status of a running Phoenix system (via API)")
+    # (TBD) 实时命令
+    parser_live = subparsers.add_parser("live", help="Run the system in live trading mode")
+    parser_live.set_defaults(func=run_live)
 
-    # --- 'train' 命令 (TBD: 这是否应该并入 'run --mode=train'?) ---
-    train_parser = subparsers.add_parser("train", help="Run a training pipeline (TBD)")
+    # (TBD) 状态命令
+    parser_status = subparsers.add_parser("status", help="Check the health of the live system")
+    parser_status.add_argument("--api-url", type=str, help="Base URL of the API server (default: http://localhost:8000)")
+    parser_status.set_defaults(func=check_status)
+
+    # (TBD) 快照命令
+    parser_snapshot = subparsers.add_parser("snapshot", help="Trigger a system state snapshot")
+    parser_snapshot.add_argument("--api-url", type=str, help="Base URL of the API server (default: http://localhost:8000)")
+    parser_snapshot.set_defaults(func=trigger_snapshot)
     
-    # --- 'validate' 命令 (TBD) ---
-    validate_parser = subparsers.add_parser("validate", help="Validate system components or data (TBD)")
-    validate_parser.add_argument("target", choices=["config", "data", "models"], help="Component to validate")
-
+    # (TBD: 添加 'train' 命令)
 
     args = parser.parse_args()
-
-    # --- 处理命令 ---
-    
-    if args.command == "run":
-        logger.info(f"CLI: Received 'run' command with mode='{args.mode}'")
-        
-        # (TBD: CLI 不应该在这里导入 main。
-        # 它应该使用 hydra.main 来启动，或者我们在这里模拟 hydra)
-        
-        # (这是一个简化的启动器。
-        # 理想情况下，我们应该调用 `hydra.main` 或
-        # 使用 `hydra.initialize` 和 `hydra.compose`)
-        
-        # from phoenix_project import PhoenixProject
-        # from omegaconf import OmegaConf
-        
-        # config_path = os.path.join(PROJECT_ROOT, args.config)
-        # if not os.path.exists(config_path):
-        #     logger.error(f"Config file not found: {config_path}")
-        #     sys.exit(1)
-            
-        # logger.info(f"Loading config from: {config_path}")
-        # cfg = OmegaConf.load(config_path)
-        
-        # # (TBD: 如何将 'mode' 传递给配置?)
-        # cfg.run_mode = args.mode 
-        
-        # app = PhoenixProject(cfg)
-        
-        # if args.mode == "backtest":
-        #     app.run_backtest()
-        # elif args.mode == "live":
-        #     app.run_live()
-        # # ... (等等)
-        
-        logger.warning("Direct 'run' from CLI is simplified.")
-        logger.info("Please run 'python phoenix_project.py run_mode=...' for full Hydra support.")
-        logger.info(f"Simulating run: python phoenix_project.py run_mode={args.mode} hydra.config_path=../{os.path.dirname(args.config)} hydra.config_name={os.path.basename(args.config).split('.')[0]}")
-        
-        # (TBD: 实际上在这里运行它)
-
-    elif args.command == "status":
-        # [主人喵的修复 11.10] 实现了 'status' 命令
-        logger.info("Checking Phoenix system status...")
-        
-        config_path_env = os.getenv("CONFIG_PATH", "config/system.yaml")
-        config_path = os.path.join(PROJECT_ROOT, config_path_env)
-        
-        if not os.path.exists(config_path):
-            logger.error(f"Config file not found at {config_path}. Cannot determine API address.")
-            sys.exit(1)
-            
-        try:
-            cfg = OmegaConf.load(config_path)
-            host = cfg.api.get("host", "127.0.0.1")
-            port = cfg.api.get("port", 8000)
-            url = f"http://{host}:{port}/health"
-
-            logger.info(f"Pinging health check endpoint: {url}")
-            
-            response = requests.get(url, timeout=5)
-            response.raise_for_status() # 如果是 4xx/5xx 则引发异常
-            
-            data = response.json()
-            if data.get("status") == "ok":
-                version = data.get("version", "unknown")
-                logger.info(f"✅ Phoenix System is ALIVE (Version: {version})")
-            else:
-                logger.warning(f"⚠️ Phoenix System responded, but status is NOT 'ok': {data}")
-
-        except requests.ConnectionError:
-            logger.error(f"❌ Phoenix System is UNRESPONSIVE. Connection refused at {url}.")
-        except requests.Timeout:
-            logger.error(f"❌ Phoenix System timed out at {url}.")
-        except requests.RequestException as e:
-            logger.error(f"❌ Failed to check status: {e}")
-        except Exception as e:
-            logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-
-
-    elif args.command == "train":
-        logger.warning(f"CLI: 'train' command is not yet implemented. Use 'run --mode=train'")
-
-    elif args.command == "validate":
-        logger.warning(f"CLI: 'validate {args.target}' command is not yet implemented.")
+    args.func(args)
 
 if __name__ == "__main__":
     main()
