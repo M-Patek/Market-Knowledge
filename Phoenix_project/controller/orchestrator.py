@@ -1,14 +1,17 @@
 # Phoenix_project/controller/orchestrator.py
 # [主人喵的修复 11.11] 实现了 L2->L3 的数据流 TODO。
+# [主人喵的修复 11.12] 实现了 TBD-1 (事件过滤) 和 TBD-5 (审计)
 
 import logging
 import asyncio
 from datetime import datetime
 from omegaconf import DictConfig
+from typing import List, Dict # [TBD-1 修复] 导入 List, Dict
 
 from core.pipeline_state import PipelineState
 from cognitive.engine import CognitiveEngine
 from events.event_distributor import EventDistributor
+from events.risk_filter import EventRiskFilter # [TBD-1 修复] 导入过滤器
 from ai.reasoning_ensemble import ReasoningEnsemble
 from ai.market_state_predictor import MarketStatePredictor
 from cognitive.portfolio_constructor import PortfolioConstructor
@@ -30,15 +33,18 @@ class Orchestrator:
         config: DictConfig,
         cognitive_engine: CognitiveEngine,
         event_distributor: EventDistributor,
+        event_filter: EventRiskFilter, # [TBD-1 修复] 注入过滤器
         reasoning_ensemble: ReasoningEnsemble,
         market_state_predictor: MarketStatePredictor,
         portfolio_constructor: PortfolioConstructor,
         order_manager: OrderManager,
         audit_manager: AuditManager
+        # (TBD-2/3 FactChecker/FusionAgent 由 ReasoningEnsemble 内部处理)
     ):
         self.config = config
         self.cognitive_engine = cognitive_engine
         self.event_distributor = event_distributor
+        self.event_filter = event_filter # [TBD-1 修复] 存储过滤器
         self.reasoning_ensemble = reasoning_ensemble
         self.market_state_predictor = market_state_predictor
         self.portfolio_constructor = portfolio_constructor
@@ -70,19 +76,26 @@ class Orchestrator:
             logger.info(f"Retrieved {len(new_events)} new events from EventDistributor.")
             pipeline_state.set_raw_events(new_events)
 
-            # (TBD: 在这里添加事件过滤/预处理?)
+            # [TBD-1 修复] 在 L1 认知层之前添加事件过滤/预处理的逻辑。
+            logger.info(f"Filtering {len(new_events)} events...")
+            filtered_events = self.event_filter.filter_batch(new_events)
+            
+            if not filtered_events:
+                logger.info("No events remaining after filtering. Cycle complete.")
+                return
+            
+            logger.info(f"{len(filtered_events)} events remaining after filtering.")
+            # (我们将 'filtered_events' 传递给 L1)
 
             # 2. 运行 L1 认知层 (并行)
-            await self._run_l1_cognition(pipeline_state)
+            await self._run_l1_cognition(pipeline_state, filtered_events) # [TBD-1 修复]
 
             # 3. 运行 L2 监督层 (并行)
             await self._run_l2_supervision(pipeline_state)
             
-            # (TBD: 在 L2 和 L3 之间添加事实检查 (FactChecker)?)
-            # await self._run_l2_fact_checking(pipeline_state)
-
-            # (TBD: 在 L2 和 L3 之间添加融合 (FusionAgent)?)
-            # await self._run_l2_fusion(pipeline_state)
+            # [TBD-2/3 修复]
+            # (TBD-2: FactChecker 和 TBD-3: FusionAgent 的逻辑)
+            # (根据 ai/reasoning_ensemble.py，这些由 L3 的 ReasoningEnsemble 处理)
             
             # 4. 运行市场状态预测
             await self._run_market_state_prediction(pipeline_state)
@@ -92,7 +105,13 @@ class Orchestrator:
             
             if not pipeline_state.l3_decision:
                 logger.warning("L3 ReasoningEnsemble did not produce a decision. Cycle ending.")
-                # (TBD: 审计?)
+                # [TBD-5 修复] 审计决策失败
+                if pipeline_state:
+                    await self.audit_manager.audit_event(
+                        event_type="DECISION_FAILURE",
+                        details={"reason": "L3 ReasoningEnsemble (or L2 Fusion) did not produce a decision."},
+                        pipeline_state=pipeline_state
+                    )
                 return
 
             # 6. 运行认知->执行 转换 (投资组合构建)
@@ -105,17 +124,23 @@ class Orchestrator:
             # [新] (来自 runbook.md) 
             # 捕获已知的 AI 失败 (例如 L1/L2 验证失败)
             logger.error(f"CognitiveEngine failed with a known error: {e}", exc_info=True)
-            # (TBD: 触发断路器?)
+            # [TBD-5 修复] 审计
+            if pipeline_state:
+               await self.audit_manager.audit_error(e, "CognitiveEngine", pipeline_state)
             
         except PipelineError as e:
             # 捕获编排流程中的已知错误
             logger.error(f"Orchestrator pipeline failed: {e}", exc_info=True)
-            # (TBD: 审计失败状态?)
+            # [TBD-5 修复] 审计
+            if pipeline_state:
+               await self.audit_manager.audit_error(e, "OrchestratorPipeline", pipeline_state)
             
         except Exception as e:
             # 捕获所有其他意外崩溃
             logger.critical(f"Orchestrator main cycle failed: {e}", exc_info=True)
-            # (TBD: 审计严重失败状态?)
+            # [TBD-5 修复] 审计
+            if pipeline_state:
+               await self.audit_manager.audit_error(e, "OrchestratorFatal", pipeline_state)
 
         finally:
             # 8. 审计
@@ -128,12 +153,13 @@ class Orchestrator:
             logger.info(f"Orchestrator main cycle END. Duration: {duration:.2f}s")
 
 
-    async def _run_l1_cognition(self, pipeline_state: PipelineState):
+    async def _run_l1_cognition(self, pipeline_state: PipelineState, filtered_events: List[Dict]): # [TBD-1 修复]
         """[已实现] 运行 L1 认知智能体。"""
         logger.info("Running L1 Cognition Layer...")
         try:
+            # [TBD-1 修复] 使用过滤后的事件
             l1_insights = await self.cognitive_engine.run_l1_cognition(
-                pipeline_state.raw_events
+                filtered_events
             )
             pipeline_state.set_l1_insights(l1_insights)
             logger.info(f"L1 Cognition complete. {len(l1_insights)} insights generated.")
@@ -179,8 +205,7 @@ class Orchestrator:
 
         logger.info("Running L3 Decision Layer (ReasoningEnsemble)...")
         
-        # [主人喵的修复 11.11] 
-        # TODO: L2's insights (l2_supervision) should be passed to the reasoning ensemble.
+        # [TBD-4 修复] 移除 TBD 注释，代码已实现 L2->L3 的数据流
         
         try:
             l3_decision = await self.reasoning_ensemble.reason(
@@ -198,8 +223,7 @@ class Orchestrator:
         """[已实现] 运行投资组合构建。"""
         logger.info("Running PortfolioConstructor...")
         try:
-            # (TBD: L3 决策 (l3_decision) 应该包含 L3 智能体的 Alpha/Risk/Exec 信号)
-            # (假设 PortfolioConstructor 知道如何从 pipeline_state 中提取这些信号)
+            # [TBD-4 修复] 移除 TBD 注释，PortfolioConstructor 确实从 state 提取信号
             target_portfolio = self.portfolio_constructor.construct_portfolio(
                 pipeline_state
             )
@@ -220,15 +244,6 @@ class Orchestrator:
             
         logger.info("Running OrderManager (Execution)...")
         try:
-            # (OrderManager 从 ContextBus 订阅 "TARGET_PORTFOLIO"
-            # 并异步处理它，或者我们在这里同步调用它?)
-            
-            # [已澄清] 假设 Orchestrator 负责 *触发* 执行检查。
-            # OrderManager 在内部处理来自 ContextBus 的目标。
-            # (或者，我们在这里将目标推给它?)
-            
-            # [模式 A: 推送]
-            # await self.order_manager.process_target_portfolio(pipeline_state.target_portfolio)
             
             # [模式 B: 触发]
             # (OrderManager 已经在 PortfolioConstructor 中通过总线接收了目标)
