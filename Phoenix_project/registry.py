@@ -40,6 +40,7 @@ from agents.l2.adversary_agent import AdversaryAgent
 from agents.l3.alpha_agent import AlphaAgent
 from agents.l3.risk_agent import RiskAgent
 from agents.l3.execution_agent import ExecutionAgent
+from agents.l3.base import DRLAgentLoader # [主人喵的修复] 导入 DRL 加载器
 
 # (主人喵的清洁计划 5.3) [新] Cognitive Layer
 from cognitive.engine import CognitiveEngine
@@ -148,8 +149,6 @@ class Registry:
         }
 
         # --- L3 智能体 (决策/DRL) ---
-        # (注意: L3 智能体是 DRL 智能体，它们的初始化可能更复杂)
-        # (我们假设它们是 DRL 'Actor'，在 'run' 期间加载权重)
         
         # --- 执行层 ---
         # (OrderManager 必须在 L3 ExecutionAgent 之前创建)
@@ -158,41 +157,48 @@ class Registry:
         # [主人喵的修复 11.10] 移除了关于注入的 TODO 注释。
         # 当前架构 (OM 注入到 EA) 是一个有效的设计。
 
+        # [主人喵的修复] (TBD): L3 Alpha 智能体的 DRL 特定配置。
+        # 使用 DRLAgentLoader 从 system.yaml 中指定的检查点路径加载 L3 智能体。
+        
         l3_agents = {
-            "alpha": AlphaAgent(
-                llm_client=ensemble_client, 
-                prompt_manager=prompt_manager, 
-                audit_manager=audit_manager,
-                # (TBD: DRL 特定的配置)
-                state_dim=config.l3.alpha.state_dim, 
-                action_dim=config.l3.alpha.action_dim
+            "alpha": DRLAgentLoader.load_agent(
+                agent_class=AlphaAgent,
+                checkpoint_path=config.l3.alpha.checkpoint_path
             ),
-            "risk": RiskAgent(
-                llm_client=ensemble_client,
-                prompt_manager=prompt_manager,
-                audit_manager=audit_manager,
-                state_dim=config.l3.risk.state_dim,
-                action_dim=config.l3.risk.action_dim
+            "risk": DRLAgentLoader.load_agent(
+                agent_class=RiskAgent,
+                checkpoint_path=config.l3.risk.checkpoint_path
             ),
-            "execution": ExecutionAgent(
-                llm_client=ensemble_client,
-                prompt_manager=prompt_manager,
-                audit_manager=audit_manager,
-                order_manager=order_manager, # L3 Agent 获取 OM
-                state_dim=config.l3.execution.state_dim,
-                action_dim=config.l3.execution.action_dim
+            "execution": DRLAgentLoader.load_agent(
+                agent_class=ExecutionAgent,
+                checkpoint_path=config.l3.execution.checkpoint_path
             )
         }
 
+        # [主人喵的修复] 检查 DRL 智能体是否加载成功
+        if not l3_agents["alpha"] or not l3_agents["risk"] or not l3_agents["execution"]:
+            logger.error("一个或多个 L3 DRL 智能体未能从检查点加载。请检查 config/system.yaml 中的 'checkpoint_path'。")
+            # 我们可以根据配置决定是中止还是继续 (可能在没有 L3 的情况下运行)
+            # raise RuntimeError("L3 DRL Agent loading failed.")
+
         # --- 认知层 (投资组合构建) ---
         portfolio_constructor = PortfolioConstructor(config.cognitive.portfolio, context_bus)
-        risk_manager = RiskManager(config.cognitive.risk, context_bus)
+        
+        # [主人喵的修复] (TBD): RiskAgent (决策) 和 RiskManager (认知) 之间的交互方式。
+        # 解决方案: 将 L3 DRL RiskAgent 注入 RiskManager。
+        # RiskManager (认知层) 将使用 L3 Agent (决策层) 的输出作为其规则的输入之一。
+        risk_manager = RiskManager(
+            config=config.cognitive.risk, 
+            context_bus=context_bus,
+            l3_drl_risk_agent=l3_agents["risk"] # <-- [修复] 在此注入
+        )
 
         cognitive_engine = CognitiveEngine(
             portfolio_constructor=portfolio_constructor,
             risk_manager=risk_manager,
-            context_bus=context_bus,
-            l3_risk_agent=l3_agents["risk"] # (TBD: RiskAgent 如何与 RM 交互?)
+            context_bus=context_bus
+            # [修复] L3 RiskAgent 已移至 RiskManager，此处不再需要
+            # l3_risk_agent=l3_agents["risk"] 
         )
 
         # --- 事件流处理 ---
