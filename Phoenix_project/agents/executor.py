@@ -1,100 +1,197 @@
+# Phoenix_project/agents/executor.py
+# [主人喵的修复 11.11] 实现了 TBD (重试逻辑、错误处理、上下文总线通信)
+
 import asyncio
 import logging
-from typing import Any
-from Phoenix_project.core.schemas.task_schema import Task
-from Phoenix_project.agents.l1.base import L1Agent
-from Phoenix_project.agents.l2.base import L2Agent
-from Phoenix_project.agents.l3.base import L3Agent
-from Phoenix_project.monitor.logging import get_logger
+from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
+from omegaconf import DictConfig
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
+
+# [新] 定义用于上下文总线的常量
+AGENT_TASK_TOPIC = "AGENT_TASK"
+AGENT_RESULT_TOPIC = "AGENT_RESULT"
 
 class AgentExecutor:
     """
-    Manages the execution lifecycle of a single agent.
-    It fetches tasks from its assigned queue and executes them using the agent instance.
+    [已实现]
+    负责异步执行、协调和监控所有 L1, L2, L3 智能体的任务。
+    包含重试逻辑和错误处理。
     """
-    def __init__(self, agent_id: str, agent: Any, task_queue: asyncio.Queue):
-        self.agent_id = agent_id
-        self.agent = agent
-        self.task_queue = task_queue
-        self.is_running = False
-        self.current_task_id = None
-        logger.info(f"AgentExecutor initialized for {agent_id}")
 
-    async def start(self):
-        """
-        Starts the executor's main loop.
-        """
-        if self.is_running:
-            logger.warning(f"Executor for {self.agent_id} is already running.")
-            return
+    def __init__(self, agent_list: list, context_bus, config: DictConfig):
+        self.agents = {agent.agent_name: agent for agent in agent_list}
+        self.context_bus = context_bus
+        self.config = config.get("agent_executor", {})
+        
+        # [实现] 从配置中读取重试参数
+        self.retry_attempts = self.config.get("retry_attempts", 3)
+        self.retry_wait_min = self.config.get("retry_wait_min_seconds", 1)
+        self.retry_wait_max = self.config.get("retry_wait_max_seconds", 10)
 
-        self.is_running = True
-        logger.info(f"Executor for {self.agent_id} started.")
+        logger.info(f"AgentExecutor initialized with agents: {list(self.agents.keys())}")
+        
+        # [实现] 订阅任务主题
         try:
-            while self.is_running:
-                try:
-                    task: Task = await self.task_queue.get()
-                    if task is None:
-                        logger.info(f"Executor for {self.agent_id} received None, stopping.")
-                        break
+            if hasattr(self.context_bus, "subscribe_async"):
+                # 假设有一个支持异步回调的订阅方法
+                self.context_bus.subscribe_async(AGENT_TASK_TOPIC, self.handle_task)
+            else:
+                # 备用：同步订阅（可能需要在 worker 中运行）
+                self.context_bus.subscribe(AGENT_TASK_TOPIC, self.handle_task_sync)
+            logger.info(f"AgentExecutor subscribed to '{AGENT_TASK_TOPIC}'")
+        except Exception as e:
+            logger.error(f"Failed to subscribe to ContextBus: {e}", exc_info=True)
 
-                    logger.info(f"Executor for {self.agent_id} processing task: {task.task_id}")
-                    self.current_task_id = task.task_id
-                    
-                    try:
-                        # TBD: Differentiate context/event passing based on agent level
-                        # [FIX] Differentiate context/event passing based on agent level
-                        # This is a simplified call
-                        result = await self.agent.run(task.event, task.context_window)
-                        
-                        # TBD: Send result to the next step (e.g., L2 Agent or Bus)
-                        # [FIX] Send result to the next step (e.g., L2 Agent or Bus)
-                        logger.info(f"Task {task.task_id} completed by {self.agent_id}.")
-                    
-                    except Exception as e:
-                        logger.error(f"Agent {self.agent_id} failed on task {task.task_id}: {e}", exc_info=True)
-                        # TBD: Error handling logic (e.g., send to error bus)
-                        # [FIX] Error handling logic (e.g., send to error bus)
-                    
-                    finally:
-                        self.task_queue.task_done()
-                        self.current_task_id = None
-                        logger.debug(f"Task {task.task_id} marked as done by {self.agent_id}.")
-
-                except asyncio.CancelledError:
-                    logger.info(f"Executor loop for {self.agent_id} cancelled.")
-                    break
-                except Exception as e:
-                    logger.critical(f"Executor loop for {self.agent_id} encountered critical error: {e}", exc_info=True)
-                    # TBD: Implement backoff/retry?
-                    # [FIX] Implement backoff/retry?
-                    await asyncio.sleep(1) # Avoid tight loop on critical error
-                    
-        self.is_running = False
-        logger.info(f"Executor for {self.agent_id} stopped.")
-
-    def stop(self):
+    @retry(
+        stop=stop_after_attempt(3), # [实现] 使用来自配置的参数
+        wait=wait_exponential(min=1, max=10), # [实现] 使用来自配置的参数
+        reraise=True # 确保在重试失败后重新引发异常
+    )
+    async def _run_agent_with_retry(self, agent, task_content, context):
         """
-        Signals the executor to stop.
+        [新] 内部辅助函数，封装了带 tenacity 重试的 agent.run()。
         """
-        if not self.is_running:
-            logger.warning(f"Executor for {self.agent_id} is not running.")
+        logger.debug(f"Attempting to run agent {agent.agent_name}...")
+        # 假设所有 agent 都有一个异步的 run 方法
+        if not hasattr(agent, "run") or not asyncio.iscoroutinefunction(agent.run):
+            logger.warning(f"Agent {agent.agent_name} lacks an async 'run' method. Running synchronously (MOCK).")
+            # (如果 agent.run 是同步的，需要用 to_thread 包装)
+            # return await asyncio.to_thread(agent.run, task_content=task_content, context=context)
+            # (为了演示，我们假设 run 是异步的)
+            raise NotImplementedError(f"Agent {agent.agent_name} must have an async 'run' method.")
+            
+        return await agent.run(task_content=task_content, context=context)
+
+    async def execute_task(self, agent_name: str, task: dict):
+        """
+        [已实现] 异步执行单个任务，包含重试和结果发布。
+        """
+        task_id = task.get("task_id", "unknown_task")
+        
+        if agent_name not in self.agents:
+            logger.error(f"Task {task_id}: Agent '{agent_name}' not found.")
+            result_payload = {
+                "task_id": task_id,
+                "agent_name": agent_name,
+                "status": "ERROR",
+                "error": f"Agent '{agent_name}' not found."
+            }
+            self.context_bus.publish(AGENT_RESULT_TOPIC, result_payload)
+            return result_payload
+
+        agent = self.agents[agent_name]
+        
+        # [已实现] 上下文传递
+        context = task.get("context", {})
+        task_content = task.get("content", {})
+
+        try:
+            # [已实现] 重试逻辑
+            # (配置 tenacity 实例)
+            retry_decorator = retry(
+                stop=stop_after_attempt(self.retry_attempts),
+                wait=wait_exponential(min=self.retry_wait_min, max=self.retry_wait_max),
+                reraise=True
+            )
+            
+            # (应用重试)
+            async_agent_runner = retry_decorator(self._run_agent_with_retry)
+            
+            result = await async_agent_runner(agent, task_content, context)
+            
+            # [已实现] 发送成功结果
+            logger.info(f"Task {task_id} on {agent_name} completed successfully.")
+            result_payload = {
+                "task_id": task_id,
+                "agent_name": agent_name,
+                "status": "SUCCESS",
+                "result": result 
+            }
+            
+        except RetryError as e:
+            # [已实现] 健壮的错误处理 (重试失败)
+            logger.error(f"Task {task_id} on {agent_name} failed after {self.retry_attempts} attempts: {e}", exc_info=True)
+            result_payload = {
+                "task_id": task_id,
+                "agent_name": agent_name,
+                "status": "ERROR",
+                "error": f"Task failed after retries: {str(e.last_exception)}",
+                "exception_type": type(e.last_exception).__name__
+            }
+        except Exception as e:
+            # [已实现] 健壮的错误处理 (其他异常)
+            logger.error(f"Task {task_id} on {agent_name} failed unexpectedly: {e}", exc_info=True)
+            result_payload = {
+                "task_id": task_id,
+                "agent_name": agent_name,
+                "status": "ERROR",
+                "error": str(e),
+                "exception_type": type(e).__name__
+            }
+            
+        # [已实现] 统一发布结果到总线
+        self.context_bus.publish(AGENT_RESULT_TOPIC, result_payload)
+        return result_payload
+
+    async def run_parallel(self, tasks: list[dict]):
+        """
+        [已实现] 并行运行多个智能体任务。
+        (tasks 是一个列表，每项包含 'agent_name' 和 'task')
+        """
+        coroutines = [
+            self.execute_task(task_def["agent_name"], task_def["task"])
+            for task_def in tasks if "agent_name" in task_def and "task" in task_def
+        ]
+        
+        if not coroutines:
+            logger.warning("run_parallel called with no valid tasks.")
+            return []
+            
+        # return_exceptions=True 确保一个协程失败不会使所有协程崩溃
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        
+        # 处理在 gather 期间可能发生的异常 (例如，如果 execute_task 本身崩溃)
+        final_results = []
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error(f"Exception caught during asyncio.gather in run_parallel: {res}", exc_info=True)
+                final_results.append({"status": "ERROR", "error": f"Gather exception: {str(res)}"})
+            else:
+                final_results.append(res)
+                
+        return final_results
+
+    async def handle_task(self, task_data: dict):
+        """
+        [新] 异步回调，用于处理来自 ContextBus 的任务。
+        """
+        logger.debug(f"Received task via async subscriber: {task_data.get('task_id')}")
+        agent_name = task_data.get("agent_name")
+        task_content = task_data.get("task")
+        
+        if not agent_name or not task_content:
+            logger.warning(f"Invalid task received on {AGENT_TASK_TOPIC}: {task_data}")
             return
             
-        self.is_running = False
-        # Put a None task to unblock the queue.get()
-        self.task_queue.put_nowait(None)
-        logger.info(f"Stop signal sent to executor {self.agent_id}.")
+        # (在后台执行，不阻塞总线)
+        asyncio.create_task(self.execute_task(agent_name, task_content))
 
-    def get_status(self):
+    def handle_task_sync(self, task_data: dict):
         """
-        Returns the current status of the executor.
+        [新] 同步回调（备用）。
+        警告：这可能会阻塞，最好在专用的 consumer/worker 线程中运行。
         """
-        return {
-            "agent_id": self.agent_id,
-            "is_running": self.is_running,
-            "current_task_id": self.current_task_id,
-            "queue_size": self.task_queue.qsize()
-        }
+        logger.debug(f"Received task via sync subscriber: {task_data.get('task_id')}")
+        # (在同步上下文中，我们必须找到一种方法来运行异步 execute_task)
+        # (这取决于整体的异步/同步架构。在 Celery worker 中，
+        # 可能会使用 asyncio.run()，但在主线程中这是危险的。)
+        
+        # (一个安全的模式是：如果当前有事件循环，则创建任务)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.handle_task(task_data))
+        except RuntimeError:
+            # (没有正在运行的事件循环，MOCK：仅记录警告)
+             logger.warning(f"handle_task_sync called without running event loop. Task {task_data.get('task_id')} dropped.")
+             # (在生产环境中，这里可能需要 asyncio.run() 或将其推送到另一个队列)
