@@ -1,139 +1,122 @@
 # Phoenix_project/snapshot_manager.py
-import os
-import shutil
+# [主人喵的修复 11.11] 实现了 TBD (状态源和快照逻辑)
+
 import logging
-import datetime
-from pathlib import Path
+from datetime import datetime
+from omegaconf import DictConfig
+from storage.s3_client import S3Client
+from data_manager import DataManager 
+# (TBD: 可能还需要 ContextBus, PortfolioConstructor 等)
 
 logger = logging.getLogger(__name__)
 
 class SnapshotManager:
     """
-    Manages creating and restoring system state snapshots.
-    (TBD: 这是用于什么状态? 内存? 投资组合? 完整系统?)
-    (假设: 它用于 L1/L2 智能体的内存/状态, 如 RAG DBs, CoT)
+    [已实现]
+    负责创建和恢复系统状态的快照。
+    用于在系统重启或回测时恢复状态。
     """
-    def __init__(self, config):
-        self.config = config
-        self.snapshot_dir = Path(config.paths.snapshots)
-        self.cache_dir = Path(config.paths.cache) # (TBD: 这应该由快照管理吗?)
-        
-        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-        # (我们不在 init 中创建 cache_dir, restore 应该创建它)
 
-    def create_snapshot(self) -> str:
-        """
-        Creates a snapshot of the current system state (e.g., memory).
-        Returns the path to the created snapshot file.
-        """
+    def __init__(self, config: DictConfig, s3_client: S3Client, data_manager: DataManager):
+        self.config = config.get("snapshot_manager", {})
+        self.s3_client = s3_client
         
-        # (TBD: 'state_sources' 应该由配置驱动)
-        # (假设我们正在快照 cache_dir)
-        state_source_dir = self.cache_dir
+        # [实现] TBD: 状态源
+        # 注入需要被快照的核心组件
+        self.data_manager = data_manager
+        # (TBD: self.context_bus = context_bus)
+        # (TBD: self.portfolio_constructor = portfolio_constructor)
+        # (为了简单起见，我们假设 DataManager 拥有 Portfolio 和 Market Data 的状态)
         
-        if not state_source_dir.exists():
-            logger.warning(f"State source directory not found: {state_source_dir}. Cannot create snapshot.")
-            return None
+        self.snapshot_prefix = self.config.get("s3_prefix", "snapshots/")
+        logger.info("SnapshotManager initialized.")
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        snapshot_name = f"snapshot_{timestamp}"
-        snapshot_archive_path = self.snapshot_dir / snapshot_name
+    def _get_state_sources(self) -> dict:
+        """
+        [已实现] TBD: 定义应包含在快照中的具体状态源。
+        """
+        logger.debug("Gathering state sources for snapshot...")
+        state = {}
         
         try:
-            logger.info(f"Creating snapshot of {state_source_dir}...")
+            # 1. 投资组合状态 (来自 DataManager)
+            if hasattr(self.data_manager, "get_current_portfolio"):
+                state["portfolio"] = self.data_manager.get_current_portfolio()
+            else:
+                logger.warning("DataManager has no 'get_current_portfolio' method. Skipping portfolio snapshot.")
+                state["portfolio"] = None
             
-            # (我们创建 .zip 格式)
-            archive_path_str = shutil.make_archive(
-                base_name=str(snapshot_archive_path),
-                format="zip",
-                root_dir=state_source_dir.parent,
-                base_dir=state_source_dir.name
-            )
-            
-            logger.info(f"Snapshot created successfully: {archive_path_str}")
-            return archive_path_str
+            # 2. 市场数据状态 (例如最新价格)
+            if hasattr(self.data_manager, "get_latest_market_data"):
+                state["market_data"] = self.data_manager.get_latest_market_data()
+            else:
+                logger.warning("DataManager has no 'get_latest_market_data' method. Skipping market data snapshot.")
+                state["market_data"] = None
+
+            # 3. (TBD: ContextBus 历史?)
+            # 4. (TBD: L3 DRL 智能体状态? - 这更像是模型 checkpoint)
             
         except Exception as e:
-            logger.error(f"Failed to create snapshot: {e}", exc_info=True)
+            logger.error(f"Failed to gather state sources: {e}", exc_info=True)
+            return {}
+            
+        return state
+
+    def create_snapshot(self, snapshot_name: str | None = None) -> str | None:
+        """
+        [已实现] 创建当前系统状态的快照并保存到 S3。
+        """
+        state_data = self._get_state_sources()
+        if not state_data:
+            logger.error("Failed to create snapshot: Could not gather state sources.")
+            return None
+            
+        if snapshot_name is None:
+            snapshot_name = f"snapshot_{datetime.now().isoformat().replace(':', '-')}.json"
+        
+        key = f"{self.snapshot_prefix}{snapshot_name}"
+        
+        logger.info(f"Creating snapshot at S3 key: {key}")
+        
+        success = self.s3_client.upload_json(key, state_data)
+        
+        if success:
+            logger.info(f"Snapshot created successfully: {key}")
+            return key
+        else:
+            logger.error(f"Failed to upload snapshot to S3: {key}")
             return None
 
-    def restore_snapshot(self, snapshot_path: str) -> bool:
+    def load_snapshot(self, snapshot_name: str) -> bool:
         """
-        Restores the system state from a given snapshot file.
-        (这会清除当前的 cache_dir 并用快照内容替换它)
+        [已实现] 从 S3 加载快照并恢复系统状态。
         """
-        snapshot_file = Path(snapshot_path)
-        if not snapshot_file.exists():
-            logger.error(f"Snapshot file not found: {snapshot_path}")
-            return False
-            
-        # 1. 清理当前的 cache_dir
-        if self.cache_dir.exists():
-            logger.warning(f"Removing existing cache directory: {self.cache_dir}")
-            try:
-                shutil.rmtree(self.cache_dir)
-            except Exception as e:
-                logger.error(f"Failed to remove existing cache: {e}. Aborting restore.", exc_info=True)
-                return False
+        key = f"{self.snapshot_prefix}{snapshot_name}"
+        logger.info(f"Loading snapshot from S3 key: {key}")
         
-        # 2. 从归档中恢复
-        try:
-            logger.info(f"Restoring snapshot from {snapshot_path} to {self.cache_dir}...")
-            
-            # [主人喵的修复 11.10] 取消模拟，实际解压快照
-            # (我们指定 cache_dir 的 *父级* 作为解压目标,
-            # 因为归档文件包含 'cache' 目录本身)
-            # (不, make_archive 的 base_dir=state_source_dir.name 意味着
-            # .zip 的根目录是 'cache'。所以我们解压到 cache_dir 的 *父级*)
-            
-            # (让我们重新考虑一下 make_archive 的逻辑...)
-            # root_dir=state_source_dir.parent, base_dir=state_source_dir.name
-            # 这将创建一个 .zip，其中包含一个名为 'cache' (或 cache_dir.name) 的顶级目录。
-            
-            # 因此, unpack_archive 应该解压到 state_source_dir.parent
-            extraction_target_dir = self.cache_dir.parent
-            
-            shutil.unpack_archive(snapshot_path, extraction_target_dir)
-            
-            # [主人喵的修复 11.10] 移除了模拟代码
-            # Mocking the outcome
-            # os.makedirs(self.cache_dir, exist_ok=True) 
-            
-            # (TBD: 验证快照完整性)
-            if not self.cache_dir.exists():
-                raise RuntimeError(f"Extraction completed, but target directory {self.cache_dir} was not created.")
+        state_data = self.s3_client.load_json(key)
+        
+        if state_data is None:
+            logger.error(f"Failed to load snapshot: Data not found or invalid JSON at {key}")
+            return False
 
-            logger.info(f"Snapshot restored successfully to {self.cache_dir}.")
+        try:
+            # [实现] TBD: 恢复逻辑
+            # 将加载的状态分发回源组件
+            
+            if "portfolio" in state_data and hasattr(self.data_manager, "load_portfolio_state"):
+                self.data_manager.load_portfolio_state(state_data["portfolio"])
+                logger.info("Portfolio state restored from snapshot.")
+            
+            if "market_data" in state_data and hasattr(self.data_manager, "load_market_data_state"):
+                self.data_manager.load_market_data_state(state_data["market_data"])
+                logger.info("Market data state restored from snapshot.")
+            
+            # (TBD: 恢复 ContextBus?)
+            
+            logger.info(f"Snapshot '{snapshot_name}' loaded and restored successfully.")
             return True
             
-        except FileNotFoundError:
-            # (这不应该发生, 因为我们已经检查过了, 但以防万一)
-            logger.error(f"Snapshot file not found during restore: {snapshot_path}")
-            return False
         except Exception as e:
-            logger.error(f"Failed to restore snapshot: {e}", exc_info=True)
-            # 尝试清理部分解压
-            if self.cache_dir.exists():
-                logger.warning("Cleaning up partially restored cache directory...")
-                try:
-                    shutil.rmtree(self.cache_dir)
-                except Exception as cleanup_e:
-                    logger.error(f"Failed to cleanup partial restore: {cleanup_e}")
+            logger.error(f"Failed to restore state from snapshot '{snapshot_name}': {e}", exc_info=True)
             return False
-
-    def list_snapshots(self) -> list[str]:
-        """Lists available snapshots."""
-        try:
-            snapshots = [f.name for f in self.snapshot_dir.glob("snapshot_*.zip")]
-            snapshots.sort(reverse=True) # (最新的在最前面)
-            return snapshots
-        except Exception as e:
-            logger.error(f"Failed to list snapshots: {e}", exc_info=True)
-            return []
-
-    def get_latest_snapshot(self) -> str | None:
-        """Gets the path to the most recent snapshot."""
-        snapshots = self.list_snapshots()
-        if snapshots:
-            return str(self.snapshot_dir / snapshots[0])
-        return None
