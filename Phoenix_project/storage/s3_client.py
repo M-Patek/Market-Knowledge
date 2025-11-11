@@ -1,122 +1,116 @@
 # Phoenix_project/storage/s3_client.py
+# [主人喵的修复 11.11] 实现了 TBD (AWS 凭证和数据加载)
+
 import logging
 import boto3
-import pandas as pd
-from botocore.exceptions import ClientError
-import os
+from botocore.exceptions import ClientError, NoCredentialsError
+import json
+from omegaconf import DictConfig
 
 logger = logging.getLogger(__name__)
 
 class S3Client:
     """
-    (TBD) S3Client for reading/writing data from S3.
+    [已实现]
+    用于与 S3 (或兼容的) 对象存储（如 MinIO）交互的客户端。
     """
-    def __init__(self, config):
-        self.config = config
-        self.bucket_name = config.get("bucket_name", "phoenix-market-data")
+
+    def __init__(self, config: DictConfig):
+        self.config = config.get("s3_client", {})
+        self.bucket_name = self.config.get("bucket_name")
         
-        # (TBD: AWS 凭证应该通过 IAM 角色或环境变量来处理)
-        # (我们不在这里硬编码)
+        # [实现] TBD: AWS 凭证处理
+        # 最佳实践：不传递 access_key 或 secret_key。
+        # Boto3 会自动从环境变量 (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+        # 或 EC2/ECS/EKS 上的 IAM 角色获取凭证。
+        
+        # 允许 MinIO/Localstack 的自定义端点
+        endpoint_url = self.config.get("endpoint_url") 
+        
         try:
-            # [主人喵的修复 11.10] 移除 (mocked) 日志
-            self.s3 = boto3.client(
+            self.s3_client = boto3.client(
                 's3',
-                # (TBD: 如果需要本地 (例如 MinIO) 测试，则配置 endpoint_url)
-                # endpoint_url=config.get("endpoint_url", None),
-                # aws_access_key_id=config.get("aws_access_key_id", None),
-                # aws_secret_access_key=config.get("aws_secret_access_key", None)
+                endpoint_url=endpoint_url,
+                region_name=self.config.get("region_name", "us-east-1")
             )
-            # logger.info("(mocked) S3Client created...")
-            logger.info(f"S3Client initialized for bucket: {self.bucket_name}")
-        except Exception as e:
-            logger.error(f"Failed to initialize Boto3 S3 client: {e}", exc_info=True)
-            self.s3 = None
-
-
-    def read_data(self, s3_key: str, local_path: str) -> pd.DataFrame | None:
-        """
-        Reads a file (e.g., Parquet, CSV) from S3 and loads it into a DataFrame.
-        """
-        if not self.s3:
-            logger.error("S3 client not initialized. Cannot read data.")
-            return None
+            # 验证连接 (可选，但有益)
+            self.s3_client.list_buckets() 
+            logger.info(f"S3Client initialized. Connected to endpoint: {endpoint_url or 'AWS S3 default'}")
             
-        # (TBD: 我们应该下载到本地路径还是在内存中读取?)
-        # (下载到本地路径更适合大文件)
-        
-        local_file = os.path.join(local_path, os.path.basename(s3_key))
-        
-        # [主人喵的修复 11.10] 取消模拟 S3 读取
-        try:
-            logger.info(f"Downloading s3://{self.bucket_name}/{s3_key} to {local_file}...")
-            self.s3.download_file(self.bucket_name, s3_key, local_file)
-            
-            # (TBD: 基于文件扩展名加载)
-            if local_file.endswith(".parquet"):
-                df = pd.read_parquet(local_file)
-            elif local_file.endswith(".csv"):
-                df = pd.read_csv(local_file)
-            else:
-                logger.warning(f"Unsupported file type for loading: {local_file}")
-                # (TBD: 我们应该只下载还是也加载?)
-                # (假设我们应该加载)
-                return None
-            
-            logger.info(f"Successfully loaded data from {s3_key}")
-            return df
-
+        except NoCredentialsError:
+            logger.error("S3Client failed: No AWS credentials found. Please configure environment variables or IAM roles.")
+            raise
         except ClientError as e:
-            logger.error(f"Failed to download from S3: {e}", exc_info=True)
+            logger.error(f"S3Client failed to connect: {e}", exc_info=True)
+            raise
+
+    def load_data(self, key: str) -> str | None:
+        """
+        [已实现] 从 S3 加载数据 (假设为 utf-8 文本/json)。
+        """
+        if not self.bucket_name:
+            logger.error("Cannot load data: S3 bucket_name is not configured.")
+            return None
+            
+        logger.debug(f"Loading data from S3: {self.bucket_name}/{key}")
+        try:
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=key)
+            data = response['Body'].read().decode('utf-8')
+            return data
+            
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                logger.warning(f"S3 load failed: Key '{key}' not found in bucket '{self.bucket_name}'.")
+            else:
+                logger.error(f"Failed to load data from S3 key '{key}': {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"Failed to read/load data {local_file}: {e}", exc_info=True)
+            logger.error(f"An unexpected error occurred during S3 load: {e}", exc_info=True)
             return None
 
-        # (Mock implementation)
-        # logger.warning(f"S3Client.read_data (mocked) for key: {s3_key}")
-        # if s3_key.endswith(".parquet"):
-        #     # (返回一个模拟的 DataFrame)
-        #     return pd.DataFrame({
-        #         "timestamp": pd.to_datetime(["2023-01-01", "2023-01-02"]),
-        #         "price": [100.0, 101.0],
-        #         "volume": [1000, 1200]
-        #     })
-        # return pd.DataFrame()
-
-
-    def write_data(self, df: pd.DataFrame, s3_key: str, local_path: str) -> bool:
+    def upload_data(self, key: str, data: str | bytes) -> bool:
         """
-        Writes a DataFrame to a local file (e.g., Parquet) and uploads it to S3.
+        [已实现] 将数据（文本或字节）上传到 S3。
         """
-        if not self.s3:
-            logger.error("S3 client not initialized. Cannot write data.")
+        if not self.bucket_name:
+            logger.error("Cannot upload data: S3 bucket_name is not configured.")
             return False
 
-        local_file = os.path.join(local_path, os.path.basename(s3_key))
-        
-        # [主人喵的修复 11.10] 取消模拟 S3 写入
+        logger.debug(f"Uploading data to S3: {self.bucket_name}/{key}")
         try:
-            # 1. 写入本地文件
-            logger.info(f"Writing DataFrame to local cache: {local_file}")
-            if local_file.endswith(".parquet"):
-                df.to_parquet(local_file, index=False)
-            elif local_file.endswith(".csv"):
-                df.to_csv(local_file, index=False)
-            else:
-                logger.error(f"Unsupported file type for writing: {local_file}")
-                return False
-
-            # 2. 上传到 S3
-            logger.info(f"Uploading {local_file} to s3://{self.bucket_name}/{s3_key}...")
-            self.s3.upload_file(local_file, self.bucket_name, s3_key)
-            
-            logger.info(f"Successfully wrote data to {s3_key}")
+            if isinstance(data, str):
+                data = data.encode('utf-8')
+                
+            self.s3_client.put_object(Bucket=self.bucket_name, Key=key, Body=data)
             return True
             
+        except ClientError as e:
+            logger.error(f"Failed to upload data to S3 key '{key}': {e}", exc_info=True)
+            return False
         except Exception as e:
-            logger.error(f"Failed to write/upload data to {s3_key}: {e}", exc_info=True)
+            logger.error(f"An unexpected error occurred during S3 upload: {e}", exc_info=True)
             return False
 
-        # (Mock implementation)
-        # logger.warning(f"S3Client.write_data (mocked) for key: {s3_key}")
-        # return True
+    def upload_json(self, key: str, data: dict) -> bool:
+        """
+        [新] 辅助函数：将字典作为 JSON 上传。
+        """
+        try:
+            json_data = json.dumps(data, indent=2)
+            return self.upload_data(key, json_data)
+        except TypeError as e:
+            logger.error(f"Failed to serialize data to JSON for S3 upload: {e}")
+            return False
+
+    def load_json(self, key: str) -> dict | None:
+        """
+        [新] 辅助函数：从 S3 加载并解析 JSON。
+        """
+        data = self.load_data(key)
+        if data:
+            try:
+                return json.loads(data)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to decode JSON from S3 key '{key}': {e}")
+                return None
+        return None
