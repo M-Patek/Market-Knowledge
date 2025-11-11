@@ -1,299 +1,303 @@
-# Phoenix_project/training/drl/trading_env.py
+# training/drl/phoenix_env_v7.py
+# [凤凰 V7 迭代] - 统一效用与务实权衡
+# 最终的、无幻觉的 DRL 环境。
+# 替代所有 V1-V6 的幻觉设计。
 
+import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
-import pandas as pd
-from typing import Dict, Any, Tuple, Optional
-import logging # [主人喵的修复]
+from typing import Dict, Any
 
-from data.data_iterator import DataIterator
-from core.schemas.data_schema import MarketData, PortfolioState
-from context_bus import ContextBus
-from controller.orchestrator import Orchestrator
-from cognitive.engine import CognitiveEngine
+# --- V7 奖励函数惩罚系数 (可调参数) ---
 
-logger = logging.getLogger(__name__) # [主人喵的修复]
+# R_Risk_Component (风险组件)
+# K_DRAWDOWN: 对回撤的平方惩罚系数。RenTec 铁律。
+K_DRAWDOWN = 10.0
+# K_UNCERTAINTY: 对“L2 不确定性 * 仓位规模”的平方惩罚系数。
+# 这是 V7 的“前瞻性风险”核心。
+K_UNCERTAINTY = 5.0 
 
-# [主人喵的修复] TBD 已解决：
-# 奖励函数在 _calculate_reward 中定义 (基于 PnL)。
-# 状态定义在 _get_observation 中定义 (基于市场数据和投资组合)。
-# reset() 已调用 self.data_iterator.reset()。
+# --- V7 凤凰多智能体环境 ---
 
-class PhoenixTradingEnv(gym.Env):
+class PhoenixMultiAgentEnvV7(gym.Env):
     """
-    A multi-agent Gymnasium environment for Phoenix.
+    凤凰 V7 多智能体 DRL 环境 (PhoenixMultiAgentEnvV7)
     
-    [主人喵的修复] (TBD 已解决)
+    该环境实现了“统一效用与务实权衡” (V7) 奖励哲学。
+    
+    - 统一效用: 所有 L3 智能体 (Alpha, Risk, Exec) 共享
+      同一个奖励信号 `Total_Reward_V7`。
+    - 即时反馈 (Dense): 奖励在每一步 (t+1) 立即计算。
+    - 无幻觉:
+        1. 不依赖“未来”PnL (V3 幻觉)。
+        2. 不依赖“全知 L2”计算的“目标投资组合” (V6 幻觉)。
+        3. 不依赖“缓慢”的 EMA 信号 (V5 幻觉)。
+        
+    - V7 奖励 = (知识调整后 PnL) - (成本) - (风险惩罚)
     """
     
-    metadata = {"render_modes": ["human"]}
-
-    def __init__(self, env_config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any]):
+        """
+        初始化 V7 环境。
+        
+        Config 必须包含:
+        - data_iterator (Object): 迭代器，返回 `(timestamp, data_batch)`。
+        - orchestrator (Object): L1/L2 编排器 (用于获取 L2 知识)。
+        - context_bus (Object): 系统的上下文总线 (用于获取投资组合状态)。
+        - initial_balance (float): 初始现金。
+        """
         super().__init__()
         
-        self.data_iterator: DataIterator = env_config["data_iterator"]
-        self.orchestrator: Orchestrator = env_config["orchestrator"]
-        self.cognitive_engine: CognitiveEngine = env_config["cognitive_engine"]
-        self.context_bus: ContextBus = env_config["context_bus"]
+        # 1. 核心组件 (从 phoenix_project.py 传入)
+        self.data_iterator = config["data_iterator"]
+        self.orchestrator = config["orchestrator"]
+        self.context_bus = config["context_bus"]
         
-        # [主人喵的修复] (TBD 已解决): DRL 环境的状态定义。
-        # 我们定义一个简化的状态：
-        # 1. 市场特征 (例如 N 天的回报/波动率)
-        # 2. 投资组合权重
+        # 2. 智能体定义
+        # (V7 哲学：它们是单一团队，但 RLLib 仍将它们视为多智能体)
+        self.agents = ["alpha", "risk", "exec"]
         
-        try:
-            # (TBD: data_iterator 需要一个方法来获取资产列表或特征形状)
-            self.assets = self.data_iterator.get_assets() 
-            self.num_assets = len(self.assets)
-        except AttributeError:
-            logger.warning("data_iterator.get_assets() not available. Using config.num_assets.")
-            self.num_assets = env_config.get("num_assets", 10) # 回退
-            self.assets = [f"ASSET_{i}" for i in range(self.num_assets)]
+        # 3. 定义 Observation 和 Action Spaces (示例)
+        # (这需要根据您的 L3 智能体的实际输入/输出进行详细定义)
+        # (这里使用简化的占位符)
+        self._obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32)
+        # 示例：动作空间 {asset_id: target_allocation}
+        self._action_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32) # 假设 5 种资产
 
-        # (TBD: 特征工程应该在 DataIterator 或 DataAdapter 中完成)
-        # (假设我们有 5 个市场特征，例如 P, V, SMA5, SMA20, RSI)
-        self.num_features = env_config.get("num_features", 5) 
-        
-        # 状态空间
-        self.observation_space = spaces.Dict({
-            # L3 Alpha 智能体观察市场特征
-            "market_features": spaces.Box(
-                low=-np.inf, 
-                high=np.inf, 
-                shape=(self.num_assets, self.num_features), 
-                dtype=np.float32
-            ),
-            # L3 Risk 智能体观察当前投资组合权重
-            "portfolio_weights": spaces.Box(
-                low=0, 
-                high=1, 
-                shape=(self.num_assets + 1,), # (资产 + 现金)
-                dtype=np.float32
-            ),
-        })
+        self.observation_space = spaces.Dict({agent: self._obs_space for agent in self.agents})
+        self.action_space = spaces.Dict({agent: self._action_space for agent in self.agents})
 
-        # [主人喵的修复] (TBD 已解决): DRL 环境的动作定义。
-        # L3 Alpha: 信号 (例如 -1 到 1)
-        # L3 Risk: 杠杆 (例如 0.5 到 2.0)
-        # (我们简化：假设 AlphaAgent 产生目标权重)
+        # 4. V7 奖励函数状态变量
+        self.initial_balance = config.get("initial_balance", 100000.0)
         
-        self.action_space = spaces.Dict({
-            # AlphaAgent: 为每个资产生成目标权重 (0 到 1)
-            # (RLLib 将处理归一化为 1)
-            "target_weights": spaces.Box(
-                low=0, 
-                high=1, 
-                shape=(self.num_assets,), 
-                dtype=np.float32
-            ),
-            # RiskAgent: 目标波动率或杠杆 (简化为 1 个值)
-            "risk_target": spaces.Box(
-                low=0.1, 
-                high=2.0, 
-                shape=(1,), 
-                dtype=np.float32
-            ), 
-        })
-        
-        self.current_step = 0
-        self.max_steps = env_config.get("max_steps", 1000) # (TBD)
-        self._initial_portfolio = self.context_bus.get_current_state().portfolio_state
-        self._last_portfolio_value = self._initial_portfolio.total_value
+        self.reset()
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """
-        重置环境。
-        """
+    def reset(self, *, seed=None, options=None):
+        """重置环境状态"""
         super().reset(seed=seed)
         
-        # [主人喵的修复] (TBD 已解决): 确保 TradingEnv.reset() 能重置 data_iterator。
-        self.data_iterator.reset()
+        # (TBD: 重置 data_iterator)
+        # self.data_iterator.reset() 
         
-        # (TBD) 重置 ContextBus 和 Portfolio
-        self.context_bus.reset_state(self._initial_portfolio)
-        self._last_portfolio_value = self._initial_portfolio.total_value
+        self.balance = self.initial_balance
+        self.total_value = self.initial_balance
+        
+        # V7 风险状态
+        self.max_total_value_seen = self.initial_balance
+        self.current_drawdown = 0.0
+        
+        # V7 仓位状态
+        # (仓位字典，例如 { 'AAPL': { 'shares': 10, 'avg_price': 150.0 } })
+        self.positions = {}
+        # (当前投资组合分配向量，例如 { 'AAPL': 0.1, 'MSFT': -0.05 })
+        self.current_allocation = {}
         
         self.current_step = 0
         
-        # (TBD) 获取初始状态
-        obs = self._get_observation()
-        info = self._get_info()
+        # (TBD: 获取初始 L1/L2 状态)
+        self.l2_knowledge = {} # 占位符
+        
+        obs = self._get_obs_dict()
+        info = self._get_info_dict()
         
         return obs, info
 
-    def step(self, action: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
+    def step(self, action_dict: Dict[str, Any]):
         """
-        执行一个时间步。
+        执行一个时间步，并计算 V7 统一奖励。
         """
-        
-        # 1. (TBD) 将 DRL 动作应用于系统
-        # (这很复杂：动作需要通过 ContextBus 发送，
-        # 或者直接调用 L3 智能体的 (模拟) execute 方法)
-        
-        # (简化的 TBD 模拟：假设动作直接传递给认知引擎)
-        # self.cognitive_engine.run(drl_actions=action)
-        
-        # 2. 运行 Phoenix 协调器一个时间步
-        # (在 DRL 中，我们可能只运行认知/执行层，而不是完整的 L1/L2 RAG)
-        terminated = False
-        try:
-            # (TBD) 运行一个模拟的 tick
-            # (在真实环境中，这会调用 orchestrator.run_step())
-            # (在这里，我们可能需要一个特殊的 DRL 模式)
-            
-            # (模拟)
-            # 1. 获取下一个数据
-            next_data = self.data_iterator.next()
-            if next_data is None:
-                # 数据结束
-                terminated = True
-                obs = self._get_observation()
-                reward = self._calculate_reward() # 计算最后一步的奖励
-                info = self._get_info()
-                return obs, reward, terminated, False, info
-
-            # 2. 将数据推送到 ContextBus
-            # (TBD: 确认 next_data 的格式)
-            # self.context_bus.publish(next_data)
-            
-            # 3. (TBD) 运行认知引擎 (使用 DRL 动作)
-            # self.cognitive_engine.run(drl_actions=action)
-            
-            # (模拟更新投资组合状态)
-            self._update_portfolio_simulation(action, next_data)
-            
-
-        except StopIteration:
-            terminated = True
-        
         self.current_step += 1
         
-        # 3. 获取新状态
-        obs = self._get_observation()
+        # 1. (TBD) 获取 L1/L2 知识 (t 时刻)
+        # (在 V7 架构中，L1/L2 必须在 L3 之前运行)
+        # try:
+        #     timestamp, data_batch = next(self.data_iterator)
+        #     self.l2_knowledge = self._run_l1_l2(data_batch)
+        # except StopIteration:
+        #     return self._terminate_episode()
         
-        # 4. [主人喵的修复] (TBD 已解决): DRL 环境的奖励函数定义。
-        reward = self._calculate_reward()
-        
-        # 5. 检查终止条件
-        if not terminated:
-             terminated = self.current_step >= self.max_steps
-        truncated = False # (TBD: 如果需要)
-        
-        info = self._get_info()
-        
-        return obs, reward, terminated, truncated, info
-
-    def _update_portfolio_simulation(self, action: Dict[str, Any], market_data: Dict[str, MarketData]):
-        """ (TBD) 这是一个临时的模拟函数来更新投资组合状态 """
-        # (在真实的 DRL 训练中，这应该调用 CognitiveEngine 或 BacktestEngine)
-        
-        current_state = self.context_bus.get_current_state()
-        old_portfolio = current_state.portfolio_state
-        
-        # (TBD: 模拟基于新价格和目标权重的 PnL)
-        # (这非常复杂，BacktestEngine 应该处理这个)
-        
-        # (极其简化的 PnL 模拟)
-        new_total_value = old_portfolio.total_value * (1 + np.random.randn() * 0.01) # 模拟市场波动
-        
-        # (TBD: 应用动作，例如杠杆)
-        risk_target = action["risk_target"][0]
-        new_total_value *= (risk_target / 1.0) # (非常粗糙的杠杆应用)
-
-        # 创建新的状态
-        new_portfolio = old_portfolio.model_copy(deep=True)
-        new_portfolio.total_value = new_total_value
-        new_portfolio.pnl = new_total_value - self._initial_portfolio.total_value
-        
-        # 更新总线
-        current_state.portfolio_state = new_portfolio
-        self.context_bus.update_state(current_state)
-
-
-    def _get_observation(self) -> Dict[str, Any]:
-        """
-        [主人喵的修复] (TBD 已解决) 从 ContextBus 或 DataManager 获取当前状态。
-        """
-        
-        # 1. 获取市场特征 (TBD: 应来自 DataIterator/Adapter)
-        market_features = np.random.rand(self.num_assets, self.num_features).astype(np.float32)
-        # (TBD: 示例 - 从 data_iterator 获取真实数据)
-        # latest_data = self.data_iterator.get_latest_features(self.assets, self.num_features)
-        # if latest_data:
-        #     market_features = ... 
-            
-        
-        # 2. 获取投资组合权重
-        portfolio_state = self.context_bus.get_current_state().portfolio_state
-        weights = np.zeros(self.num_assets + 1, dtype=np.float32)
-        
-        if portfolio_state and portfolio_state.total_value > 0:
-            weights[0] = portfolio_state.cash / portfolio_state.total_value # 现金
-            for i, asset_id in enumerate(self.assets):
-                if asset_id in portfolio_state.positions:
-                    pos = portfolio_state.positions[asset_id]
-                    # (TBD: 需要资产的当前价格来计算市值)
-                    # (简化：假设 'value' 存储在 position 中)
-                    # [主人喵的修复] 假设 pos 有 'value' 字段
-                    pos_value = getattr(pos, 'value', 0) 
-                    weights[i+1] = pos_value / portfolio_state.total_value
-        else:
-            weights[0] = 1.0 # 100% 现金
-
-        return {
-            "market_features": market_features,
-            "portfolio_weights": weights,
+        # (使用占位符数据进行模拟)
+        self.l2_knowledge = {
+            'AAPL': {'price_t': 150.0, 'price_t1': 150.1, 'l2_sentiment': 0.6, 'l2_confidence': 0.8},
+            'MSFT': {'price_t': 300.0, 'price_t1': 299.8, 'l2_sentiment': -0.3, 'l2_confidence': 0.5}
         }
 
-    def _calculate_reward(self) -> float:
-        """
-        [主人喵的修复] (TBD 已解决): DRL 环境的奖励函数定义。
+        # 2. (TBD) 执行交易 (t -> t+1)
+        # V7 哲学：L3 团队 (Alpha, Risk, Exec) 共同决定一个动作
+        # (这里简化为只使用 'alpha' 智能体的动作作为团队决策)
+        team_action = action_dict.get('alpha') 
         
-        我们使用一个简单的奖励：当前步骤的 PnL 变化。
-        (TBD: 更好的奖励是夏普比率或风险调整后回报)
-        """
-        current_value = self.context_bus.get_current_state().portfolio_state.total_value
-        
-        # 计算自上一步以来的 PnL
-        reward = current_value - self._last_portfolio_value
-        
-        # 更新上一步的值
-        self._last_portfolio_value = current_value
-        
-        # (TBD: 惩罚高换手率或高风险)
-        # reward -= transaction_costs
-        
-        return float(reward) # [主人喵的修复] 确保返回 float
+        # _execute_trades 必须更新 self.positions, self.balance, self.current_allocation
+        # 并且必须返回 t+1 时刻的实际成本
+        costs_t1 = self._execute_trades(team_action, self.l2_knowledge)
 
-    def _get_info(self) -> Dict[str, Any]:
-        """
-        (TBD) 返回调试信息。
-        """
-        portfolio_state = self.context_bus.get_current_state().portfolio_state
+        # 3. 计算投资组合指标 (t+1)
+        old_value = self.total_value
+        self.total_value = self._update_portfolio_value(self.l2_knowledge) # 使用 t+1 的价格
+
+        # --- 4. 计算 V7 统一奖励 (t+1 时刻) ---
+        
+        # 4.A. Alpha & Cost 组件
+        R_alpha_cost = self._calculate_alpha_cost_reward(old_value, self.total_value, costs_t1)
+        
+        # 4.B. 风险组件
+        R_risk = self._calculate_risk_reward()
+        
+        # 4.C. 最终 V7 统一奖励
+        Total_Reward_V7 = R_alpha_cost + R_risk
+
+        # 5. 统一分配奖励 (V7 哲学)
+        rewards = {agent: Total_Reward_V7 for agent in self.agents}
+
+        # 6. 返回结果
+        obs = self._get_obs_dict()
+        info = self._get_info_dict(R_alpha_cost, R_risk, Total_Reward_V7)
+        
+        # (TBD: 定义终止/截断条件)
+        terminated = self.total_value <= (self.initial_balance * 0.5) # 50% 回撤
+        truncated = self.current_step >= 1000 # 示例
+        
+        terminateds = {agent: terminated for agent in self.agents}
+        terminateds["__all__"] = terminated
+        truncateds = {agent: truncated for agent in self.agents}
+        truncateds["__all__"] = truncated
+        
+        return obs, rewards, terminateds, truncateds, info
+
+    # --- V7 奖励函数辅助方法 ---
+
+    def _calculate_alpha_cost_reward(self, old_value: float, new_value: float, costs: Dict[str, float]) -> float:
+        """(V7 Alpha+Cost) 计算知识调整后的 PnL 和成本。"""
+        
+        # 1. (无幻觉) 计算*实际*的 Delta PnL
+        # (这是市值（Mark-to-Market）PnL，*不包括*成本)
+        delta_pnl_t1 = new_value - old_value
+        
+        # 2. (无幻觉) 计算*实际*的成本惩罚
+        R_cost_penalty_t1 = - (costs.get('slippage', 0.0) + costs.get('fees', 0.0))
+
+        # 3. (V7 核心) 计算“知识调整因子” (L2 Factor)
+        # L2_Factor = (1.0 + (l2_sentiment * l2_confidence * sign(Position)))
+        # 我们必须计算投资组合的*加权平均*知识因子
+        
+        l2_factor_total = 0.0
+        total_abs_allocation = 0.0001 # 避免除以零
+        
+        for asset_id, alloc in self.current_allocation.items():
+            l2_info = self.l2_knowledge.get(asset_id)
+            if not l2_info:
+                continue
+            
+            alloc_abs = abs(alloc)
+            total_abs_allocation += alloc_abs
+            
+            pos_sign = np.sign(alloc)
+            l2_sent = l2_info['l2_sentiment']
+            l2_conf = l2_info['l2_confidence']
+            
+            # (1.0 + (sent * conf * sign))
+            factor = 1.0 + (l2_sent * l2_conf * pos_sign)
+            
+            l2_factor_total += (factor * alloc_abs)
+
+        # 加权平均 L2 因子
+        avg_l2_factor_t = l2_factor_total / total_abs_allocation
+
+        # 4. 组合 Alpha 组件
+        # (如果 PnL 为正，且符合知识，则放大；如果 PnL 为负，且符合知识，则惩罚放大)
+        # (如果 PnL 为正，但不符合知识，则抑制)
+        R_alpha = delta_pnl_t1 * avg_l2_factor_t
+        
+        return R_alpha + R_cost_penalty_t1
+
+    def _calculate_risk_reward(self) -> float:
+        """(V7 风险) 计算回撤和不确定性惩罚。"""
+        
+        # 1. (无幻觉) 已实现风险：回撤
+        self.max_total_value_seen = max(self.max_total_value_seen, self.total_value)
+        self.current_drawdown = (self.max_total_value_seen - self.total_value) / self.max_total_value_seen
+        
+        R_drawdown_penalty = -K_DRAWDOWN * (self.current_drawdown ** 2)
+        
+        # 2. (无幻觉) 前瞻性风险：L2 不确定性 * 仓位规模
+        
+        total_uncertainty_penalty = 0.0
+        
+        for asset_id, alloc in self.current_allocation.items():
+            l2_info = self.l2_knowledge.get(asset_id)
+            if not l2_info:
+                continue
+            
+            l2_uncertainty = 1.0 - l2_info['l2_confidence']
+            pos_size = abs(alloc) # 分配比例
+            
+            # V7 核心惩罚：(仓位 * 不确定性)^2
+            penalty = (pos_size * l2_uncertainty) ** 2
+            total_uncertainty_penalty += penalty
+            
+        R_uncertainty_penalty = -K_UNCERTAINTY * total_uncertainty_penalty
+        
+        return R_drawdown_penalty + R_uncertainty_penalty
+
+    # --- 环境辅助方法 (TBD) ---
+
+    def _execute_trades(self, target_allocation_vector: Any, l2_knowledge: Dict) -> Dict[str, float]:
+        """(TBD) 模拟交易执行 (t -> t+1)。"""
+        # (这是一个复杂的实现)
+        # 1. 计算从 self.current_allocation 到 target_allocation_vector 所需的交易
+        # 2. 基于 l2_knowledge['price_t'] 计算名义价值
+        # 3. 模拟滑点和费用
+        # 4. 更新 self.positions (shares, avg_price)
+        # 5. 更新 self.balance
+        # 6. 更新 self.current_allocation (基于 t+1 的新价值)
+        
+        # 占位符：模拟更新 allocation
+        self.current_allocation = {'AAPL': 0.1, 'MSFT': -0.05}
+        
+        return {'slippage': 0.01, 'fees': 1.0} # (模拟 0.01 滑点, 1.0 费用)
+
+    def _update_portfolio_value(self, l2_knowledge: Dict) -> float:
+        """(TBD) 使用 t+1 的价格计算当前总价值。"""
+        value = self.balance
+        
+        # (这个逻辑需要基于 self.positions 和 t+1 的价格)
+        # for asset_id, pos in self.positions.items():
+        #     current_price_t1 = l2_knowledge.get(asset_id, {}).get('price_t1')
+        #     if current_price_t1:
+        #         value += pos['shares'] * current_price_t1
+        
+        # 占位符：
+        if self.current_step > 1:
+            value = self.total_value + np.random.randn() * 100 # 模拟价值变化
+        
+        return value
+
+    def _get_obs_dict(self) -> Dict[str, Any]:
+        """(TBD) 为每个智能体构建观察空间。"""
+        # 必须包含 L2 知识 (sentiment, confidence)
+        # 必须包含当前仓位 (self.current_allocation)
+        # 必须包含风险状态 (self.current_drawdown)
+        obs = np.random.rand(10).astype(np.float32) # 占位符
+        return {agent: obs for agent in self.agents}
+
+    def _get_info_dict(self, r_alpha_cost=0, r_risk=0, r_total=0) -> Dict[str, Any]:
+        """(TBD) 返回调试信息。"""
         return {
             "step": self.current_step,
-            "portfolio_value": portfolio_state.total_value,
-            "total_pnl": portfolio_state.pnl
+            "total_value": self.total_value,
+            "drawdown": self.current_drawdown,
+            "reward_total": r_total,
+            "reward_alpha_cost": r_alpha_cost,
+            "reward_risk": r_risk
         }
-
-    def render(self, mode="human"):
-        """
-        (TBD) 渲染环境状态。
-        """
-        if mode == "human":
-            portfolio_state = self.context_bus.get_current_state().portfolio_state
-            print(f"Step: {self.current_step}")
-            if portfolio_state:
-                print(f"Portfolio Value: {portfolio_state.total_value:.2f} | Total PnL: {portfolio_state.pnl:.2f}")
-            else:
-                print("Portfolio state is None.")
-
-
-    def close(self):
-        """
-        (TBD) 清理资源。
-        """
-        if hasattr(self, 'data_iterator') and self.data_iterator:
-            self.data_iterator.close()
-        print("PhoenixTradingEnv closed.")
+    
+    def _terminate_episode(self):
+        """(TBD) 处理数据结束。"""
+        obs = self._get_obs_dict()
+        rewards = {agent: 0 for agent in self.agents}
+        terminateds = {agent: True for agent in self.agents}
+        terminateds["__all__"] = True
+        truncateds = {agent: True for agent in self.agents}
+        truncateds["__all__"] = True
+        info = self._get_info_dict()
+        return obs, rewards, terminateds, truncateds, info
