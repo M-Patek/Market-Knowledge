@@ -1,20 +1,30 @@
 核心框架 (Web & Async)
 aiohttp>=3.9
 fastapi>=0.111
+
+(注: 新列表中有 fastapi，这里保留了更详细的版本号)
+
 flask>=3.1,<3.2
 flask-cors>=4.0
 httpx>=0.27
 uvicorn[standard]>=0.29
+
+(注: 新列表中有 uvicorn，这里保留了带 [standard] 的版本)
+
 websockets # <--- [阶段 2] 为 PaperTrading/Alpaca 添加
 
 任务队列 & 事件流
 celery[redis]
+redis # <--- 从新列表中合并
 schedule
 
 数据科学 & 机器学习 (核心)
 joblib>=1.4
 lightgbm>=4.5
 numpy>=1.26
+
+(注: 新列表中有 numpy, pandas, scikit-learn，这里保留了更详细的版本号)
+
 optuna>=3.6
 pandas>=2.2
 pandera # <--- 添加了缺失的依赖 (用于 scripts/validate_dataset.py)
@@ -35,14 +45,25 @@ ray[rllib]>=2.9.0 # ADDED: For new L3 DRL Agents (Alpha, Risk, Exec)
 
 torch>=2.2
 
+(注: 新列表中有 torch，这里保留了更详细的版本号)
+
+torch-geometric # <--- 从新列表中合并 ([阶段 1] GNN 依赖)
+
 AI / LLM (生成式 AI & NLP)
 faiss-cpu>=1.8
 google-cloud-aiplatform
 google-generativeai>=0.5
+
+(注: 新列表中有 google-generativeai，这里保留了更详细的版本号)
+
 langchain>=0.2
 langchain-google-genai # <--- 添加了缺失的依赖 (用于 agents/ 和 ai/ 模块)
 openai>=1.35
 sentence-transformers>=3.0
+
+(注: 新列表中有 sentence-transformers，这里保留了更详细的版本号)
+
+cross-encoder # <--- 从新列表中合并 (用于 reranker)
 shap>=0.45
 tiktoken>=0.7
 transformers>=4.43
@@ -51,9 +72,15 @@ transformers>=4.43
 asyncpg>=0.29
 boto3>=1.34
 elasticsearch>=8.13
+sqlalchemy # <--- 从新列表中合并
+psycopg2-binary # <--- 从新列表中合并
+influxdb-client # <--- 从新列表中合并
 
 向量 & 图数据库
 neo4j>=5.20
+
+(注: 新列表中有 neo4j，这里保留了更详细的版本号)
+
 pinecone-client>=4.1
 
 量化交易 & 回测
@@ -76,12 +103,16 @@ opentelemetry-sdk>=1.26
 prometheus-client>=0.20
 prometheus-fastapi-instrumentator
 rich>=13.7
+statsd # <--- 从新列表中合并
 
 数据序列化 & 格式化
 jinja2>=3.1 # (VERIFIED: Exists for renderer.py)
 jsonschema>=4.23
 pydantic>=2.6,<3
 pyyaml>=6.0
+
+(注: 新列表中有 pyyaml，这里保留了更详细的版本号)
+
 pyarrow
 
 可视化
@@ -95,10 +126,17 @@ click>=8.1
 networkx>=3.3
 pydash>=8.0
 python-dateutil>=2.9
+
+(注: 新列表中有 python-dateutil，这里保留了更详细的版本号)
+
 python-dotenv>=1.0
+
+(注: 新列表中有 python-dotenv，这里保留了更详细的版本号)
+
 requests>=2.32
 tqdm>=4.66
 typer>=0.12
+pytz # <--- 从新列表中合并 ([阶段 1] 时区库)
 
 开发 & 测试 & Linter
 black>=24.4
