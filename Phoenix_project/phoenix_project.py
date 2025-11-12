@@ -102,9 +102,8 @@ def main(cfg: DictConfig) -> None:
         if cfg.main.mode == "backtest":
             loop_manager.run_backtest_loop()
         elif cfg.main.mode == "live":
-            # (TBD: 实现实时循环)
-            logger.warning("Live mode not fully implemented. Running placeholder loop.")
-            loop_manager.run_live_loop_placeholder()
+            # (TBD: 实现实时循环) - [FIX Applied]
+            loop_manager.run_live_loop()
         else:
             logger.error(f"Unknown main mode: {cfg.main.mode}")
             
@@ -113,8 +112,15 @@ def main(cfg: DictConfig) -> None:
     except Exception as e:
         logger.exception(f"Unhandled exception in main loop: {e}")
     finally:
-        logger.info("Phoenix system shutdown complete.")
-        # (TBD: 清理资源，例如数据库连接)
+        logger.info("Phoenix system shutting down...")
+        # (TBD: 清理资源，例如数据库连接) - [FIX Applied]
+        try:
+            if 'registry' in locals() and registry:
+                registry.cleanup_resources()
+            logger.info("Phoenix system shutdown complete.")
+        except Exception as e:
+            logger.exception(f"Error during resource cleanup: {e}")
+            logger.info("Phoenix system shutdown complete despite cleanup error.")
 
 
 if __name__ == "__main__":
