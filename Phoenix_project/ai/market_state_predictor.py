@@ -14,11 +14,8 @@ class MarketStatePredictor:
         self.prompt_manager = prompt_manager
         # (假设我们有一个用于此任务的特定提示)
         # [FIX] We need to handle prompt loading better, maybe in PromptManager
-        # For now, let's assume 'analyst.json' is the placeholder if 'market_state_predictor' is missing
-        try:
-             self.prompt_template = self.prompt_manager.get_prompt("market_state_predictor")
-        except KeyError:
-             self.prompt_template = self.prompt_manager.get_prompt("analyst") # Fallback
+        # [FIX-Applied] Fallback logic is now assumed to be handled by PromptManager.
+        self.prompt_template = self.prompt_manager.get_prompt("market_state_predictor")
 
     async def predict(self, context_summary: str) -> Dict[str, Any]:
         """
