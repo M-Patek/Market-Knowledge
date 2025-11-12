@@ -5,6 +5,7 @@ Handles hybrid search (vector, keyword, graph) and reranking.
 """
 
 import logging
+import asyncio
 from typing import Any, List, Dict, Optional
 
 from sentence_transformers import CrossEncoder  # type: ignore
@@ -18,6 +19,7 @@ from ..core.schemas.evidence_schema import (
 from ..memory.vector_store import VectorStore
 from ..ai.graph_db_client import GraphDBClient
 from ..api.gemini_pool_manager import GeminiClient
+from ..ai.gnn_inferencer import GNNInferencer
 # [Task 4] 导入 PromptManager 和 PromptRenderer
 from ..ai.prompt_manager import PromptManager
 from ..ai.prompt_renderer import PromptRenderer
@@ -42,7 +44,8 @@ class Retriever:
         config: Dict[str, Any],
         # [Task 4] 假设这些是由 Registry.py 注入的
         prompt_manager: PromptManager,
-        prompt_renderer: PromptRenderer
+        prompt_renderer: PromptRenderer,
+        gnn_inferencer: GNNInferencer  # [GNN Plan Task 2.1]
     ):
         """
         Initializes the Retriever.
@@ -54,9 +57,11 @@ class Retriever:
             config: Configuration dictionary.
             prompt_manager: [Task 4] Injected PromptManager.
             prompt_renderer: [Task 4] Injected PromptRenderer.
+            gnn_inferencer: [GNN Plan Task 2.1] Injected GNNInferencer.
         """
         self.vector_store = vector_store
         self.graph_db = graph_db
+        self.gnn_inferencer = gnn_inferencer  # [GNT Plan Task 2.1]
         self.llm_client = llm_client
         self.config = config.get("retriever", {})
         
@@ -69,6 +74,7 @@ class Retriever:
         )
         self.top_k_vector = self.config.get("top_k_vector", 10)
         self.top_k_graph = self.config.get("top_k_graph", 5)
+        self.top_k_gnn = self.config.get("top_k_gnn", 5)  # [GNN Plan Task 2.3]
         self.rerank_threshold = self.config.get("rerank_threshold", 0.1)
 
         self._initialize_reranker()
@@ -287,15 +293,99 @@ class Retriever:
             logger.error(f"Error during graph search with query '{cypher_query}': {e}")
             return []
 
+    # [GNN Plan Task 2.2] New GNN-enhanced query method
+    async def _query_graph_with_gnn(self, query_text: str, k: int) -> List[Evidence]:
+        """
+        Performs a GNN-enhanced query on the knowledge graph.
+
+        Implements refinements:
+        1. (Robustness) Top-level try/except to prevent asyncio.gather failure.
+        2. (Performance) Assumes a single, efficient Cypher query.
+        """
+        # [Refinement Point 2] Top-level error handling for robustness
+        try:
+            logger.debug(f"Performing GNN-enhanced graph query for: {query_text}")
+
+            # [Refinement Point 1]
+            # Step A: Fetch Subgraph with a single query.
+            # This query should find seed nodes AND fetch their N-hop neighbors
+            # in one database operation.
+            # (Placeholder query for now)
+            cypher_query = """
+            // Placeholder: Future query will find seeds and expand.
+            MATCH (n)
+            WHERE n.name IS NOT NULL
+            RETURN {
+                nodes: collect(DISTINCT n),
+                edges: [] 
+            } AS subgraph_data
+            LIMIT 1
+            """
+            params = {"query": query_text, "k_seeds": k}
+            
+            # [Future Implementation] This logic will be more complex
+            query_results = await self.graph_db.execute_query(cypher_query, params)
+            
+            if not query_results or 'subgraph_data' not in query_results[0]:
+                logger.warning("GNN query: Could not retrieve valid subgraph data.")
+                return []
+                
+            subgraph_data = query_results[0]['subgraph_data']
+
+            # Step B: Call GNN Inference
+            gnn_results = await self.gnn_inferencer.infer(graph_data=subgraph_data)
+
+            # Step C: Process Results
+            if not gnn_results or 'node_embeddings' not in gnn_results:
+                logger.info("GNN inference returned no results or model not loaded.")
+                return []
+
+            # [Future Implementation] Parse actual gnn_results.
+            # For now, create placeholder evidence.
+            gnn_evidence_list = [
+                Evidence(
+                    id=f"gnn_node_{i}",
+                    content=f"GNN processed node {i} from query '{query_text}'",
+                    score=0.99,  # GNN results get high initial score
+                    source_type=DataSource.GRAPH,
+                    metadata={"source": "knowledge_graph_gnn"} # Differentiate
+                ) for i in range(self.top_k_gnn) # Use self.top_k_gnn
+            ]
+            return gnn_evidence_list.copy()
+
+        except Exception as e:
+            logger.error(f"Failed GNN-enhanced query for '{query_text}': {e}", exc_info=True)
+            return [] # Return empty list to not break asyncio.gather
+
     async def retrieve_and_rerank(self, query: str) -> List[Evidence]:
         """
         Orchestrates the retrieval and reranking process.
+        [Refactored for GNN Plan Task 2.3] Now runs sources in parallel.
         """
         logger.info(f"Starting retrieval for query: {query}")
 
-        vector_results = await self.search_vector_db(query)
+        # [GNN Plan Task 2.3] Run all retrieval tasks in parallel
+        tasks = [
+            self.search_vector_db(query),
+            self.search_knowledge_graph(query), # Returns List[GraphQueryResult]
+            self._query_graph_with_gnn(query, k=self.top_k_gnn) # Returns List[Evidence]
+        ]
+        
+        try:
+            # Our _query_graph_with_gnn is already robust (returns [] on error)
+            # search_vector_db and search_knowledge_graph also have internal
+            # try/except blocks that return [], so this is safe.
+            all_results = await asyncio.gather(*tasks)
+        except Exception as e:
+            logger.error(f"Critical error during parallel retrieval: {e}", exc_info=True)
+            all_results = [[], [], []] # Empty results for each task
 
-        graph_search_results = await self.search_knowledge_graph(query)
+        # Unpack results
+        vector_results: List[Evidence] = all_results[0]
+        graph_search_results: List[GraphQueryResult] = all_results[1]
+        gnn_results: List[Evidence] = all_results[2]
+
+        # Convert graph results to Evidence schema
         graph_results: List[Evidence] = [
             Evidence(
                 id=res.node_id,
@@ -307,14 +397,15 @@ class Retriever:
             for res in graph_search_results
         ]
 
-        combined_results = vector_results + graph_results
+        combined_results = vector_results + graph_results + gnn_results
         if not combined_results:
             logger.warning(f"No results found for query: {query}")
             return []
 
         logger.info(
-            f"Combined {len(vector_results)} vector results and "
-            f"{len(graph_results)} graph results."
+            f"Combined {len(vector_results)} vector, "
+            f"{len(graph_results)} graph, and "
+            f"{len(gnn_results)} GNN results."
         )
 
         final_results = self._rerank_documents(query, combined_results)
@@ -326,3 +417,5 @@ class Retriever:
             f"Retrieval complete. Returning {len(final_results)} reranked documents."
         )
         return final_results
+
+}
