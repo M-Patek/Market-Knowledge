@@ -80,6 +80,14 @@ except ImportError:
     logger.critical("无法导入 'run_all_cleanup_tasks'。Janitor 任务将无法运行。")
     run_all_cleanup_tasks = None
 
+# [Task III.1] 导入 GNN 训练流水线
+try:
+    from Phoenix_project.training.gnn.gnn_engine import run_gnn_training_pipeline
+except ImportError:
+    setup_logging()
+    logger = get_logger(__name__)
+    logger.critical("无法导入 'run_gnn_training_pipeline'。GNN 任务将无法运行。")
+    run_gnn_training_pipeline = None
 
 # [蓝图 2 修复] 导入 registry (假设它在 registry.py 中)
 try:
@@ -382,6 +390,23 @@ def run_system_janitor_task():
         logger.error(f"Task: run_system_janitor_task failed: {e}", exc_info=True)
 
 
+# [Task III.1] 新增 GNN 训练任务
+@celery_app.task(name='phoenix.run_gnn_training')
+def run_gnn_training_task():
+    """[Task III.1] Celery 任务，用于执行夜间 GNN 训练。"""
+    logger = get_logger('phoenix.run_gnn_training')
+    try:
+        if run_gnn_training_pipeline:
+            logger.info("Task: run_gnn_training_task started...")
+            run_gnn_training_pipeline() # <--- [Task III.1] 调用 GNN 引擎
+            logger.info("Task: run_gnn_training_task finished.")
+        else:
+            logger.error("Task: run_gnn_training_task failed: 'run_gnn_training_pipeline' 未能导入。")
+            
+    except Exception as e:
+        logger.error(f"Task: run_gnn_training_task failed: {e}", exc_info=True)
+
+
 @celery_app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
     """
@@ -403,6 +428,14 @@ def setup_periodic_tasks(sender, **kwargs):
             crontab(hour=3, minute=0), # 每天 3:00 AM
             run_system_janitor_task.s(),
             name='run system janitor daily'
+        )
+
+    # [Task III.1] 每天 22:05 UTC 运行 GNN 训练
+    if run_gnn_training_pipeline:
+        sender.add_periodic_task(
+            crontab(hour=22, minute=5), # 每天 22:0D5 UTC
+            run_gnn_training_task.s(),
+            name='run gnn training nightly'
         )
 
 
