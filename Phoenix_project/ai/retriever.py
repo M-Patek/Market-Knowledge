@@ -21,6 +21,9 @@ from ..ai.graph_db_client import GraphDBClient
 from ..api.gemini_pool_manager import GeminiClient
 from ..ai.gnn_inferencer import GNNInferencer
 # [Task 4] 导入 PromptManager 和 PromptRenderer
+from ..ai.tabular_db_client import TabularDBClient
+from ..ai.temporal_db_client import TemporalDBClient
+from ..ai.ensemble_client import EnsembleClient
 from ..ai.prompt_manager import PromptManager
 from ..ai.prompt_renderer import PromptRenderer
 
@@ -45,7 +48,12 @@ class Retriever:
         # [Task 4] 假设这些是由 Registry.py 注入的
         prompt_manager: PromptManager,
         prompt_renderer: PromptRenderer,
-        gnn_inferencer: GNNInferencer  # [GNN Plan Task 2.1]
+        gnn_inferencer: GNNInferencer,  # [GNN Plan Task 2.1]
+        # --- 添加/更新这些参数 喵! ---
+        temporal_db: Optional[TemporalDBClient] = None,
+        tabular_db: Optional[TabularDBClient] = None,
+        search_client: Optional[Any] = None,
+        ensemble_client: Optional[EnsembleClient] = None
     ):
         """
         Initializes the Retriever.
@@ -63,19 +71,29 @@ class Retriever:
         self.graph_db = graph_db
         self.gnn_inferencer = gnn_inferencer  # [GNT Plan Task 2.1]
         self.llm_client = llm_client
-        self.config = config.get("retriever", {})
-        
+        # --- 存储这些新客户端 喵! ---
+        self.temporal_db = temporal_db
+        self.tabular_db = tabular_db
+        self.search_client = search_client
+        self.ensemble_client = ensemble_client # 存储
+
         # [Task 4] 存储注入的依赖
         self.prompt_manager = prompt_manager
         self.prompt_renderer = prompt_renderer
         
-        self.rerank_model_name = self.config.get(
+        # [修复] 存储 'ai_components.retriever' 根配置
+        self.config = config 
+
+        # [修复] 
+        default_l1_config = self.config.get("l1_retriever", {})
+
+        self.rerank_model_name = default_l1_config.get(
             "rerank_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
         )
-        self.top_k_vector = self.config.get("top_k_vector", 10)
-        self.top_k_graph = self.config.get("top_k_graph", 5)
-        self.top_k_gnn = self.config.get("top_k_gnn", 5)  # [GNN Plan Task 2.3]
-        self.rerank_threshold = self.config.get("rerank_threshold", 0.1)
+        self.top_k_vector = default_l1_config.get("vector_top_k", 10)
+        self.top_k_graph = default_l1_config.get("top_k_graph", 5)
+        self.top_k_gnn = default_l1_config.get("top_k_gnn", 5)
+        self.rerank_threshold = default_l1_config.get("rerank_threshold", 0.1)
 
         self._initialize_reranker()
 
@@ -357,6 +375,23 @@ class Retriever:
             logger.error(f"Failed GNN-enhanced query for '{query_text}': {e}", exc_info=True)
             return [] # Return empty list to not break asyncio.gather
 
+    # --- 新的 RAG 搜索方法 (占位符) 喵! ---
+
+    async def search_temporal_db(self, query: str) -> List[Evidence]:
+        if not self.temporal_db: return []
+        logger.info("TemporalDB search not yet implemented.")
+        return [] # TODO: 实现时序检索
+
+    async def search_tabular_db(self, query: str) -> List[Evidence]:
+        if not self.tabular_db: return []
+        logger.info("TabularDB search not yet implemented.")
+        return [] # TODO: 实现表格检索 (e.g., Text-to-SQL)
+
+    async def search_web(self, query: str) -> List[Evidence]:
+        if not self.search_client: return []
+        logger.info("Web search not yet implemented.")
+        return [] # TODO: 实现网络搜索
+
     async def retrieve_and_rerank(self, query: str) -> List[Evidence]:
         """
         Orchestrates the retrieval and reranking process.
@@ -368,7 +403,11 @@ class Retriever:
         tasks = [
             self.search_vector_db(query),
             self.search_knowledge_graph(query), # Returns List[GraphQueryResult]
-            self._query_graph_with_gnn(query, k=self.top_k_gnn) # Returns List[Evidence]
+            self._query_graph_with_gnn(query, k=self.top_k_gnn), # Returns List[Evidence]
+            # --- 添加新任务 喵! ---
+            self.search_temporal_db(query),
+            self.search_tabular_db(query),
+            self.search_web(query)
         ]
         
         try:
@@ -378,12 +417,16 @@ class Retriever:
             all_results = await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"Critical error during parallel retrieval: {e}", exc_info=True)
-            all_results = [[], [], []] # Empty results for each task
+            all_results = [[], [], [], [], [], []] # Empty results for each task
 
         # Unpack results
         vector_results: List[Evidence] = all_results[0]
         graph_search_results: List[GraphQueryResult] = all_results[1]
         gnn_results: List[Evidence] = all_results[2]
+        # --- 解包新任务 喵! ---
+        temporal_results: List[Evidence] = all_results[3]
+        tabular_results: List[Evidence] = all_results[4]
+        web_results: List[Evidence] = all_results[5]
 
         # Convert graph results to Evidence schema
         graph_results: List[Evidence] = [
@@ -397,25 +440,33 @@ class Retriever:
             for res in graph_search_results
         ]
 
-        combined_results = vector_results + graph_results + gnn_results
+        combined_results = (
+            vector_results + 
+            graph_results + 
+            gnn_results +
+            temporal_results +
+            tabular_results +
+            web_results
+        )
         if not combined_results:
             logger.warning(f"No results found for query: {query}")
             return []
 
         logger.info(
             f"Combined {len(vector_results)} vector, "
-            f"{len(graph_results)} graph, and "
-            f"{len(gnn_results)} GNN results."
+            f"{len(graph_results)} graph, "
+            f"{len(gnn_results)} GNN, "
+            f"{len(temporal_results)} temporal, "
+            f"{len(tabular_results)} tabular, and "
+            f"{len(web_results)} web results."
         )
 
         final_results = self._rerank_documents(query, combined_results)
 
-        final_top_k = self.config.get("final_top_k", 5)
+        final_top_k = self.config.get("l1_retriever", {}).get("final_top_k", 5)
         final_results = final_results[:final_top_k]
 
         logger.info(
             f"Retrieval complete. Returning {len(final_results)} reranked documents."
         )
         return final_results
-
-}
