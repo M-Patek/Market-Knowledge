@@ -24,6 +24,7 @@ try:
     from Phoenix_project.models.registry import registry, MODEL_ARTIFACTS_DIR
     # [GNN 写回] 导入 GraphDBClient 以便写回
     from Phoenix_project.ai.graph_db_client import GraphDBClient
+    from graphdatascience import GraphDataScience # [Task I.1] 导入 GDS 库
 except ImportError:
     # 回退 (Fallback) 逻辑，用于本地测试或模块尚未完全建立
     logger = logging.getLogger(__name__)
@@ -54,6 +55,26 @@ except ImportError:
         async def close(self):
             logger.info("GraphDBClient.close()")
     GraphDBClient = MockGraphDBClient # 覆盖
+
+    # [Task I.1] Mock GDS 库
+    class MockGDS:
+        def __init__(self, *args, **kwargs):
+            self.graph = self
+        def exists(self, *args, **kwargs):
+            return self
+        def drop(self, *args, **kwargs):
+            pass
+        def project(self, *args, **kwargs):
+            logger.info(f"MockGDS.graph.project({args}, {kwargs})")
+            # 返回一个模拟的结果对象
+            class MockProjectResult:
+                graphName = "mock_graph"
+                nodeCount = 100
+                relationshipCount = 200
+            return MockProjectResult()
+        def close(self):
+            pass
+    GraphDataScience = MockGDS
     # --- End Mock Objects ---
 
 # [阶段 3] 关键时区和安全停止时间
@@ -157,6 +178,55 @@ async def _write_predictions_to_graph(predictions: List[Dict[str, Any]]):
         if graph_client and hasattr(graph_client, 'close'):
             await graph_client.close()
 
+# --- [Task I.1] GDS 辅助函数 ---
+
+def _run_gds_projection(graph_name: str) -> bool:
+    """
+    [Task I.1] 连接到 Neo4j GDS 并投影训练图。
+    """
+    logger.info(f"[GNN GDS] Connecting to GDS to project graph '{graph_name}'...")
+    gds = None
+    try:
+        # GDS 客户端使用与 GraphDBClient 相同的环境变量
+        uri = os.environ.get("NEO4J_URI", "bolt://neo4j:7687")
+        user = os.environ.get("NEO4J_USER", "neo4j")
+        password = os.environ.get("NEO4J_PASSWORD", "password")
+        
+        # 实例化 GDS 客户端
+        gds = GraphDataScience(uri, auth=(user, password))
+        
+        # 检查图是否已存在，如果存在则删除
+        # [Fix] gds.graph.exists() 返回一个布尔值，而不是链式对象
+        if gds.graph.exists(graph_name):
+            logger.info(f"[GNN GDS] Dropping existing graph: {graph_name}")
+            gds.graph.drop(graph_name)
+
+        # [配置] 定义节点和关系投影
+        # (这是一个示例；在生产中应将其外部化)
+        node_projection = ["Symbol", "Analysis", "FusionDecision"]
+        relationship_projection = {
+            "IS_ANALYSIS_OF": {"orientation": "UNDIRECTED"},
+            "TARGETS_SYMBOL": {"orientation": "UNDIRECTED"},
+            "BASED_ON_ANALYSIS": {"orientation": "UNDIRECTED"}
+        }
+
+        # 运行投影
+        # (注意: 在真实 GNN 中，我们可能还需要投影节点属性)
+        result = gds.graph.project(
+            graph_name,
+            node_projection,
+            relationship_projection
+        )
+        logger.info(f"[GNN GDS] Graph projection successful: {result.graphName}, {result.nodeCount} nodes, {result.relationshipCount} relationships.")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[GNN GDS] Graph projection failed: {e}", exc_info=True)
+        return False
+    finally:
+        if gds:
+            gds.close()
+
 # --- 主训练函数 ---
 
 def run_gnn_training_pipeline():
@@ -168,9 +238,14 @@ def run_gnn_training_pipeline():
     
     try:
         # 1. 导出图数据 (来自 Neo4j GDS)
-        # (模拟)
         logger.info("[GNN Training] Exporting graph data from Neo4j GDS...")
-        time.sleep(2) # 模拟 GDS 导出
+        # time.sleep(2) # [Task I.1] 移除模拟
+        
+        GDS_GRAPH_NAME = "gnn_projection_graph"
+        if not _run_gds_projection(GDS_GRAPH_NAME):
+            logger.critical("[GNN Training] Failed to project GDS graph. Aborting training.")
+            raise RuntimeError("GDS Projection Failed")
+            
         logger.info("[GNN Training] Graph data exported.")
 
         # 2. 训练 GNN 模型
@@ -263,5 +338,25 @@ if __name__ == "__main__":
             async def close(self):
                 logger.info("GraphDBClient.close()")
         GraphDBClient = MockGraphDBClient
+    
+    # [Task I.1] Mock GDS 库
+    if "GraphDataScience" not in globals():
+        class MockGDS:
+            def __init__(self, *args, **kwargs):
+                self.graph = self
+            def exists(self, *args, **kwargs):
+                return False
+            def drop(self, *args, **kwargs):
+                pass
+            def project(self, *args, **kwargs):
+                logger.info(f"MockGDS.graph.project({args}, {kwargs})")
+                class MockProjectResult:
+                    graphName = "mock_graph"
+                    nodeCount = 100
+                    relationshipCount = 200
+                return MockProjectResult()
+            def close(self):
+                pass
+        GraphDataScience = MockGDS
         
     run_gnn_training_pipeline()
