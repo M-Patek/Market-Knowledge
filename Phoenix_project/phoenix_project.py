@@ -4,6 +4,7 @@ Phoenix Project (Market Knowledge) - 主入口点
 
 import asyncio
 import logging
+from typing import Dict, Any
 
 from config.loader import ConfigLoader
 from monitor.logging import setup_logging
@@ -26,6 +27,15 @@ from cognitive.engine import CognitiveEngine
 from cognitive.risk_manager import RiskManager
 from cognitive.portfolio_constructor import PortfolioConstructor
 from execution.order_manager import OrderManager
+# --- Task 5 Imports 喵! ---
+from execution.trade_lifecycle_manager import TradeLifecycleManager
+from execution.adapters import PaperBrokerAdapter # (或 SimulatedBrokerAdapter, 假设在 adapters.py)
+from execution.interfaces import IBrokerAdapter
+# --- Task 6 Imports 喵! ---
+from events.event_distributor import EventDistributor
+from events.risk_filter import EventRiskFilter
+from ai.reasoning_ensemble import ReasoningEnsemble
+from ai.market_state_predictor import MarketStatePredictor
 from controller.orchestrator import Orchestrator
 from controller.loop_manager import LoopManager
 from data_manager import DataManager
@@ -51,8 +61,8 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
     embedding_client = EmbeddingClient(
         provider=config.get('api_gateway.embedding_model.provider'),
         model_name=config.get('api_gateway.embedding_model.model_name'),
-        dimensions=config.get('api_gateway.embedding_model.dimensions'),
-        api_key=api_gateway.get_api_key('openai') # 假设
+        # dimensions=config.get('api_gateway.embedding_model.dimensions'), # <--- 移除
+        api_key=api_gateway.get_api_key('gemini') # <--- 修改为 'gemini' 密钥
     )
     
     # (RAG) 搜索工具 (Search Tool) - 示例
@@ -73,7 +83,7 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
     )
     
     # (RAG) 知识图谱 (Knowledge Graph)
-    graph_db_client = GraphDBClient(config=config.get_config('knowledge_graph'))
+    graph_db_client = GraphDBClient()
     
     # (RAG) 表格数据库 (Tabular DB)
     tabular_db_client = TabularDBClient(config=config.get_config('data_manager.tabular_db'))
@@ -96,6 +106,9 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
         config=config.get('ai_components.relation_extractor')
     )
 
+    # (RAG) 数据适配器 (Data Adapter)
+    data_adapter = DataAdapter()
+
     # [GNN Plan Task 1.3] Instantiate GNNInferencer Service
     gnn_model_path = config.get('ai_components.gnn.model_path', '/app/models/default_gnn')
     gnn_inferencer_service = GNNInferencer(model_path=gnn_model_path)
@@ -107,12 +120,14 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
         graph_db=graph_db_client,
         llm_client=ensemble_client.get_client("gemini"), # 假设
         # TODO: 修复 RAG 依赖 (Temporal, Tabular, Search)
-        # temporal_db=temporal_db_client,
-        # tabular_db=tabular_db_client,
-        # search_client=search_client,
+        temporal_db=temporal_db_client,
+        tabular_db=tabular_db_client,
+        search_client=search_client,
         ensemble_client=ensemble_client,
-        config=config.get('ai_components.retriever.l1_retriever'), # TODO: This should be dynamic based on L1/L2
-        gnn_inferencer=gnn_inferencer_service
+        config=config.get_config('ai_components.retriever'), # [修复] 移除硬编码
+        gnn_inferencer=gnn_inferencer_service,
+        prompt_manager=prompt_manager,
+        prompt_renderer=prompt_renderer
     )
 
     # L1 智能体执行器 (L1 Agent Executor)
@@ -145,8 +160,45 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
         sizer_config=config.get_config('portfolio.sizer')
     )
 
+    # (L3) 交易生命周期管理器 (Trade Lifecycle Manager)
+    # (喵~ TLM 可能需要 portfolio_constructor 或其他状态管理器)
+    trade_lifecycle_manager = TradeLifecycleManager(
+         # portfolio_constructor=portfolio_constructor # 假设
+    )
+
+    # (L3) 券商适配器 (Broker Adapter)
+    # (喵~ 适配器可能需要 config 和 api_gateway)
+    broker_adapter: IBrokerAdapter = PaperBrokerAdapter(
+        config=config.get_config('broker'), # 假设配置
+        api_gateway=api_gateway            # 假设配置
+    )
+
     # (L3) 订单管理器 (Order Manager)
-    order_manager = OrderManager()
+    order_manager = OrderManager(
+        broker=broker_adapter,
+        trade_lifecycle_manager=trade_lifecycle_manager
+    )
+    
+    # --- (L3) 创建 Orchestrator 依赖 (Task 6) ---
+    event_distributor = EventDistributor(
+        config=config.get_config('events.distributor') # 假设
+    )
+    event_filter = EventRiskFilter(
+        config=config.get_config('events.risk_filter') # 假设
+    )
+    reasoning_ensemble = ReasoningEnsemble(
+        llm_client=ensemble_client,
+        prompt_manager=prompt_manager,
+        prompt_renderer=prompt_renderer
+    )
+    market_state_predictor = MarketStatePredictor(
+        llm_client=ensemble_client
+    )
+    
+    # (AuditManager 在 create_main_systems 中创建，因为它依赖 cot_db)
+    # ...
+
+
 
     logger.info("Core services initialized.")
     return {
@@ -170,6 +222,14 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
         "risk_manager": risk_manager,
         "portfolio_constructor": portfolio_constructor,
         "order_manager": order_manager,
+        # --- Task 5 Additions 喵! ---
+        "trade_lifecycle_manager": trade_lifecycle_manager,
+        "broker_adapter": broker_adapter,
+        # --- Task 6 Additions 喵! ---
+        "event_distributor": event_distributor,
+        "event_filter": event_filter,
+        "reasoning_ensemble": reasoning_ensemble,
+        "market_state_predictor": market_state_predictor
     }
 
 def create_main_systems(services: Dict[str, Any]) -> Dict[str, Any]:
@@ -178,13 +238,21 @@ def create_main_systems(services: Dict[str, Any]) -> Dict[str, Any]:
     """
     logger.info("Initializing main systems...")
     
+    # [修复 喵!] 审计管理器必须在 Orchestrator 之前创建
+    audit_manager = AuditManager(cot_db=services["cot_db"])
+
     # (L3) 编排器 (Orchestrator)
+    # [修复 喵!] 使用 orchestrator.py 中定义的 9 个参数
     orchestrator = Orchestrator(
+        config=services["config"],
         cognitive_engine=services["cognitive_engine"],
-        risk_manager=services["risk_manager"],
+        event_distributor=services["event_distributor"],
+        event_filter=services["event_filter"],
+        reasoning_ensemble=services["reasoning_ensemble"],
+        market_state_predictor=services["market_state_predictor"],
         portfolio_constructor=services["portfolio_constructor"],
-        order_manager=services["order_manager"],
-        cot_db=services["cot_db"]
+        order_manager=services.get("order_manager"), # 使用 .get()
+        audit_manager=audit_manager
     )
 
     # (L0/L1/L2) 循环管理器 (Loop Manager)
@@ -212,7 +280,7 @@ def create_main_systems(services: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # 审计管理器 (Audit Manager)
-    audit_manager = AuditManager(cot_db=services["cot_db"])
+    # audit_manager = AuditManager(cot_db=services["cot_db"]) # 移动到 Orchestrator 之前
 
     logger.info("Main systems initialized.")
     return {
