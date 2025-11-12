@@ -159,3 +159,10 @@ ai_components:
     # (用于 KnowledgeInjector)
     enabled: true
     llm_model: "gemini-1.5-flash-latest" # (使用 Flash 进行提取)
+
+  # (RAG) GNN 推理器 (GNN Inferencer) - [GNN Plan Task 1.2]
+  gnn:
+    # (用于 GNNInferencer)
+    model_path: "/app/models/gnn/v1_saved_model" # (容器内的占位符路径)
+
+}
