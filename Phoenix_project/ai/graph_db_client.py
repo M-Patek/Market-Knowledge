@@ -110,6 +110,33 @@ class GraphDBClient:
             logger.error(f"{self.log_prefix} Cypher 写入事务失败: {e}", exc_info=True)
             return False
 
+    async def ensure_schema_constraints(self):
+        """
+        [Task I.3] 确保图 schema 约束已创建。
+        这是一个幂等操作 (idempotent)。
+        """
+        if not self.driver:
+            logger.error(f"{self.log_prefix} 无法确保约束：驱动程序未初始化。")
+            return False
+        
+        logger.info(f"{self.log_prefix} 正在确保 schema 约束...")
+        
+        # 约束：Symbol 节点的 'id' 必须是唯一的
+        # 这对于 gnn_engine.py 中的 MERGE (s:Symbol {id: pred.symbol}) 至关重要
+        constraint_query = """
+        CREATE CONSTRAINT symbol_id_unique IF NOT EXISTS
+        FOR (s:Symbol) REQUIRE s.id IS UNIQUE
+        """
+        
+        try:
+            await self.execute_write(constraint_query)
+            logger.info(f"{self.log_prefix} 约束 'symbol_id_unique' 已确保。")
+            return True # [Fix] 返回布尔值以保持一致性
+        except Exception as e:
+            # (在某些 Neo4j 版本/配置中，CREATE IF NOT EXISTS 仍可能在并发中失败或出错)
+            logger.warning(f"{self.log_prefix} 确保约束时出错 (可能已存在): {e}")
+            return False # [Fix] 返回布尔值以保持一致性
+
     async def add_triples(self, triples: List[Tuple[str, str, Any]]) -> bool:
         """
         [Task 3] 批量添加三元组 (subject_id, predicate, object_literal_or_id) 到图。
@@ -171,9 +198,14 @@ class GraphDBClient:
         """
         
         try:
-            await self.execute_write(query, params={"triples": params_list})
-            logger.info(f"{self.log_prefix} 成功添加/更新了 {len(params_list)} 个三元组。")
-            return True
+            # [Fix] 此处应使用 execute_write 而不是 execute_query
+            success = await self.execute_write(query, params={"triples": params_list})
+            if success:
+                logger.info(f"{self.log_prefix} 成功添加/更新了 {len(params_list)} 个三元组。")
+                return True
+            else:
+                logger.error(f"{self.log_prefix} add_triples 事务失败。")
+                return False
         except Exception as e:
             logger.error(f"{self.log_prefix} add_triples 事务失败 (是否安装了 APOC?): {e}", exc_info=True)
             return False
