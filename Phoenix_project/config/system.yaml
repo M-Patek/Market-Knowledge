@@ -17,9 +17,9 @@ api_gateway:
   
   # 嵌入模型 (Embedding Model) - [✅ 修复] 与 RAG 架构和代码实现 (embedding_client.py) 保持一致
   embedding_model:
-    provider: "openai" # (或 "gemini", "local" 等)
-    model_name: "text-embedding-3-large" # (与 RAG 架构对应)
-    dimensions: 3072 # (text-embedding-3-large 的维度)
+    provider: "google" # <--- 修改
+    model_name: "models/text-embedding-004" # <--- 修改 (Google 的标准模型)
+    # dimensions: 3072 # <--- 移除 (Google 模型不需要这个)
     # (API 密钥应来自 .env, 例如 OPENAI_API_KEY)
   
   # LLM (用于 L1/L2/L3 智能体, RAG 合成)
