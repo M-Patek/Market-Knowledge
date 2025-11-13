@@ -13,7 +13,7 @@ import time # [阶段 4]
 
 from Phoenix_project.training.drl.multi_agent_trainer import MultiAgentDRLTrainer
 from Phoenix_project.training.walk_forward_trainer import WalkForwardTrainer
-from Phoenix_project.config.loader import load_config
+from Phoenix_project.config.loader import ConfigLoader # [Fix II.2]
 from Phoenix_project.monitor.logging import get_logger
 # [阶段 4] 导入安全逻辑依赖
 from Phoenix_project.monitor.metrics import METRICS
@@ -39,7 +39,7 @@ def _check_et_safety_window() -> bool:
     is_danger_window = is_weekday and (now_et.time() >= SAFE_STOP_TIME_ET)
     return is_danger_window
 
-def run_fine_tuning(config: dict):
+def run_fine_tuning(config: ConfigLoader): # [Fix II.2]
     """
     [阶段 4] 已修改
     执行 DRL 模型的夜间微调 (fine-tuning)。
@@ -123,7 +123,7 @@ def run_fine_tuning(config: dict):
         # 向上抛出异常，以便 Celery 链 (chain) 知道它失败了
         raise
 
-def run_walk_forward(config: dict):
+def run_walk_forward(config: ConfigLoader): # [Fix II.2]
     """执行步进优化 (Walk-Forward Optimization)"""
     logger.info("Starting Walk-Forward Optimization (WFO)...")
     wfo_trainer = WalkForwardTrainer(config)
@@ -141,7 +141,11 @@ def main():
     args = parser.parse_args()
 
     # 加载主配置
-    config = load_config("system.yaml")
+    # [Fix II.2] 使用 ConfigLoader 完整构造函数
+    config = ConfigLoader(
+        system_config_path="config/system.yaml",
+        rules_config_path="config/symbolic_rules.yaml"
+    )
     
     if args.mode == "fine-tune":
         run_fine_tuning(config)
