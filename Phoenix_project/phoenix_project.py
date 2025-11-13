@@ -29,7 +29,7 @@ from cognitive.portfolio_constructor import PortfolioConstructor
 from execution.order_manager import OrderManager
 # --- Task 5 Imports 喵! ---
 from execution.trade_lifecycle_manager import TradeLifecycleManager
-from execution.adapters import PaperBrokerAdapter # (或 SimulatedBrokerAdapter, 假设在 adapters.py)
+from execution.adapters import AlpacaAdapter
 from execution.interfaces import IBrokerAdapter
 # --- Task 6 Imports 喵! ---
 from events.event_distributor import EventDistributor
@@ -162,15 +162,15 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
 
     # (L3) 交易生命周期管理器 (Trade Lifecycle Manager)
     # (喵~ TLM 可能需要 portfolio_constructor 或其他状态管理器)
+    initial_capital = config.get('trading.initial_capital', 100000.0)
     trade_lifecycle_manager = TradeLifecycleManager(
-         # portfolio_constructor=portfolio_constructor # 假设
+        initial_cash=initial_capital
     )
 
     # (L3) 券商适配器 (Broker Adapter)
     # (喵~ 适配器可能需要 config 和 api_gateway)
-    broker_adapter: IBrokerAdapter = PaperBrokerAdapter(
-        config=config.get_config('broker'), # 假设配置
-        api_gateway=api_gateway            # 假设配置
+    broker_adapter: IBrokerAdapter = AlpacaAdapter(
+        config=config.get_config('broker')
     )
 
     # (L3) 订单管理器 (Order Manager)
@@ -336,7 +336,7 @@ async def main():
 
         # --- 5. 启动 API 服务器 (前台) ---
         logger.info("Starting FastAPI server...")
-        await api_server.run() # 假设 run() 是一个启动 Uvicorn 的异步方法
+        api_server.run() # Call directly; it starts in a background thread
 
         # --- 6. (优雅关闭) ---
         logger.info("--- Phoenix Project Shutting Down ---")
