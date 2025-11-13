@@ -41,7 +41,7 @@ COPY Phoenix_project /app/Phoenix_project
 # COPY prompts /app/prompts
 # COPY reasoning /app/reasoning
 # COPY sizing /app/sizing
-# COPY storage /app/storage
+# COPY storage /app/storage # [Fix III.3] 移除此行
 # COPY templates /app/templates
 # COPY training /app/training
 # COPY utils /app/utils
