@@ -11,7 +11,7 @@ uvicorn[standard]>=0.29
 
 (注: 新列表中有 uvicorn，这里保留了带 [standard] 的版本)
 
-websockets # <--- [阶段 2] 为 PaperTrading/Alpaca 添加
+websockets
 
 任务队列 & 事件流
 celery[redis]
@@ -34,13 +34,7 @@ scipy>=1.11
 深度学习 & DRL (PyTorch)
 
 --- [DRL Heart Transplant] ---
-
-stable-baselines3[torch]>=2.3.0 (REMOVED: Replaced by RLLib)
-
-pettingzoo>=1.24.0 (REMOVED: New Gym Env doesn't require it)
-
-ray[rllib]>=2.9.0 # ADDED: For new L3 DRL Agents (Alpha, Risk, Exec)
-
+ray[rllib]>=2.9.0
 --- [DRL Heart Transplant End] ---
 
 torch>=2.2
@@ -89,7 +83,7 @@ neo4j>=5.20
 [Fix III.5] 移除 pinecone-client
 
 量化交易 & 回测
-alpaca-trade-api-python # <--- [阶段 2] 为 PaperTrading/Alpaca 添加
+alpaca-trade-api-python
 alphalens-reloaded>=0.5
 backtesting>=0.3.4
 empyrical>=0.5
