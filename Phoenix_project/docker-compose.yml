@@ -14,6 +14,7 @@ volumes:
   elastic_data:
   kafka_data: # (已优化) 为 Kafka 添加持久化
   zookeeper_data: # (已优化) 为 Zookeeper 添加持久化
+  qdrant_data: # [Fix I.1] 为 Qdrant 添加卷
 
 services:
   # -----------------------------------------------------------------
@@ -31,7 +32,8 @@ services:
       - phoenix_net
     restart: unless-stopped # (已优化) 增加重启策略
     healthcheck: # (已优化) 增加健康检查
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-supersecret}", "ping"]
+      # [Fix I.4] 使用 CMD-SHELL 确保 $${REDIS_PASSWORD} 被正确解析
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD:-supersecret} ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -70,6 +72,20 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # -----------------------------------------------------------------
+  #  Qdrant (Vector DB for RAG)
+  # -----------------------------------------------------------------
+  qdrant: # [Fix I.1] 添加 Qdrant 服务
+    image: qdrant/qdrant:v1.8.4
+    container_name: phoenix_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - phoenix_net
+    restart: unless-stopped
 
   # -----------------------------------------------------------------
   #  其他基础设施服务 (来自项目文件)
@@ -180,6 +196,8 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      qdrant: # [Fix I.1] 增加 Qdrant 依赖
+        condition: service_started # Qdrant 尚无健康检查
     env_file:
       - .env
     environment:
@@ -189,6 +207,7 @@ services:
       - TABULAR_DB_URI=postgresql://phoenix_user:${POSTGRES_PASSWORD:-changeme_in_prod}@postgres_db:5432/phoenix_tabular
       - TEMPORAL_DB_URI=http://elasticsearch:9200
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - QDRANT_HOST=phoenix_qdrant # [Fix I.1] 为代码提供 Qdrant 主机名
     networks:
       - phoenix_net
     restart: unless-stopped
@@ -205,6 +224,8 @@ services:
         condition: service_healthy
       postgres_db:
         condition: service_healthy
+      qdrant: # [Fix I.1] API 也可能需要 RAG
+        condition: service_started
     ports:
       - "8000:8000"
     env_file:
@@ -212,6 +233,7 @@ services:
     environment:
       - REDIS_HOST=redis
       - NEO4J_URI=bolt://neo4j:7687
+      - QDRANT_HOST=phoenix_qdrant # [Fix I.1] 为 API 提供 Qdrant 主机名
     networks:
       - phoenix_net
     restart: unless-stopped
