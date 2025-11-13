@@ -6,133 +6,129 @@ Phoenix (Market Knowledge) 系统配置文件 (system.yaml)
 
 controller:
 
-(L0/L1/L2) 认知循环 (Cognitive Loop) - (由 LoopManager 管理)
+  (L0/L1/L2) 认知循环 (Cognitive Loop) - (由 LoopManager 管理)
 
-l0_l1_loop_frequency_sec: 60  # (L0) 检查新数据源的频率 (例如 1 分钟)
-l2_loop_frequency_sec: 120    # (L2) 运行 L2 智能体 (融合, 批评) 的频率 (例如 2 分钟)
+  l0_l1_loop_frequency_sec: 60  # (L0) 检查新数据源的频率 (例如 1 分钟)
+  l2_loop_frequency_sec: 120    # (L2) 运行 L2 智能体 (融合, 批评) 的频率 (例如 2 分钟)
 
-(L3) 决策循环 (Decision Loop) - (由 Orchestrator 管理)
+  (L3) 决策循环 (Decision Loop) - (由 Orchestrator 管理)
 
-l3_loop_frequency_sec: 300    # (L3) 运行 L3 智能体 (Alpha, Risk) 的频率 (例如 5 分钟)
+  l3_loop_frequency_sec: 300    # (L3) 运行 L3 智能体 (Alpha, Risk) 的频率 (例如 5 分钟)
 
 2. API 网关 (APIGateway)
 
 api_gateway:
 
-(用于 LLM, Embedding, Tools)
+  (用于 LLM, Embedding, Tools)
 
-(RAG) 'embedding_model' 和 'llm' (用于合成) 是 RAG 的关键
+  (RAG) 'embedding_model' 和 'llm' (用于合成) 是 RAG 的关键
 
-嵌入模型 (Embedding Model) - [✅ 修复] 与 RAG 架构和代码实现 (embedding_client.py) 保持一致
+  嵌入模型 (Embedding Model) - [✅ 修复] 与 RAG 架构和代码实现 (embedding_client.py) 保持一致
 
-embedding_model:
-provider: "google" # <--- 修改
-model_name: "models/text-embedding-004" # <--- 修改 (Google 的标准模型)
-# dimensions: 3072 # <--- 移除 (Google 模型不需要这个)
-# (API 密钥应来自 .env, 例如 OPENAI_API_KEY)
+  embedding_model:
+    provider: "google" # <--- 修改
+    model_name: "models/text-embedding-004" # <--- 修改 (Google 的标准模型)
+    # dimensions: 3072 # <--- 移除 (Google 模型不需要这个)
+    # (API 密钥应来自 .env, 例如 OPENAI_API_KEY)
 
-LLM (用于 L1/L2/L3 智能体, RAG 合成)
+  LLM (用于 L1/L2/L3 智能体, RAG 合成)
 
-llm:
-provider: "gemini" # (或 "openai")
-model_name: "gemini-1.5-pro-latest" # (RAG) 用于 L1/L2 和 RAG 合成
-# (API 密钥应来自 .env, 例如 GEMINI_API_KEY)
+  llm:
+    provider: "gemini" # (或 "openai")
+    model_name: "gemini-1.5-pro-latest" # (RAG) 用于 L1/L2 和 RAG 合成
+    # (API 密钥应来自 .env, 例如 GEMINI_API_KEY)
 
-(API 池/限速器配置 - [您的最新设置])
+  (API 池/限速器配置 - [您的最新设置])
 
-pool:
-max_workers: 10 # 并行 API 调用的最大数量
-rate_limit_calls: 5 # 每
-rate_limit_period: 1 # 1 秒
+  pool:
+    max_workers: 10 # 并行 API 调用的最大数量
+    rate_limit_calls: 5 # 每
+    rate_limit_period: 1 # 1 秒
 
-(工具 API，例如搜索) - (RAG) [✅ 修复] 明确定义工具 (RAG 架构)
+  (工具 API，例如搜索) - (RAG) [✅ 修复] 明确定义工具 (RAG 架构)
 
-tools:
-search_api:
-provider: "tavily" # (或 "google", "serper" 等)
-api_key_env: "TAVILY_API_KEY" # (来自 .env)
-gemini:
-api_key: "YOUR_GEMINI_KEY" # Placeholder/Default
+  tools:
+    search_api:
+      provider: "tavily" # (或 "google", "serper" 等)
+      api_key_env: "TAVILY_API_KEY" # (来自 .env)
+    gemini:
+      api_key: "YOUR_GEMINI_KEY" # Placeholder/Default
 
 3. 数据管理器 (DataManager)
 
 data_manager:
 
-(RAG) DataManager 充当 RAG 管道的 "Data Sources" (数据源) 接口
+  (RAG) DataManager 充当 RAG 管道的 "Data Sources" (数据源) 接口
 
-数据库 (Tabular - 财务/基本面) - [✅ 修复] 与 RAG 架构和代码实现 (tabular_db_client.py) 保持一致
+  数据库 (Tabular - 财务/基本面) - [✅ 修复] 与 RAG 架构和代码实现 (tabular_db_client.py) 保持一致
 
-tabular_db:
-type: "postgresql"
-host_env: "TABULAR_DB_HOST"
-port_env: "TABULAR_DB_PORT"
-db_env: "TABULAR_DB_NAME"
-user_env: "TABULAR_DB_USER"
-pass_env: "TABULAR_DB_PASS"
-# (RAG) 用于 DataAdapter (table-to-text)
-uri_env: "TABULAR_DB_URI" # (在 Docker 中, .env 应设为 "postgresql://user:pass@phoenix_postgres:5432/db")
+  tabular_db:
+    type: "postgresql"
+    # [Fix III.7] 移除冗余的 env 键
+    # (RAG) 用于 DataAdapter (table-to-text)
+    uri_env: "TABULAR_DB_URI" # (在 Docker 中, .env 应设为 "postgresql://user:pass@phoenix_postgres:5432/db")
 
-数据库 (Temporal - 时序事件) - [✅ 修复] 与 RAG 架构和代码实现 (temporal_db_client.py) 保持一致
+  数据库 (Temporal - 时序事件) - [✅ 修复] 与 RAG 架构和代码实现 (temporal_db_client.py) 保持一致
 
-temporal_db:
-type: "elasticsearch" # (或 "opensearch", "timescale")
-host: "phoenix_elasticsearch" # (Docker 服务名称)
-port: 9200
-index_name: "phoenix-temporal-events" # [✅ 修复] 明确指定索引名称 (与 RAG 架构对应)
+  temporal_db:
+    type: "elasticsearch" # (或 "opensearch", "timescale")
+    host: "phoenix_elasticsearch" # (Docker 服务名称)
+    port: 9200
+    index_name: "phoenix-temporal-events" # [✅ 修复] 明确指定索引名称 (与 RAG 架构对应)
 
-交易和投资组合 - [您的最新设置]
+  交易和投资组合 - [您的最新设置]
 
-trading:
-initial_capital: 100000.0 # Aligned with Task 1.1 Code
+  trading:
+    initial_capital: 100000.0 # Aligned with Task 1.1 Code
 
-[FIX] Add default symbols list to remove hardcoding from orchestrator
+  [FIX] Add default symbols list to remove hardcoding from orchestrator
 
-default_symbols: ["AAPL", "GOOG", "MSFT", "TSLA"]
+  default_symbols: ["AAPL", "GOOG", "MSFT", "TSLA"]
 
-broker:
-alpaca_api_key: "YOUR_KEY"
-alpaca_api_secret: "YOUR_SECRET"
-paper_trading: true
+  broker:
+    alpaca_api_key: "YOUR_KEY"
+    alpaca_api_secret: "YOUR_SECRET"
+    paper_trading: true
 
-portfolio:
-sizer:
-default_method: "fixed_fraction" # (默认仓位大小调整方法)
-fixed_fraction:
-fraction: 0.01 # (例如，每次交易承担 1% 的风险)
-volatility_parity:
-lookback: 20 # (例如，20 天的波动率)
+  portfolio:
+    sizer:
+      default_method: "fixed_fraction" # (默认仓位大小调整方法)
+      fixed_fraction:
+        fraction: 0.01 # (例如，每次交易承担 1% 的风险)
+      volatility_parity:
+        lookback: 20 # (例如，20 天的波动率)
 
 4. (RAG) 知识图谱 (Knowledge Graph) - [✅ 修复] 与 RAG 架构和代码实现 (graph_db_client.py) 保持一致
 
 knowledge_graph:
-type: "neo4j"
-uri_env: "NEO4J_URI" # (例如 "bolt://phoenix_neo4j:7687")
-user_env: "NEO4J_USER"
-pass_env: "NEO4J_PASS"
+  type: "neo4j"
+  uri_env: "NEO4J_URI" # (例如 "bolt://phoenix_neo4j:7687")
+  user_env: "NEO4J_USER"
+  pass_env: "NEO4J_PASS"
 
-(RAG) GraphDBClient (用于 Graph-RAG)
+  (RAG) GraphDBClient (用于 Graph-RAG)
 
 5. (RAG) 内存/向量存储 (Memory / Vector Store)
 
 memory:
 
-(RAG) VectorStore (用于 L1/L2 智能体的 RAG 检索)
+  (RAG) VectorStore (用于 L1/L2 智能体的 RAG 检索)
 
-vector_store:
-type: "qdrant" # (或 "chroma", "pinecone")
-host: "phoenix_qdrant" # (Docker 服务名称)
-port: 6333
-# (RAG) 存储 L1 证据 (Evidence) 和 RAG 文档 (Documents) 的集合
-l1_evidence_collection: "phoenix_l1_evidence"
-rag_documents_collection: "phoenix_rag_documents" # (RAG) [✅ 修复] 明确的 RAG 文档集合
+  vector_store:
+    type: "qdrant" # (或 "chroma", "pinecone")
+    host: "phoenix_qdrant" # (Docker 服务名称)
+    port: 6333
+    # (RAG) 存储 L1 证据 (Evidence) 和 RAG 文档 (Documents) 的集合
+    l1_evidence_collection: "phoenix_l1_evidence"
+    rag_documents_collection: "phoenix_rag_documents" # (RAG) [✅ 修复] 明确的 RAG 文档集合
 
-(CoT) 思维链/审计数据库
+  (CoT) 思维链/审计数据库
 
-cot_database:
-type: "mongodb"
-uri_env: "MONGO_URI" # (例如 "mongodb://phoenix_mongo:27017/")
-database: "phoenix_cot"
-collection: "agent_traces" # (存储 L1/L2/L3 的 CoT)
+  cot_database:
+    type: "mongodb"
+    uri_env: "MONGO_URI" # (例如 "mongodb://phoenix_mongo:27017/")
+    database: "phoenix_cot"
+    collection: "agent_traces" # (存储 L1/L2/L3 的 CoT)
 
 6. L1 智能体配置 (L1 Agent Configuration)
 
@@ -140,76 +136,76 @@ collection: "agent_traces" # (存储 L1/L2/L3 的 CoT)
 
 l1_agents:
 
-(RAG) L1 智能体是 RAG (Retrieve) 和 RAG (Generate) 的主要消费者
+  (RAG) L1 智能体是 RAG (Retrieve) 和 RAG (Generate) 的主要消费者
 
-(它们使用 RAG (Retriever) 来获取上下文)
+  (它们使用 RAG (Retriever) 来获取上下文)
 
-(技术分析师)
+  (技术分析师)
 
-technical_analyst:
-enabled: true
-# [FIX] Add lookback period config
-technical_lookback_days: 90
+  technical_analyst:
+    enabled: true
+    # [FIX] Add lookback period config
+    technical_lookback_days: 90
 
-(基本面分析师) - (RAG) 可能使用 Tabular-RAG
+  (基本面分析师) - (RAG) 可能使用 Tabular-RAG
 
-fundamental_analyst:
-enabled: true
+  fundamental_analyst:
+    enabled: true
 
-(宏观策略师) - (RAG) 可能使用 Search-RAG
+  (宏观策略师) - (RAG) 可能使用 Search-RAG
 
-macro_strategist:
-enabled: true
+  macro_strategist:
+    enabled: true
 
-(地缘政治分析师) - (RAG) 可能使用 Search-RAG
+  (地缘政治分析师) - (RAG) 可能使用 Search-RAG
 
-geopolitical_analyst:
-enabled: true
+  geopolitical_analyst:
+    enabled: true
 
-(催化剂监控器)
+  (催化剂监控器)
 
-catalyst_monitor:
-enabled: true
+  catalyst_monitor:
+    enabled: true
 
-(供应链情报) - (RAG) 可能使用 Graph-RAG
+  (供应链情报) - (RAG) 可能使用 Graph-RAG
 
-supply_chain_intelligence:
-enabled: true
+  supply_chain_intelligence:
+    enabled: true
 
-(创新追踪器)
+  (创新追踪器)
 
-innovation_tracker:
-enabled: true
+  innovation_tracker:
+    enabled: true
 
 7. (RAG) AI 组件配置
 
 ai_components:
 
-(RAG) 检索器 (Retriever) - [✅ 修复] 与 RAG 架构和代码实现 (retriever.py) 保持一致
+  (RAG) 检索器 (Retriever) - [✅ 修复] 与 RAG 架构和代码实现 (retriever.py) 保持一致
 
-retriever:
-# (L1 智能体用于 RAG 的检索器)
-l1_retriever:
-vector_top_k: 5 # (RAG) 从 VectorDB 检索 5 个
-graph_top_k: 3  # (RAG) 从 GraphDB 检索 3 个
-search_top_k: 2 # (RAG) 从 Search Tool 检索 2 个
+  retriever:
+    # (L1 智能体用于 RAG 的检索器)
+    l1_retriever:
+      vector_top_k: 5 # (RAG) 从 VectorDB 检索 5 个
+      graph_top_k: 3  # (RAG) 从 GraphDB 检索 3 个
+      search_top_k: 2 # (RAG) 从 Search Tool 检索 2 个
 
-# (L2 智能体用于 RAG 的检索器)
-l2_retriever:
-  vector_top_k: 10 # (L2 需要更广泛的 L1 证据上下文)
-  graph_top_k: 5
-  search_top_k: 0
+    # (L2 智能体用于 RAG 的检索器)
+    l2_retriever:
+      vector_top_k: 10 # (L2 需要更广泛的 L1 证据上下文)
+      graph_top_k: 5
+      search_top_k: 0
 
 
-(RAG) 关系提取器 (Relation Extractor) - [✅ 修复] (用于 KG 填充)
+  (RAG) 关系提取器 (Relation Extractor) - [✅ 修复] (用于 KG 填充)
 
-relation_extractor:
-# (用于 KnowledgeInjector)
-enabled: true
-llm_model: "gemini-1.5-flash-latest" # (使用 Flash 进行提取)
+  relation_extractor:
+    # (用于 KnowledgeInjector)
+    enabled: true
+    llm_model: "gemini-1.5-flash-latest" # (使用 Flash 进行提取)
 
-(RAG) GNN 推理器 (GNN Inferencer) - [GNN Plan Task 1.2]
+  (RAG) GNN 推理器 (GNN Inferencer) - [GNN Plan Task 1.2]
 
-gnn:
-# (用于 GNNInferencer)
-model_path: "/app/models/gnn/v1_saved_model" # (容器内的占位符路径)
+  gnn:
+    # (用于 GNNInferencer)
+    model_path: "/app/models/gnn/v1_saved_model" # (容器内的占位符路径)
