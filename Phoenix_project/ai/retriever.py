@@ -18,7 +18,7 @@ from ..core.schemas.evidence_schema import (
 )
 from ..memory.vector_store import VectorStore
 from ..ai.graph_db_client import GraphDBClient
-from ..api.gemini_pool_manager import GeminiClient
+# [Fix II.3] 移除 GeminiClient
 from ..ai.gnn_inferencer import GNNInferencer
 # [Task 4] 导入 PromptManager 和 PromptRenderer
 from ..ai.tabular_db_client import TabularDBClient
@@ -43,17 +43,16 @@ class Retriever:
         self,
         vector_store: VectorStore,
         graph_db: GraphDBClient,
-        llm_client: GeminiClient,
         config: Dict[str, Any],
         # [Task 4] 假设这些是由 Registry.py 注入的
         prompt_manager: PromptManager,
         prompt_renderer: PromptRenderer,
         gnn_inferencer: GNNInferencer,  # [GNN Plan Task 2.1]
+        ensemble_client: EnsembleClient, # [Fix II.3]
         # --- 添加/更新这些参数 喵! ---
         temporal_db: Optional[TemporalDBClient] = None,
         tabular_db: Optional[TabularDBClient] = None,
-        search_client: Optional[Any] = None,
-        ensemble_client: Optional[EnsembleClient] = None
+        search_client: Optional[Any] = None
     ):
         """
         Initializes the Retriever.
@@ -61,21 +60,24 @@ class Retriever:
         Args:
             vector_store: An instance of VectorStore.
             graph_db: An instance of GraphDBClient.
-            llm_client: An instance of the GeminiClient for LLM operations.
             config: Configuration dictionary.
             prompt_manager: [Task 4] Injected PromptManager.
             prompt_renderer: [Task 4] Injected PromptRenderer.
             gnn_inferencer: [GNN Plan Task 2.1] Injected GNNInferencer.
+            ensemble_client: [Fix II.3] The EnsembleClient for LLM interactions.
         """
         self.vector_store = vector_store
         self.graph_db = graph_db
         self.gnn_inferencer = gnn_inferencer  # [GNT Plan Task 2.1]
-        self.llm_client = llm_client
+        
+        # [Fix II.3] Simplify dependency: extract API gateway from ensemble client
+        self.ensemble_client = ensemble_client
+        self.llm_client = ensemble_client.api_gateway 
+        
         # --- 存储这些新客户端 喵! ---
         self.temporal_db = temporal_db
         self.tabular_db = tabular_db
         self.search_client = search_client
-        self.ensemble_client = ensemble_client # 存储
 
         # [Task 4] 存储注入的依赖
         self.prompt_manager = prompt_manager
@@ -246,6 +248,7 @@ class Retriever:
 
             prompt = self._generate_cypher_prompt(query, schema)
             
+            # [Fix II.3] 使用 self.llm_client (来自 EnsembleClient)
             response_text = await self.llm_client.generate_text(prompt)
 
             if not response_text:
@@ -425,9 +428,32 @@ class Retriever:
             return []
 
     async def search_web(self, query: str) -> List[Evidence]:
+        # [Fix IV.2] 实现 Web 搜索
         if not self.search_client: return []
-        logger.info("Web search not yet implemented.")
-        return [] # TODO: 实现网络搜索
+        logger.info(f"Performing web search for: {query}")
+        try:
+            # [Task IV.2] 使用 asyncio.to_thread 运行同步的 Tavily 客户端
+            search_limit = self.config.get("l1_retriever", {}).get("search_top_k", 2)
+            response = await asyncio.to_thread(
+                self.search_client.search,
+                query=query,
+                max_results=search_limit
+            )
+            results = response.get("results", [])
+            evidence_list = []
+            for res in results:
+                evidence_list.append(Evidence(
+                    id=res.get("url", "web_unknown"),
+                    content=res.get("content", ""),
+                    score=0.7, # Web 结果的默认置信度
+                    source_type=DataSource.WEB if hasattr(DataSource, 'WEB') else "web",
+                    metadata={"title": res.get("title"), "url": res.get("url")}
+                ))
+            logger.info(f"Web search found {len(evidence_list)} results.")
+            return evidence_list
+        except Exception as e:
+            logger.error(f"Web search failed: {e}", exc_info=True)
+            return []
 
     async def retrieve_and_rerank(self, query: str) -> List[Evidence]:
         """
@@ -444,7 +470,7 @@ class Retriever:
             # --- 添加新任务 喵! ---
             self.search_temporal_db(query),
             self.search_tabular_db(query),
-            self.search_web(query)
+            self.search_web(query) # [Fix IV.2]
         ]
         
         try:
@@ -463,7 +489,7 @@ class Retriever:
         # --- 解包新任务 喵! ---
         temporal_results: List[Evidence] = all_results[3]
         tabular_results: List[Evidence] = all_results[4]
-        web_results: List[Evidence] = all_results[5]
+        web_results: List[Evidence] = all_results[5] # [Fix IV.2]
 
         # Convert graph results to Evidence schema
         graph_results: List[Evidence] = [
@@ -483,7 +509,7 @@ class Retriever:
             gnn_results +
             temporal_results +
             tabular_results +
-            web_results
+            web_results # [Fix IV.2]
         )
         if not combined_results:
             logger.warning(f"No results found for query: {query}")
@@ -495,7 +521,7 @@ class Retriever:
             f"{len(gnn_results)} GNN, "
             f"{len(temporal_results)} temporal, "
             f"{len(tabular_results)} tabular, and "
-            f"{len(web_results)} web results."
+            f"{len(web_results)} web results." # [Fix IV.2]
         )
 
         final_results = self._rerank_documents(query, combined_results)
