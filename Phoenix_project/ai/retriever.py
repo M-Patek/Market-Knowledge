@@ -378,14 +378,51 @@ class Retriever:
     # --- 新的 RAG 搜索方法 (占位符) 喵! ---
 
     async def search_temporal_db(self, query: str) -> List[Evidence]:
-        if not self.temporal_db: return []
-        logger.info("TemporalDB search not yet implemented.")
-        return [] # TODO: 实现时序检索
+        if not self.temporal_db:
+            return []
+        try:
+            # Retrieve events using the client's specific method
+            results = await self.temporal_db.search_events(query_string=query, size=5)
+
+            evidence_list = []
+            for event_data, score in results:
+                evidence_list.append(Evidence(
+                    id=event_data.get('id', 'temp_unknown'),
+                    content=event_data.get('content') or event_data.get('summary') or str(event_data),
+                    score=float(score),
+                    source_type=DataSource.TEMPORAL,
+                    metadata={"timestamp": event_data.get('timestamp')}
+                ))
+            
+            logger.info(f"Temporal search found {len(evidence_list)} results.")
+            return evidence_list
+        except Exception as e:
+            logger.error(f"Temporal search failed: {e}")
+            return []
 
     async def search_tabular_db(self, query: str) -> List[Evidence]:
-        if not self.tabular_db: return []
-        logger.info("TabularDB search not yet implemented.")
-        return [] # TODO: 实现表格检索 (e.g., Text-to-SQL)
+        if not self.tabular_db:
+            return []
+        try:
+            # Delegate Text-to-SQL generation and execution to the client
+            response = await self.tabular_db.query(query)
+            results = response.get("results", [])
+
+            evidence_list = []
+            for i, row in enumerate(results):
+                evidence_list.append(Evidence(
+                    id=f"sql_res_{i}",
+                    content=str(row),
+                    score=1.0, # High confidence for exact database results
+                    source_type=DataSource.STRUCTURED,
+                    metadata={"sql_query": response.get("generated_sql")}
+                ))
+            
+            logger.info(f"Tabular search found {len(evidence_list)} results.")
+            return evidence_list
+        except Exception as e:
+            logger.warning(f"Tabular search failed: {e}")
+            return []
 
     async def search_web(self, query: str) -> List[Evidence]:
         if not self.search_client: return []
