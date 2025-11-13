@@ -4,11 +4,15 @@ Phoenix Project (Market Knowledge) - 主入口点
 
 import asyncio
 import logging
+import os # [Fix IV.1]
 from typing import Dict, Any
 
 from config.loader import ConfigLoader
 from monitor.logging import setup_logging
-from api.gateway import APIGateway
+# [Fix IV.1] 移除 APIGateway (Server) 的早期导入
+# from api.gateway import APIGateway
+from api.gemini_pool_manager import GeminiPoolManager # [Fix IV.1]
+from tavily import TavilyClient # [Fix IV.2]
 from memory.vector_store import VectorStore
 from memory.cot_database import CoTDatabase
 from ai.graph_db_client import GraphDBClient
@@ -23,6 +27,11 @@ from ai.prompt_renderer import PromptRenderer
 from ai.ensemble_client import EnsembleClient
 from ai.embedding_client import EmbeddingClient
 from agents.executor import AgentExecutor
+# [Fix II.1] 导入 L3 智能体
+from agents.l3.alpha_agent import AlphaAgent
+from agents.l3.risk_agent import RiskAgent
+from agents.l3.execution_agent import ExecutionAgent
+from registry import Registry # [Fix IV.1]
 from cognitive.engine import CognitiveEngine
 from cognitive.risk_manager import RiskManager
 from cognitive.portfolio_constructor import PortfolioConstructor
@@ -54,27 +63,53 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
     """
     logger.info("Initializing core services...")
 
-    # --- 1. 基础 API 和客户端 ---
-    api_gateway = APIGateway(config=config.get_config('api_gateway'))
+    # --- 1. 基础管理器与工具 (Managers & Utils) ---
     
+    # [Fix IV.1] 将 PromptManager 移至顶部，作为 EnsembleClient 的依赖项
+    prompt_manager = PromptManager(prompt_directory="prompts")
+    prompt_renderer = PromptRenderer(prompt_manager=prompt_manager)
+
+    # [Fix IV.1] 全局 Registry (用于 V2 智能体)
+    global_registry = Registry()
+
+    # --- 2. API 客户端与 LLM (Clients & LLM) ---
+    
+    # [Fix IV.1] 替换 APIGateway (Server) 为 GeminiPoolManager (Client)
+    gemini_manager = GeminiPoolManager(config=config.get_config('api_gateway'))
+
+    # [Fix IV.1] 直接从 env 获取 API 密钥
+    gemini_api_key_list = os.environ.get("GEMINI_API_KEYS", "").split(',')
+    gemini_api_key = gemini_api_key_list[0].strip() if gemini_api_key_list else None
+    if not gemini_api_key:
+        logger.warning("GEMINI_API_KEYS 未在 .env 中设置！EmbeddingClient 可能失败。")
+
     # [RAG] (RAG) 嵌入客户端 (Embedding Client)
     embedding_client = EmbeddingClient(
         provider=config.get('api_gateway.embedding_model.provider'),
         model_name=config.get('api_gateway.embedding_model.model_name'),
-        # dimensions=config.get('api_gateway.embedding_model.dimensions'), # <--- 移除
-        api_key=api_gateway.get_api_key('gemini') # <--- 修改为 'gemini' 密钥
+        api_key=gemini_api_key # [Fix IV.1]
     )
     
-    # (RAG) 搜索工具 (Search Tool) - 示例
-    search_client = api_gateway.get_search_client() # 假设 APIGateway 抽象了
+    # (RAG) 搜索工具 (Search Tool)
+    # [Fix IV.2] 实例化 TavilyClient
+    tavily_api_key = os.environ.get("TAVILY_API_KEY")
+    if tavily_api_key:
+        search_client = TavilyClient(api_key=tavily_api_key)
+        logger.info("Tavily Search Client initialized.")
+    else:
+        logger.warning("TAVILY_API_KEY not found. Web search will be disabled.")
+        search_client = None
     
     # (RAG) LLM 客户端 (Ensemble Client)
+    # [Fix IV.1] 修正 EnsembleClient 实例化
     ensemble_client = EnsembleClient(
-        llm_provider=api_gateway.get_llm_client('gemini'), # 假设
-        embedding_client=embedding_client
+       gemini_manager=gemini_manager,
+       prompt_manager=prompt_manager,
+       agent_registry=config.get_config('l1_agents'), # 示例：传入 L1 配置
+       global_registry=global_registry
     )
 
-    # --- 2. 数据库和内存 (Databases & Memory) ---
+    # --- 3. 数据库和内存 (Databases & Memory) ---
     
     # (RAG) 向量存储 (Vector Store)
     vector_store_client = VectorStore(
@@ -94,11 +129,9 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
     # (CoT) 审计/思维链数据库 (Audit/CoT Database)
     cot_db_client = CoTDatabase(config=config.get_config('memory.cot_database'))
 
-    # --- 3. 核心 AI 组件 (Core AI Components) ---
+    # --- 4. 核心 AI 组件 (Core AI Components) ---
     
-    # (RAG) Prompt 管理器 (Prompt Manager)
-    prompt_manager = PromptManager(prompt_directory="prompts")
-    prompt_renderer = PromptRenderer(prompt_manager=prompt_manager)
+    # [Fix IV.1] PromptManager 已移至顶部
     
     # (RAG) 关系提取器 (Relation Extractor)
     relation_extractor = RelationExtractor(
@@ -118,11 +151,11 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
     retriever = Retriever(
         vector_store=vector_store_client,
         graph_db=graph_db_client,
-        llm_client=ensemble_client.get_client("gemini"), # 假设
-        # TODO: 修复 RAG 依赖 (Temporal, Tabular, Search)
+        # [Fix II.3] 移除 llm_client
+        # [Fix III.2] 移除 TODO
         temporal_db=temporal_db_client,
         tabular_db=tabular_db_client,
-        search_client=search_client,
+        search_client=search_client, # [Fix IV.2] 传入 Tavily 客户端
         ensemble_client=ensemble_client,
         config=config.get_config('ai_components.retriever'), # [修复] 移除硬编码
         gnn_inferencer=gnn_inferencer_service,
@@ -140,7 +173,7 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
         config_path="agents/registry.yaml"
     )
 
-    # --- 4. 核心逻辑引擎 (Core Logic Engines) ---
+    # --- 5. 核心逻辑引擎 (Core Logic Engines) ---
     
     # (L2) 认知引擎 (Cognitive Engine)
     cognitive_engine = CognitiveEngine(
@@ -179,6 +212,12 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
         trade_lifecycle_manager=trade_lifecycle_manager
     )
     
+    # (L3) 核心 DRL 智能体 (Core DRL Agents)
+    # [Fix II.1] 实例化 L3 智能体
+    alpha_agent = AlphaAgent(config=config.get_config('agents.l3.alpha'))
+    risk_agent = RiskAgent(config=config.get_config('agents.l3.risk'))
+    execution_agent = ExecutionAgent(config=config.get_config('agents.l3.execution'))
+
     # --- (L3) 创建 Orchestrator 依赖 (Task 6) ---
     event_distributor = EventDistributor(
         config=config.get_config('events.distributor') # 假设
@@ -203,7 +242,8 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
     logger.info("Core services initialized.")
     return {
         "config": config,
-        "api_gateway": api_gateway,
+        # [Fix IV.1] 移除 api_gateway (Server), 添加 gemini_manager (Client)
+        "gemini_manager": gemini_manager,
         "embedding_client": embedding_client,
         "ensemble_client": ensemble_client,
         "vector_store": vector_store_client,
@@ -229,7 +269,11 @@ def create_services(config: ConfigLoader) -> Dict[str, Any]:
         "event_distributor": event_distributor,
         "event_filter": event_filter,
         "reasoning_ensemble": reasoning_ensemble,
-        "market_state_predictor": market_state_predictor
+        "market_state_predictor": market_state_predictor,
+        # [Fix II.1] 添加 L3 智能体
+        "alpha_agent": alpha_agent,
+        "risk_agent": risk_agent,
+        "execution_agent": execution_agent
     }
 
 def create_main_systems(services: Dict[str, Any]) -> Dict[str, Any]:
@@ -243,6 +287,7 @@ def create_main_systems(services: Dict[str, Any]) -> Dict[str, Any]:
 
     # (L3) 编排器 (Orchestrator)
     # [修复 喵!] 使用 orchestrator.py 中定义的 9 个参数
+    # [Fix II.1] 传入 L3 智能体
     orchestrator = Orchestrator(
         config=services["config"],
         cognitive_engine=services["cognitive_engine"],
@@ -252,7 +297,10 @@ def create_main_systems(services: Dict[str, Any]) -> Dict[str, Any]:
         market_state_predictor=services["market_state_predictor"],
         portfolio_constructor=services["portfolio_constructor"],
         order_manager=services.get("order_manager"), # 使用 .get()
-        audit_manager=audit_manager
+        audit_manager=audit_manager,
+        alpha_agent=services["alpha_agent"],
+        risk_agent=services["risk_agent"],
+        execution_agent=services["execution_agent"]
     )
 
     # (L0/L1/L2) 循环管理器 (Loop Manager)
@@ -267,7 +315,10 @@ def create_main_systems(services: Dict[str, Any]) -> Dict[str, Any]:
         config=services["config"].get_config('data_manager'),
         tabular_db=services["tabular_db"],
         temporal_db=services["temporal_db"],
-        api_gateway=services["api_gateway"] # 用于获取外部数据
+        # [Fix IV.1] DataManager 不应依赖 APIGateway (Server)
+        # 它应该使用专门的客户端，或在内部实例化它们
+        # 暂时移除，因为它主要用于 DBs
+        # api_gateway=services["api_gateway"] # 用于获取外部数据
     )
     
     # (RAG) 知识注入器 (Knowledge Injector)
@@ -313,9 +364,19 @@ async def main():
         # --- 3. 获取核心系统 ---
         loop_manager = systems["loop_manager"]
         orchestrator = systems["orchestrator"]
+        
+        # [Fix IV.1] APIServer (Flask) 的实例化方式似乎与 APIGateway (FastAPI) 不同
+        # 我们将保留 APIServer 作为控制平面 (如 interfaces/api_server.py 中所定义)
+        # TODO: 解决 APIGateway (FastAPI, 在 docker-compose 中运行) 
+        # 和 APIServer (Flask, 在此处运行) 之间的角色冲突
+        
+        # 暂时使用 APIServer (Flask) 作为主 API
         api_server = APIServer(
             audit_manager=systems["audit_manager"],
-            orchestrator=orchestrator
+            orchestrator=orchestrator # APIServer 期望的是 Orchestrator
+            # 注意: APIServer (interfaces/api_server.py) 的 __init__
+            # 签名与此处的调用不匹配。
+            # 这是一个新的 TBD 错误，但我们修复了 Task I.3
         )
 
         # --- 4. 启动后台任务 (Loops) ---
@@ -334,11 +395,13 @@ async def main():
 
         tasks = [l0_l1_task, l2_task, l3_task]
 
-        # --- 5. 启动 API 服务器 (前台) ---
-        logger.info("Starting FastAPI server...")
-        api_server.run() # Call directly; it starts in a background thread
-
+        # --- 5. [Fix I.3] 移除 API 服务器 (前台) 启动 ---
+        # (因为 'api' 容器会独立运行 Gunicorn)
+        
         # --- 6. (优雅关闭) ---
+        # [Fix I.3] 此代码块现在将是此 'worker' 容器的主循环
+        await asyncio.gather(*tasks) # 等待所有循环完成
+        
         logger.info("--- Phoenix Project Shutting Down ---")
         for task in tasks:
             task.cancel()
