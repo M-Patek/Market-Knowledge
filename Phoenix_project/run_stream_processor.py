@@ -32,10 +32,16 @@ def main():
         try:
             # 2. 构建依赖项
             # (在循环内部构建，以便在 Redis 失败时可以重建)
-            config_path = os.environ.get('PHOENIX_CONFIG_PATH', 'config')
-            config_loader = ConfigLoader(config_path)
+            # [Fix I.2] 使用 ConfigLoader 完整构造函数
+            config_loader = ConfigLoader(
+                system_config_path="config/system.yaml",
+                rules_config_path="config/symbolic_rules.yaml"
+            )
             
-            event_distributor = EventDistributor()
+            # [Fix III.8] 显式传递配置
+            event_distributor = EventDistributor(
+                config=config_loader.get_config('events.distributor')
+            )
             if not event_distributor.redis_client:
                 raise ConnectionError("Failed to connect to EventDistributor (Redis). Retrying...")
                 
