@@ -12,9 +12,10 @@ test:
 	pytest --maxfail=1 --disable-warnings -q
 
 lint:
-	@echo "Running linter..."
-	# Run flake8 linter (install with: pip install flake8)
-	flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+	# [Fix III.1] 更新 Linter 为 Ruff
+	@echo "Running linter (Ruff)..."
+	ruff check .
+	ruff format .
 
 build:
 	@echo "Building Docker images..."
