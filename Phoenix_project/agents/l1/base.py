@@ -28,7 +28,7 @@ class BaseL1Agent(ABC):
         self.llm_client = llm_client
 
     @abstractmethod
-    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> 'EvidenceItem':
+    def run(self, state: PipelineState, dependencies: Dict[str, 'EvidenceItem']) -> 'EvidenceItem':
         """
         The main execution method for the agent.
         
@@ -37,7 +37,7 @@ class BaseL1Agent(ABC):
         
         Args:
             state (PipelineState): The current state of the analysis pipeline.
-            dependencies (Dict[str, Any]): Outputs from any upstream tasks this agent depends on.
+            dependencies (Dict[str, 'EvidenceItem']): Outputs from any upstream tasks this agent depends on.
             
         Returns:
             EvidenceItem: An object (defined in core.schemas) containing the
