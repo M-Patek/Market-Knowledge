@@ -68,20 +68,25 @@ shap>=0.45
 tiktoken>=0.7
 transformers>=4.43
 
+[Fix IV.2] RAG / 外部工具
+
+tavily-python>=0.3.0
+
 数据库 & 云存储
 asyncpg>=0.29
 boto3>=1.34
 elasticsearch>=8.13
 sqlalchemy # <--- 从新列表中合并
 psycopg2-binary # <--- 从新列表中合并
-influxdb-client # <--- 从新列表中合并
+
+[Fix III.5] 移除 influxdb-client
 
 向量 & 图数据库
 neo4j>=5.20
 
 (注: 新列表中有 neo4j，这里保留了更详细的版本号)
 
-pinecone-client>=4.1
+[Fix III.5] 移除 pinecone-client
 
 量化交易 & 回测
 alpaca-trade-api-python # <--- [阶段 2] 为 PaperTrading/Alpaca 添加
