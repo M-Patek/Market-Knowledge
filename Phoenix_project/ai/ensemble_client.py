@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from Phoenix_project.core.schemas.fusion_result import AgentDecision
 from Phoenix_project.ai.prompt_manager import PromptManager
-from Phoenix_project.api.gateway import APIGateway
+from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager # [Fix IV.1]
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.core.pipeline_state import PipelineState
 # (FIX 1.1) 导入 Registry 类型，但不是实例
@@ -28,7 +28,7 @@ class EnsembleClient:
     # (FIX 1.2) 更新 __init__ 以接收 global_registry
     def __init__(
         self, 
-        api_gateway: APIGateway, 
+        gemini_manager: GeminiPoolManager, # [Fix IV.1]
         prompt_manager: PromptManager, 
         agent_registry: Dict[str, Any],
         global_registry: Registry  # <--- 注入的依赖
@@ -37,17 +37,45 @@ class EnsembleClient:
         初始化 EnsembleClient。
         
         参数:
-            api_gateway (APIGateway): 用于调用 LLM API 的网关。
+            gemini_manager (GeminiPoolManager): [Fix IV.1] 用于管理 Gemini 客户端和速率限制。
             prompt_manager (PromptManager): 用于管理和渲染提示。
             agent_registry (Dict[str, Any]): V1 智能体的配置 (来自 config)。
             global_registry (Registry): V2 智能体的依赖注入容器。
         """
-        self.api_gateway = api_gateway
+        self.gemini_manager = gemini_manager # [Fix IV.1]
         self.prompt_manager = prompt_manager
         self.agent_registry = agent_registry # V1 (config) agents
         self.global_registry = global_registry # V2 (python) agents
         self.max_workers = agent_registry.get("config", {}).get("max_parallel_agents", 5)
         self.log_prefix = "EnsembleClient:"
+
+    @property
+    def api_gateway(self):
+        """
+        [Fix IV.1] [Compatibility] Expose self as the 'api_gateway' for Retriever.
+        Retriever expects an object with 'generate_text', which EnsembleClient now implements.
+        """
+        return self
+
+    async def generate_text(self, prompt: str, model_id: Optional[str] = None, use_json_mode: bool = False) -> Optional[str]:
+        """
+        [Fix IV.1] Generates text using the GeminiPoolManager.
+        """
+        target_model = model_id if model_id else "gemini-1.5-flash" # Default
+        try:
+            async with self.gemini_manager.get_client(target_model) as client:
+                # Prepare contents
+                contents = [prompt]
+                generation_config = {"response_mime_type": "application/json"} if use_json_mode else None
+                
+                response = await client.generate_content_async(
+                    contents=contents,
+                    generation_config=generation_config
+                )
+                return response.get("text")
+        except Exception as e:
+            logger.error(f"{self.log_prefix} generate_text failed: {e}")
+            return None
 
     # --- V2 逻辑 (同步执行, 内部使用线程池) ---
     
@@ -181,10 +209,11 @@ class EnsembleClient:
         try:
             start_time = time.time()
             
-            response_text = await self.api_gateway.generate_text(
+            # [Fix IV.1] 使用 self.generate_text
+            response_text = await self.generate_text(
                 prompt=prompt,
-                model_id=model_id,  # 使用智能体特定的模型或网关的默认模型
-                use_json_mode=True  # 假设 V1 智能体都返回 JSON
+                model_id=model_id,
+                use_json_mode=True
             )
             
             if not response_text:
