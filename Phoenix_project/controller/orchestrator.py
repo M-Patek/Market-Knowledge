@@ -6,7 +6,7 @@ import logging
 import asyncio
 from datetime import datetime
 from omegaconf import DictConfig
-from typing import List, Dict # [TBD-1 修复] 导入 List, Dict
+from typing import List, Dict, Optional, Any # [Fix II.1]
 
 from core.pipeline_state import PipelineState
 from cognitive.engine import CognitiveEngine
@@ -38,7 +38,11 @@ class Orchestrator:
         market_state_predictor: MarketStatePredictor,
         portfolio_constructor: PortfolioConstructor,
         order_manager: OrderManager,
-        audit_manager: AuditManager
+        audit_manager: AuditManager,
+        # [Fix II.1] 注入 L3 DRL 智能体
+        alpha_agent: Optional[Any] = None,
+        risk_agent: Optional[Any] = None,
+        execution_agent: Optional[Any] = None
         # (TBD-2/3 FactChecker/FusionAgent 由 ReasoningEnsemble 内部处理)
     ):
         self.config = config
@@ -50,6 +54,10 @@ class Orchestrator:
         self.portfolio_constructor = portfolio_constructor
         self.order_manager = order_manager
         self.audit_manager = audit_manager
+        # [Fix II.1] 存储 L3 智能体
+        self.alpha_agent = alpha_agent
+        self.risk_agent = risk_agent
+        self.execution_agent = execution_agent
         
         logger.info("Orchestrator initialized.")
 
@@ -101,6 +109,7 @@ class Orchestrator:
             await self._run_market_state_prediction(pipeline_state)
 
             # 5. 运行 L3 决策层 (Reasoning Ensemble)
+            # TODO: L3 决策应使用 [Fix II.1] 中注入的 DRL 智能体 (self.alpha_agent 等)
             await self._run_l3_decision(pipeline_state)
             
             if not pipeline_state.l3_decision:
@@ -208,6 +217,7 @@ class Orchestrator:
         # [TBD-4 修复] 移除 TBD 注释，代码已实现 L2->L3 的数据流
         
         try:
+            # TODO: 此处应调用 DRL 智能体 (alpha, risk, exec)
             l3_decision = await self.reasoning_ensemble.reason(
                 l1_insights=pipeline_state.l1_insights,
                 l2_supervision=pipeline_state.l2_supervision, # <-- [TODO 已修复]
