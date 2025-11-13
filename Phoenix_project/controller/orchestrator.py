@@ -211,22 +211,70 @@ class Orchestrator:
         if not pipeline_state.l1_insights or not pipeline_state.market_state:
             logger.warning("Skipping L3 Decision: Missing L1 insights or Market state.")
             return
-
-        logger.info("Running L3 Decision Layer (ReasoningEnsemble)...")
         
-        # [TBD-4 修复] 移除 TBD 注释，代码已实现 L2->L3 的数据流
+        logger.info("Running L3 Decision Layer (DRL Agents)...")
         
         try:
-            # TODO: 此处应调用 DRL 智能体 (alpha, risk, exec)
-            l3_decision = await self.reasoning_ensemble.reason(
-                l1_insights=pipeline_state.l1_insights,
-                l2_supervision=pipeline_state.l2_supervision, # <-- [TODO 已修复]
-                market_state=pipeline_state.market_state
-            )
+            # [Task I.1 & I.2] Replace ReasoningEnsemble with DRL Agents
+            
+            # 1. Prepare Context / State Data
+            # Identify the symbol we are trading (Assuming single-symbol focus for now based on task query)
+            task_query = pipeline_state.get_main_task_query()
+            symbol = task_query.get("symbol", "BTC/USD") # Default fallback
+            
+            market_data = pipeline_state.get_latest_market_data(symbol)
+            price = market_data.close if market_data else 0.0
+            
+            pf_state = pipeline_state.portfolio_state
+            balance = pf_state.cash if pf_state else 0.0
+            # Get holdings for the specific symbol
+            holdings = 0.0
+            if pf_state and symbol in pf_state.positions:
+                holdings = pf_state.positions[symbol].quantity
+
+            state_data = {
+                "balance": balance,
+                "holdings": holdings,
+                "price": price,
+                "symbol": symbol
+            }
+
+            # 2. Alpha Agent Decision
+            alpha_action = None
+            if self.alpha_agent:
+                obs = self.alpha_agent.format_observation(state_data, pipeline_state.l2_supervision)
+                alpha_action = self.alpha_agent.compute_action(obs)
+                logger.info(f"Alpha Agent Action: {alpha_action}")
+
+            # 3. Risk Agent Decision (Optional)
+            risk_action = None
+            if self.risk_agent:
+                obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_supervision)
+                risk_action = self.risk_agent.compute_action(obs)
+                logger.info(f"Risk Agent Action: {risk_action}")
+
+            # 4. Execution Agent Decision (Optional)
+            exec_action = None
+            if self.execution_agent:
+                obs = self.execution_agent.format_observation(state_data, pipeline_state.l2_supervision)
+                exec_action = self.execution_agent.compute_action(obs)
+                logger.info(f"Execution Agent Action: {exec_action}")
+
+            # 5. Consolidate Results
+            l3_decision = {
+                "type": "DRL_DECISION",
+                "symbol": symbol,
+                "alpha_action": alpha_action.tolist() if hasattr(alpha_action, 'tolist') else alpha_action,
+                "risk_action": risk_action.tolist() if hasattr(risk_action, 'tolist') else risk_action,
+                "exec_action": exec_action.tolist() if hasattr(exec_action, 'tolist') else exec_action,
+                "timestamp": datetime.now().isoformat()
+            }
+            
             pipeline_state.set_l3_decision(l3_decision)
-            logger.info("L3 Decision complete.")
+            logger.info(f"L3 Decision complete. Result: {l3_decision}")
+            
         except Exception as e:
-            raise PipelineError(f"L3 ReasoningEnsemble failed: {e}") from e
+            raise PipelineError(f"L3 DRL Decision failed: {e}") from e
             
 
     async def _run_portfolio_construction(self, pipeline_state: PipelineState):
