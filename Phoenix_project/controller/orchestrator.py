@@ -12,7 +12,6 @@ from core.pipeline_state import PipelineState
 from cognitive.engine import CognitiveEngine
 from events.event_distributor import EventDistributor
 from events.risk_filter import EventRiskFilter # [TBD-1 修复] 导入过滤器
-from ai.reasoning_ensemble import ReasoningEnsemble
 from ai.market_state_predictor import MarketStatePredictor
 from cognitive.portfolio_constructor import PortfolioConstructor
 from execution.order_manager import OrderManager
@@ -34,7 +33,6 @@ class Orchestrator:
         cognitive_engine: CognitiveEngine,
         event_distributor: EventDistributor,
         event_filter: EventRiskFilter, # [TBD-1 修复] 注入过滤器
-        reasoning_ensemble: ReasoningEnsemble,
         market_state_predictor: MarketStatePredictor,
         portfolio_constructor: PortfolioConstructor,
         order_manager: OrderManager,
@@ -49,7 +47,6 @@ class Orchestrator:
         self.cognitive_engine = cognitive_engine
         self.event_distributor = event_distributor
         self.event_filter = event_filter # [TBD-1 修复] 存储过滤器
-        self.reasoning_ensemble = reasoning_ensemble
         self.market_state_predictor = market_state_predictor
         self.portfolio_constructor = portfolio_constructor
         self.order_manager = order_manager
@@ -101,24 +98,24 @@ class Orchestrator:
             # 3. 运行 L2 监督层 (并行)
             await self._run_l2_supervision(pipeline_state)
             
-            # [TBD-2/3 修复]
-            # (TBD-2: FactChecker 和 TBD-3: FusionAgent 的逻辑)
-            # (根据 ai/reasoning_ensemble.py，这些由 L3 的 ReasoningEnsemble 处理)
+            # 3.5. 运行 L2 融合/事实检查 (Task A.1)
+            # [TBD-2/3 修复] - 此调用实现了 L2 融合/检查逻辑
+            logger.info("Running L2 Cognitive Cycle (Fusion, Fact-Checking, Guardrails)...")
+            await self.cognitive_engine.process_cognitive_cycle(pipeline_state)
             
             # 4. 运行市场状态预测
             await self._run_market_state_prediction(pipeline_state)
 
             # 5. 运行 L3 决策层 (Reasoning Ensemble)
-            # TODO: L3 决策应使用 [Fix II.1] 中注入的 DRL 智能体 (self.alpha_agent 等)
             await self._run_l3_decision(pipeline_state)
             
             if not pipeline_state.l3_decision:
-                logger.warning("L3 ReasoningEnsemble did not produce a decision. Cycle ending.")
+                logger.warning("L3 DRL Agents (Decision Layer) did not produce a decision. Cycle ending.") # [Task B.4]
                 # [TBD-5 修复] 审计决策失败
                 if pipeline_state:
                     await self.audit_manager.audit_event(
                         event_type="DECISION_FAILURE",
-                        details={"reason": "L3 ReasoningEnsemble (or L2 Fusion) did not produce a decision."},
+                        details={"reason": "L3 DRL Agents (Decision Layer) did not produce a decision."}, # [Task B.4]
                         pipeline_state=pipeline_state
                     )
                 return
@@ -220,7 +217,9 @@ class Orchestrator:
             # 1. Prepare Context / State Data
             # Identify the symbol we are trading (Assuming single-symbol focus for now based on task query)
             task_query = pipeline_state.get_main_task_query()
-            symbol = task_query.get("symbol", "BTC/USD") # Default fallback
+            # [Task C.1] Remove hardcoded fallback, use config
+            default_symbol = self.config.get('data_manager.default_symbols', ["BTC/USD"])[0]
+            symbol = task_query.get("symbol", default_symbol) # Default fallback
             
             market_data = pipeline_state.get_latest_market_data(symbol)
             price = market_data.close if market_data else 0.0
@@ -242,21 +241,21 @@ class Orchestrator:
             # 2. Alpha Agent Decision
             alpha_action = None
             if self.alpha_agent:
-                obs = self.alpha_agent.format_observation(state_data, pipeline_state.l2_supervision)
+                obs = self.alpha_agent.format_observation(state_data, pipeline_state.l2_fusion_result) # [Task A.2]
                 alpha_action = self.alpha_agent.compute_action(obs)
                 logger.info(f"Alpha Agent Action: {alpha_action}")
 
             # 3. Risk Agent Decision (Optional)
             risk_action = None
             if self.risk_agent:
-                obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_supervision)
+                obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_fusion_result) # [Task A.2]
                 risk_action = self.risk_agent.compute_action(obs)
                 logger.info(f"Risk Agent Action: {risk_action}")
 
             # 4. Execution Agent Decision (Optional)
             exec_action = None
             if self.execution_agent:
-                obs = self.execution_agent.format_observation(state_data, pipeline_state.l2_supervision)
+                obs = self.execution_agent.format_observation(state_data, pipeline_state.l2_fusion_result) # [Task A.2]
                 exec_action = self.execution_agent.compute_action(obs)
                 logger.info(f"Execution Agent Action: {exec_action}")
 
@@ -281,7 +280,6 @@ class Orchestrator:
         """[已实现] 运行投资组合构建。"""
         logger.info("Running PortfolioConstructor...")
         try:
-            # [TBD-4 修复] 移除 TBD 注释，PortfolioConstructor 确实从 state 提取信号
             target_portfolio = self.portfolio_constructor.construct_portfolio(
                 pipeline_state
             )
