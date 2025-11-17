@@ -293,7 +293,6 @@ def create_main_systems(services: Dict[str, Any]) -> Dict[str, Any]:
         cognitive_engine=services["cognitive_engine"],
         event_distributor=services["event_distributor"],
         event_filter=services["event_filter"],
-        reasoning_ensemble=services["reasoning_ensemble"],
         market_state_predictor=services["market_state_predictor"],
         portfolio_constructor=services["portfolio_constructor"],
         order_manager=services.get("order_manager"), # 使用 .get()
