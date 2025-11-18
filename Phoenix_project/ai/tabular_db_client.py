@@ -7,6 +7,7 @@ including a text-to-SQL agent capability.
 
 import logging
 import re
+import asyncio
 from typing import Any, List, Dict, Optional, Callable
 
 import sqlalchemy  # type: ignore
@@ -17,6 +18,7 @@ from ..api.gemini_pool_manager import GeminiClient
 # [Task 4] 导入 PromptManager 和 PromptRenderer
 from ..ai.prompt_manager import PromptManager
 from ..ai.prompt_renderer import PromptRenderer
+from ..utils.retry import retry_with_exponential_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +148,7 @@ class TabularDBClient:
             SQL Query:
             """
 
+    @retry_with_exponential_backoff(exceptions_to_retry=(SQLAlchemyError,))
     async def _run_sql_agent(self, query: str) -> Dict[str, Any]:
         """
         OPTIMIZED: This is the actual agent execution logic.
@@ -171,10 +174,16 @@ class TabularDBClient:
 
             logger.info(f"Generated SQL: {sql_query}")
 
-            # 3. 执行 SQL
-            with self.engine.connect() as connection:
-                result = connection.execute(text(sql_query))
-                rows = [dict(row._mapping) for row in result.fetchall()]
+            # 3. 执行 SQL (I/O operation, needs to be retried)
+            # Since this is sync I/O inside an async def, we wrap the I/O
+            # part in a sync function and run it in a thread.
+            def _execute_sync_query():
+                with self.engine.connect() as connection:
+                    result = connection.execute(text(sql_query))
+                    return [dict(row._mapping) for row in result.fetchall()]
+
+            # We apply the retry logic to this async thread execution
+            rows = await asyncio.to_thread(_execute_sync_query)
             
             logger.info(f"SQL query returned {len(rows)} rows.")
             
@@ -185,8 +194,13 @@ class TabularDBClient:
                 "error": None
             }
 
+        except SQLAlchemyError as e:
+            logger.error(f"SQLAlchemyError in SQL Agent execution: {e}", exc_info=True)
+            # This will be caught by the retry decorator
+            raise e # Re-raise for the decorator
         except Exception as e:
-            logger.error(f"Error in SQL Agent execution: {e}")
+            logger.error(f"Unexpected error in SQL Agent execution: {e}", exc_info=True)
+            # This will NOT be retried by default, which is correct
             return {
                 "query": query,
                 "generated_sql": sql_query_generated,
@@ -255,6 +269,7 @@ class TabularDBClient:
                 "error": f"Unhandled exception: {e}"
             }
 
+    @retry_with_exponential_backoff(exceptions_to_retry=(SQLAlchemyError,))
     async def upsert_data(self, table_name: str, data: Dict[str, Any], unique_key: str) -> bool:
         """
         [Task 2] 插入或更新 (Upsert) 一行数据到指定的表格。
@@ -311,7 +326,7 @@ class TabularDBClient:
             return True
         except SQLAlchemyError as e:
             logger.error(f"Failed to upsert data into {table_name}: {e}", exc_info=True)
-            return False
+            raise e # Re-raise for the decorator to handle
 
     def close(self):
         """Closes the database engine connection pool."""
