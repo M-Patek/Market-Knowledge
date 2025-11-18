@@ -59,6 +59,7 @@ from Phoenix_project.ai.tabular_db_client import TabularDBClient
 from Phoenix_project.ai.temporal_db_client import TemporalDBClient
 from Phoenix_project.ai.relation_extractor import RelationExtractor
 from Phoenix_project.knowledge_graph_service import KnowledgeGraphService
+from Phoenix_project.ai.gnn_inferencer import GNNInferencer # [Task 5A] Import for pre-loading
 # --- [修复结束] ---
 
 import json
@@ -129,6 +130,25 @@ def start_prometheus_server(**kwargs):
     except Exception as e:
         # 可能是端口已在使用中（如果 worker 重启）
         print(f"Failed to start Prometheus metrics server on port {port}: {e}")
+
+@worker_process_init.connect
+def preload_gnn_model(**kwargs):
+    """
+    [Task 5A] Pre-load the GNN model as a Singleton when the worker process starts.
+    This prevents resource contention and latency during the first request.
+    """
+    logger = get_logger(__name__)
+    model_path = os.environ.get("GNN_MODEL_PATH", "Phoenix_project/models/gnn_model")
+    
+    try:
+        logger.info(f"Worker Init: Pre-loading GNN Model Singleton from {model_path}...")
+        # Instantiating the Singleton loads the model into memory once.
+        # Future calls to GNNInferencer(model_path) will return this same instance.
+        GNNInferencer(model_path)
+        logger.info("Worker Init: GNN Model successfully pre-loaded.")
+    except Exception as e:
+        logger.error(f"Worker Init: Failed to pre-load GNN Model: {e}", exc_info=True)
+        # We do not raise here, to allow the worker to start even if GNN fails (resilience)
 # --- 结束：蓝图 1 ---
 
 
@@ -388,6 +408,31 @@ def run_system_janitor_task():
             
     except Exception as e:
         logger.error(f"Task: run_system_janitor_task failed: {e}", exc_info=True)
+
+
+# [Task 5B] Isolate GNN intensive tasks
+@celery_app.task(name='phoenix.run_gnn_inference', queue='gnn_queue')
+def run_gnn_inference_task(graph_data: dict):
+    """
+    [Task 5B] Dedicated task for running GNN inference.
+    Runs on the 'gnn_queue' to avoid blocking main agents.
+    """
+    logger = get_logger('phoenix.run_gnn_inference')
+    try:
+        # Use the Singleton instance (pre-loaded by worker_process_init)
+        model_path = os.environ.get("GNN_MODEL_PATH", "Phoenix_project/models/gnn_model")
+        inferencer = GNNInferencer(model_path)
+        
+        # Run inference synchronously within this worker process
+        # (Note: .infer() is async, so we run it in a loop if needed, 
+        # but since this is a Celery task, we can just run it. 
+        # However, GNNInferencer.infer is async def. We need a loop.)
+        import asyncio
+        return asyncio.run(inferencer.infer(graph_data))
+        
+    except Exception as e:
+        logger.error(f"Task: run_gnn_inference failed: {e}", exc_info=True)
+        return {}
 
 
 # [Task III.1] 新增 GNN 训练任务
