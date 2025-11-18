@@ -17,6 +17,7 @@ FIX (E1, E2, E4):
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from uuid import UUID
 from enum import Enum
 
 # --- 市场与事件数据 (Market & Event Data) ---
@@ -33,6 +34,7 @@ class MarketData(BaseModel):
     low: float = Field(..., description="最低价")
     close: float = Field(..., description="收盘价")
     volume: float = Field(..., description="成交量")
+    ingestion_batch_id: Optional[UUID] = Field(None, description="[Task 3] Atomic batch ID for ingestion tracking.")
     
     class Config:
         frozen = True
@@ -49,6 +51,7 @@ class NewsData(BaseModel):
     content: str = Field(..., description="事件的文本内容")
     headline: Optional[str] = Field(None, description="事件标题")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="其他元数据")
+    ingestion_batch_id: Optional[UUID] = Field(None, description="[Task 3] Atomic batch ID for ingestion tracking.")
 
     class Config:
         frozen = True
@@ -65,6 +68,7 @@ class EconomicIndicator(BaseModel):
     expected: Optional[float] = Field(None, description="市场预期值")
     previous: Optional[float] = Field(None, description="前值")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="其他元数据 (e.g., 'country')")
+    ingestion_batch_id: Optional[UUID] = Field(None, description="[Task 3] Atomic batch ID for ingestion tracking.")
 
     class Config:
         frozen = True
