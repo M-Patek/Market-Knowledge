@@ -1,10 +1,14 @@
 import os
 import asyncio
+import re
 from neo4j import AsyncGraphDatabase
 from typing import List, Dict, Any, Optional, Tuple # [Task 3] 导入 Tuple
+from uuid import UUID
 
 # 导入 Phoenix 项目的日志记录器
 from Phoenix_project.monitor.logging import get_logger
+from ..core.exceptions import QuerySafetyError
+from ..utils.retry import retry_with_exponential_backoff
 
 logger = get_logger(__name__)
 
@@ -37,6 +41,28 @@ class GraphDBClient:
             logger.error(f"{self.log_prefix} 初始化 Neo4j 驱动程序失败: {e}", exc_info=True)
             self.driver = None
 
+    @staticmethod
+    def validate_cypher_query(query: str):
+        """
+        [Task 2A] 验证 Cypher 查询是否为只读。
+        检查是否存在 CREATE, SET, DELETE, MERGE 关键字。
+        
+        Args:
+            query (str): 要验证的 Cypher 查询语句。
+            
+        Raises:
+            QuerySafetyError: 如果检测到任何写入/修改关键字。
+        """
+        # \b 确保我们匹配的是整个单词
+        # re.IGNORECASE 使其不区分大小写
+        forbidden_keywords = r'\b(CREATE|SET|DELETE|MERGE)\b'
+        if re.search(forbidden_keywords, query, re.IGNORECASE):
+            logger.warning(f"QuerySafetyError: 检测到潜在的不安全查询。Query: '{query}'")
+            raise QuerySafetyError(f"Query validation failed: Detected forbidden write/modify operation.")
+        
+        logger.debug(f"Cypher query validated successfully.")
+
+    @retry_with_exponential_backoff()
     async def verify_connectivity(self):
         """检查与 Neo4j 的连接。"""
         if not self.driver:
@@ -50,6 +76,7 @@ class GraphDBClient:
             logger.error(f"{self.log_prefix} Neo4j 连接验证失败: {e}", exc_info=True)
             return False
 
+    @retry_with_exponential_backoff()
     async def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         对 Neo4j 数据库执行一个只读的 Cypher 查询。
@@ -79,6 +106,7 @@ class GraphDBClient:
             logger.error(f"{self.log_prefix} Cypher 查询执行失败: {e}", exc_info=True)
             return []
 
+    @retry_with_exponential_backoff()
     async def execute_write(self, query: str, params: Optional[Dict[str, Any]] = None) -> bool:
         """
         对 Neo4j 数据库执行一个写入事务 (WRITE query)。
@@ -137,7 +165,8 @@ class GraphDBClient:
             logger.warning(f"{self.log_prefix} 确保约束时出错 (可能已存在): {e}")
             return False # [Fix] 返回布尔值以保持一致性
 
-    async def add_triples(self, triples: List[Tuple[str, str, Any]]) -> bool:
+    @retry_with_exponential_backoff()
+    async def add_triples(self, triples: List[Tuple[str, str, Any]], batch_id: Optional[UUID] = None) -> bool:
         """
         [Task 3] 批量添加三元组 (subject_id, predicate, object_literal_or_id) 到图。
         这使用 UNWIND 和 APOC 来高效处理。
@@ -147,6 +176,7 @@ class GraphDBClient:
         
         Args:
             triples (List[Tuple[str, str, Any]]): (subject_id, predicate, object) 的列表。
+            batch_id (Optional[UUID]): [Task 3C] The atomic ingestion batch ID to stamp on new nodes.
         """
         if not self.driver:
             logger.error(f"{self.log_prefix} 写入三元组失败：驱动程序未初始化。")
@@ -173,7 +203,7 @@ class GraphDBClient:
         WITH t, split(t.s, ':')[0] AS s_label, split(t.s, ':')[1] AS s_id
         MERGE (s {id: t.s})
         // 在创建时设置标签
-        ON CREATE SET s.id = t.s, s.uid = s_id, s_label_dynamic = s_label
+        ON CREATE SET s.id = t.s, s.uid = s_id, s_label_dynamic = s_label, s.ingestion_batch_id = $batch_id
         WITH s, s_label_dynamic, t
         CALL apoc.create.addLabels(s, [s_label_dynamic]) YIELD node AS s_labeled
         
@@ -198,10 +228,14 @@ class GraphDBClient:
         """
         
         try:
+            query_params = {
+                "triples": params_list,
+                "batch_id": str(batch_id) if batch_id else None
+            }
             # [Fix] 此处应使用 execute_write 而不是 execute_query
-            success = await self.execute_write(query, params={"triples": params_list})
+            success = await self.execute_write(query, params=query_params)
             if success:
-                logger.info(f"{self.log_prefix} 成功添加/更新了 {len(params_list)} 个三元组。")
+                logger.info(f"{self.log_prefix} 成功添加/更新了 {len(params_list)} 个三元组 (Batch ID: {batch_id})。")
                 return True
             else:
                 logger.error(f"{self.log_prefix} add_triples 事务失败。")
@@ -209,6 +243,27 @@ class GraphDBClient:
         except Exception as e:
             logger.error(f"{self.log_prefix} add_triples 事务失败 (是否安装了 APOC?): {e}", exc_info=True)
             return False
+
+    async def count_by_batch_id(self, batch_id: UUID) -> int:
+        """
+        [Task 3C] Count the number of nodes created in a specific ingestion batch.
+        """
+        if not self.driver:
+            logger.warning(f"{self.log_prefix} count_by_batch_id called but driver not initialized.")
+            return 0
+        
+        query = "MATCH (n {ingestion_batch_id: $batch_id}) RETURN count(n) as count"
+        
+        try:
+            results = await self.execute_query(query, {"batch_id": str(batch_id)})
+            if results:
+                count = results[0].get("count", 0)
+                logger.info(f"{self.log_prefix} Found {count} nodes for batch_id {batch_id}.")
+                return count
+            return 0
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Failed to count by batch_id {batch_id}: {e}", exc_info=True)
+            return 0
 
     async def close(self):
         """关闭 Neo4j 驱动程序连接。"""
