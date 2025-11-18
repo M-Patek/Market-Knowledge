@@ -5,6 +5,7 @@ from datetime import datetime
 
 # 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
 from Phoenix_project.monitor.logging import get_logger
+from ..utils.retry import retry_with_exponential_backoff
 
 logger = get_logger(__name__)
 
@@ -30,6 +31,7 @@ class TemporalDBClient:
         self.index_name = db_config.get('index_name', 'market_events')
         logger.info(f"TemporalDBClient initialized for index: {self.index_name}")
 
+    @retry_with_exponential_backoff()
     async def connect(self):
         """Checks the connection to Elasticsearch."""
         try:
@@ -70,6 +72,7 @@ class TemporalDBClient:
         await self.es.close()
         logger.info("Elasticsearch connection closed.")
 
+    @retry_with_exponential_backoff()
     async def index_event(self, event_id: str, event_data: Dict[str, Any]) -> bool:
         """
         Indexes a single event document in Elasticsearch.
@@ -101,6 +104,7 @@ class TemporalDBClient:
             logger.error(f"Error indexing event {event_id} in Elasticsearch: {e}", exc_info=True)
             return False
 
+    @retry_with_exponential_backoff()
     async def search_events(
         self, 
         symbols: Optional[List[str]] = None,
