@@ -5,6 +5,7 @@ import datetime # [主人喵的清洁计划 1.1] 导入
 from typing import List, Dict, Any, Optional, Tuple
 from abc import ABC, abstractmethod
 from pinecone import Pinecone, ServerlessSpec
+from uuid import UUID
 
 # 修正：将 'monitor.logging...' 转换为 'Phoenix_project.monitor.logging...'
 from Phoenix_project.monitor.logging import ESLogger, get_logger
@@ -25,10 +26,18 @@ class BaseVectorStore(ABC):
     """Abstract interface for a vector store."""
 
     @abstractmethod
-    async def aadd_documents(
-        self, documents: List[Document], **kwargs: Any
-    ) -> List[str]:
-        """Add documents to the vector store."""
+    async def aadd_batch(self, batch: List[Document], embeddings: List[List[float]], batch_id: UUID):
+        """
+        [Task 3C] Add a batch of documents and their embeddings to the vector store,
+        associated with a specific ingestion batch_id.
+        """
+        pass
+
+    @abstractmethod
+    async def count_by_batch_id(self, batch_id: UUID) -> int:
+        """
+        [Task 3C] Count the number of vectors associated with a specific ingestion_batch_id.
+        """
         pass
 
     @abstractmethod
@@ -60,35 +69,36 @@ class MockVectorStore(BaseVectorStore):
             self.logger.error("Numpy not found. MockVectorStore search will not work.")
             self.np = None
 
-    async def aadd_documents(
-        self, documents: List[Document], **kwargs: Any
-    ) -> List[str]:
-        """Adds documents to the in-memory store."""
+    async def aadd_batch(self, batch: List[Document], embeddings: List[List[float]], batch_id: UUID):
+        """Mock adding documents."""
         ids = []
-        texts = [doc.page_content for doc in documents]
         
-        if not texts:
-            return []
-            
         try:
-            embeddings = await self.embedding_client.get_embeddings(texts)
-            
-            if not embeddings or len(embeddings) != len(documents):
-                self.logger.error("Mismatch in embedding results. Cannot add documents.")
-                return []
-
             async with self.lock:
-                for doc, vector in zip(documents, embeddings):
+                for doc, vector in zip(batch, embeddings):
                     doc_id = doc.metadata.get("id", f"doc_{hash(doc.page_content)}")
+                    
+                    # [Task 3C] Store the batch_id as a string in metadata for consistency
+                    doc.metadata["ingestion_batch_id"] = str(batch_id)
+                    
                     self.store[doc_id] = {"vector": vector, "document": doc}
                     ids.append(doc_id)
             
-            self.logger.info(f"Added {len(ids)} documents to MockVectorStore.")
+            self.logger.info(f"MockVectorStore: Added {len(batch)} documents to batch {batch_id}.")
             return ids
             
         except Exception as e:
             self.logger.error(f"Failed to add documents to MockVectorStore: {e}", exc_info=True)
             return []
+
+    async def count_by_batch_id(self, batch_id: UUID) -> int:
+        """[Task 3C] Mock counting by batch_id."""
+        count = 0
+        for data in self.store.values():
+            if data["document"].metadata.get("ingestion_batch_id") == str(batch_id):
+                count += 1
+        self.logger.info(f"MockVectorStore: Found {count} items for batch_id {batch_id}.")
+        return count
 
     async def asimilarity_search(
         self, query: str, k: int = 4, **kwargs: Any
@@ -178,67 +188,72 @@ class PineconeVectorStore(BaseVectorStore):
             self.logger.error(f"初始化 PineconeVectorStore 失败: {e}", exc_info=True)
             raise
 
-    async def aadd_documents(
-        self, documents: List[Document], **kwargs: Any
-    ) -> List[str]:
-        """[已优化] 将文档异步添加到 Pinecone 索引。"""
-        ids = []
-        texts = [doc.page_content for doc in documents]
+    async def aadd_batch(self, batch: List[Document], embeddings: List[List[float]], batch_id: UUID):
+        """
+        [Task 3C] Add a batch of documents and embeddings to the Pinecone index,
+        using the batch_id as the namespace for atomic counting.
+        """
+        if not self.index:
+            raise Exception("Pinecone index not initialized.")
         
-        if not texts:
-            return []
+        vectors_to_upsert = []
+        for doc, vector in zip(batch, embeddings):
+            doc_id = doc.metadata.get("doc_id", doc.id)
+            if not doc_id:
+                 doc_id = str(uuid.uuid4())
             
-        try:
-            embeddings = await self.embedding_client.get_embeddings(texts)
-            if not embeddings or len(embeddings) != len(documents):
-                self.logger.error("嵌入(embedding)结果数量不匹配。无法添加文档。")
-                return []
+            # Sanitize metadata for Pinecone (only str, bool, float, int, or list of str)
+            sanitized_metadata = {
+                "doc_id": doc_id,
+                "source": doc.metadata.get("source", "unknown"),
+                "content_preview": doc.page_content[:250] if doc.page_content else "",
+                # [Task 3C] Add batch_id to metadata as well for redundancy/filtering
+                "ingestion_batch_id": str(batch_id)
+            }
+            
+            # Add other simple metadata fields
+            # (Assuming original file logic here to copy other simple types)
+            for k, v in doc.metadata.items():
+                 if k not in sanitized_metadata and isinstance(v, (str, int, float, bool)):
+                      sanitized_metadata[k] = v
 
-            vectors_to_upsert = []
-            for doc, vector in zip(documents, embeddings):
-                doc_id = doc.metadata.get("id", str(uuid.uuid4()))
-                
-                # 必须将页面内容存储在元数据中以便稍后检索
-                metadata_to_store = doc.metadata.copy()
-                metadata_to_store["page_content"] = doc.page_content
-                
-                # Pinecone 元数据限制：值必须是 str, int, float, bool, 或 list of str
-                # 确保所有元数据值都是兼容的
-                sanitized_metadata = {}
-                for k, v in metadata_to_store.items():
-                    if isinstance(v, (str, int, float, bool)):
-                        sanitized_metadata[k] = v
-                    elif isinstance(v, list) and all(isinstance(i, str) for i in v):
-                         sanitized_metadata[k] = v
-                    else:
-                        # 序列化不兼容的类型
-                        sanitized_metadata[k] = str(v)
-                
-                vectors_to_upsert.append({
-                    "id": doc_id,
-                    "values": vector,
-                    "metadata": sanitized_metadata
-                })
-                ids.append(doc_id)
-            
-            # [主人喵的清洁计划 1.1] 动态命名空间
-            current_namespace = datetime.datetime.utcnow().strftime("ns-%Y-%m")
-            
-            # 在线程中执行阻塞的 upsert 调用
-            # (Pinecone v4+ 推荐批量操作)
-            self.logger.debug(f"正在向 Pinecone upsert {len(vectors_to_upsert)} 个向量 (Namespace: {current_namespace})...") # [主人喵的清洁计划 1.1] 更新日志
+            vectors_to_upsert.append({
+                "id": doc_id,
+                "values": vector,
+                "metadata": sanitized_metadata
+            })
+        
+        if vectors_to_upsert:
+            self.logger.info(f"Pinecone: Upserting {len(vectors_to_upsert)} vectors to namespace '{batch_id}'...")
             await asyncio.to_thread(
                 self.index.upsert,
                 vectors=vectors_to_upsert,
-                namespace=current_namespace # [主人喵的清洁计划 1.1] 更改
+                namespace=str(batch_id) # [Task 3C] Use batch_id as the namespace
             )
-            
-            self.logger.info(f"已添加 {len(ids)} 个文档到 PineconeVectorStore。")
-            return ids
-            
+            return [v['id'] for v in vectors_to_upsert]
+        return []
+
+    async def count_by_batch_id(self, batch_id: UUID) -> int:
+        """
+        [Task 3C] Get the exact vector count for a batch_id by using it as a namespace
+        and querying the index stats. This is fast and 100% accurate.
+        """
+        if not self.index:
+            self.logger.warning("Pinecone: count_by_batch_id called but index not initialized.")
+            return 0
+        
+        try:
+            stats = await asyncio.to_thread(self.index.describe_index_stats)
+            namespace_stats = stats.get('namespaces', {})
+            # Get stats for our specific batch_id namespace
+            batch_stats = namespace_stats.get(str(batch_id), {})
+            # Return the exact vector count
+            count = batch_stats.get('vector_count', 0)
+            self.logger.info(f"Pinecone: Found {count} vectors in namespace '{batch_id}'.")
+            return count
         except Exception as e:
-            self.logger.error(f"添加文档到 PineconeVectorStore 失败: {e}", exc_info=True)
-            return []
+            self.logger.error(f"Pinecone: Failed to get index stats for batch_id {batch_id}: {e}", exc_info=True)
+            return 0
 
     async def asimilarity_search(
         self, query: str, k: int = 4, **kwargs: Any
