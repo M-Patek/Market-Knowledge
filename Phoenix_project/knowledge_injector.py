@@ -1,27 +1,149 @@
-from typing import Dict, Any, List, Tuple
-from uuid import uuid4
+import uuid
+from typing import Dict, Any, List, Tuple, Union
+from uuid import uuid4, UUID
 import pandas as pd
 
 from Phoenix_project.ai.graph_db_client import GraphDBClient
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.core.schemas.fusion_result import FusionResult
 
+# [Task 3] Import all necessary components for orchestration
+from Phoenix_project.core.schemas.data_schema import (
+    NewsData, 
+    MarketData, 
+    EconomicIndicator
+)
+from Phoenix_project.ai.embedding_client import EmbeddingClient
+from Phoenix_project.ai.relation_extractor import RelationExtractor
+from Phoenix_project.memory.vector_store import VectorStore, Document
+from Phoenix_project.core.exceptions import CognitiveError
+
 logger = get_logger(__name__)
 
 class KnowledgeInjector:
     """
     Injects insights (L1 analysis, L2 fusions) into the Knowledge Graph.
+    Acts as the Orchestrator for the entire Ingestion Pipeline (Task 3).
     """
 
-    def __init__(self, graph_db_client: GraphDBClient):
+    def __init__(
+        self, 
+        graph_db_client: GraphDBClient,
+        # [Task 3B] Inject all clients needed for the ingestion orchestra
+        embedding_client: EmbeddingClient,
+        relation_extractor: RelationExtractor,
+        vector_store: VectorStore
+    ):
         """
         Initializes the KnowledgeInjector.
         
         Args:
             graph_db_client: The client for interacting with the graph DB (e.g., Neo4j).
+            embedding_client: The client for generating text embeddings.
+            relation_extractor: The client for extracting KG triples.
+            vector_store: The client for storing vector embeddings.
         """
         self.db_client = graph_db_client
+        self.embedding_client = embedding_client
+        self.relation_extractor = relation_extractor
+        self.vector_store = vector_store
         logger.info("KnowledgeInjector initialized.")
+
+    async def process_batch(
+        self, 
+        batch: List[Union[NewsData, MarketData, EconomicIndicator]]
+    ):
+        """
+        [Task 3B] The main orchestration method for the ingestion flow.
+        
+        This method:
+        1. Generates a single atomic batch ID.
+        2. Stamps this ID onto every item in the batch.
+        3. Passes the batch to all clients (embedding, relation, DBs) for processing.
+        4. Performs final consistency validation.
+        """
+        if not batch:
+            logger.info("KnowledgeInjector: process_batch called with empty batch.")
+            return
+
+        # [Task 3B] 1. Generate an Atomic ID at the start (The "Transaction ID")
+        ingestion_batch_id = uuid.uuid4()
+        logger.info(f"Starting ingestion process for batch_id: {ingestion_batch_id}")
+
+        # [Task 3B] 2. Propagate and Mutate: Stamp the ID onto all items.
+        # Also prepare text/documents for embedding and storage.
+        texts_to_embed = []
+        documents_for_store = []
+        
+        for item in batch:
+            item.ingestion_batch_id = ingestion_batch_id
+            
+            # Handle different data types safely
+            if hasattr(item, 'content'):
+                text_content = item.content
+            else:
+                # Fallback for MarketData/EconomicIndicator: stringify the model
+                text_content = str(item.model_dump())
+            
+            texts_to_embed.append(text_content)
+            
+            # Create Document object for VectorStore (carrying the batch_id in metadata)
+            doc_metadata = item.model_dump(mode='json')
+            documents_for_store.append(Document(page_content=text_content, metadata=doc_metadata))
+
+        try:
+            # --- Step A: Embedding & Vector Store ---
+            logger.debug(f"[{ingestion_batch_id}] Generating embeddings...")
+            embeddings = await self.embedding_client.get_embeddings(texts_to_embed)
+            
+            logger.debug(f"[{ingestion_batch_id}] Adding to VectorStore (Namespace: {ingestion_batch_id})...")
+            # [Task 3C Phase 1] Use the new aadd_batch method
+            await self.vector_store.aadd_batch(documents_for_store, embeddings, ingestion_batch_id)
+
+            # --- Step B: Relation Extraction & Graph DB ---
+            logger.debug(f"[{ingestion_batch_id}] Extracting relations and updating GraphDB...")
+            all_triples = []
+            for item in batch:
+                # Use content if available, else skip relation extraction for numeric data
+                if hasattr(item, 'content'):
+                    # Extract using LLM
+                    graph_data = await self.relation_extractor.extract_relations(item.content, metadata=item.model_dump(mode='json'))
+                    # Convert edges to triples (source, relation, target)
+                    # Note: This is a simplification. Real logic might need node mapping.
+                    for edge in graph_data.get("edges", []):
+                        # Assuming edge is dict with 'source', 'relation', 'target'
+                        if 'source' in edge and 'relation' in edge and 'target' in edge:
+                            all_triples.append((edge['source'], edge['relation'], edge['target']))
+            
+            if all_triples:
+                # [Task 3C Phase 2] Use the new add_triples with batch_id stamping
+                await self.db_client.add_triples(all_triples, batch_id=ingestion_batch_id)
+        
+            # --- Step C: Final Validation (Task 3C) ---
+            logger.info(f"[{ingestion_batch_id}] Performing consistency checks...")
+            
+            # 1. Vector Store Check (Strict)
+            vector_count = await self.vector_store.count_by_batch_id(ingestion_batch_id)
+            expected_count = len(batch)
+            
+            if vector_count != expected_count:
+                error_msg = (f"[Data Inconsistency] Ingestion batch {ingestion_batch_id} failed vector check. "
+                             f"Expected {expected_count}, found {vector_count}.")
+                logger.critical(error_msg)
+                raise CognitiveError(error_msg)
+            
+            # 2. Graph DB Check (Sanity)
+            graph_count = await self.db_client.count_by_batch_id(ingestion_batch_id)
+            if expected_count > 0 and graph_count == 0:
+                # Just a warning, as relation extraction is probabilistic/generative
+                logger.warning(f"[{ingestion_batch_id}] GraphDB count is 0 for non-empty batch. "
+                               "This might be normal if no relations were found, but worth investigating.")
+            
+            logger.info(f"[{ingestion_batch_id}] Ingestion complete. Vectors: {vector_count}, Graph Nodes: {graph_count}.")
+
+        except Exception as e:
+            logger.error(f"[{ingestion_batch_id}] Critical failure during ingestion orchestration: {e}", exc_info=True)
+            raise CognitiveError(f"Ingestion failed for batch {ingestion_batch_id}: {e}")
 
     async def inject_l1_analysis(self, analysis_result: Dict[str, Any], event: Dict[str, Any]):
         """
