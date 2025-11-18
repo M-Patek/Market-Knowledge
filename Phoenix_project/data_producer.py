@@ -60,6 +60,11 @@ class RealTimeDataProducer:
             logger.error("WebSocket URL or API Key not configured. Producer cannot start.")
             raise ValueError("Missing websocket_url or api_key in config")
 
+        # [Task 4C] Exponential backoff parameters
+        self.retry_attempt = 0
+        self.initial_backoff = self.config.get("retry_initial_backoff", 5.0) # 5 seconds
+        self.max_backoff = self.config.get("retry_max_backoff", 120.0) # 2 minutes
+
         self.ws: Optional[websocket.WebSocketApp] = None
         self._stop_event = threading.Event()
 
@@ -124,13 +129,23 @@ class RealTimeDataProducer:
     def _on_close(self, ws, close_status_code, close_msg):
         """Callback for WebSocket close."""
         logger.info(f"WebSocket closed. Code: {close_status_code}, Msg: {close_msg}")
+        
+        # [Task 4C] Implement exponential backoff instead of simple 5s retry
         if not self._stop_event.is_set():
-            logger.info("Attempting to reconnect in 5 seconds...")
-            time.sleep(5)
+            # Calculate delay: 5s, 10s, 20s, 40s, 80s, 120s (max)
+            delay = min(self.initial_backoff * (2 ** self.retry_attempt), self.max_backoff)
+            self.retry_attempt += 1
+            
+            logger.info(f"Attempting to reconnect in {delay:.2f} seconds... (Attempt {self.retry_attempt})")
+            
+            # Use time.sleep as this callback runs in its own thread
+            time.sleep(delay)
             self.run() # 尝试重连
 
     def _on_open(self, ws):
         """Callback for WebSocket open. Handles authentication and subscription."""
+        # [Task 4C] Reset retry counter on successful (re)connection
+        self.retry_attempt = 0
         logger.info("WebSocket connection opened.")
         try:
             # 1. 认证
@@ -168,7 +183,11 @@ class RealTimeDataProducer:
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
-            on_close=self._on_close
+            on_close=self._on_close,
+            
+            # [Task 4C] Enable native Ping/Pong heartbeat
+            ping_interval=21, # (Based on polygon-python defaults)
+            ping_timeout=20
         )
         
         # run_forever() 是一个阻塞调用
