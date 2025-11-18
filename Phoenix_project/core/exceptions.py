@@ -9,3 +9,7 @@ class PhoenixError(Exception):
 class CognitiveError(PhoenixError):
     """Raised when a fatal error occurs within the CognitiveEngine."""
     pass
+
+class QuerySafetyError(PhoenixError):
+    """Raised when a query fails a security validation check (e.g., Cypher injection)."""
+    pass
