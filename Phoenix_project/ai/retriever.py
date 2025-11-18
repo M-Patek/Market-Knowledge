@@ -2,13 +2,17 @@
 Advanced Retrieval module for the Phoenix project.
 
 Handles hybrid search (vector, keyword, graph) and reranking.
+Optimized for Fault Tolerance (Task 1), Security (Task 2), and Resource Management (Task 5).
 """
 
 import logging
 import asyncio
+from asyncio.exceptions import TimeoutError
 from typing import Any, List, Dict, Optional
 
 from sentence_transformers import CrossEncoder  # type: ignore
+from celery import current_app # [Task 5B] For sending tasks by name
+from celery.result import AsyncResult # [Task 5B] For typing
 
 from ..core.schemas.evidence_schema import (
     Evidence,
@@ -17,6 +21,7 @@ from ..core.schemas.evidence_schema import (
     DataSource,
 )
 from ..memory.vector_store import VectorStore
+from ..core.exceptions import QuerySafetyError, CognitiveError
 from ..ai.graph_db_client import GraphDBClient
 # [Fix II.3] 移除 GeminiClient
 from ..ai.gnn_inferencer import GNNInferencer
@@ -96,6 +101,8 @@ class Retriever:
         self.top_k_graph = default_l1_config.get("top_k_graph", 5)
         self.top_k_gnn = default_l1_config.get("top_k_gnn", 5)
         self.rerank_threshold = default_l1_config.get("rerank_threshold", 0.1)
+        # [Task 1C] Minimum required sources for a valid context
+        self.min_successful_sources = default_l1_config.get("min_successful_sources", 2)
 
         self._initialize_reranker()
 
@@ -107,10 +114,18 @@ class Retriever:
         try:
             self.reranker = CrossEncoder(self.rerank_model_name)
             logger.info(f"Successfully loaded reranker model: {self.rerank_model_name}")
+        except ImportError as e:
+            logger.error(
+                f"[Reranker Load Failure] CrossEncoder or dependencies not found: {e}. "
+                f"Falling back to simple reranker.",
+                exc_info=True
+            )
+            self.reranker = None
         except Exception as e:
             logger.error(
-                f"Failed to load CrossEncoder model '{self.rerank_model_name}'. "
-                f"Error: {e}. Falling back to simple reranker."
+                f"[Reranker Load Failure] Failed to load CrossEncoder model '{self.rerank_model_name}'. "
+                f"Error: {e}. Falling back to simple reranker.",
+                exc_info=True
             )
             self.reranker = None  # Flag to use fallback
 
@@ -166,7 +181,10 @@ class Retriever:
             return reranked_docs
 
         except Exception as e:
-            logger.error(f"Error during document reranking: {e}")
+            logger.error(
+                f"[Rerank Failure] Error during document reranking: {e}",
+                exc_info=True
+            )
             return sorted(documents, key=lambda x: x.score, reverse=True)[
                 : self.top_k_vector
             ]
@@ -182,8 +200,18 @@ class Retriever:
             )
             logger.info(f"Vector search found {len(results)} results.")
             return results
+        except (ConnectionError, TimeoutError) as e:
+            # Step 1A/1B: Specific, logged error
+            logger.error(
+                f"[RAG Retrieval Failure] Connection/Timeout error during vector search: {e}",
+                exc_info=True
+            )
+            return []
         except Exception as e:
-            logger.error(f"Error during vector search: {e}")
+            logger.error(
+                f"[RAG Retrieval Failure] Unexpected error during vector search: {e}",
+                exc_info=True
+            )
             return []
 
     def _generate_cypher_prompt(self, query: str, schema: str) -> str:
@@ -212,7 +240,10 @@ class Retriever:
             return prompt_str
 
         except Exception as e:
-            logger.error(f"Failed to render text_to_cypher prompt: {e}. Using fallback.", exc_info=True)
+            logger.error(
+                f"[Prompt Render Failure] Failed to render text_to_cypher prompt: {e}. Using fallback.",
+                exc_info=True
+            )
             # [Task 4] 回退到旧的硬编码逻辑
             return f"""
             You are an expert Cypher query generator. Your task is to convert a
@@ -264,14 +295,25 @@ class Retriever:
             logger.info(f"Generated Cypher query: {cypher_query}")
             return cypher_query
 
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(
+                f"[RAG Retrieval Failure] Connection/Timeout error in _generate_text_to_cypher (LLM or DB call): {e}",
+                exc_info=True
+            )
+            return None
         except Exception as e:
-            logger.error(f"Error in _generate_text_to_cypher: {e}")
+            # Step 1A/1B: Log the failure
+            logger.error(
+                f"[RAG Retrieval Failure] Unexpected error in _generate_text_to_cypher: {e}",
+                exc_info=True
+            )
             return None
 
 
     async def search_knowledge_graph(self, query: str) -> List[GraphQueryResult]:
         """
         OPTIMIZED: Performs a search in the Knowledge Graph.
+        Includes security validation (Task 2) and robust error handling (Task 1).
         """
         logger.debug(f"Performing knowledge graph search for: {query}")
         
@@ -288,6 +330,19 @@ class Retriever:
         else:
             params = {} 
 
+        # [Task 2B] Enforce Cypher query validation before execution.
+        try:
+            # Use the static method from GraphDBClient we created.
+            GraphDBClient.validate_cypher_query(cypher_query)
+        except QuerySafetyError as e:
+            # Log the failure event as per Task 2B
+            logger.error(
+                f"Cypher validation failed for query: {cypher_query}. Error: {e}",
+                exc_info=True
+            )
+            # Re-raise to stop execution. This prevents silent failure.
+            raise e
+        
         try:
             results = await self.graph_db.execute_query(cypher_query, params)
             
@@ -310,18 +365,25 @@ class Retriever:
             logger.info(f"Graph search found {len(graph_results)} results.")
             return graph_results
 
+        except (ConnectionError, TimeoutError) as e:
+            # Step 1A/1B: Specific, logged error
+            logger.error(
+                f"[RAG Retrieval Failure] Connection/Timeout error during graph search with query '{cypher_query}': {e}",
+                exc_info=True
+            )
+            return []
         except Exception as e:
-            logger.error(f"Error during graph search with query '{cypher_query}': {e}")
+            logger.error(
+                f"[RAG Retrieval Failure] Unexpected error during graph search with query '{cypher_query}': {e}",
+                exc_info=True
+            )
             return []
 
     # [GNN Plan Task 2.2] New GNN-enhanced query method
     async def _query_graph_with_gnn(self, query_text: str, k: int) -> List[Evidence]:
         """
         Performs a GNN-enhanced query on the knowledge graph.
-
-        Implements refinements:
-        1. (Robustness) Top-level try/except to prevent asyncio.gather failure.
-        2. (Performance) Assumes a single, efficient Cypher query.
+        [Task 5B] Optimized to offload heavy inference to a dedicated Celery queue.
         """
         # [Refinement Point 2] Top-level error handling for robustness
         try:
@@ -329,11 +391,7 @@ class Retriever:
 
             # [Refinement Point 1]
             # Step A: Fetch Subgraph with a single query.
-            # This query should find seed nodes AND fetch their N-hop neighbors
-            # in one database operation.
-            # (Placeholder query for now)
             cypher_query = """
-            // Placeholder: Future query will find seeds and expand.
             MATCH (n)
             WHERE n.name IS NOT NULL
             RETURN {
@@ -353,12 +411,29 @@ class Retriever:
                 
             subgraph_data = query_results[0]['subgraph_data']
 
+            # [Task 5B] Offload GNN inference to a dedicated Celery queue
+            # This prevents blocking the main retrieval loop with heavy computation.
+            logger.debug(f"Dispatching GNN inference task to 'gnn_queue'...")
+            
+            # Send task by name to avoid circular imports with worker.py
+            task: AsyncResult = current_app.send_task(
+                'phoenix.run_gnn_inference',
+                args=[subgraph_data],
+                queue='gnn_queue'
+            )
+
             # Step B: Call GNN Inference
-            gnn_results = await self.gnn_inferencer.infer(graph_data=subgraph_data)
+            # We wait for the result asynchronously without blocking the loop
+            try:
+                # Run the blocking .get() in a thread
+                gnn_results = await asyncio.to_thread(task.get, timeout=30)
+            except Exception as task_err:
+                logger.error(f"GNN inference task failed or timed out: {task_err}")
+                return []
 
             # Step C: Process Results
             if not gnn_results or 'node_embeddings' not in gnn_results:
-                logger.info("GNN inference returned no results or model not loaded.")
+                logger.info("GNN inference returned no results (or model not loaded).")
                 return []
 
             # [Future Implementation] Parse actual gnn_results.
@@ -374,8 +449,14 @@ class Retriever:
             ]
             return gnn_evidence_list.copy()
 
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(
+                f"[RAG Retrieval Failure] Connection/Timeout error in GNN-enhanced query for '{query_text}': {e}",
+                exc_info=True
+            )
+            return [] # Return empty list to not break asyncio.gather
         except Exception as e:
-            logger.error(f"Failed GNN-enhanced query for '{query_text}': {e}", exc_info=True)
+            logger.error(f"[RAG Retrieval Failure] Failed GNN-enhanced query for '{query_text}': {e}", exc_info=True)
             return [] # Return empty list to not break asyncio.gather
 
     # --- 新的 RAG 搜索方法 (占位符) 喵! ---
@@ -399,8 +480,18 @@ class Retriever:
             
             logger.info(f"Temporal search found {len(evidence_list)} results.")
             return evidence_list
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(
+                f"[RAG Retrieval Failure] Connection/Timeout error during temporal search: {e}",
+                exc_info=True
+            )
+            return []
         except Exception as e:
-            logger.error(f"Temporal search failed: {e}")
+            # Step 1A/1B: Log the failure
+            logger.error(
+                f"[RAG Retrieval Failure] Temporal search failed: {e}",
+                exc_info=True
+            )
             return []
 
     async def search_tabular_db(self, query: str) -> List[Evidence]:
@@ -423,8 +514,18 @@ class Retriever:
             
             logger.info(f"Tabular search found {len(evidence_list)} results.")
             return evidence_list
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(
+                f"[RAG Retrieval Failure] Connection/Timeout error during tabular search: {e}",
+                exc_info=True
+            )
+            return []
         except Exception as e:
-            logger.warning(f"Tabular search failed: {e}")
+            # Step 1A/1B: Log the failure (changed from warning to error)
+            logger.error(
+                f"[RAG Retrieval Failure] Tabular search failed: {e}",
+                exc_info=True
+            )
             return []
 
     async def search_web(self, query: str) -> List[Evidence]:
@@ -451,8 +552,18 @@ class Retriever:
                 ))
             logger.info(f"Web search found {len(evidence_list)} results.")
             return evidence_list
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(
+                f"[RAG Retrieval Failure] Connection/Timeout error during web search: {e}",
+                exc_info=True
+            )
+            return []
         except Exception as e:
-            logger.error(f"Web search failed: {e}", exc_info=True)
+            # Step 1A/1B: Log the failure
+            logger.error(
+                f"[RAG Retrieval Failure] Web search failed: {e}",
+                exc_info=True
+            )
             return []
 
     async def retrieve_and_rerank(self, query: str) -> List[Evidence]:
@@ -479,7 +590,11 @@ class Retriever:
             # try/except blocks that return [], so this is safe.
             all_results = await asyncio.gather(*tasks)
         except Exception as e:
-            logger.error(f"Critical error during parallel retrieval: {e}", exc_info=True)
+            # Step 1A/1B: Log the top-level gather failure
+            logger.error(
+                f"[RAG Retrieval Failure] Critical error during asyncio.gather in retrieve_and_rerank: {e}",
+                exc_info=True
+            )
             all_results = [[], [], [], [], [], []] # Empty results for each task
 
         # Unpack results
@@ -490,6 +605,23 @@ class Retriever:
         temporal_results: List[Evidence] = all_results[3]
         tabular_results: List[Evidence] = all_results[4]
         web_results: List[Evidence] = all_results[5] # [Fix IV.2]
+
+        # [Task 1C] Context Completeness Check
+        # Count how many of the parallel tasks returned non-empty results
+        # (Our patches in 1A/1B ensure they return [] on failure)
+        successful_sources_count = sum(1 for result_list in all_results if result_list)
+        
+        if successful_sources_count < self.min_successful_sources:
+            # Log the critical failure
+            logger.critical(
+                f"[RAG Completeness Failure] Failed to retrieve minimum context. "
+                f"Sources Found: {successful_sources_count}, "
+                f"Minimum Required: {self.min_successful_sources}. "
+                f"Query: '{query}'. Aborting L1 Agent task.",
+                exc_info=False # This is a planned check, not an unexpected error
+            )
+            # Throw CognitiveError as instructed to halt the L1 Agent
+            raise CognitiveError(f"Failed to retrieve minimum required context sources.")
 
         # Convert graph results to Evidence schema
         graph_results: List[Evidence] = [
