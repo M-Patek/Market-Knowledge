@@ -13,6 +13,14 @@ class GNNInferencer:
     inference interface.
     """
 
+    # [Task 5A] Singleton instance storage
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(GNNInferencer, cls).__new__(cls)
+        return cls._instance
+
     def __init__(self, model_path: str):
         """
         Initializes the inferencer and attempts to load the model.
@@ -20,10 +28,16 @@ class GNNInferencer:
         Args:
             model_path: The file path to the TensorFlow SavedModel.
         """
+        # [Task 5A] Prevent re-initialization if already loaded
+        if hasattr(self, "_initialized") and self._initialized:
+            return
+
         logger.info(f"GNNInferencer initializing and loading model from {model_path}...")
         self.model_path = model_path
         self.model = None
         self._load_model(self.model_path)
+        
+        self._initialized = True
 
     def _load_model(self, model_path: str):
         """
