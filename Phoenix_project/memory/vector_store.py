@@ -11,6 +11,8 @@ from uuid import UUID
 from Phoenix_project.monitor.logging import ESLogger, get_logger
 # 修正：将 'ai.embedding_client...' 转换为 'Phoenix_project.ai.embedding_client...'
 from Phoenix_project.ai.embedding_client import EmbeddingClient
+# [Task 2] Import retry decorator
+from Phoenix_project.utils.retry import retry_with_exponential_backoff
 
 # Mock Document class
 class Document:
@@ -188,6 +190,23 @@ class PineconeVectorStore(BaseVectorStore):
             self.logger.error(f"初始化 PineconeVectorStore 失败: {e}", exc_info=True)
             raise
 
+    @retry_with_exponential_backoff(max_retries=3, initial_backoff=1.0)
+    async def _execute_upsert(self, vectors, namespace):
+        """[Task 2] Async wrapper for Pinecone upsert with retry logic."""
+        return await asyncio.to_thread(
+            self.index.upsert,
+            vectors=vectors,
+            namespace=namespace
+        )
+
+    @retry_with_exponential_backoff(max_retries=3, initial_backoff=1.0)
+    async def _execute_query(self, **kwargs):
+        """[Task 2] Async wrapper for Pinecone query with retry logic."""
+        return await asyncio.to_thread(
+            self.index.query,
+            **kwargs
+        )
+
     async def aadd_batch(self, batch: List[Document], embeddings: List[List[float]], batch_id: UUID):
         """
         [Task 3C] Add a batch of documents and embeddings to the Pinecone index,
@@ -225,11 +244,8 @@ class PineconeVectorStore(BaseVectorStore):
         
         if vectors_to_upsert:
             self.logger.info(f"Pinecone: Upserting {len(vectors_to_upsert)} vectors to namespace '{batch_id}'...")
-            await asyncio.to_thread(
-                self.index.upsert,
-                vectors=vectors_to_upsert,
-                namespace=str(batch_id) # [Task 3C] Use batch_id as the namespace
-            )
+            # [Task 2] Use _execute_upsert
+            await self._execute_upsert(vectors=vectors_to_upsert, namespace=str(batch_id))
             return [v['id'] for v in vectors_to_upsert]
         return []
 
@@ -283,13 +299,13 @@ class PineconeVectorStore(BaseVectorStore):
             
             # 在线程中执行阻塞的 query 调用
             self.logger.debug(f"正在 Pinecone 中查询 '{query[:20]}...' (Filter: {pinecone_filter}, Namespace: {namespace_to_search})")
-            results = await asyncio.to_thread(
-                self.index.query,
+            # [Task 2] Use _execute_query
+            results = await self._execute_query(
                 vector=query_embedding[0],
                 top_k=k,
                 include_metadata=True,
-                filter=pinecone_filter, # <--- [蓝图 2] 传递过滤器
-                namespace=namespace_to_search # [主人喵的清洁计划 1.1] 指定命名空间
+                filter=pinecone_filter,
+                namespace=namespace_to_search
             )
             
             # 从元数据中重构 Document 对象
