@@ -5,9 +5,8 @@ from google.generativeai import GenerativeModel
 import google.generativeai as genai
 from typing import Dict, Any, List, Optional, Union
 from contextlib import asynccontextmanager
-from collections import defaultdict # <-- 步骤 1: 添加 Import
+from collections import defaultdict 
 
-# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
 from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
@@ -21,7 +20,7 @@ logger = get_logger(__name__)
 DEFAULT_QPM_LIMITS = {
     "gemini-1.5-pro": 5,
     "gemini-1.5-flash": 15,
-    "gemini-pro": 15, # 假设
+    "gemini-pro": 15, 
     "default": 10
 }
 # We use a safety margin to avoid hitting the limit exactly
@@ -34,12 +33,6 @@ class GeminiClient:
     """
     def __init__(self, model_id: str, api_key: str, qpm_limit: int):
         self.model_id = model_id
-        
-        # MODIFICATION: 确保此客户端实例配置了密钥
-        # 注意：genai.configure是全局的，但在APIGateway中已调用。
-        # 在这里单独配置模型实例可能更安全，但genai库
-        # 倾向于全局配置。我们依赖于 APIGateway 已经调用了 genai.configure。
-        # self.model = GenerativeModel(model_id)
         
         # MODIFICATION: 不依赖全局 'genai' 状态，配置此实例
         # 尽管 genai.configure(api_key=api_key) 是全局的，
@@ -60,20 +53,20 @@ class GeminiClient:
         
         logger.info(f"GeminiClient for {model_id} initialized with QPM limit {qpm_limit} (Rate: {self.semaphore_rate:.2f}s/query)")
 
-    # MODIFICATION: 更改 generate_content_async 签名
     async def generate_content_async(
         self,
         contents: List[Union[str, Any]], # 替换 system_prompt 和 user_prompt
+        tools: List[Any] = None, # [Step 1] Add tools support
         generation_config: Dict[str, Any] = None,
         safety_settings: List[Dict[str, Any]] = None, # 添加 safety_settings
         request_id: str = "N/A" # 保留 request_id
     ) -> Dict[str, Any]:
         """
         Generates content from the model, respecting rate limits.
-        (Updated signature to match APIGateway)
+        (Updated signature to match APIGateway and support Tools)
         
         Returns:
-            Dict[str, Any]: A dictionary containing the 'text' response.
+            Dict[str, Any]: A dictionary containing the 'text' response and optional 'grounding_metadata'.
         """
         async with self.semaphore:
             # Enforce time-based rate limit
@@ -94,6 +87,7 @@ class GeminiClient:
                 # 使用 self.model (已在 __init__ 中初始化)
                 response = await self.model.generate_content_async(
                     contents, # 传递 'contents' 列表
+                    tools=tools, # [Step 1] Pass tools
                     generation_config=generation_config,
                     safety_settings=safety_settings # 传递 'safety_settings'
                 )
@@ -104,15 +98,26 @@ class GeminiClient:
                     if response.prompt_feedback and response.prompt_feedback.block_reason:
                         logger.warning(f"Request {request_id} to {self.model_id} blocked. Reason: {response.prompt_feedback.block_reason}")
                         raise ValueError(f"Content generation blocked: {response.prompt_feedback.block_reason}")
-                    raise ValueError(f"Model response ({request_id}) contained no parts.")
+                    # 如果没有 parts，但可能有 candidates (例如仅返回 grounding metadata 但没生成文本的情况，虽少见)
+                    # 通常 generate_content_async 至少会返回一些内容。
+                    # 为了健壮性，如果完全没内容才报错
+                    if not response.candidates:
+                         raise ValueError(f"Model response ({request_id}) contained no parts/candidates.")
                     
-                response_text = response.parts[0].text
+                response_text = response.parts[0].text if response.parts else ""
                 
+                # [Step 1] Extract grounding metadata if available
+                grounding_metadata = None
+                if response.candidates:
+                    grounding_metadata = getattr(response.candidates[0], 'grounding_metadata', None)
+
                 # 无论是否为JSON，我们都返回包含文本的字典
                 # APIGateway 将处理这个字典。
                 # 如果请求了JSON，response_text 将是JSON字符串。
-                
-                return {"text": response_text}
+                return {
+                    "text": response_text,
+                    "grounding_metadata": grounding_metadata
+                }
 
             except Exception as e:
                 logger.error(f"Error calling Gemini API ({self.model_id}) for {request_id}: {e}", exc_info=True)
@@ -125,7 +130,6 @@ class GeminiPoolManager:
     Provides a context manager to acquire and release clients.
     """
     
-    # 步骤 2: 重构 __init__ 方法
     def __init__(self, config: Dict[str, Any] = None):
         if config is None:
             config = {}
@@ -156,12 +160,6 @@ class GeminiPoolManager:
         qpm_limits_config = config.get('gemini_qpm_limits', {})
         self.qpm_limits = {**DEFAULT_QPM_LIMITS, **qpm_limits_config}
 
-
-    # 步骤 4: 删除旧方法
-    # async def _get_or_create_client(self, model_id: str) -> GeminiClient:
-    #    ... (已移除) ...
-
-    # 步骤 3: 重构 get_client 方法
     @asynccontextmanager
     async def get_client(self, model_id: str) -> GeminiClient:
         """
