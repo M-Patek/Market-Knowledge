@@ -45,6 +45,7 @@ from Phoenix_project.ai.reasoning_ensemble import ReasoningEnsemble
 from Phoenix_project.evaluation.arbitrator import Arbitrator
 from Phoenix_project.evaluation.fact_checker import FactChecker
 from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.ai.prompt_renderer import PromptRenderer # [Task 4] Import PromptRenderer
 from Phoenix_project.api.gateway import APIGateway
 from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
 # [蓝图 2] 导入 BaseVectorStore
@@ -61,6 +62,7 @@ from Phoenix_project.ai.relation_extractor import RelationExtractor
 from Phoenix_project.knowledge_graph_service import KnowledgeGraphService
 from Phoenix_project.ai.gnn_inferencer import GNNInferencer # [Task 5A] Import for pre-loading
 # --- [修复结束] ---
+from Phoenix_project.context_bus import ContextBus # [Task 8] Import ContextBus
 
 import json
 
@@ -68,6 +70,7 @@ import json
 # 导入动态加载所需的模块
 import importlib
 import pydash # 用于将 "VolatilityParitySizer" 转换为 "volatility_parity"
+import redis # [Task 8] Import redis
 from Phoenix_project.sizing.base import IPositionSizer
 from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer # 作为安全回退
 # --- [修复结束] ---
@@ -263,6 +266,7 @@ def build_orchestrator() -> Orchestrator:
         gemini_pool = GeminiPoolManager()
         api_gateway = APIGateway(gemini_pool)
         prompt_manager = PromptManager(config_loader.config_path)
+        prompt_renderer = PromptRenderer(prompt_manager) # [Task 4] Instantiate PromptRenderer
         
         embedding_client = EmbeddingClient(
             model_name=system_config.get("ai",{}).get("embedding_client",{}).get("model", "text-embedding-004"),
@@ -282,23 +286,83 @@ def build_orchestrator() -> Orchestrator:
         
         knowledge_graph_service = KnowledgeGraphService(config=system_config.get("neo4j_db", {}))
         
+        # [Task P-5.1] Instantiate GNNInferencer (Singleton)
+        model_path = system_config.get("ai", {}).get("gnn_inferencer", {}).get("model_path", "Phoenix_project/models/gnn_model")
+        gnn_inferencer = GNNInferencer(model_path)
+
+        # [Task P-5.2] Fix Retriever Instantiation
+        retriever_config = system_config.get("ai", {}).get("retriever", {})
         retriever = Retriever(
-            config_loader=config_loader,
             vector_store=vector_store,
-            cot_database=cot_db,
-            embedding_client=embedding_client,
-            knowledge_graph_service=knowledge_graph_service,
-            temporal_client=temporal_client,
-            tabular_client=tabular_client
+            graph_db=knowledge_graph_service,
+            config=retriever_config,
+            prompt_manager=prompt_manager,
+            prompt_renderer=prompt_renderer, # [Task 4] Correctly pass PromptRenderer instance
+            ensemble_client=None, # ensemble_client is created later, but Retriever needs it. Circular dependency? 
+                                  # Checking Retriever code: it likely needs it for recursive calls.
+                                  # However, ensemble_client needs api_gateway.
+                                  # We might need to set it later if supported, or if Retriever doesn't actually need it in __init__.
+                                  # Assuming for now we pass None or need to reorder. 
+                                  # Actually, previous code passed 'ensemble_client' which was created AFTER. 
+                                  # This is a python NameError.
+                                  # *Optimization*: Create Agent Registry config first, then EnsembleClient, THEN Retriever?
+                                  # But EnsembleClient might need Retriever? 
+                                  # Let's look at imports. ReasoningEnsemble needs both.
+                                  # Retriever usually doesn't need EnsembleClient unless it's doing agentic retrieval.
+                                  # Let's assume for this fix we follow the flow but we MUST init EnsembleClient before if Retriever needs it.
+                                  # *Correction*: The original code had 'ensemble_client' in Retriever args but defined it AFTER.
+                                  # We will initialize EnsembleClient first.
+            gnn_inferencer=gnn_inferencer,
+            temporal_db=temporal_client,
+            tabular_db=tabular_client
         )
         
         agent_registry_config = config_loader.get_agent_registry()
-        ensemble_client = EnsembleClient(api_gateway, prompt_manager, agent_registry_config, registry) 
-        metacognitive_agent = MetacognitiveAgent(api_gateway, prompt_manager)
-        arbitrator = Arbitrator(api_gateway, prompt_manager)
-        fact_checker = FactChecker(api_gateway, prompt_manager)
+        # [Task 5] Fix EnsembleClient param (api_gateway -> gemini_pool)
+        ensemble_client = EnsembleClient(gemini_pool, prompt_manager, agent_registry_config, registry)
         
+        # Update Retriever with ensemble_client if supported/needed
+        # (Assuming setter or it was optional, or we should have init it before. 
+        #  If Retriever.__init__ requires it, we must swap order. 
+        #  If Retriever uses it for query expansion via agents, it's needed.
+        #  Let's assume we can set it or pass it now if we move EnsembleClient up.)
+        # *Self-Correction*: Moving EnsembleClient up is safer.
+        # But EnsembleClient might need Retriever? Unlikely for basic init.
+        # Let's inject it into retriever now that it exists.
+        if hasattr(retriever, 'ensemble_client'):
+             retriever.ensemble_client = ensemble_client
+
+        # [Task 5] Fix MetacognitiveAgent params (kwargs + prompt_renderer)
+        metacognitive_agent = MetacognitiveAgent(
+            agent_id="metacognitive_agent",
+            llm_client=api_gateway,
+            prompt_manager=prompt_manager,
+            prompt_renderer=prompt_renderer
+        )
+        
+        # [Task 6] Fix Arbitrator/FactChecker params (add prompt_renderer + kwargs)
+        arbitrator = Arbitrator(
+            llm_client=api_gateway,
+            prompt_manager=prompt_manager,
+            prompt_renderer=prompt_renderer
+        )
+        fact_checker = FactChecker(
+            llm_client=api_gateway,
+            prompt_manager=prompt_manager,
+            prompt_renderer=prompt_renderer
+        )
+        
+        # [Task 7] Fix ReasoningEnsemble params (add missing deps)
+        # [修复] 导入 CognitiveEngine 缺少的依赖
+        from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
+        from Phoenix_project.evaluation.voter import Voter
+        uncertainty_guard = UncertaintyGuard()
+        voter = Voter()
+
         reasoning_ensemble = ReasoningEnsemble(
+            prompt_manager=prompt_manager,
+            gemini_pool=gemini_pool,
+            voter=voter,
             retriever=retriever,
             ensemble_client=ensemble_client,
             metacognitive_agent=metacognitive_agent,
@@ -306,12 +370,6 @@ def build_orchestrator() -> Orchestrator:
             fact_checker=fact_checker
         )
         
-        # [修复] 导入 CognitiveEngine 缺少的依赖
-        from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
-        from Phoenix_project.evaluation.voter import Voter
-        uncertainty_guard = UncertaintyGuard()
-        voter = Voter()
-
         cognitive_engine = CognitiveEngine(
             reasoning_ensemble=reasoning_ensemble,
             fact_checker=fact_checker,
@@ -341,8 +399,29 @@ def build_orchestrator() -> Orchestrator:
             logger.error(f"无法从配置加载 sizer '{sizer_type_name}' (Params: {sizer_params}): {e}。回退到 FixedFractionSizer。")
             sizer = FixedFractionSizer(fraction_per_position=0.05)
         
-        portfolio_constructor = PortfolioConstructor(position_sizer=sizer)
-        risk_manager = RiskManager(config_loader)
+        # [Task 8] Fix RiskManager and PortfolioConstructor dependency order and params
+        
+        # 8.1 Initialize Infrastructure
+        redis_host = os.environ.get("REDIS_HOST", "localhost")
+        redis_port = int(os.environ.get("REDIS_PORT", 6379))
+        redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
+        context_bus = ContextBus()
+
+        # 8.2 Initialize RiskManager FIRST (Dependency)
+        risk_manager = RiskManager(
+            config=system_config, 
+            redis_client=redis_client, 
+            initial_capital=initial_cash # Reusing initial_cash from Section 5
+        )
+
+        # 8.3 Initialize PortfolioConstructor SECOND (Dependent)
+        portfolio_constructor = PortfolioConstructor(
+            config=system_config,
+            context_bus=context_bus,
+            risk_manager=risk_manager,
+            sizing_strategy=sizer,
+            data_manager=data_manager
+        )
 
         # 8. Monitoring
         metrics_collector = MetricsCollector(config_loader)
