@@ -49,6 +49,11 @@ class KnowledgeInjector:
         self.vector_store = vector_store
         logger.info("KnowledgeInjector initialized.")
 
+    @staticmethod
+    def _construct_node_id(node_type: str, item_id: Union[str, UUID]) -> str:
+        """[Task 3] Construct a standardized node ID for the Knowledge Graph."""
+        return f"{node_type}:{item_id}"
+
     async def process_batch(
         self, 
         batch: List[Union[NewsData, MarketData, EconomicIndicator]]
@@ -183,8 +188,8 @@ class KnowledgeInjector:
         
         try:
             triples = []
-            # [Task 1] 节点 ID 使用 'FusionDecision:' 前缀
-            fusion_id = f"FusionDecision:{fusion_result.id}"
+            # [Task 3] 节点 ID 统一使用 _construct_node_id
+            fusion_id = self._construct_node_id("FusionDecision", fusion_result.id)
             symbol = fusion_result.target_symbol
             
             # 1. 创建 FusionDecision 节点并链接到 Symbol
@@ -202,8 +207,8 @@ class KnowledgeInjector:
             l1_ids = set(fusion_result.supporting_evidence_ids) | set(fusion_result.conflicting_evidence_ids)
             
             for l1_id in l1_ids:
-                # [Task 1] 链接到 L1 节点 (假设 L1 节点 ID 是 'Analysis:{l1_id}')
-                l1_node_id = f"Analysis:{l1_id}"
+                # [Task 3] 节点 ID 统一使用 _construct_node_id
+                l1_node_id = self._construct_node_id("Analysis", l1_id)
                 # (我们假设 'basedOnAnalysis' 在 add_triples 中被处理为关系)
                 triples.append((fusion_id, "basedOnAnalysis", l1_node_id))
 
@@ -255,8 +260,8 @@ class KnowledgeInjector:
                  return []
         
         # 2. 创建一个代表本次分析本身的唯一节点 (Subject)
-        # [MODIFIED] 使用 L1 EvidenceItem ID 作为节点 ID
-        analysis_id = f"Analysis:{analysis_item_id}"
+        # [Task 3] 节点 ID 统一使用 _construct_node_id
+        analysis_id = self._construct_node_id("Analysis", analysis_item_id)
         
         # 3. 链接元数据到分析节点
         timestamp = analysis_result.get('timestamp', event.get('timestamp') or pd.Timestamp.now(tz='UTC').isoformat())
