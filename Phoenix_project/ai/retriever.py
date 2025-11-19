@@ -23,9 +23,7 @@ from ..core.schemas.evidence_schema import (
 from ..memory.vector_store import VectorStore
 from ..core.exceptions import QuerySafetyError, CognitiveError
 from ..ai.graph_db_client import GraphDBClient
-# [Fix II.3] 移除 GeminiClient
 from ..ai.gnn_inferencer import GNNInferencer
-# [Task 4] 导入 PromptManager 和 PromptRenderer
 from ..ai.tabular_db_client import TabularDBClient
 from ..ai.temporal_db_client import TemporalDBClient
 from ..ai.ensemble_client import EnsembleClient
@@ -49,49 +47,30 @@ class Retriever:
         vector_store: VectorStore,
         graph_db: GraphDBClient,
         config: Dict[str, Any],
-        # [Task 4] 假设这些是由 Registry.py 注入的
         prompt_manager: PromptManager,
         prompt_renderer: PromptRenderer,
-        gnn_inferencer: GNNInferencer,  # [GNN Plan Task 2.1]
-        ensemble_client: EnsembleClient, # [Fix II.3]
-        # --- 添加/更新这些参数 喵! ---
+        gnn_inferencer: GNNInferencer,
+        ensemble_client: EnsembleClient,
         temporal_db: Optional[TemporalDBClient] = None,
         tabular_db: Optional[TabularDBClient] = None,
         search_client: Optional[Any] = None
     ):
-        """
-        Initializes the Retriever.
-
-        Args:
-            vector_store: An instance of VectorStore.
-            graph_db: An instance of GraphDBClient.
-            config: Configuration dictionary.
-            prompt_manager: [Task 4] Injected PromptManager.
-            prompt_renderer: [Task 4] Injected PromptRenderer.
-            gnn_inferencer: [GNN Plan Task 2.1] Injected GNNInferencer.
-            ensemble_client: [Fix II.3] The EnsembleClient for LLM interactions.
-        """
         self.vector_store = vector_store
         self.graph_db = graph_db
-        self.gnn_inferencer = gnn_inferencer  # [GNT Plan Task 2.1]
+        self.gnn_inferencer = gnn_inferencer
         
-        # [Fix II.3] Simplify dependency: extract API gateway from ensemble client
         self.ensemble_client = ensemble_client
         self.llm_client = ensemble_client.api_gateway 
         
-        # --- 存储这些新客户端 喵! ---
         self.temporal_db = temporal_db
         self.tabular_db = tabular_db
         self.search_client = search_client
 
-        # [Task 4] 存储注入的依赖
         self.prompt_manager = prompt_manager
         self.prompt_renderer = prompt_renderer
         
-        # [修复] 存储 'ai_components.retriever' 根配置
         self.config = config 
 
-        # [修复] 
         default_l1_config = self.config.get("l1_retriever", {})
 
         self.rerank_model_name = default_l1_config.get(
@@ -101,7 +80,6 @@ class Retriever:
         self.top_k_graph = default_l1_config.get("top_k_graph", 5)
         self.top_k_gnn = default_l1_config.get("top_k_gnn", 5)
         self.rerank_threshold = default_l1_config.get("rerank_threshold", 0.1)
-        # [Task 1C] Minimum required sources for a valid context
         self.min_successful_sources = default_l1_config.get("min_successful_sources", 2)
 
         self._initialize_reranker()
@@ -127,7 +105,7 @@ class Retriever:
                 f"Error: {e}. Falling back to simple reranker.",
                 exc_info=True
             )
-            self.reranker = None  # Flag to use fallback
+            self.reranker = None
 
     def _fallback_reranker(
         self, query: str, documents: List[Evidence]
@@ -136,7 +114,6 @@ class Retriever:
         A simple fallback reranker if the CrossEncoder model fails to load.
         """
         logger.warning("Using fallback reranker (no reranking).")
-        # Just return top N documents without reranking
         return sorted(documents, key=lambda x: x.score, reverse=True)[
             : self.top_k_vector
         ]
@@ -151,28 +128,23 @@ class Retriever:
             return []
 
         if self.reranker is None:
-            # 使用回退重排器（如果 CrossEncoder 加载失败）
             return self._fallback_reranker(query, documents)
 
         try:
-            # 准备 CrossEncoder 的输入
             pairs: List[List[str]] = [[query, doc.content] for doc in documents]
             if not pairs:
                 return []
 
-            # 计算分数
             scores = self.reranker.predict(pairs)
 
-            # 更新文档分数并过滤
             reranked_docs: List[Evidence] = []
             for i, doc in enumerate(documents):
                 new_score = float(scores[i])
                 if new_score >= self.rerank_threshold:
-                    doc.score = new_score  # 更新为 reranker 的分数
+                    doc.score = new_score
                     doc.source_type = DataSource.RERANKED_VECTOR
                     reranked_docs.append(doc)
 
-            # 按新分数排序
             reranked_docs.sort(key=lambda x: x.score, reverse=True)
 
             logger.info(
@@ -201,7 +173,6 @@ class Retriever:
             logger.info(f"Vector search found {len(results)} results.")
             return results
         except (ConnectionError, TimeoutError) as e:
-            # Step 1A/1B: Specific, logged error
             logger.error(
                 f"[RAG Retrieval Failure] Connection/Timeout error during vector search: {e}",
                 exc_info=True
@@ -218,7 +189,6 @@ class Retriever:
         """
         [Task 4] 重构：使用 PromptRenderer 生成 Cypher 提示。
         """
-        # 优化：[Task 4] 这个模板现在从 PromptManager 加载
         logger.debug("Rendering text_to_cypher prompt...")
         
         try:
@@ -227,12 +197,8 @@ class Retriever:
                 "query": query
             }
             
-            # 1. 渲染整个模板结构
-            # [Task 4] get_prompt 应该返回原始 dict
             rendered_data = self.prompt_renderer.render("text_to_cypher", context)
             
-            # 2. 提取最终的提示字符串
-            # (基于我们的 text_to_cypher.json 结构)
             prompt_str = rendered_data.get("full_prompt_template")
             if not prompt_str:
                  raise ValueError("'full_prompt_template' key not found in rendered prompt.")
@@ -244,7 +210,6 @@ class Retriever:
                 f"[Prompt Render Failure] Failed to render text_to_cypher prompt: {e}. Using fallback.",
                 exc_info=True
             )
-            # [Task 4] 回退到旧的硬编码逻辑
             return f"""
             You are an expert Cypher query generator. Your task is to convert a
             natural language question into a Cypher query based on the provided
@@ -272,14 +237,13 @@ class Retriever:
         OPTIMIZED: Uses an LLM to generate a Cypher query from text.
         """
         try:
-            schema = await self.graph_db.get_schema() # 假设 graph_db 有这个方法
+            schema = await self.graph_db.get_schema()
             if not schema:
                 logger.warning("Could not retrieve graph schema for text-to-Cypher.")
-                schema = "No schema available." # 继续尝试
+                schema = "No schema available."
 
             prompt = self._generate_cypher_prompt(query, schema)
             
-            # [Fix II.3] 使用 self.llm_client (来自 EnsembleClient)
             response_text = await self.llm_client.generate_text(prompt)
 
             if not response_text:
@@ -302,7 +266,6 @@ class Retriever:
             )
             return None
         except Exception as e:
-            # Step 1A/1B: Log the failure
             logger.error(
                 f"[RAG Retrieval Failure] Unexpected error in _generate_text_to_cypher: {e}",
                 exc_info=True
@@ -330,17 +293,13 @@ class Retriever:
         else:
             params = {} 
 
-        # [Task 2B] Enforce Cypher query validation before execution.
         try:
-            # Use the static method from GraphDBClient we created.
             GraphDBClient.validate_cypher_query(cypher_query)
         except QuerySafetyError as e:
-            # Log the failure event as per Task 2B
             logger.error(
                 f"Cypher validation failed for query: {cypher_query}. Error: {e}",
                 exc_info=True
             )
-            # Re-raise to stop execution. This prevents silent failure.
             raise e
         
         try:
@@ -366,7 +325,6 @@ class Retriever:
             return graph_results
 
         except (ConnectionError, TimeoutError) as e:
-            # Step 1A/1B: Specific, logged error
             logger.error(
                 f"[RAG Retrieval Failure] Connection/Timeout error during graph search with query '{cypher_query}': {e}",
                 exc_info=True
@@ -379,18 +337,14 @@ class Retriever:
             )
             return []
 
-    # [GNN Plan Task 2.2] New GNN-enhanced query method
     async def _query_graph_with_gnn(self, query_text: str, k: int) -> List[Evidence]:
         """
         Performs a GNN-enhanced query on the knowledge graph.
         [Task 5B] Optimized to offload heavy inference to a dedicated Celery queue.
         """
-        # [Refinement Point 2] Top-level error handling for robustness
         try:
             logger.debug(f"Performing GNN-enhanced graph query for: {query_text}")
 
-            # [Refinement Point 1]
-            # Step A: Fetch Subgraph with a single query.
             cypher_query = """
             MATCH (n)
             WHERE n.name IS NOT NULL
@@ -402,7 +356,6 @@ class Retriever:
             """
             params = {"query": query_text, "k_seeds": k}
             
-            # [Future Implementation] This logic will be more complex
             query_results = await self.graph_db.execute_query(cypher_query, params)
             
             if not query_results or 'subgraph_data' not in query_results[0]:
@@ -411,41 +364,32 @@ class Retriever:
                 
             subgraph_data = query_results[0]['subgraph_data']
 
-            # [Task 5B] Offload GNN inference to a dedicated Celery queue
-            # This prevents blocking the main retrieval loop with heavy computation.
             logger.debug(f"Dispatching GNN inference task to 'gnn_queue'...")
             
-            # Send task by name to avoid circular imports with worker.py
             task: AsyncResult = current_app.send_task(
                 'phoenix.run_gnn_inference',
                 args=[subgraph_data],
                 queue='gnn_queue'
             )
 
-            # Step B: Call GNN Inference
-            # We wait for the result asynchronously without blocking the loop
             try:
-                # Run the blocking .get() in a thread
                 gnn_results = await asyncio.to_thread(task.get, timeout=30)
             except Exception as task_err:
                 logger.error(f"GNN inference task failed or timed out: {task_err}")
                 return []
 
-            # Step C: Process Results
             if not gnn_results or 'node_embeddings' not in gnn_results:
                 logger.info("GNN inference returned no results (or model not loaded).")
                 return []
 
-            # [Future Implementation] Parse actual gnn_results.
-            # For now, create placeholder evidence.
             gnn_evidence_list = [
                 Evidence(
                     id=f"gnn_node_{i}",
                     content=f"GNN processed node {i} from query '{query_text}'",
-                    score=0.99,  # GNN results get high initial score
+                    score=0.99,
                     source_type=DataSource.GRAPH,
-                    metadata={"source": "knowledge_graph_gnn"} # Differentiate
-                ) for i in range(self.top_k_gnn) # Use self.top_k_gnn
+                    metadata={"source": "knowledge_graph_gnn"}
+                ) for i in range(self.top_k_gnn)
             ]
             return gnn_evidence_list.copy()
 
@@ -454,18 +398,15 @@ class Retriever:
                 f"[RAG Retrieval Failure] Connection/Timeout error in GNN-enhanced query for '{query_text}': {e}",
                 exc_info=True
             )
-            return [] # Return empty list to not break asyncio.gather
+            return []
         except Exception as e:
             logger.error(f"[RAG Retrieval Failure] Failed GNN-enhanced query for '{query_text}': {e}", exc_info=True)
-            return [] # Return empty list to not break asyncio.gather
-
-    # --- 新的 RAG 搜索方法 (占位符) 喵! ---
+            return []
 
     async def search_temporal_db(self, query: str) -> List[Evidence]:
         if not self.temporal_db:
             return []
         try:
-            # Retrieve events using the client's specific method
             results = await self.temporal_db.search_events(query_string=query, size=5)
 
             evidence_list = []
@@ -487,7 +428,6 @@ class Retriever:
             )
             return []
         except Exception as e:
-            # Step 1A/1B: Log the failure
             logger.error(
                 f"[RAG Retrieval Failure] Temporal search failed: {e}",
                 exc_info=True
@@ -498,7 +438,6 @@ class Retriever:
         if not self.tabular_db:
             return []
         try:
-            # Delegate Text-to-SQL generation and execution to the client
             response = await self.tabular_db.query(query)
             results = response.get("results", [])
 
@@ -507,7 +446,7 @@ class Retriever:
                 evidence_list.append(Evidence(
                     id=f"sql_res_{i}",
                     content=str(row),
-                    score=1.0, # High confidence for exact database results
+                    score=1.0, 
                     source_type=DataSource.STRUCTURED,
                     metadata={"sql_query": response.get("generated_sql")}
                 ))
@@ -521,7 +460,6 @@ class Retriever:
             )
             return []
         except Exception as e:
-            # Step 1A/1B: Log the failure (changed from warning to error)
             logger.error(
                 f"[RAG Retrieval Failure] Tabular search failed: {e}",
                 exc_info=True
@@ -533,13 +471,20 @@ class Retriever:
         if not self.search_client: return []
         logger.info(f"Performing web search for: {query}")
         try:
-            # [Task IV.2] 使用 asyncio.to_thread 运行同步的 Tavily 客户端
+            # [Task IV.2] Updated to support both Async (Gemini) and Sync (Tavily) clients
             search_limit = self.config.get("l1_retriever", {}).get("search_top_k", 2)
-            response = await asyncio.to_thread(
-                self.search_client.search,
-                query=query,
-                max_results=search_limit
-            )
+            
+            if asyncio.iscoroutinefunction(self.search_client.search):
+                # Gemini Adapter is async
+                response = await self.search_client.search(query=query, max_results=search_limit)
+            else:
+                # Old Tavily client is sync, requires thread wrapping
+                response = await asyncio.to_thread(
+                    self.search_client.search,
+                    query=query,
+                    max_results=search_limit
+                )
+
             results = response.get("results", [])
             evidence_list = []
             for res in results:
@@ -559,7 +504,6 @@ class Retriever:
             )
             return []
         except Exception as e:
-            # Step 1A/1B: Log the failure
             logger.error(
                 f"[RAG Retrieval Failure] Web search failed: {e}",
                 exc_info=True
@@ -573,57 +517,43 @@ class Retriever:
         """
         logger.info(f"Starting retrieval for query: {query}")
 
-        # [GNN Plan Task 2.3] Run all retrieval tasks in parallel
         tasks = [
             self.search_vector_db(query),
-            self.search_knowledge_graph(query), # Returns List[GraphQueryResult]
-            self._query_graph_with_gnn(query, k=self.top_k_gnn), # Returns List[Evidence]
-            # --- 添加新任务 喵! ---
+            self.search_knowledge_graph(query), 
+            self._query_graph_with_gnn(query, k=self.top_k_gnn), 
             self.search_temporal_db(query),
             self.search_tabular_db(query),
-            self.search_web(query) # [Fix IV.2]
+            self.search_web(query) 
         ]
         
         try:
-            # Our _query_graph_with_gnn is already robust (returns [] on error)
-            # search_vector_db and search_knowledge_graph also have internal
-            # try/except blocks that return [], so this is safe.
             all_results = await asyncio.gather(*tasks)
         except Exception as e:
-            # Step 1A/1B: Log the top-level gather failure
             logger.error(
                 f"[RAG Retrieval Failure] Critical error during asyncio.gather in retrieve_and_rerank: {e}",
                 exc_info=True
             )
-            all_results = [[], [], [], [], [], []] # Empty results for each task
+            all_results = [[], [], [], [], [], []] 
 
-        # Unpack results
         vector_results: List[Evidence] = all_results[0]
         graph_search_results: List[GraphQueryResult] = all_results[1]
         gnn_results: List[Evidence] = all_results[2]
-        # --- 解包新任务 喵! ---
         temporal_results: List[Evidence] = all_results[3]
         tabular_results: List[Evidence] = all_results[4]
-        web_results: List[Evidence] = all_results[5] # [Fix IV.2]
+        web_results: List[Evidence] = all_results[5]
 
-        # [Task 1C] Context Completeness Check
-        # Count how many of the parallel tasks returned non-empty results
-        # (Our patches in 1A/1B ensure they return [] on failure)
         successful_sources_count = sum(1 for result_list in all_results if result_list)
         
         if successful_sources_count < self.min_successful_sources:
-            # Log the critical failure
             logger.critical(
                 f"[RAG Completeness Failure] Failed to retrieve minimum context. "
                 f"Sources Found: {successful_sources_count}, "
                 f"Minimum Required: {self.min_successful_sources}. "
                 f"Query: '{query}'. Aborting L1 Agent task.",
-                exc_info=False # This is a planned check, not an unexpected error
+                exc_info=False
             )
-            # Throw CognitiveError as instructed to halt the L1 Agent
             raise CognitiveError(f"Failed to retrieve minimum required context sources.")
 
-        # Convert graph results to Evidence schema
         graph_results: List[Evidence] = [
             Evidence(
                 id=res.node_id,
@@ -641,7 +571,7 @@ class Retriever:
             gnn_results +
             temporal_results +
             tabular_results +
-            web_results # [Fix IV.2]
+            web_results
         )
         if not combined_results:
             logger.warning(f"No results found for query: {query}")
@@ -653,7 +583,7 @@ class Retriever:
             f"{len(gnn_results)} GNN, "
             f"{len(temporal_results)} temporal, "
             f"{len(tabular_results)} tabular, and "
-            f"{len(web_results)} web results." # [Fix IV.2]
+            f"{len(web_results)} web results."
         )
 
         final_results = self._rerank_documents(query, combined_results)
