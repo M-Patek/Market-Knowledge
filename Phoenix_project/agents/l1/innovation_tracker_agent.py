@@ -1,102 +1,120 @@
 import json
 import logging
-from typing import List, Any, Generator, AsyncGenerator
-import time
+from typing import Any, Dict, AsyncGenerator
 
-from Phoenix_project.agents.l1.base import L1Agent
-from Phoenix_project.core.schemas.task_schema import Task
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
-
-# 获取日志记录器
-logger = logging.getLogger(__name__)
+from Phoenix_project.agents.l1.base import L1Agent, logger
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceSource
+from Phoenix_project.core.pipeline_state import PipelineState
 
 class InnovationTrackerAgent(L1Agent):
     """
-    L1 智能体：创新追踪者
-    监控新技术、专利和研发。
+    L1 智能体，专注于创新追踪。
+    监控研发动态、专利申请和新产品发布。
     """
     def __init__(
         self,
         agent_id: str,
         llm_client: Any,
         data_manager: Any,
+        config: Dict[str, Any] = None
     ):
-        """
-        初始化 InnovationTrackerAgent。
-        
-        参数:
-            agent_id (str): 智能体的唯一标识符。
-            llm_client (Any): 用于与 LLM API 交互的客户端 (例如 EnsembleClient)。
-            data_manager (Any): 用于检索数据的 DataManager。
-        """
         super().__init__(
             agent_id=agent_id,
+            role="Innovation Tracker",
+            prompt_template_name="l1_innovation_tracker",
             llm_client=llm_client,
             data_manager=data_manager
         )
-        logger.info(f"[{self.agent_id}] InnovationTrackerAgent initialized.")
+        self.config = config or {}
+        logger.info(f"[{self.agent_id}] Initialized.")
 
-    async def run(self, task: Task, context: List[Any]) -> AsyncGenerator[EvidenceItem, None]:
+    async def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> AsyncGenerator[EvidenceItem, None]:
         """
-        异步运行智能体以追踪技术创新。
+        [Refactored Phase 3.1] 适配 PipelineState 和 DataManager。
+        """
+        symbol = dependencies.get("symbol")
+        task_id = dependencies.get("task_id", "unknown_task")
+        event_id = dependencies.get("event_id", "unknown_event")
         
-        参数:
-            task (Task): 分配给智能体的任务。
-            context (List[Any]): 智能体运行所需的附加上下文（例如，原始文档）。
-
-        收益:
-            AsyncGenerator[EvidenceItem, None]: 异步生成一个或多个 EvidenceItem。
-        """
-        logger.info(f"[{self.agent_id}] Running innovation tracking for task: {task.task_id} on symbols: {task.symbols}")
-
-        if not task.symbols:
-            logger.warning(f"[{self.agent_id}] Task {task.task_id} has no symbols. Skipping.")
+        if not symbol:
             return
 
-        # 1. 准备 Prompt 的上下文
-        symbol = task.symbols[0]
-        context_str = "\n---\n".join([doc.content for doc in context if hasattr(doc, 'content')])
-        
-        if not context_str:
-            logger.warning(f"[{self.agent_id}] No string content found in context for task {task.task_id}. Skipping.")
-            return
+        logger.info(f"[{self.agent_id}] Tracking innovation for: {symbol}")
 
-        context_map = {
-            "symbol": symbol,
-            "context": context_str
-        }
-        
-        # [关键] 设置此智能体对应的 Prompt 名称
-        agent_prompt_name = "l1_innovation_tracker" 
-
+        # 1. 获取创新相关新闻
         try:
-            # 2. 异步调用 LLM
-            logger.debug(f"[{self.agent_id}] Calling LLM with prompt: {agent_prompt_name} for symbol: {symbol}")
+            query = f"{symbol} new product patent R&D technology launch"
+            news_items = await self.data_manager.fetch_news_data(query=query)
             
-            response_str = await self.llm_client.run_llm_task(
-                agent_prompt_name=agent_prompt_name,
-                context_map=context_map
-            )
-            
-            if not response_str:
-                logger.warning(f"[{self.agent_id}] LLM returned no response for task {task.task_id}.")
+            if not news_items:
+                logger.debug(f"[{self.agent_id}] No innovation news for {symbol}.")
                 return
 
-            # 3. 解析和验证 JSON 输出
-            logger.debug(f"[{self.agent_id}] Received LLM response (raw): {response_str[:200]}...")
-            response_data = json.loads(response_str)
+            news_summary = "\n".join([
+                f"- {item.headline} ({item.timestamp})" for item in news_items[:5]
+            ])
+
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Error fetching news: {e}", exc_info=True)
+            return
+
+        # 2. 渲染 Prompt
+        prompt_data = {
+            "symbol": symbol,
+            "innovation_news": news_summary,
+            "current_date": state.current_time.isoformat()
+        }
+
+        try:
+            prompt = self.render_prompt(prompt_data)
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Error rendering prompt: {e}", exc_info=True)
+            return
+
+        # 3. 调用 LLM
+        try:
+            llm_response = await self.llm_client.generate(prompt)
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Error calling LLM: {e}", exc_info=True)
+            return
+
+        # 4. 解析结果
+        try:
+            response_json = json.loads(llm_response)
             
-            # 4. 验证并生成 EvidenceItem
-            evidence = EvidenceItem.model_validate(response_data)
-            evidence.agent_id = self.agent_id
-            
-            logger.info(f"[{self.agent_id}] Successfully generated evidence for {symbol} with confidence {evidence.confidence}")
+            analysis = response_json.get("analysis", "N/A")
+            innovation_score = response_json.get("innovation_score", 5) # 1-10
+
+            content = (
+                f"**Innovation Report:** {analysis}\n"
+                f"**Innovation Score:** {innovation_score}/10"
+            )
+
+            evidence = EvidenceItem(
+                agent_id=self.agent_id,
+                task_id=task_id,
+                event_id=event_id,
+                symbol=symbol,
+                headline="Innovation & Tech Update",
+                content=content,
+                data_source=EvidenceSource.AGENT_ANALYSIS,
+                timestamp=state.current_time.timestamp(),
+                tags=["innovation", "technology", f"score_{innovation_score}"],
+                raw_data=response_json
+            )
+
             yield evidence
 
-        except json.JSONDecodeError as e:
-            logger.error(f"[{self.agent_id}] Failed to decode LLM JSON response for task {task.task_id}. Error: {e}")
-            logger.debug(f"[{self.agent_id}] Faulty JSON string: {response_str}")
-            return
-        except Exception as e:
-            logger.error(f"[{self.agent_id}] An error occurred during agent run for task {task.task_id}. Error: {e}")
-            return
+        except json.JSONDecodeError:
+             yield EvidenceItem(
+                agent_id=self.agent_id,
+                task_id=task_id,
+                event_id=event_id,
+                symbol=symbol,
+                headline="Innovation Analysis (Raw)",
+                content=f"Raw Output: {llm_response}",
+                data_source=EvidenceSource.AGENT_ANALYSIS,
+                timestamp=state.current_time.timestamp(),
+                tags=["innovation", "raw"],
+                raw_data={"raw_text": llm_response}
+            )
