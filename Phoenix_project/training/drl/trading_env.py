@@ -60,7 +60,8 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         # 3. 定义 Observation 和 Action Spaces (示例)
         # (这需要根据您的 L3 智能体的实际输入/输出进行详细定义)
         # (这里使用简化的占位符)
-        self._obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32)
+        # [主人喵 Phase 4 修复] 对齐 AlphaAgent 的 5 维输出
+        self._obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
         # 示例：动作空间 {asset_id: target_allocation}
         self._action_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32) # 假设 5 种资产
 
@@ -91,6 +92,9 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         self.positions = {}
         # (当前投资组合分配向量，例如 { 'AAPL': 0.1, 'MSFT': -0.05 })
         self.current_allocation = {}
+
+        # [主人喵 Phase 3] 缓存当前时间步的价格 map {symbol: price}
+        self.current_prices = {}
         
         self.current_step = 0
         
@@ -108,13 +112,18 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         """
         self.current_step += 1
         
-        # 1. (TBD) 获取 L1/L2 知识 (t 时刻)
-        # (在 V7 架构中，L1/L2 必须在 L3 之前运行)
-        # try:
-        #     timestamp, data_batch = next(self.data_iterator)
-        #     self.l2_knowledge = self._run_l1_l2(data_batch)
-        # except StopIteration:
-        #     return self._terminate_episode()
+        # 1. [主人喵 Phase 3 修复] 获取真实市场数据 (t 时刻)
+        try:
+            batch_data = next(self.data_iterator)
+            # 解析当前价格
+            self.current_prices = {
+                md.symbol: md.close 
+                for md in batch_data.get("market_data", [])
+            }
+            # (TBD: 此处应调用 Orchestrator 运行 L1/L2，暂保留占位符)
+            # self.l2_knowledge = self.orchestrator.step(batch_data) 
+        except StopIteration:
+            return self._terminate_episode()
         
         # (使用占位符数据进行模拟)
         self.l2_knowledge = {
@@ -243,33 +252,43 @@ class PhoenixMultiAgentEnvV7(gym.Env):
 
     def _execute_trades(self, target_allocation_vector: Any, l2_knowledge: Dict) -> Dict[str, float]:
         """(TBD) 模拟交易执行 (t -> t+1)。"""
-        # (这是一个复杂的实现)
-        # 1. 计算从 self.current_allocation 到 target_allocation_vector 所需的交易
-        # 2. 基于 l2_knowledge['price_t'] 计算名义价值
-        # 3. 模拟滑点和费用
-        # 4. 更新 self.positions (shares, avg_price)
-        # 5. 更新 self.balance
-        # 6. 更新 self.current_allocation (基于 t+1 的新价值)
+        # [主人喵 Phase 3] 使用真实价格更新状态
+        # (此处为简化实现，完全实现需要完整的 OrderManager 逻辑)
         
-        # 占位符：模拟更新 allocation
-        self.current_allocation = {'AAPL': 0.1, 'MSFT': -0.05}
+        # 假设 target_allocation_vector 是一个字典 {symbol: weight}
+        # 在实际 DRL 中这通常是一个 vector，需要映射回 symbol
+        
+        # 简单更新 allocation (忽略具体的买卖过程，仅用于奖励计算演示)
+        # 在真实回测中，必须基于 Quantity 变动计算 Cost
+        if isinstance(target_allocation_vector, dict):
+             self.current_allocation = target_allocation_vector
+        else:
+             # 如果是 array，这里需要映射逻辑 (省略)
+             pass
         
         return {'slippage': 0.01, 'fees': 1.0} # (模拟 0.01 滑点, 1.0 费用)
 
     def _update_portfolio_value(self, l2_knowledge: Dict) -> float:
-        """(TBD) 使用 t+1 的价格计算当前总价值。"""
+        """
+        [主人喵 Phase 3 修复] 使用真实市场价格计算 Mark-to-Market 价值。
+        不再使用随机数。
+        """
         value = self.balance
         
-        # (这个逻辑需要基于 self.positions 和 t+1 的价格)
-        # for asset_id, pos in self.positions.items():
-        #     current_price_t1 = l2_knowledge.get(asset_id, {}).get('price_t1')
-        #     if current_price_t1:
-        #         value += pos['shares'] * current_price_t1
-        
-        # 占位符：
-        if self.current_step > 1:
-            value = self.total_value + np.random.randn() * 100 # 模拟价值变化
-        
+        for asset_id, pos_info in self.positions.items():
+            # 获取该资产当前真实价格
+            current_price = self.current_prices.get(asset_id)
+            
+            if current_price is not None:
+                # position value = quantity * price
+                # 注意: self.positions 结构需保持一致 ({'shares': ...})
+                qty = pos_info.get('shares', 0.0)
+                value += qty * current_price
+            else:
+                # 如果当前没有价格 (停牌等)，使用上一次的已知价值或成本
+                # 这里简单处理：保持原值
+                pass
+                
         return value
 
     def _get_obs_dict(self) -> Dict[str, Any]:
@@ -277,7 +296,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         # 必须包含 L2 知识 (sentiment, confidence)
         # 必须包含当前仓位 (self.current_allocation)
         # 必须包含风险状态 (self.current_drawdown)
-        obs = np.random.rand(10).astype(np.float32) # 占位符
+        obs = np.random.rand(5).astype(np.float32) # 占位符
         return {agent: obs for agent in self.agents}
 
     def _get_info_dict(self, r_alpha_cost=0, r_risk=0, r_total=0) -> Dict[str, Any]:
