@@ -15,8 +15,10 @@ from typing import Dict, Optional, Any, Callable
 try:
     from stable_baselines3.common.utils import get_device
     from stable_baselines3.common.base_class import BaseAlgorithm
+    from stable_baselines3 import PPO # [Task 2.2] Explicit import
 except ImportError:
     BaseAlgorithm = None # Handle optional dependency
+    PPO = None
 
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.config.loader import load_config
@@ -40,6 +42,12 @@ def _load_torch_model(path: str) -> Any:
 
 def _load_joblib_model(path: str) -> Any:
     return joblib.load(path)
+
+def _load_sb3_ppo_model(path: str) -> Any:
+    """[Task 2.2] Explicit loader for PPO models."""
+    if PPO is None:
+        raise ImportError("stable_baselines3 is not installed. Please install it to load SB3 PPO models.")
+    return PPO.load(path)
 
 def _load_sb3_model(path: str) -> Any:
     if BaseAlgorithm is None:
@@ -65,6 +73,7 @@ class ModelRegistry:
             "torch": _load_torch_model,
             "joblib": _load_joblib_model,
             "sb3": _load_sb3_model,
+            "sb3_ppo": _load_sb3_ppo_model, # [Task 2.2] Register PPO loader
             # Add other loader types here (e.g., "tensorflow", "sklearn")
         }
 
