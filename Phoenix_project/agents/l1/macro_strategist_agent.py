@@ -1,102 +1,125 @@
 import json
 import logging
-from typing import List, Any, Generator, AsyncGenerator
-import time
+from typing import Any, Dict, AsyncGenerator
 
-from Phoenix_project.agents.l1.base import L1Agent
-from Phoenix_project.core.schemas.task_schema import Task
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
-
-# 获取日志记录器
-logger = logging.getLogger(__name__)
+from Phoenix_project.agents.l1.base import L1Agent, logger
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceSource
+from Phoenix_project.core.pipeline_state import PipelineState
 
 class MacroStrategistAgent(L1Agent):
     """
-    L1 智能体：宏观策略师
-    评估宏观经济趋势（通胀、利率等）的影响。
+    L1 智能体，专注于宏观经济策略。
+    分析利率、通胀、GDP 和央行政策对市场的影响。
     """
     def __init__(
         self,
         agent_id: str,
         llm_client: Any,
         data_manager: Any,
+        config: Dict[str, Any] = None
     ):
-        """
-        初始化 MacroStrategistAgent。
-        
-        参数:
-            agent_id (str): 智能体的唯一标识符。
-            llm_client (Any): 用于与 LLM API 交互的客户端 (例如 EnsembleClient)。
-            data_manager (Any): 用于检索数据的 DataManager。
-        """
         super().__init__(
             agent_id=agent_id,
+            role="Macro Strategist",
+            prompt_template_name="l1_macro_strategist",
             llm_client=llm_client,
             data_manager=data_manager
         )
-        logger.info(f"[{self.agent_id}] MacroStrategistAgent initialized.")
+        self.config = config or {}
+        logger.info(f"[{self.agent_id}] Initialized.")
 
-    async def run(self, task: Task, context: List[Any]) -> AsyncGenerator[EvidenceItem, None]:
+    async def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> AsyncGenerator[EvidenceItem, None]:
         """
-        异步运行智能体以执行宏观经济分析。
+        [Refactored Phase 3.1] 适配 PipelineState 和 DataManager。
+        """
+        symbol = dependencies.get("symbol", "GLOBAL") # Macro might not be symbol-specific
+        task_id = dependencies.get("task_id", "unknown_task")
+        event_id = dependencies.get("event_id", "unknown_event")
         
-        参数:
-            task (Task): 分配给智能体的任务。
-            context (List[Any]): 智能体运行所需的附加上下文（例如，原始文档）。
+        logger.info(f"[{self.agent_id}] Running macro analysis. Context Symbol: {symbol}")
 
-        收益:
-            AsyncGenerator[EvidenceItem, None]: 异步生成一个或多个 EvidenceItem。
-        """
-        logger.info(f"[{self.agent_id}] Running macro analysis for task: {task.task_id} on symbols: {task.symbols}")
+        # 1. 获取宏观新闻/数据
+        try:
+            # 定义宏观关键词
+            macro_keywords = "interest rates, inflation, central bank, GDP, unemployment, market sentiment"
+            query = f"{macro_keywords} {symbol if symbol != 'GLOBAL' else ''}"
+            
+            # 使用 DataManager 获取新闻
+            news_items = await self.data_manager.fetch_news_data(query=query)
+            
+            if not news_items:
+                logger.warning(f"[{self.agent_id}] No macro news found.")
+                return # Macro agent requires news context
 
-        if not task.symbols:
-            logger.warning(f"[{self.agent_id}] Task {task.task_id} has no symbols. Skipping.")
+            # 摘要前 5 条新闻
+            news_summary = "\n".join([
+                f"- [{item.timestamp}] {item.headline}: {item.summary[:200]}..." 
+                for item in news_items[:5]
+            ])
+
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Error fetching macro data: {e}", exc_info=True)
             return
 
-        # 1. 准备 Prompt 的上下文
-        symbol = task.symbols[0] # 或者 'GLOBAL_MACRO' 等
-        context_str = "\n---\n".join([doc.content for doc in context if hasattr(doc, 'content')])
-        
-        if not context_str:
-            logger.warning(f"[{self.agent_id}] No string content found in context for task {task.task_id}. Skipping.")
-            return
-
-        context_map = {
+        # 2. 渲染 Prompt
+        prompt_data = {
             "symbol": symbol,
-            "context": context_str
+            "macro_news_summary": news_summary,
+            "current_date": state.current_time.isoformat()
         }
-        
-        # [关键] 设置此智能体对应的 Prompt 名称
-        agent_prompt_name = "l1_macro_strategist" 
 
         try:
-            # 2. 异步调用 LLM
-            logger.debug(f"[{self.agent_id}] Calling LLM with prompt: {agent_prompt_name} for symbol: {symbol}")
-            
-            response_str = await self.llm_client.run_llm_task(
-                agent_prompt_name=agent_prompt_name,
-                context_map=context_map
-            )
-            
-            if not response_str:
-                logger.warning(f"[{self.agent_id}] LLM returned no response for task {task.task_id}.")
-                return
+            prompt = self.render_prompt(prompt_data)
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Error rendering prompt: {e}", exc_info=True)
+            return
 
-            # 3. 解析和验证 JSON 输出
-            logger.debug(f"[{self.agent_id}] Received LLM response (raw): {response_str[:200]}...")
-            response_data = json.loads(response_str)
+        # 3. 调用 LLM
+        try:
+            llm_response = await self.llm_client.generate(prompt)
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Error calling LLM: {e}", exc_info=True)
+            return
+
+        # 4. 解析结果
+        try:
+            response_json = json.loads(llm_response)
             
-            # 4. 验证并生成 EvidenceItem
-            evidence = EvidenceItem.model_validate(response_data)
-            evidence.agent_id = self.agent_id
+            analysis_text = response_json.get("analysis", "No analysis provided.")
+            risk_level = response_json.get("risk_level", "Medium")
             
-            logger.info(f"[{self.agent_id}] Successfully generated evidence for {symbol} with confidence {evidence.confidence}")
+            content = (
+                f"**Macro Strategy:** {analysis_text}\n"
+                f"**Risk Level:** {risk_level}"
+            )
+
+            evidence = EvidenceItem(
+                agent_id=self.agent_id,
+                task_id=task_id,
+                event_id=event_id,
+                symbol=symbol,
+                headline="Macro Strategy Update",
+                content=content,
+                data_source=EvidenceSource.AGENT_ANALYSIS,
+                timestamp=state.current_time.timestamp(),
+                tags=["macro", "strategy", risk_level.lower()],
+                raw_data=response_json
+            )
+
+            logger.info(f"[{self.agent_id}] Generated macro evidence.")
             yield evidence
 
-        except json.JSONDecodeError as e:
-            logger.error(f"[{self.agent_id}] Failed to decode LLM JSON response for task {task.task_id}. Error: {e}")
-            logger.debug(f"[{self.agent_id}] Faulty JSON string: {response_str}")
-            return
-        except Exception as e:
-            logger.error(f"[{self.agent_id}] An error occurred during agent run for task {task.task_id}. Error: {e}")
-            return
+        except json.JSONDecodeError:
+             # Fallback
+            yield EvidenceItem(
+                agent_id=self.agent_id,
+                task_id=task_id,
+                event_id=event_id,
+                symbol=symbol,
+                headline="Macro Analysis (Raw)",
+                content=f"Raw Output: {llm_response}",
+                data_source=EvidenceSource.AGENT_ANALYSIS,
+                timestamp=state.current_time.timestamp(),
+                tags=["macro", "raw", "error"],
+                raw_data={"raw_text": llm_response}
+            )
