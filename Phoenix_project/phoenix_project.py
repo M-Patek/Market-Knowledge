@@ -231,9 +231,9 @@ class PhoenixProject:
         execution_agent = ExecutionAgent(config=config.agents.l3.execution) if 'agents' in config and 'l3' in config.agents else None
 
         # --- (L3) 创建 Orchestrator 依赖 (Task 6) ---
-        event_distributor = EventDistributor(
-            config=config.events.distributor 
-        )
+        # [主人喵 Phase 0 修复] 移除错误的 config 参数
+        event_distributor = EventDistributor()
+        
         event_filter = EventRiskFilter(
             config=config.events.risk_filter 
         )
