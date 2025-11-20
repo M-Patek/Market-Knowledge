@@ -8,15 +8,17 @@ from datetime import datetime
 from omegaconf import DictConfig
 from typing import List, Dict, Optional, Any # [Fix II.1]
 
-from core.pipeline_state import PipelineState
-from cognitive.engine import CognitiveEngine
-from events.event_distributor import EventDistributor
-from events.risk_filter import EventRiskFilter # [TBD-1 修复] 导入过滤器
-from ai.market_state_predictor import MarketStatePredictor
-from cognitive.portfolio_constructor import PortfolioConstructor
-from execution.order_manager import OrderManager
-from audit_manager import AuditManager
-from core.exceptions import CognitiveError, PipelineError
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.context_bus import ContextBus
+from Phoenix_project.data_manager import DataManager
+from Phoenix_project.cognitive.engine import CognitiveEngine
+from Phoenix_project.events.event_distributor import EventDistributor
+from Phoenix_project.events.risk_filter import EventRiskFilter # [TBD-1 修复] 导入过滤器
+from Phoenix_project.ai.market_state_predictor import MarketStatePredictor
+from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
+from Phoenix_project.execution.order_manager import OrderManager
+from Phoenix_project.audit_manager import AuditManager
+from Phoenix_project.core.exceptions import CognitiveError, PipelineError
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,8 @@ class Orchestrator:
     def __init__(
         self,
         config: DictConfig,
+        context_bus: ContextBus, # [Task 2.3]
+        data_manager: Optional[DataManager], # [Task 2.3]
         cognitive_engine: CognitiveEngine,
         event_distributor: EventDistributor,
         event_filter: EventRiskFilter, # [TBD-1 修复] 注入过滤器
@@ -44,6 +48,8 @@ class Orchestrator:
         # (TBD-2/3 FactChecker/FusionAgent 由 ReasoningEnsemble 内部处理)
     ):
         self.config = config
+        self.context_bus = context_bus
+        self.data_manager = data_manager
         self.cognitive_engine = cognitive_engine
         self.event_distributor = event_distributor
         self.event_filter = event_filter # [TBD-1 修复] 存储过滤器
@@ -69,8 +75,19 @@ class Orchestrator:
 
         pipeline_state = None
         try:
-            # 0. 初始化状态
-            pipeline_state = PipelineState(start_time)
+            # 0. 初始化/恢复状态 [Task 2.3 Refactor]
+            # 尝试加载上一帧状态 (实现断点续传)
+            pipeline_state = self.context_bus.load_latest_state()
+            
+            if not pipeline_state:
+                logger.info("No previous state found. Creating new PipelineState.")
+                pipeline_state = PipelineState()
+            
+            # [Time Machine] 关键：使用 DataManager 的时间同步 State
+            # 这样回测时，pipeline_state.current_time 会被正确设置为仿真时间
+            if self.data_manager:
+                pipeline_state.update_time(self.data_manager.get_current_time())
+                pipeline_state.step_index += 1
 
             # 1. 从事件分发器（Redis）获取新事件
             new_events = self.event_distributor.get_new_events()
@@ -154,6 +171,9 @@ class Orchestrator:
                 self.audit_manager.log_cycle(pipeline_state)
                 logger.info("Pipeline state logged to AuditManager.")
                 
+                # [Task 2.3] 持久化状态到 Redis
+                self.context_bus.save_state(pipeline_state)
+                
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
             logger.info(f"Orchestrator main cycle END. Duration: {duration:.2f}s")
@@ -221,7 +241,12 @@ class Orchestrator:
             default_symbol = self.config.get('data_manager.default_symbols', ["BTC/USD"])[0]
             symbol = task_query.get("symbol", default_symbol) # Default fallback
             
-            market_data = pipeline_state.get_latest_market_data(symbol)
+            # [Task 2.3 Fix] Use DataManager instead of PipelineState history
+            market_data = None
+            if self.data_manager:
+                # This is async in DataManager, need await
+                market_data = await self.data_manager.get_latest_market_data(symbol)
+            
             price = market_data.close if market_data else 0.0
             
             pf_state = pipeline_state.portfolio_state
@@ -241,21 +266,21 @@ class Orchestrator:
             # 2. Alpha Agent Decision
             alpha_action = None
             if self.alpha_agent:
-                obs = self.alpha_agent.format_observation(state_data, pipeline_state.l2_fusion_result) # [Task A.2]
+                obs = self.alpha_agent.format_observation(state_data, pipeline_state.latest_fusion_result) # [Task A.2]
                 alpha_action = self.alpha_agent.compute_action(obs)
                 logger.info(f"Alpha Agent Action: {alpha_action}")
 
             # 3. Risk Agent Decision (Optional)
             risk_action = None
             if self.risk_agent:
-                obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_fusion_result) # [Task A.2]
+                obs = self.risk_agent.format_observation(state_data, pipeline_state.latest_fusion_result) # [Task A.2]
                 risk_action = self.risk_agent.compute_action(obs)
                 logger.info(f"Risk Agent Action: {risk_action}")
 
             # 4. Execution Agent Decision (Optional)
             exec_action = None
             if self.execution_agent:
-                obs = self.execution_agent.format_observation(state_data, pipeline_state.l2_fusion_result) # [Task A.2]
+                obs = self.execution_agent.format_observation(state_data, pipeline_state.latest_fusion_result) # [Task A.2]
                 exec_action = self.execution_agent.compute_action(obs)
                 logger.info(f"Execution Agent Action: {exec_action}")
 
@@ -303,7 +328,8 @@ class Orchestrator:
             
             # [模式 B: 触发]
             # (OrderManager 已经在 PortfolioConstructor 中通过总线接收了目标)
-            await self.order_manager.reconcile_portfolio()
+            # [Task 4.2] Pass state to reconcile_portfolio
+            await self.order_manager.reconcile_portfolio(pipeline_state)
 
             logger.info("OrderManager reconciliation triggered.")
             
