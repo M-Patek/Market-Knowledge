@@ -39,9 +39,9 @@ def main():
             )
             
             # [Fix III.8] 显式传递配置
-            event_distributor = EventDistributor(
-                config=config_loader.get_config('events.distributor')
-            )
+            # [主人喵 Phase 1 修复] 移除错误的 config 参数，与类定义保持一致
+            event_distributor = EventDistributor()
+            
             if not event_distributor.redis_client:
                 raise ConnectionError("Failed to connect to EventDistributor (Redis). Retrying...")
                 
