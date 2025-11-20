@@ -238,8 +238,8 @@ class Orchestrator:
             # Identify the symbol we are trading (Assuming single-symbol focus for now based on task query)
             task_query = pipeline_state.get_main_task_query()
             # [Task C.1] Remove hardcoded fallback, use config
-            default_symbol = self.config.get('data_manager.default_symbols', ["BTC/USD"])[0]
-            symbol = task_query.get("symbol", default_symbol) # Default fallback
+            # [主人喵 Phase 4 修复] 优先从任务查询中获取，否则从配置中获取，最后回退到 BTC/USD
+            symbol = task_query.get("symbol") or self.config.get('trading.default_symbol', "BTC/USD")
             
             # [Task 2.3 Fix] Use DataManager instead of PipelineState history
             market_data = None
@@ -266,21 +266,24 @@ class Orchestrator:
             # 2. Alpha Agent Decision
             alpha_action = None
             if self.alpha_agent:
-                obs = self.alpha_agent.format_observation(state_data, pipeline_state.latest_fusion_result) # [Task A.2]
+                # [Task A.2] 确保使用正确的属性名 l2_fusion_result
+                obs = self.alpha_agent.format_observation(state_data, pipeline_state.l2_fusion_result) 
                 alpha_action = self.alpha_agent.compute_action(obs)
                 logger.info(f"Alpha Agent Action: {alpha_action}")
 
             # 3. Risk Agent Decision (Optional)
             risk_action = None
             if self.risk_agent:
-                obs = self.risk_agent.format_observation(state_data, pipeline_state.latest_fusion_result) # [Task A.2]
+                # [Task A.2] 确保使用正确的属性名
+                obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_fusion_result)
                 risk_action = self.risk_agent.compute_action(obs)
                 logger.info(f"Risk Agent Action: {risk_action}")
 
             # 4. Execution Agent Decision (Optional)
             exec_action = None
             if self.execution_agent:
-                obs = self.execution_agent.format_observation(state_data, pipeline_state.latest_fusion_result) # [Task A.2]
+                # [Task A.2] 确保使用正确的属性名
+                obs = self.execution_agent.format_observation(state_data, pipeline_state.l2_fusion_result)
                 exec_action = self.execution_agent.compute_action(obs)
                 logger.info(f"Execution Agent Action: {exec_action}")
 
