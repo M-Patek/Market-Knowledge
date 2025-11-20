@@ -2,10 +2,11 @@ import pandas as pd
 from elasticsearch import AsyncElasticsearch
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
+from elasticsearch.helpers import async_bulk
 
 # 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
 from Phoenix_project.monitor.logging import get_logger
-from ..utils.retry import retry_with_exponential_backoff
+from Phoenix_project.utils.retry import retry_with_exponential_backoff
 
 logger = get_logger(__name__)
 
@@ -49,6 +50,7 @@ class TemporalDBClient:
                     "mappings": {
                         "properties": {
                             "timestamp": {"type": "date"},
+                            "measurement": {"type": "keyword"},
                             "symbols": {"type": "keyword"},
                             "headline": {"type": "text", "analyzer": "standard"},
                             "summary": {"type": "text", "analyzer": "standard"},
@@ -179,3 +181,100 @@ class TemporalDBClient:
         except Exception as e:
             logger.error(f"Error searching Elasticsearch: {e}", exc_info=True)
             return []
+
+    @retry_with_exponential_backoff()
+    async def query_range(
+        self,
+        measurement: str,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        columns: Optional[List[str]] = None
+    ) -> pd.DataFrame:
+        """
+        Retrieves historical data for a specific measurement and symbol within a time range.
+        """
+        try:
+            query = {
+                "bool": {
+                    "filter": [
+                        {"term": {"measurement": measurement}},
+                        {"term": {"symbols": symbol}},
+                        {"range": {"timestamp": {"gte": start.isoformat(), "lte": end.isoformat()}}}
+                    ]
+                }
+            }
+            
+            # 使用 size=10000 暂时满足需求，后续可升级为 Scroll API
+            response = await self.es.search(
+                index=self.index_name,
+                query=query,
+                size=10000,
+                sort=[{"timestamp": "asc"}],
+                _source=columns if columns else True
+            )
+            
+            hits = response.get('hits', {}).get('hits', [])
+            if not hits:
+                return pd.DataFrame()
+                
+            data = [hit['_source'] for hit in hits]
+            df = pd.DataFrame(data)
+            
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                
+            return df
+        except Exception as e:
+            logger.error(f"Error querying range in TemporalDB: {e}", exc_info=True)
+            return pd.DataFrame()
+
+    @retry_with_exponential_backoff()
+    async def get_latest_data_point(self, symbol: str, point_in_time: datetime) -> Optional[Dict[str, Any]]:
+        """
+        [Time Machine] Retrieves the latest data point for a symbol prior to or at point_in_time.
+        """
+        try:
+            query = {
+                "bool": {
+                    "filter": [
+                        {"term": {"symbols": symbol}},
+                        {"range": {"timestamp": {"lte": point_in_time.isoformat()}}}
+                    ]
+                }
+            }
+            response = await self.es.search(
+                index=self.index_name, 
+                query=query, 
+                size=1, 
+                sort=[{"timestamp": "desc"}]
+            )
+            hits = response.get('hits', {}).get('hits', [])
+            return hits[0]['_source'] if hits else None
+        except Exception as e:
+            logger.error(f"Error getting latest data point: {e}", exc_info=True)
+            return None
+
+    @retry_with_exponential_backoff()
+    async def write_dataframe(self, measurement: str, df: pd.DataFrame, tags: Dict[str, str] = None) -> bool:
+        """
+        Writes a Pandas DataFrame to Elasticsearch using Bulk API.
+        """
+        if df.empty: return True
+        try:
+            actions = []
+            for record in df.to_dict(orient='records'):
+                doc = record.copy()
+                doc['measurement'] = measurement
+                if tags:
+                    if 'symbol' in tags: doc['symbols'] = tags['symbol']
+                    doc.update(tags)
+                if 'timestamp' in doc and hasattr(doc['timestamp'], 'isoformat'):
+                    doc['timestamp'] = doc['timestamp'].isoformat()
+                actions.append({"_index": self.index_name, "_source": doc})
+            
+            await async_bulk(self.es, actions, refresh=True)
+            return True
+        except Exception as e:
+            logger.error(f"Error writing dataframe to TemporalDB: {e}", exc_info=True)
+            return False
