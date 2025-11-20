@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.core.schemas.fusion_result import FusionResult
+from Phoenix_project.core.exceptions import CognitiveError # Use existing exception or generic
 # 修复：使用 get_logger
 logger = get_logger(__name__)
 
@@ -14,21 +15,24 @@ from Phoenix_project.agents.l3.alpha_agent import AlphaAgent
 from Phoenix_project.evaluation.voter import Voter
 from Phoenix_project.evaluation.arbitrator import Arbitrator
 from Phoenix_project.evaluation.fact_checker import FactChecker
-from Phoenix_project.core.schemas.task_schema import Task
+from Phoenix_project.data_manager import DataManager
 
 class ReasoningEnsemble:
     """
     Reasoning Ensemble (L2/L3) Coordination Logic
     Orchestrates Fusion, Fact-Checking, Arbitration, and Alpha Decision.
+    [Refactored Phase 3.3] Added DataManager, removed hallucinations.
     """
 
     def __init__(self, fusion_agent: FusionAgent, alpha_agent: AlphaAgent,
-                 voter: Voter, arbitrator: Arbitrator, fact_checker: FactChecker):
+                 voter: Voter, arbitrator: Arbitrator, fact_checker: FactChecker,
+                 data_manager: DataManager):
         self.fusion_agent = fusion_agent
         self.alpha_agent = alpha_agent
         self.voter = voter
         self.arbitrator = arbitrator
         self.fact_checker = fact_checker
+        self.data_manager = data_manager
 
     async def run_ensemble(self, state: PipelineState, agent_insights: Dict[str, Any], target_assets: List[str]) -> Dict[str, Any]:
         """
@@ -42,18 +46,13 @@ class ReasoningEnsemble:
         # L2 Fusion Agent 接收 L1 见解
         logger.debug("Running L2 Fusion Agent...")
         try:
-            # [Task III Fix] Construct valid Task object
-            fusion_task = Task(
-                task_id=f"fusion_{state.current_time.timestamp()}",
-                task_type="fusion",
-                symbols=target_assets,
-                subgoals=[],
-                dependencies={}
-            )
-            
-            # [Task III Fix] Handle AsyncGenerator return
+            # [Task 3.3 Refactor] 适配 FusionAgent.run(state, dependencies) 新签名
             fusion_result: FusionResult = None
-            async for result in self.fusion_agent.run(task=fusion_task, dependencies=list(agent_insights.values())):
+            
+            # 将 dict values 转为 list 传给 dependencies
+            dependencies = list(agent_insights.values())
+            
+            async for result in self.fusion_agent.run(state=state, dependencies=dependencies):
                 fusion_result = result
                 break # We only need the first result
 
@@ -94,11 +93,17 @@ class ReasoningEnsemble:
 
             # [Task III Fix] Adapt DRL Agent Interface
             # 1. Get Market Data
-            market_data = state.get_latest_market_data(stocks_to_analyze[0])
+            # [Refactored Phase 3.3] 使用 DataManager 获取真实数据，禁止幻觉
+            symbol = stocks_to_analyze[0]
+            market_data = await self.data_manager.get_latest_market_data(symbol)
+            
+            if not market_data:
+                raise CognitiveError(f"CRITICAL: No market data available for {symbol}. Cannot make L3 decision.")
+
             state_data = {
                 "balance": state.portfolio_state.cash if state.portfolio_state else 10000.0,
                 "holdings": 0.0, # Simplified for fix
-                "price": market_data.close if market_data else 100.0
+                "price": market_data.close
             }
             
             # 2. Construct Observation & Compute Action
