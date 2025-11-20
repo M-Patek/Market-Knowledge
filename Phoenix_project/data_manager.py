@@ -15,9 +15,9 @@ from datetime import datetime, timedelta
 import pandas as pd  # type: ignore
 import redis  # type: ignore
 
-from .core.schemas.data_schema import MarketData, NewsData, FundamentalData
-from .ai.tabular_db_client import TabularDBClient
-from .ai.temporal_db_client import TemporalDBClient
+from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, FundamentalData
+from Phoenix_project.ai.tabular_db_client import TabularDBClient
+from Phoenix_project.ai.temporal_db_client import TemporalDBClient
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ class DataManager:
         self.redis_client = redis_client
         self.tabular_db = tabular_db
         self.temporal_db = temporal_db
+        self._simulation_time: Optional[datetime] = None
 
         # 加载数据目录 (Data Catalog)
         self.data_catalog = self._load_data_catalog(
@@ -62,6 +63,21 @@ class DataManager:
         self.market_data_api_url = self.config.get("market_data_api_url", "https://api.polygon.io/v2/aggs/ticker")
         
         logger.info("DataManager initialized.")
+
+    def set_simulation_time(self, sim_time: Optional[datetime]):
+        """
+        [Time Machine] 设置仿真时间。
+        如果设置为非 None，系统将进入回测模式，所有数据获取都将相对于此时刻。
+        """
+        self._simulation_time = sim_time
+        mode = f"BACKTEST ({sim_time})" if sim_time else "LIVE"
+        logger.info(f"DataManager time mode switched to: {mode}")
+
+    def get_current_time(self) -> datetime:
+        """
+        获取当前系统时间 (如果是回测模式，则返回仿真时间)。
+        """
+        return self._simulation_time if self._simulation_time else datetime.now()
 
     def _load_data_catalog(self, catalog_path: str) -> Dict[str, Any]:
         """Loads the data catalog JSON file."""
@@ -131,6 +147,11 @@ class DataManager:
             logger.warning("TemporalDB client not configured. Cannot fetch history.")
             return None
         
+        # [Time Machine] 防止窥探未来
+        if self._simulation_time and end > self._simulation_time:
+            logger.debug(f"Clamping history request end time from {end} to {self._simulation_time}")
+            end = self._simulation_time
+
         # 缓存键可以基于 symbol 和时间范围
         cache_key = self._get_cache_key(
             "market_history", f"{symbol}_{start.isoformat()}_{end.isoformat()}"
@@ -143,6 +164,8 @@ class DataManager:
         # 从时序数据库 (Temporal DB) 获取
         logger.info(f"Fetching market history for {symbol} from TemporalDB.")
         try:
+            # [Contract] 期望 TemporalDBClient 实现 query_range
+            # 这是一个 DataFrame 返回接口
             df = await self.temporal_db.query_range(
                 measurement="market_data",
                 symbol=symbol,
@@ -161,12 +184,29 @@ class DataManager:
             logger.error(f"Failed to fetch history from TemporalDB for {symbol}: {e}")
             return None
 
-    def get_latest_market_data(self, symbol: str) -> Optional[MarketData]:
+    async def _get_historical_latest(self, symbol: str, point_in_time: datetime) -> Optional[MarketData]:
+        """
+        [Time Machine] 从历史数据库中获取指定时间点之前最新的数据。
+        """
+        if not self.temporal_db:
+            return None
+        # [Contract] 期望 TemporalDBClient 实现 get_latest_data_point
+        data = await self.temporal_db.get_latest_data_point(symbol, point_in_time)
+        if data:
+            return MarketData(**data)
+        return None
+
+    async def get_latest_market_data(self, symbol: str) -> Optional[MarketData]:
         """
         OPTIMIZED: Retrieves the latest market data for a symbol
         from the 'production' (live) Redis stream/cache.
         This replaces the mock object.
         """
+        # [Time Machine] 路由逻辑
+        if self._simulation_time:
+            return await self._get_historical_latest(symbol, self._simulation_time)
+
+        # --- Live Mode (Redis) ---
         # 假设实时数据存储在 'phoenix:market_data:live:{symbol}'
         live_key = f"phoenix:market_data:live:{symbol}"
         
@@ -220,7 +260,7 @@ class DataManager:
                 fund_data_dict = result["results"][0]
                 fund_data = FundamentalData(
                     symbol=symbol,
-                    timestamp=datetime.now(), # 假设数据是“现在”获取的
+                    timestamp=self.get_current_time(), # [Time Machine] 使用统一时间
                     market_cap=fund_data_dict.get("market_cap"),
                     pe_ratio=fund_data_dict.get("pe_ratio"),
                     sector=fund_data_dict.get("sector"),
@@ -321,7 +361,7 @@ class DataManager:
             return
 
         # 示例: 获取过去一天的数据
-        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        yesterday = (self.get_current_time() - timedelta(days=1)).strftime('%Y-%m-%d')
         url = f"{self.market_data_api_url}/{symbol}/range/1/day/{yesterday}/{yesterday}"
         params = {"apiKey": market_api_key}
 
@@ -340,7 +380,7 @@ class DataManager:
                 df = df.set_index("time")
                 
                 # 3. 写入 TemporalDB
-                self.temporal_db.write_dataframe(
+                await self.temporal_db.write_dataframe(
                     measurement="market_data",
                     df=df,
                     tags={"symbol": symbol}
@@ -396,7 +436,7 @@ class DataManager:
             # (我们将 Alpha Vantage 键 映射到 我们的数据库列)
             data_to_store = {
                 "symbol": api_data.get("Symbol"),
-                "timestamp": datetime.now(), # 记录我们获取数据的时间
+                "timestamp": self.get_current_time(), # [Time Machine] 使用统一时间
                 "market_cap": float(api_data.get("MarketCapitalization", 0)),
                 "pe_ratio": float(api_data.get("PERatio", 0) if api_data.get("PERatio") != "None" else 0),
                 "sector": api_data.get("Sector"),
