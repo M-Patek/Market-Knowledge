@@ -15,9 +15,12 @@ import os
 import json
 import redis # <-- [阶段 2] 添加
 from kafka import KafkaConsumer
+from pydantic import ValidationError
 from Phoenix_project.config.loader import ConfigLoader
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.events.event_distributor import EventDistributor # <-- [主人喵的修复 2] 导入
+from Phoenix_project.core.schemas.data_schema import MarketData
+from Phoenix_project.config.constants import REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE
 
 logger = get_logger(__name__)
 
@@ -115,24 +118,27 @@ class StreamProcessor:
                     logger.error(f"Failed to publish event {data.get('id', 'N/A')} to distributor.")
             
             elif topic == "phoenix_market_data":
-                # 阶段 2 逻辑: 写入 Redis 缓存 (HSET)
+                # [主人喵 Phase 1 修复] 实施数据契约与全量存储
                 if not self.redis_client:
-                    logger.error("Cannot write latest_prices, Redis client not connected.")
+                    logger.error("Cannot write market data, Redis client not connected.")
                     return
 
-                symbol = data.get("symbol")
-                price = data.get("close") # MarketData 模式使用 'close'
+                # 1. 验证数据 (Fail Fast)
+                market_data = MarketData(**data)
                 
-                if symbol and price is not None:
-                    self.redis_client.hset("latest_prices", symbol, str(price)) # 确保值为 str
-                    logger.debug(f"Updated latest_prices for {symbol}: {price}")
-                else:
-                    logger.warning(f"Invalid market data message received from Kafka: {data}")
+                # 2. 生成标准 Key
+                redis_key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=market_data.symbol)
+                
+                # 3. 存储完整数据 (OHLCV)
+                self.redis_client.set(redis_key, market_data.model_dump_json())
+                logger.debug(f"Updated market data for {market_data.symbol} at {redis_key}")
             
             else:
                 logger.warning(f"Received message from unhandled topic: {topic}")
             # --- [阶段 2 结束] ---
 
+        except ValidationError as e:
+            logger.error(f"Data Schema Violation: Invalid data received on {topic}: {e}")
         except json.JSONDecodeError as e:
             logger.error(f"Message value is not valid JSON: {e}. Value: {data}")
         except Exception as e:
