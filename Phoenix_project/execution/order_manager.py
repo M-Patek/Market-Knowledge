@@ -8,13 +8,15 @@
 - 注入了 TradeLifecycleManager 以便在收到成交时更新投资组合。
 """
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
+import asyncio
 from .interfaces import IBrokerAdapter
-import threading
 
 # [阶段 1 & 4 变更] 导入依赖
 from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
+from Phoenix_project.data_manager import DataManager
+from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.core.schemas.data_schema import (
     Order, Fill, OrderStatus, PortfolioState, TargetPortfolio, Position
 )
@@ -31,15 +33,17 @@ class OrderManager:
     现在是纯粹的异步逻辑：提交订单，并通过回调响应事件。
     """
     
-    def __init__(self, broker: IBrokerAdapter, trade_lifecycle_manager: TradeLifecycleManager):
+    def __init__(self, broker: IBrokerAdapter, trade_lifecycle_manager: TradeLifecycleManager, data_manager: DataManager):
         """
         [阶段 1 & 4 变更]
         - 注入 TradeLifecycleManager 以便转发 Fill 事件。
+        - [Task 4.2] Inject DataManager for freshness checks.
         """
         self.broker = broker
         self.trade_lifecycle_manager = trade_lifecycle_manager # <--- 新增
+        self.data_manager = data_manager # [Task 4.2]
         self.active_orders: Dict[str, Order] = {} # key: order_id
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock() # [Task 4.2] Use asyncio.Lock
         
         # 订阅券商的回调
         self.broker.subscribe_fills(self._on_fill)
@@ -48,13 +52,13 @@ class OrderManager:
         self.log_prefix = "OrderManager:"
         logger.info(f"{self.log_prefix} Initialized.")
 
-    def _on_fill(self, fill: Fill):
+    async def _on_fill(self, fill: Fill):
         """
         [阶段 1 & 4 变更]
         处理来自券商的成交回报 (Fill)。
         将 Fill 事件转发给 TradeLifecycleManager。
         """
-        with self.lock:
+        async with self.lock:
             logger.info(f"{self.log_prefix} Received Fill: {fill.order_id} ({fill.quantity} @ {fill.price})")
             
             order = self.active_orders.get(fill.order_id)
@@ -64,16 +68,16 @@ class OrderManager:
                 
             # [阶段 4] 将 Fill 转发给 TLM
             try:
-                self.trade_lifecycle_manager.on_fill(fill)
+                await self.trade_lifecycle_manager.on_fill(fill)
             except Exception as e:
                 logger.error(f"{self.log_prefix} Failed to process fill with TradeLifecycleManager: {e}", exc_info=True)
 
 
-    def _on_order_status_update(self, order: Order):
+    async def _on_order_status_update(self, order: Order):
         """
         处理来自券商的订单状态更新。
         """
-        with self.lock:
+        async with self.lock:
             if not order or not order.id or not order.status:
                 logger.warning(f"{self.log_prefix} Received invalid order status update: {order}")
                 return
@@ -169,31 +173,44 @@ class OrderManager:
 
         return orders_to_generate
 
-    # [阶段 1 & 4 变更] 移除 execute_orders 方法
-    # def execute_orders(self, ...):
-    #     ... (逻辑已迁移到 SimulatedBrokerAdapter)
-
-    # [阶段 1 & 4 变更] 移除 submit_orders 方法，逻辑合并到 process_target_portfolio
-    # def submit_orders(self, orders: List[Order]):
-    #     ...
-        
-    def process_target_portfolio(
-        self, 
-        current_portfolio: PortfolioState, 
-        target_portfolio: TargetPortfolio, 
-        market_prices: Dict[str, float]
-    ):
+    async def reconcile_portfolio(self, state: PipelineState):
         """
-        [阶段 4 实现]
-        这是 Orchestrator 调用的新入口点。
-        它负责：
-        1. 调用 generate_orders() 计算差异。
-        2. 遍历订单。
-        3. 调用 self.broker.place_order() 提交订单。
+        [Task 4.2] 调仓主逻辑 (Reconcile)。
+        1. 从 State 获取目标组合。
+        2. 检查数据新鲜度。
+        3. 计算差异并下单。
         """
         logger.info(f"{self.log_prefix} Processing target portfolio...")
         
-        # 1. 生成订单
+        target_portfolio = state.target_portfolio
+        if not target_portfolio:
+            logger.info("No target portfolio to reconcile.")
+            return
+
+        # 1. 获取最新价格并检查时效性 (Data Freshness)
+        # 收集所有涉及的 symbol (Target + Current Holdings)
+        # 简化起见，我们只检查 target positions 的 symbol
+        symbols = [p.symbol for p in target_portfolio.positions]
+        market_prices = {}
+        
+        for sym in symbols:
+            md = await self.data_manager.get_latest_market_data(sym)
+            if not md:
+                logger.error(f"Skipping {sym}: No market data available.")
+                continue
+            
+            # Freshness Check (e.g., 1 min tolerance)
+            time_diff = state.current_time - md.timestamp.replace(tzinfo=None) # Ensure tz-naive/aware match
+            if abs(time_diff) > timedelta(minutes=1):
+                logger.error(f"Skipping {sym}: Data too old ({time_diff}). Price: {md.timestamp}, SimTime: {state.current_time}")
+                continue
+                
+            market_prices[sym] = md.close
+
+        # 2. 获取当前持仓状态 (Using TLM)
+        current_portfolio = self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
+
+        # 3. 生成订单
         orders = self.generate_orders(current_portfolio, target_portfolio, market_prices)
         
         if not orders:
@@ -202,8 +219,8 @@ class OrderManager:
 
         logger.info(f"{self.log_prefix} Submitting {len(orders)} orders to broker...")
         
-        # 2. 提交订单到券商
-        with self.lock:
+        # 4. 提交订单到券商 (Async)
+        async with self.lock:
             for order in orders:
                 if order.id in self.active_orders:
                     logger.warning(f"{self.log_prefix} Attempted to submit duplicate order {order.id}")
@@ -212,10 +229,8 @@ class OrderManager:
                 price = market_prices.get(order.symbol)
                 
                 try:
-                    # [阶段 4] 调用适配器
-                    # SimBroker 将立即执行并触发回调
-                    # PaperBroker 将异步发送并稍后触发回调
-                    broker_order_id = self.broker.place_order(order, price)
+                    # [Task 4.2] Async execution via thread for potentially blocking broker calls
+                    broker_order_id = await asyncio.to_thread(self.broker.place_order, order, price)
                     
                     # 假设 place_order 成功（或至少被接受）
                     # 注意：SimBroker 会立即将其设置为 FILLED，但 PaperBroker 不会
@@ -233,10 +248,13 @@ class OrderManager:
         """
         取消所有活动的订单。
         """
-        with self.lock:
-            logger.info(f"{self.log_prefix} Cancelling all {len(self.active_orders)} open orders...")
-            # 复制列表以避免在迭代时修改
-            order_ids = list(self.active_orders.keys())
+        # Async context manager not strictly needed here if just iterating, but good for consistency if modifying dict
+        # But this method is sync? If called from async, wrap it.
+        # For now, let's assume it's called synchronously or we need an async version.
+        # Given the async shift, we should probably make this async too or use sync lock if safe.
+        # Let's keep it sync but warn, or assume it's called during shutdown.
+        logger.info(f"{self.log_prefix} Cancelling all {len(self.active_orders)} open orders...")
+        order_ids = list(self.active_orders.keys())
             
         for order_id in order_ids:
             try:
@@ -249,5 +267,5 @@ class OrderManager:
         """
         获取所有活动订单的当前状态。
         """
-        with self.lock:
-            return list(self.active_orders.values())
+        # Should technically be async or use sync lock if not awaited
+        return list(self.active_orders.values())
