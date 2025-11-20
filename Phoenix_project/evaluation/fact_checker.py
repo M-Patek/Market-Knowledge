@@ -1,4 +1,5 @@
 import asyncio
+import copy # [Task 2.1] Import copy to prevent prompt pollution
 from typing import List, Dict, Any
 
 from ..ai.ensemble_client import EnsembleClient
@@ -49,7 +50,7 @@ class FactChecker:
         # --- 优化：更新提示 ---
         # 加载 'l2_critic' 提示，与核心 L2 CriticAgent 保持一致
         # 旧值: "fact_checker"
-        self.prompt = self.prompt_manager.get_prompt("l2_critic")
+        self.prompt = copy.deepcopy(self.prompt_manager.get_prompt("l2_critic")) # [Task 2.1] Use deepcopy
         # --- 结束优化 ---
         
         if not self.prompt:
@@ -62,13 +63,11 @@ class FactChecker:
         # 这比在运行时动态修改用户提示更清晰、更健壮。
         
         search_instruction = (
-            "\n\n---
-"
+            "\n\n---\n"
             "MANDATORY INSTRUCTION: You MUST use the 'search_documents' tool "
             "to find evidence for every claim presented. Do not rely on "
             "internal knowledge. Your task is to verify claims using external search."
-            "\n---
-"
+            "\n---\n"
         )
         
         if "system" in self.prompt:
