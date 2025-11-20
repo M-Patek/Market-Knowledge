@@ -80,17 +80,17 @@ class Arbitrator:
             # 注意：'l2_fusion' 提示可能比旧的 'arbitrator' 提示需要更多的上下文
             prompt_str = self.prompt_renderer.render(self.prompt, **prompt_context)
             
-            response = await self.llm_client.run_chain(
-                prompt_str,
-                model_name=self.model_name,
-                # Arbitrator 通常不解析工具，除非它需要核查事实
-            )
+            # [Task 2.3] Temporarily disable LLM arbitration until structured parsing is implemented
+            # response = await self.llm_client.run_chain(
+            #     prompt_str,
+            #     model_name=self.model_name,
+            #     # Arbitrator 通常不解析工具，除非它需要核查事实
+            # )
             
-            # ... (假设的解析逻辑) ...
+            # TODO: Implement structured output parsing for LLM arbitration.
+            # Currently falling back to rule-based to save tokens and avoid parsing errors.
             
-            # 鉴于 run_chain 返回的是原始文本，我们回退到基于规则的仲裁
-            # 在一个完整的实现中，这里应该解析 run_chain 的响应
-            logger.warning("LLM arbitration response parsing not fully implemented. Falling back to rule-based.")
+            logger.info("LLM arbitration skipped (not implemented). Using rule-based fallback.")
             return self._rule_based_arbitration(original_fusion, decisions)
 
         except Exception as e:
@@ -112,12 +112,13 @@ class Arbitrator:
 
         # 寻找强烈的否决票 (e.g., Critic or Adversary 提出了高置信度的反对意见)
         for decision in decisions:
-            if (decision.decision['action'] == "OVERRIDE" or 
-                decision.decision['action'] == "FLAG_FOR_REVIEW") and \
-               decision.decision['confidence'] > 0.75:
+            # [Task 1.2] Fix: Access Pydantic model attributes directly
+            if (decision.decision.action == "OVERRIDE" or 
+                decision.decision.action == "FLAG_FOR_REVIEW") and \
+               decision.decision.confidence > 0.75:
                 
                 # 如果有强烈的否决票，采取否决票的意见
-                final_decision = decision.decision.copy() # 复制字典
+                final_decision = decision.decision.model_dump() # [Task 1.2] Use model_dump()
                 final_decision["reason"] = f"[Arbitrator_Rule] Overridden by {decision.source_agent}: {final_decision.get('reason', 'N/A')}"
                 logger.warning(f"Rule-based arbitration: Overriding original fusion based on {decision.source_agent}.")
                 return SupervisionResult(
