@@ -8,6 +8,7 @@ by the cognitive engine and agents (e.g., market data, news, fundamentals).
 import logging
 import json
 import requests
+import httpx # [Task 3.1] Import httpx for async I/O
 import os # [Task 2] 导入 os
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
@@ -267,7 +268,8 @@ class DataManager:
         }
         
         try:
-            response = requests.get(self.news_api_url, params=params, timeout=10)
+            async with httpx.AsyncClient() as client: # [Task 3.1] Use httpx
+                response = await client.get(self.news_api_url, params=params, timeout=10.0)
             response.raise_for_status() # 如果是 4xx/5xx 则抛出异常
             
             articles = response.json().get("articles", [])
@@ -292,7 +294,7 @@ class DataManager:
             
             return news_list
 
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, httpx.HTTPError) as e:
             logger.error(f"Failed to fetch news from API: {e}")
             return []
         except Exception as e:
@@ -301,7 +303,7 @@ class DataManager:
 
     # --- 内部辅助方法 (用于 refresh_data_sources) ---
 
-    def _fetch_and_store_market_data(self, config: Dict[str, Any]):
+    async def _fetch_and_store_market_data(self, config: Dict[str, Any]): # [Task 3.1] async def
         """
         Helper: Fetches market data from external API and stores
         it in persistent storage (e.g., TemporalDB).
@@ -324,7 +326,8 @@ class DataManager:
         params = {"apiKey": market_api_key}
 
         try:
-            response = requests.get(url, params=params, timeout=10)
+            async with httpx.AsyncClient() as client: # [Task 3.1] Use httpx
+                response = await client.get(url, params=params, timeout=10.0)
             response.raise_for_status()
             data = response.json()
 
@@ -344,7 +347,7 @@ class DataManager:
                 )
                 logger.info(f"Successfully refreshed and stored market data for {symbol}")
 
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, httpx.HTTPError) as e:
             logger.error(f"Failed to fetch market data from API for {symbol}: {e}")
         except Exception as e:
             logger.error(f"Error processing/storing market data for {symbol}: {e}")
@@ -380,9 +383,8 @@ class DataManager:
         }
 
         try:
-            # (同步的 requests 调用在 async 方法中不是最佳选择，但为了简单起见...)
-            # (在生产环境中，我们会使用 httpx.AsyncClient)
-            response = await asyncio.to_thread(requests.get, url, params=params, timeout=10)
+            async with httpx.AsyncClient() as client: # [Task 3.2] Use httpx
+                response = await client.get(url, params=params, timeout=10.0)
             response.raise_for_status()
             api_data = response.json()
             
@@ -417,7 +419,7 @@ class DataManager:
             else:
                 logger.error(f"Failed to store fundamentals for {symbol} in TabularDB.")
 
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, httpx.HTTPError) as e:
             logger.error(f"Failed to fetch fundamentals from Alpha Vantage for {symbol}: {e}")
         except Exception as e:
             logger.error(f"Error processing/storing fundamentals for {symbol}: {e}", exc_info=True)
@@ -435,9 +437,8 @@ class DataManager:
             
             try:
                 if source_type == "market_data_api":
-                    # (同步)
-                    # [Task 2] 这应该是异步的
-                    await asyncio.to_thread(self._fetch_and_store_market_data, config)
+                    # [Task 3.1] Now natively async
+                    await self._fetch_and_store_market_data(config)
                     
                 elif source_type == "news_api":
                     # (异步)
