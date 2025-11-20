@@ -5,6 +5,8 @@ import asyncio
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 from omegaconf import DictConfig
+from Phoenix_project.agents.l1.base import BaseL1Agent
+from Phoenix_project.core.pipeline_state import PipelineState
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +55,33 @@ class AgentExecutor:
         [新] 内部辅助函数，封装了带 tenacity 重试的 agent.run()。
         """
         logger.debug(f"Attempting to run agent {agent.agent_name}...")
-        # 假设所有 agent 都有一个异步的 run 方法
-        if not hasattr(agent, "run") or not asyncio.iscoroutinefunction(agent.run):
-            logger.warning(f"Agent {agent.agent_name} lacks an async 'run' method. Running synchronously (MOCK).")
-            # (如果 agent.run 是同步的，需要用 to_thread 包装)
-            # return await asyncio.to_thread(agent.run, task_content=task_content, context=context)
-            # (为了演示，我们假设 run 是异步的)
-            raise NotImplementedError(f"Agent {agent.agent_name} must have an async 'run' method.")
+        
+        if not hasattr(agent, "run"):
+            # 注意：L1 Agent 的 run 可能是同步的也可能是异步的，但在这里我们需要统一处理
+            logger.warning(f"Agent {agent.agent_name} lacks a 'run' method.")
+            raise NotImplementedError(f"Agent {agent.agent_name} must have a 'run' method.")
+
+        if isinstance(agent, BaseL1Agent):
+            # [Task I Fix] Adapt for BaseL1Agent signature: run(state, dependencies)
+            # Extract state from context or create a dummy one if missing
+            state = context.get('state')
+            if not state:
+                # Create a temporary state or handle the error. Here we assume a minimal valid state is needed.
+                # For safety, we log this event.
+                logger.warning(f"No state provided for L1 Agent {agent.agent_name}. Using task_content as dependencies only.")
+                state = PipelineState() # Initialize empty/default state
+            
+            # If run is async, await it. If it's sync, wrap it? 
+            # Assuming L1 agents follow the async pattern or we wrap them:
+            if asyncio.iscoroutinefunction(agent.run):
+                return await agent.run(state=state, dependencies=task_content)
+            else:
+                return await asyncio.to_thread(agent.run, state=state, dependencies=task_content)
+
+        # Default behavior for other agents (L2/L3)
+        if not asyncio.iscoroutinefunction(agent.run):
+             logger.warning(f"Agent {agent.agent_name} has sync run method. Running in thread.")
+             return await asyncio.to_thread(agent.run, task_content=task_content, context=context)
             
         return await agent.run(task_content=task_content, context=context)
 
@@ -183,15 +205,10 @@ class AgentExecutor:
         警告：这可能会阻塞，最好在专用的 consumer/worker 线程中运行。
         """
         logger.debug(f"Received task via sync subscriber: {task_data.get('task_id')}")
-        # (在同步上下文中，我们必须找到一种方法来运行异步 execute_task)
-        # (这取决于整体的异步/同步架构。在 Celery worker 中，
-        # 可能会使用 asyncio.run()，但在主线程中这是危险的。)
         
         # (一个安全的模式是：如果当前有事件循环，则创建任务)
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self.handle_task(task_data))
         except RuntimeError:
-            # (没有正在运行的事件循环，MOCK：仅记录警告)
              logger.warning(f"handle_task_sync called without running event loop. Task {task_data.get('task_id')} dropped.")
-             # (在生产环境中，这里可能需要 asyncio.run() 或将其推送到另一个队列)
