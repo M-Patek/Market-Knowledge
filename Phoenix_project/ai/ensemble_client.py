@@ -57,9 +57,10 @@ class EnsembleClient:
         """
         return self
 
-    async def generate_text(self, prompt: str, model_id: Optional[str] = None, use_json_mode: bool = False) -> Optional[str]:
+    async def generate_text(self, prompt: str, model_id: Optional[str] = None, use_json_mode: bool = False, tools: Optional[List[Any]] = None) -> Optional[str]:
         """
         [Fix IV.1] Generates text using the GeminiPoolManager.
+        [Task V Fix] Added support for 'tools' and robust response access.
         """
         target_model = model_id if model_id else "gemini-1.5-flash" # Default
         try:
@@ -70,11 +71,62 @@ class EnsembleClient:
                 
                 response = await client.generate_content_async(
                     contents=contents,
-                    generation_config=generation_config
+                    generation_config=generation_config,
+                    tools=tools
                 )
-                return response.get("text")
+                
+                # Robust access to text (supports both Object and Dict interfaces)
+                if hasattr(response, "text"):
+                    return response.text
+                elif isinstance(response, dict):
+                    return response.get("text")
+                return str(response)
         except Exception as e:
             logger.error(f"{self.log_prefix} generate_text failed: {e}")
+            return None
+
+    async def run_llm_task(self, agent_prompt_name: str, context_map: Dict[str, Any]) -> Optional[str]:
+        """
+        [Task V Fix] Wrapper for FusionAgent to render prompt and generate text.
+        """
+        try:
+            # Render the prompt using PromptManager
+            # Assuming render_prompt accepts context kwargs or a context dict
+            # Based on FusionAgent usage, it passes a map.
+            prompt_text = self.prompt_manager.render_prompt(agent_prompt_name, **context_map)
+            
+            if not prompt_text:
+                logger.warning(f"{self.log_prefix} run_llm_task: Prompt rendering failed for {agent_prompt_name}")
+                return None
+
+            return await self.generate_text(prompt=prompt_text, use_json_mode=True)
+        except Exception as e:
+            logger.error(f"{self.log_prefix} run_llm_task failed for {agent_prompt_name}: {e}")
+            return None
+
+    async def run_chain_structured(self, prompt: str, tools: Optional[List[Any]] = None, model_name: Optional[str] = None) -> Optional[Any]:
+        """
+        [Task V Fix] Wrapper for FactChecker to execute with tools and return structured data (JSON).
+        """
+        try:
+            response_text = await self.generate_text(
+                prompt=prompt, 
+                model_id=model_name, 
+                use_json_mode=True, # FactChecker expects JSON response
+                tools=tools
+            )
+            
+            if not response_text:
+                return None
+                
+            # Parse JSON result
+            return json.loads(response_text)
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"{self.log_prefix} run_chain_structured: JSON parse failed: {e}. Text: {response_text}")
+            return None
+        except Exception as e:
+            logger.error(f"{self.log_prefix} run_chain_structured failed: {e}")
             return None
 
     # --- V2 逻辑 (同步执行, 内部使用线程池) ---
