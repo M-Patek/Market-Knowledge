@@ -16,7 +16,19 @@ def load_config(config_path: str) -> Optional[Dict[str, Any]]:
     
     这是为了修复 phoenix_project.py 中
     试图从 .yaml 文件导入函数的严重启动错误。
+    [主人喵 Phase 0 修复]: 增加路径解析鲁棒性。
     """
+    # 尝试解析绝对路径，解决从不同目录运行脚本时的路径问题
+    if not os.path.isabs(config_path):
+        # 假设 config_path 是相对于项目根目录 config/ 的 (例如 "system.yaml")
+        # 或者相对于此 loader.py 文件的
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        abs_path = os.path.join(base_dir, config_path)
+        
+        # 如果拼接后的路径不存在，回退到原始路径尝试
+        if os.path.exists(abs_path):
+            config_path = abs_path
+            
     if not os.path.exists(config_path):
         logger.critical(f"配置文件未找到: {config_path}")
         return None
