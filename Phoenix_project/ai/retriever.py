@@ -60,7 +60,7 @@ class Retriever:
         self.gnn_inferencer = gnn_inferencer
         
         self.ensemble_client = ensemble_client
-        self.llm_client = ensemble_client.api_gateway 
+        # [Task II Fix] Removed obsolete api_gateway reference
         
         self.temporal_db = temporal_db
         self.tabular_db = tabular_db
@@ -244,7 +244,8 @@ class Retriever:
 
             prompt = self._generate_cypher_prompt(query, schema)
             
-            response_text = await self.llm_client.generate_text(prompt)
+            # [Task II Fix] Use ensemble_client directly for generation
+            response_text = await self.ensemble_client.generate_text(prompt)
 
             if not response_text:
                 logger.warning("LLM failed to generate Cypher query.")
@@ -373,9 +374,14 @@ class Retriever:
             )
 
             try:
-                gnn_results = await asyncio.to_thread(task.get, timeout=30)
+                # [Task IV Fix] Circuit Breaker: Reduced timeout from 30s to 5s.
+                # If GNN is slow, we skip it to prevent blocking the entire RAG pipeline.
+                gnn_results = await asyncio.to_thread(task.get, timeout=5.0)
+            except TimeoutError:
+                logger.warning(f"GNN inference task timed out (>5.0s). Skipping GNN evidence.")
+                return []
             except Exception as task_err:
-                logger.error(f"GNN inference task failed or timed out: {task_err}")
+                logger.error(f"GNN inference task failed: {task_err}")
                 return []
 
             if not gnn_results or 'node_embeddings' not in gnn_results:
