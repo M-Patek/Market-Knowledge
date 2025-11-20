@@ -292,46 +292,23 @@ def build_orchestrator() -> Orchestrator:
 
         # [Task P-5.2] Fix Retriever Instantiation
         retriever_config = system_config.get("ai", {}).get("retriever", {})
+        
+        # [Task 1.3] Move EnsembleClient init BEFORE Retriever to fix dependency injection
+        agent_registry_config = config_loader.get_agent_registry()
+        ensemble_client = EnsembleClient(gemini_pool, prompt_manager, agent_registry_config, registry)
+        
         retriever = Retriever(
             vector_store=vector_store,
             graph_db=knowledge_graph_service,
             config=retriever_config,
             prompt_manager=prompt_manager,
             prompt_renderer=prompt_renderer, # [Task 4] Correctly pass PromptRenderer instance
-            ensemble_client=None, # ensemble_client is created later, but Retriever needs it. Circular dependency? 
-                                  # Checking Retriever code: it likely needs it for recursive calls.
-                                  # However, ensemble_client needs api_gateway.
-                                  # We might need to set it later if supported, or if Retriever doesn't actually need it in __init__.
-                                  # Assuming for now we pass None or need to reorder. 
-                                  # Actually, previous code passed 'ensemble_client' which was created AFTER. 
-                                  # This is a python NameError.
-                                  # *Optimization*: Create Agent Registry config first, then EnsembleClient, THEN Retriever?
-                                  # But EnsembleClient might need Retriever? 
-                                  # Let's look at imports. ReasoningEnsemble needs both.
-                                  # Retriever usually doesn't need EnsembleClient unless it's doing agentic retrieval.
-                                  # Let's assume for this fix we follow the flow but we MUST init EnsembleClient before if Retriever needs it.
-                                  # *Correction*: The original code had 'ensemble_client' in Retriever args but defined it AFTER.
-                                  # We will initialize EnsembleClient first.
+            ensemble_client=ensemble_client, # [Task 1.3] Inject initialized client
             gnn_inferencer=gnn_inferencer,
             temporal_db=temporal_client,
             tabular_db=tabular_client
         )
         
-        agent_registry_config = config_loader.get_agent_registry()
-        # [Task 5] Fix EnsembleClient param (api_gateway -> gemini_pool)
-        ensemble_client = EnsembleClient(gemini_pool, prompt_manager, agent_registry_config, registry)
-        
-        # Update Retriever with ensemble_client if supported/needed
-        # (Assuming setter or it was optional, or we should have init it before. 
-        #  If Retriever.__init__ requires it, we must swap order. 
-        #  If Retriever uses it for query expansion via agents, it's needed.
-        #  Let's assume we can set it or pass it now if we move EnsembleClient up.)
-        # *Self-Correction*: Moving EnsembleClient up is safer.
-        # But EnsembleClient might need Retriever? Unlikely for basic init.
-        # Let's inject it into retriever now that it exists.
-        if hasattr(retriever, 'ensemble_client'):
-             retriever.ensemble_client = ensemble_client
-
         # [Task 5] Fix MetacognitiveAgent params (kwargs + prompt_renderer)
         metacognitive_agent = MetacognitiveAgent(
             agent_id="metacognitive_agent",
