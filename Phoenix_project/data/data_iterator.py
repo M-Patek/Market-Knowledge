@@ -3,6 +3,7 @@
 负责按时间顺序模拟数据流，用于回测。
 """
 import pandas as pd
+import asyncio
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Generator, Optional # 修复：导入 Optional
 
@@ -49,7 +50,7 @@ class DataIterator:
 
         print(f"DataIterator initialized (unconfigured). Step size: {self.step}")
 
-    def setup(self, start_date: datetime, end_date: datetime, symbols: List[str]):
+    async def setup(self, start_date: datetime, end_date: datetime, symbols: List[str]):
         """
         [修复] 新增方法，用于配置 DataIterator 并加载数据。
         (由 BacktestingEngine 调用)
@@ -64,12 +65,16 @@ class DataIterator:
         # (我们加载一个稍大的窗口，以确保有足够的数据用于回溯 (lookbacks))
         preload_start = self.start_date - pd.Timedelta(days=90) 
         
-        # 修复：DataManager.get_market_data 返回 Dict[str, pd.DataFrame]
-        self.market_data_iters = self.data_manager.get_market_data(
-            symbols, preload_start, self.end_date
-        )
+        # [主人喵 Phase 3 修复] 并发加载历史数据 (DataFrame)
+        tasks = [
+            self.data_manager.get_market_data_history(sym, preload_start, self.end_date)
+            for sym in symbols
+        ]
+        results = await asyncio.gather(*tasks)
+        self.market_data_iters = {sym: df for sym, df in zip(symbols, results) if df is not None}
         
-        self.news_data = self.data_manager.get_news_data(
+        # 异步加载新闻
+        self.news_data = await self.data_manager.get_news_data(
             preload_start, self.end_date
         )
         
