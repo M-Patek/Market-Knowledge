@@ -46,6 +46,10 @@ class PipelineState:
         self.decision_history: deque[AgentDecision] = deque(maxlen=self.max_history)
         self.fusion_history: deque[FusionResult] = deque(maxlen=self.max_history)
         
+        # FIX (Task 1.1): Add missing history queues
+        self.fact_check_history: deque[Any] = deque(maxlen=self.max_history)
+        self.final_decision_history: deque[Dict[str, Any]] = deque(maxlen=self.max_history)
+        
         logger.info(f"{self.log_prefix} Initialized. Max history size: {self.max_history}")
 
     def update_time(self, new_time: datetime):
@@ -83,6 +87,16 @@ class PipelineState:
             
         logger.debug(f"{self.log_prefix} AI outputs updated with FusionID {fusion_result.id}")
 
+    def add_fact_check_report(self, report: Any):
+        """Add a fact check report to history."""
+        self.fact_check_history.append(report)
+        logger.debug(f"{self.log_prefix} Fact check report added.")
+
+    def add_final_decision(self, decision: Dict[str, Any]):
+        """Add a final arbitration decision to history."""
+        self.final_decision_history.append(decision)
+        logger.debug(f"{self.log_prefix} Final decision added.")
+
     def get_snapshot(self) -> Dict[str, Any]:
         """
         创建系统当前状态的快照，用于持久化。
@@ -93,7 +107,9 @@ class PipelineState:
             "history_counts": {
                 "market_data": len(self.market_data_history),
                 "news": len(self.news_history),
-                "fusion_results": len(self.fusion_history)
+                "fusion_results": len(self.fusion_history),
+                "fact_checks": len(self.fact_check_history),
+                "decisions": len(self.final_decision_history)
             }
             # 注意：不序列化完整的 deque 历史，以避免快照过大
         }
