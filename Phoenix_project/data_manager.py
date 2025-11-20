@@ -8,6 +8,7 @@ by the cognitive engine and agents (e.g., market data, news, fundamentals).
 import logging
 import json
 import requests
+import asyncio
 import httpx # [Task 3.1] Import httpx for async I/O
 import os # [Task 2] 导入 os
 from typing import Any, Dict, List, Optional
@@ -18,6 +19,7 @@ import redis  # type: ignore
 from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, FundamentalData
 from Phoenix_project.ai.tabular_db_client import TabularDBClient
 from Phoenix_project.ai.temporal_db_client import TemporalDBClient
+from Phoenix_project.config.constants import REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -207,30 +209,46 @@ class DataManager:
             return await self._get_historical_latest(symbol, self._simulation_time)
 
         # --- Live Mode (Redis) ---
-        # 假设实时数据存储在 'phoenix:market_data:live:{symbol}'
-        live_key = f"phoenix:market_data:live:{symbol}"
+        # [主人喵 Phase 2 修复] 使用标准 Key 模板和 Pydantic 验证
+        live_key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=symbol)
         
         try:
             data_json = self.redis_client.get(live_key)
             
             if data_json:
-                data = json.loads(data_json)
-                # 确保时间戳是正确的
-                data['timestamp'] = datetime.fromisoformat(data['timestamp'])
-                logger.debug(f"Got live market data for {symbol} from Redis")
-                return MarketData(**data)
-            else:
-                logger.warning(f"No live market data found in Redis for {symbol} (Key: {live_key})")
-                return None
+                # 使用 model_validate_json 自动处理 datetime 和类型转换
+                return MarketData.model_validate_json(data_json)
+            
+            # Data not found is expected for illiquid assets, verify logic before warning
+            # logger.debug(f"No live market data found in Redis for {symbol}")
+            return None
                 
         except redis.RedisError as e:
             logger.error(f"Redis error getting live market data for {symbol}: {e}")
-        except json.JSONDecodeError:
-            logger.error(f"Failed to decode live market data for {symbol} from Redis")
         except Exception as e:
-            logger.error(f"Error processing live market data for {symbol}: {e}")
+            logger.error(f"Error validating market data for {symbol}: {e}")
             
         return None
+
+    async def get_market_data(self, symbols: List[str]) -> Dict[str, MarketData]:
+        """
+        [Task 2.1] 批量获取市场数据。使用 asyncio.gather 并发拉取。
+        """
+        tasks = [self.get_latest_market_data(sym) for sym in symbols]
+        results = await asyncio.gather(*tasks)
+        
+        # 过滤掉 None 的结果，返回 {symbol: MarketData}
+        return {
+            sym: res for sym, res in zip(symbols, results) if res is not None
+        }
+
+    async def get_news_data(self, query: str = "", limit: int = 10) -> List[NewsData]:
+        """
+        [Task 2.1] DataIterator 适配器接口。
+        """
+        # 简单的包装现有的 fetch_news_data
+        # 注意：这里未来可以扩展为从 Redis 流 (REDIS_KEY_NEWS_STREAM) 读取实时新闻
+        return await self.fetch_news_data(query=query)
 
     async def get_fundamental_data(
         self, symbol: str
