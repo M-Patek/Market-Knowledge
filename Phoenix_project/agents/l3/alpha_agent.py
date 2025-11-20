@@ -28,17 +28,25 @@ class AlphaAgent(BaseDRLAgent):
         price = state_data.get('price', 0.0)
 
         # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
-        if fusion_result and hasattr(fusion_result, 'sentiment_score'):
-            # [任务 1.1] 匹配 trading_env.py
-            # 假设 fusion_result 有一个数值情感得分 (例如 -1.0 到 1.0)
-            # (如果您的 FusionResult 使用 'final_decision' (BUY/SELL), 
-            #  您需要在这里将其转换为数值，例如 BUY=1.0, SELL=-1.0, HOLD=0.0)
-            sentiment = fusion_result.sentiment_score 
-            confidence = fusion_result.confidence
-        else:
-            # 如果没有 L2 结果 (例如周期开始时)，提供默认值
-            sentiment = 0.0  # 中性情感
-            confidence = 0.5 # 中性信心
+        # [主人喵 Phase 4 修复] 映射字符串决策到数值情感
+        sentiment = 0.0
+        confidence = 0.5
+        
+        if fusion_result:
+            # 映射字符串决策到数值情感
+            decision_map = {
+                "STRONG_BUY": 1.0, 
+                "BUY": 0.5, 
+                "HOLD": 0.0, "NEUTRAL": 0.0,
+                "SELL": -0.5, 
+                "STRONG_SELL": -1.0
+            }
+            # 获取 decision 字段，默认 HOLD
+            decision_str = getattr(fusion_result, 'decision', 'HOLD')
+            sentiment = decision_map.get(str(decision_str).upper(), 0.0)
+            
+            # 获取 confidence 字段
+            confidence = getattr(fusion_result, 'confidence', 0.5)
 
         # 3. 构建与 TradingEnv._get_state() 完全匹配的状态向量
         # 状态 (5-d): [balance, shares_held, price, l2_sentiment, l2_confidence]
