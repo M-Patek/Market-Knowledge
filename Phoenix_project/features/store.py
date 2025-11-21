@@ -5,6 +5,7 @@
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from datetime import datetime
+import os # [Task 10] Import os for file operations
 
 # FIX (E8): 导入 IFeatureStore 接口 (原为 FeatureBase)
 from .base import IFeatureStore
@@ -12,12 +13,17 @@ from .base import IFeatureStore
 class FeatureStore(IFeatureStore):
     """
     特征存储的实现。
-    (目前是一个占位符，可以基于 Parquet 文件或数据库实现)
+    (Task 10: Implemented Parquet file-based storage)
     """
     
     def __init__(self, base_path: str):
         self.base_path = base_path
         self.cache: Dict[str, pd.DataFrame] = {}
+        
+        # [Task 10] Ensure directory exists
+        if not os.path.exists(base_path):
+            os.makedirs(base_path, exist_ok=True)
+            
         print(f"FeatureStore initialized at {base_path}")
 
     def get_features(
@@ -28,26 +34,40 @@ class FeatureStore(IFeatureStore):
         end_time: datetime
     ) -> Optional[pd.DataFrame]:
         """
-        检索一个特征集。
+        检索一个特征集。支持按时间和实体(Symbol)切片。
         """
-        # 这是一个占位符实现
-        print(f"Retrieving features for {feature_set_name} from {start_time} to {end_time}")
+        # 构建文件路径
+        file_path = os.path.join(self.base_path, f"{feature_set_name}.parquet")
         
-        # 示例：尝试从缓存或文件加载
-        if feature_set_name in self.cache:
-            df = self.cache[feature_set_name]
-        else:
-            # (在此处实现从 Parquet 加载的逻辑)
-            # df = pd.read_parquet(f"{self.base_path}/{feature_set_name}.parquet")
-            # self.cache[feature_set_name] = df
-            print(f"Warning: Feature set {feature_set_name} not found in cache.")
+        if not os.path.exists(file_path):
+            print(f"Warning: Feature set {feature_set_name} not found at {file_path}")
             return None
             
-        # (在此处实现基于 entity_ids 和时间的过滤)
-        # filtered_df = df[...]
-        # return filtered_df
-        
-        return pd.DataFrame() # 返回空
+        try:
+            # 1. Load dataset
+            # (Optimization Note: For huge files, use pyarrow.parquet.read_table with filters)
+            df = pd.read_parquet(file_path)
+            
+            # 2. Filter by Time
+            # Standardize index to datetime for filtering
+            if 'timestamp' in df.columns:
+                df = df.set_index('timestamp')
+            
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.sort_index()
+                # Flexible slicing (inclusive)
+                df = df[start_time:end_time]
+            
+            # 3. Filter by Entity (Symbol)
+            if entity_ids and 'symbol' in df.columns:
+                df = df[df['symbol'].isin(entity_ids)]
+                
+            print(f"Retrieved {len(df)} rows for {feature_set_name}")
+            return df
+            
+        except Exception as e:
+            print(f"Error reading feature set {feature_set_name}: {e}")
+            return None
         
 
     def register_feature_set(self, feature_set_name: str, schema: Dict[str, Any]):
@@ -59,9 +79,36 @@ class FeatureStore(IFeatureStore):
 
     def ingest_features(self, feature_set_name: str, data: pd.DataFrame):
         """
-        将新的特征数据写入存储。
+        将新的特征数据写入存储 (增量更新/Upsert)。
         """
-        print(f"Ingesting {len(data)} rows into {feature_set_name}")
+        file_path = os.path.join(self.base_path, f"{feature_set_name}.parquet")
+        print(f"Ingesting {len(data)} rows into {feature_set_name}...")
         
-        # (在此处实现写入 Parquet 或数据库的逻辑)
-        pass
+        try:
+            final_df = data
+            
+            # [Task 10] Incremental Upsert Logic
+            if os.path.exists(file_path):
+                existing_df = pd.read_parquet(file_path)
+                final_df = pd.concat([existing_df, data])
+                
+                # Deduplicate based on index and symbol to allow re-runs
+                if 'symbol' in final_df.columns:
+                    # Reset index to use timestamp in duplicate check
+                    if isinstance(final_df.index, pd.DatetimeIndex):
+                         final_df = final_df.reset_index()
+                         final_df = final_df.drop_duplicates(subset=['timestamp', 'symbol'], keep='last')
+                         final_df = final_df.set_index('timestamp')
+                    else:
+                         # Assuming 'timestamp' is a column if not index
+                         if 'timestamp' in final_df.columns:
+                            final_df = final_df.drop_duplicates(subset=['timestamp', 'symbol'], keep='last')
+                else:
+                     # Basic deduplication
+                     final_df = final_df.drop_duplicates(keep='last')
+            
+            final_df.to_parquet(file_path)
+            print(f"Successfully ingested features into {file_path}. Total rows: {len(final_df)}")
+            
+        except Exception as e:
+             print(f"Error ingesting features: {e}")
