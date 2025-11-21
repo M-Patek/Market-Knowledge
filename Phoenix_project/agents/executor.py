@@ -1,5 +1,6 @@
 # Phoenix_project/agents/executor.py
 # [主人喵的修复 11.11] 实现了 TBD (重试逻辑、错误处理、上下文总线通信)
+# [Code Opt Expert Fix] Task 5: Remove double retry decorator to prevent retry explosion
 
 import asyncio
 import logging
@@ -45,11 +46,7 @@ class AgentExecutor:
         except Exception as e:
             logger.error(f"Failed to subscribe to ContextBus: {e}", exc_info=True)
 
-    @retry(
-        stop=stop_after_attempt(3), # [实现] 使用来自配置的参数
-        wait=wait_exponential(min=1, max=10), # [实现] 使用来自配置的参数
-        reraise=True # 确保在重试失败后重新引发异常
-    )
+    # [Task 5 Fix] Removed @retry decorator here. Retry is handled by execute_task dynamically.
     async def _run_agent_with_retry(self, agent, task_content, context):
         """
         [新] 内部辅助函数，封装了带 tenacity 重试的 agent.run()。
