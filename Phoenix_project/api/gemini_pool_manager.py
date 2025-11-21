@@ -33,10 +33,8 @@ class GeminiClient:
     """
     def __init__(self, model_id: str, api_key: str, qpm_limit: int):
         self.model_id = model_id
+        self.api_key = api_key # [Task 7] Store API key for JIT configuration
         
-        # MODIFICATION: 不依赖全局 'genai' 状态，配置此实例
-        # 尽管 genai.configure(api_key=api_key) 是全局的，
-        # 再次调用它来设置正确的密钥是安全的。
         genai.configure(api_key=api_key)
         
         # 移除 system_instruction，因为它将在 generate_content_async 中传递
@@ -82,6 +80,10 @@ class GeminiClient:
             
             try:
                 logger.info(f"Sending request {request_id} to {self.model_id}")
+                
+                # [Task 7] Just-In-Time Configuration to fix concurrency race condition
+                # In asyncio (single-threaded loop), this is safe as long as no await occurs before generation.
+                genai.configure(api_key=self.api_key)
                 
                 # MODIFICATION: 更新 API 调用
                 # 使用 self.model (已在 __init__ 中初始化)
