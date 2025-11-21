@@ -5,9 +5,10 @@
 import logging
 from omegaconf import DictConfig
 from cognitive.risk_manager import RiskManager
-from sizing.base import BaseSizingStrategy
+from Phoenix_project.sizing.base import IPositionSizer
 from core.pipeline_state import PipelineState
 from core.schemas.risk_schema import RiskReport
+from Phoenix_project.core.schemas.data_schema import TargetPortfolio, TargetPosition
 from context_bus import ContextBus
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ class PortfolioConstructor:
     计算出目标投资组合。
     """
 
-    def __init__(self, config: DictConfig, context_bus: ContextBus, risk_manager: RiskManager, sizing_strategy: BaseSizingStrategy, data_manager):
+    def __init__(self, config: DictConfig, context_bus: ContextBus, risk_manager: RiskManager, sizing_strategy: IPositionSizer, data_manager):
         self.config = config.get("portfolio_constructor", {})
         self.context_bus = context_bus
         self.risk_manager = risk_manager
@@ -120,18 +121,34 @@ class PortfolioConstructor:
         # 4. [已实现] 计算目标投资组合 (从权重到股数/规模)
         
         try:
-            logger.debug(f"Calculating target portfolio shares with SizingStrategy for weights: {adjusted_weights}")
-            target_portfolio = self.sizing_strategy.calculate_target_portfolio(
-                adjusted_weights, 
-                self.current_portfolio,
-                market_data,
-                self.data_manager # (Sizing 可能需要访问最新价格)
+            logger.debug(f"Sizing positions for adjusted weights: {adjusted_weights}")
+            
+            # [Task 3] Adapter: Convert weights dict to Sizing candidates list
+            # Note: Sizing strategies typically expect a list of dicts
+            candidates = [{"ticker": symbol, "weight": weight} for symbol, weight in adjusted_weights.items()]
+            
+            # [Task 3] Call correct interface method: size_positions
+            # Assuming max_total_allocation is 1.0 (100%) unless configured otherwise
+            allocation_results = self.sizing_strategy.size_positions(
+                candidates=candidates, 
+                max_total_allocation=1.0
             )
             
-            logger.info(f"Target portfolio constructed: {target_portfolio.get('positions')}")
+            # [Task 3] Adapter: Convert Sizing results back to TargetPortfolio object
+            # FIX: Use TargetPosition, not Position (which is for current holdings)
+            target_positions_list = []
+            for res in allocation_results:
+                target_positions_list.append(TargetPosition(
+                    symbol=res.get("ticker"),
+                    target_weight=res.get("capital_allocation_pct", 0.0),
+                    reasoning="Sizing Strategy Output"
+                ))
+            
+            target_portfolio = TargetPortfolio(positions=target_positions_list, metadata={"source": "PortfolioConstructor"})
+            logger.info(f"Target portfolio constructed with {len(target_positions_list)} positions.")
             
         except Exception as e:
-            logger.error(f"SizingStrategy failed: {e}. Aborting portfolio construction.", exc_info=True)
+            logger.error(f"SizingStrategy/Adapter failed: {e}. Aborting.", exc_info=True)
             return None
 
         
