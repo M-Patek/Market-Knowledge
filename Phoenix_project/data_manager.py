@@ -237,10 +237,15 @@ class DataManager:
         tasks = [self.get_latest_market_data(sym) for sym in symbols]
         results = await asyncio.gather(*tasks)
         
-        # 过滤掉 None 的结果，返回 {symbol: MarketData}
-        return {
-            sym: res for sym, res in zip(symbols, results) if res is not None
-        }
+        # [Task 2] Strict Data Integrity Check (All-or-Nothing)
+        # Prevent silent failures that could lead to naked exposure in pair trading
+        failed_symbols = [sym for sym, res in zip(symbols, results) if res is None]
+        
+        if failed_symbols:
+            raise ValueError(f"Data integrity check failed. Missing market data for symbols: {failed_symbols}")
+            
+        # Only return if ALL data is present
+        return {sym: res for sym, res in zip(symbols, results)}
 
     async def get_news_data(self, query: str = "", limit: int = 10) -> List[NewsData]:
         """
