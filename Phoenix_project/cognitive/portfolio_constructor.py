@@ -1,6 +1,7 @@
 # Phoenix_project/cognitive/portfolio_constructor.py
 # [主人喵的修复 11.11] 实现了 FIXME (TBD 风险管理逻辑)。
 # [主人喵的修复 11.12] 实现了 TBD (从 DataManager 加载初始投资组合)。
+# [Code Opt Expert Fix] Task 3: Clean Architecture / Remove ContextBus Communication
 
 import logging
 from omegaconf import DictConfig
@@ -29,10 +30,7 @@ class PortfolioConstructor:
         self.data_manager = data_manager # [新] 需要 DataManager 来获取当前状态
         
         self.current_portfolio = self._load_initial_portfolio()
-        
-        # [新] 订阅投资组合更新 (来自 OrderManager) 以保持状态同步
-        self.context_bus.subscribe("PORTFOLIO_UPDATE", self._handle_portfolio_update)
-        logger.info("PortfolioConstructor initialized and subscribed to PORTFOLIO_UPDATE.")
+        logger.info("PortfolioConstructor initialized.")
 
 
     def _load_initial_portfolio(self):
@@ -55,13 +53,6 @@ class PortfolioConstructor:
         except Exception as e:
             logger.error(f"Failed to load initial portfolio from DataManager: {e}. Starting with empty.", exc_info=True)
             return {"cash": self.config.get("initial_cash", 1_000_000), "positions": {}}
-
-    def _handle_portfolio_update(self, portfolio_data: dict):
-        """
-        [新] 回调函数，用于在订单执行后更新内部的 'current_portfolio' 状态。
-        """
-        logger.debug(f"Received PORTFOLIO_UPDATE. Updating internal state.")
-        self.current_portfolio = portfolio_data
 
     def construct_portfolio(self, pipeline_state: PipelineState):
         """
@@ -151,13 +142,4 @@ class PortfolioConstructor:
             logger.error(f"SizingStrategy/Adapter failed: {e}. Aborting.", exc_info=True)
             return None
 
-        
-        # 5. [已实现] 将最终的目标投资组合发布到 ContextBus
-        # OrderManager 应该订阅这个
-        self.context_bus.publish("TARGET_PORTFOLIO", {
-            "target": target_portfolio,
-            "risk_report": risk_report.to_dict() if risk_report else None,
-            "alpha_signal": alpha_signals
-        })
-        
         return target_portfolio
