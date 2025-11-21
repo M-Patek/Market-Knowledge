@@ -9,26 +9,27 @@ import logging
 import asyncio
 from asyncio.exceptions import TimeoutError
 from typing import Any, List, Dict, Optional
+import re # [Task 6] Import regex module
 
 from sentence_transformers import CrossEncoder  # type: ignore
 from celery import current_app # [Task 5B] For sending tasks by name
 from celery.result import AsyncResult # [Task 5B] For typing
 
-from ..core.schemas.evidence_schema import (
+from Phoenix_project.core.schemas.evidence_schema import (
     Evidence,
     QueryResult,
     GraphQueryResult,
     DataSource,
 )
-from ..memory.vector_store import VectorStore
-from ..core.exceptions import QuerySafetyError, CognitiveError
-from ..ai.graph_db_client import GraphDBClient
-from ..ai.gnn_inferencer import GNNInferencer
-from ..ai.tabular_db_client import TabularDBClient
-from ..ai.temporal_db_client import TemporalDBClient
-from ..ai.ensemble_client import EnsembleClient
-from ..ai.prompt_manager import PromptManager
-from ..ai.prompt_renderer import PromptRenderer
+from Phoenix_project.memory.vector_store import VectorStore
+from Phoenix_project.core.exceptions import QuerySafetyError, CognitiveError
+from Phoenix_project.ai.graph_db_client import GraphDBClient
+from Phoenix_project.ai.gnn_inferencer import GNNInferencer
+from Phoenix_project.ai.tabular_db_client import TabularDBClient
+from Phoenix_project.ai.temporal_db_client import TemporalDBClient
+from Phoenix_project.ai.ensemble_client import EnsembleClient
+from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.ai.prompt_renderer import PromptRenderer
 
 
 # 配置日志
@@ -60,7 +61,6 @@ class Retriever:
         self.gnn_inferencer = gnn_inferencer
         
         self.ensemble_client = ensemble_client
-        # [Task II Fix] Removed obsolete api_gateway reference
         
         self.temporal_db = temporal_db
         self.tabular_db = tabular_db
@@ -251,10 +251,21 @@ class Retriever:
                 logger.warning("LLM failed to generate Cypher query.")
                 return None
 
-            cypher_query = response_text.strip().replace("```cypher", "").replace("```", "").strip()
-
-            if not cypher_query.upper().startswith("MATCH"):
-                logger.warning(f"LLM generated invalid Cypher: {cypher_query}")
+            # [Task 6] Robust Regex Extraction
+            # 1. Try extracting from markdown code block first
+            # Note: String concatenation used to avoid breaking markdown parser
+            code_block_pattern = r"``" + r"`(?:cypher)?\s*([\s\S]*?)``" + r"`"
+            match = re.search(code_block_pattern, response_text, re.IGNORECASE)
+            
+            if match:
+                cypher_query = match.group(1).strip()
+            else:
+                # 2. Fallback: Remove leading/trailing whitespace
+                cypher_query = response_text.strip()
+            
+            # 3. Validate structure (Must start with MATCH, ignoring case/whitespace)
+            if not re.match(r"^\s*MATCH\b", cypher_query, re.IGNORECASE):
+                logger.warning(f"LLM generated invalid Cypher structure (Must start with MATCH): {cypher_query}")
                 return None
             
             logger.info(f"Generated Cypher query: {cypher_query}")
@@ -494,6 +505,13 @@ class Retriever:
             results = response.get("results", [])
             evidence_list = []
             for res in results:
+                # [Task 5] Security: Strict URL Protocol Whitelist
+                # Filter out toxic protocols like 'ai://' or unsafe 'file://'
+                url = res.get("url", "")
+                if not url.startswith(("http://", "https://")):
+                    logger.warning(f"Skipping invalid or unsafe URL protocol in web search result: {url}")
+                    continue
+
                 evidence_list.append(Evidence(
                     id=res.get("url", "web_unknown"),
                     content=res.get("content", ""),
