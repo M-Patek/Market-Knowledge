@@ -408,12 +408,17 @@ class PhoenixProject:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             
-            # 清理数据库连接
-            await self.services["graph_db"].close()
-            await self.services["vector_store"].close()
-
         except Exception as e:
             logger.critical(f"Fatal error in main: {e}", exc_info=True)
+
+        finally:
+            # [Code Opt Expert Fix] Task 6: Ensure cleanup uses self.services and runs in finally block
+            logger.info("Cleaning up resources...")
+            if hasattr(self, 'services'):
+                if "graph_db" in self.services:
+                    await self.services["graph_db"].close()
+                if "vector_store" in self.services:
+                    await self.services["vector_store"].close()
 
 
 @hydra.main(version_base=None, config_path="config", config_name="system")
