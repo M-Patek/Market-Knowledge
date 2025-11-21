@@ -131,7 +131,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             'MSFT': {'price_t': 300.0, 'price_t1': 299.8, 'l2_sentiment': -0.3, 'l2_confidence': 0.5}
         }
 
-        # 2. (TBD) 执行交易 (t -> t+1)
+        # 2. 执行交易 (t -> t+1)
         # V7 哲学：L3 团队 (Alpha, Risk, Exec) 共同决定一个动作
         # (这里简化为只使用 'alpha' 智能体的动作作为团队决策)
         team_action = action_dict.get('alpha') 
@@ -248,29 +248,81 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         
         return R_drawdown_penalty + R_uncertainty_penalty
 
-    # --- 环境辅助方法 (TBD) ---
+    # --- 环境辅助方法 (Task 9 Implementations) ---
 
     def _execute_trades(self, target_allocation_vector: Any, l2_knowledge: Dict) -> Dict[str, float]:
-        """(TBD) 模拟交易执行 (t -> t+1)。"""
-        # [主人喵 Phase 3] 使用真实价格更新状态
-        # (此处为简化实现，完全实现需要完整的 OrderManager 逻辑)
+        """(V7) 真实交易执行引擎：计算差额、扣除成本、更新持仓。"""
+        total_fees = 0.0
+        total_slippage = 0.0
         
-        # 假设 target_allocation_vector 是一个字典 {symbol: weight}
-        # 在实际 DRL 中这通常是一个 vector，需要映射回 symbol
-        
-        # 简单更新 allocation (忽略具体的买卖过程，仅用于奖励计算演示)
-        # 在真实回测中，必须基于 Quantity 变动计算 Cost
-        if isinstance(target_allocation_vector, dict):
-             self.current_allocation = target_allocation_vector
+        # 费率配置
+        COMMISSION_RATE = 0.001 # 10 bps
+        SLIPPAGE_RATE = 0.001   # 10 bps
+
+        # 1. 适配层：处理 Numpy Array -> Dict 映射
+        if isinstance(target_allocation_vector, (list, np.ndarray)):
+            # 假设 vector 顺序对应 current_prices 的字母序 (在真实场景中应有固定的 asset_list)
+            sorted_symbols = sorted(self.current_prices.keys())
+            # 防止维度不匹配
+            limit = min(len(sorted_symbols), len(target_allocation_vector))
+            target_allocation = {sorted_symbols[i]: float(target_allocation_vector[i]) for i in range(limit)}
         else:
-             # 如果是 array，这里需要映射逻辑 (省略)
-             pass
+            target_allocation = target_allocation_vector
+
+        # 2. MTM 预计算：基于当前价格计算总权益，作为权重分配的基数
+        current_equity = self.balance
+        for sym, pos in self.positions.items():
+            price = self.current_prices.get(sym)
+            if price:
+                current_equity += pos['shares'] * price
         
-        return {'slippage': 0.01, 'fees': 1.0} # (模拟 0.01 滑点, 1.0 费用)
+        # 3. 执行交易
+        all_symbols = set(self.positions.keys()) | set(target_allocation.keys())
+        
+        for symbol in all_symbols:
+            price = self.current_prices.get(symbol)
+            if not price or price <= 0:
+                continue
+            
+            target_weight = target_allocation.get(symbol, 0.0)
+            target_pos_value = current_equity * target_weight
+            
+            current_pos = self.positions.get(symbol, {'shares': 0.0})
+            current_pos_value = current_pos['shares'] * price
+            
+            diff_value = target_pos_value - current_pos_value
+            
+            # 最小交易阈值 ($10)
+            if abs(diff_value) < 10.0:
+                continue
+                
+            # 计算量价与成本
+            delta_shares = diff_value / price
+            trade_val_abs = abs(diff_value)
+            
+            fee = trade_val_abs * COMMISSION_RATE
+            slippage = trade_val_abs * SLIPPAGE_RATE
+            cost = fee + slippage
+            
+            # 更新状态
+            # 买入: balance 减少 (diff > 0); 卖出: balance 增加 (diff < 0)
+            # 成本永远是扣减
+            self.balance -= (diff_value + cost)
+            
+            new_shares = current_pos['shares'] + delta_shares
+            self.positions[symbol] = {'shares': new_shares}
+            
+            total_fees += fee
+            total_slippage += slippage
+            
+            # 更新实际权重 (用于 Observation)
+            self.current_allocation[symbol] = (new_shares * price) / current_equity if current_equity > 0 else 0.0
+        
+        return {'fees': total_fees, 'slippage': total_slippage}
 
     def _update_portfolio_value(self, l2_knowledge: Dict) -> float:
         """
-        [主人喵 Phase 3 修复] 使用真实市场价格计算 Mark-to-Market 价值。
+        [Task 9] 使用真实市场价格计算 Mark-to-Market 价值。
         不再使用随机数。
         """
         value = self.balance
