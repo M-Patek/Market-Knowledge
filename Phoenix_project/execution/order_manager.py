@@ -6,6 +6,7 @@
 - 移除了所有模拟执行逻辑 (已迁移到 SimulatedBrokerAdapter)。
 - 实现了 'process_target_portfolio' 作为统一的入口点。
 - 注入了 TradeLifecycleManager 以便在收到成交时更新投资组合。
+- [Code Opt Expert Fix] Task 2 & 4: Deadlock Prevention & Risk Control
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
@@ -191,6 +192,18 @@ class OrderManager:
         2. 检查数据新鲜度。
         3. 计算差异并下单。
         """
+        # [Fix Task 4] Risk Control: Emergency Brake Check
+        if state.l3_decision:
+            risk_action = state.l3_decision.get("risk_action")
+            decision_type = state.l3_decision.get("type")
+            
+            # Check for HALT signal from Risk Agent or Global Emergency
+            if (isinstance(risk_action, str) and risk_action == "HALT_TRADING") or \
+               decision_type == "EMERGENCY_STOP":
+                logger.critical(f"{self.log_prefix} EMERGENCY BRAKE TRIGGERED (Action: {risk_action}, Type: {decision_type}). Cancelling all orders.")
+                self.cancel_all_open_orders()
+                return
+
         logger.info(f"{self.log_prefix} Processing target portfolio...")
         
         target_portfolio = state.target_portfolio
@@ -231,28 +244,35 @@ class OrderManager:
         logger.info(f"{self.log_prefix} Submitting {len(orders)} orders to broker...")
         
         # 4. 提交订单到券商 (Async)
+        # [Fix Task 2] Deadlock Prevention: Split logic into Prepare -> Execute (No Lock) -> Update (Lock)
+        orders_to_submit = []
         async with self.lock:
             for order in orders:
                 if order.id in self.active_orders:
                     logger.warning(f"{self.log_prefix} Attempted to submit duplicate order {order.id}")
                     continue
+                orders_to_submit.append(order)
+
+        # Execute outside lock to allow callbacks (e.g., _on_fill) to acquire lock
+        for order in orders_to_submit:
+            price = market_prices.get(order.symbol)
+            try:
+                # [Task 4.2] Async execution via thread for potentially blocking broker calls
+                broker_order_id = await asyncio.to_thread(self.broker.place_order, order, price)
                 
-                price = market_prices.get(order.symbol)
-                
-                try:
-                    # [Task 4.2] Async execution via thread for potentially blocking broker calls
-                    broker_order_id = await asyncio.to_thread(self.broker.place_order, order, price)
-                    
+                async with self.lock:
                     # 假设 place_order 成功（或至少被接受）
                     # 注意：SimBroker 会立即将其设置为 FILLED，但 PaperBroker 不会
                     if order.status == OrderStatus.NEW: # 如果 SimBroker 没有改变它
                         order.status = OrderStatus.PENDING 
                         
                     self.active_orders[order.id] = order
-                    logger.info(f"{self.log_prefix} Submitted order {order.id} (Broker ID: {broker_order_id})")
-                    
-                except Exception as e:
-                    logger.error(f"{self.log_prefix} Failed to place order {order.id}: {e}")
+                
+                logger.info(f"{self.log_prefix} Submitted order {order.id} (Broker ID: {broker_order_id})")
+                
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Failed to place order {order.id}: {e}")
+                async with self.lock:
                     order.status = OrderStatus.REJECTED # 标记为本地拒绝
 
     def cancel_all_open_orders(self):
