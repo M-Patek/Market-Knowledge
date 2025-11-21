@@ -1,6 +1,7 @@
 # Phoenix_project/controller/orchestrator.py
 # [主人喵的修复 11.11] 实现了 L2->L3 的数据流 TODO。
 # [主人喵的修复 11.12] 实现了 TBD-1 (事件过滤) 和 TBD-5 (审计)
+# [Code Opt Expert Fix] Task 1: State Sync Implementation
 
 import logging
 import asyncio
@@ -41,6 +42,7 @@ class Orchestrator:
         portfolio_constructor: PortfolioConstructor,
         order_manager: OrderManager,
         audit_manager: AuditManager,
+        trade_lifecycle_manager: Optional[Any] = None, # [Task 1 Fix] Explicit Injection
         # [Fix II.1] 注入 L3 DRL 智能体
         alpha_agent: Optional[Any] = None,
         risk_agent: Optional[Any] = None,
@@ -57,6 +59,7 @@ class Orchestrator:
         self.portfolio_constructor = portfolio_constructor
         self.order_manager = order_manager
         self.audit_manager = audit_manager
+        self.trade_lifecycle_manager = trade_lifecycle_manager # [Task 1 Fix]
         # [Fix II.1] 存储 L3 智能体
         self.alpha_agent = alpha_agent
         self.risk_agent = risk_agent
@@ -88,6 +91,19 @@ class Orchestrator:
             if self.data_manager:
                 pipeline_state.update_time(self.data_manager.get_current_time())
                 pipeline_state.step_index += 1
+
+            # [Task 1 Fix] State Sync: Active sync from Ledger (Brain-Body Connection)
+            # Priority: Injected TLM -> OrderManager's TLM
+            tlm = self.trade_lifecycle_manager or (self.order_manager.trade_lifecycle_manager if hasattr(self.order_manager, 'trade_lifecycle_manager') else None)
+            
+            if tlm:
+                # Pass empty dict for market prices; we only need fresh position quantities here.
+                # Real-time pricing will be handled by MarketStatePredictor later.
+                real_portfolio = tlm.get_current_portfolio_state({}) 
+                pipeline_state.update_portfolio_state(real_portfolio)
+                logger.info(f"Synced portfolio state from Ledger: {len(real_portfolio.positions)} positions.")
+            else:
+                logger.warning("TradeLifecycleManager not available. Running with potentially stale/empty portfolio state.")
 
             # 1. 从事件分发器（Redis）获取新事件
             new_events = self.event_distributor.get_new_events()
