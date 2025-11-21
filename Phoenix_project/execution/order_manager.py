@@ -45,6 +45,10 @@ class OrderManager:
         self.active_orders: Dict[str, Order] = {} # key: order_id
         self.lock = asyncio.Lock() # [Task 4.2] Use asyncio.Lock
         
+        # [Task 1] Risk Control Limits
+        self.max_order_value = 100000.0  # Max value per order
+        self.max_notional_exposure = 1000000.0 # Max total exposure
+        
         # 订阅券商的回调
         self.broker.subscribe_fills(self._on_fill)
         self.broker.subscribe_order_status(self._on_order_status_update)
@@ -153,6 +157,13 @@ class OrderManager:
                     continue
                 
                 order_quantity = target_dollar_value / price
+
+                # [Task 1] Fat Finger Protection
+                expected_value = order_quantity * price
+                if abs(expected_value) > self.max_order_value:
+                    logger.warning(f"{self.log_prefix} Order value {expected_value:.2f} exceeds limit {self.max_order_value}. Truncating order.")
+                    sign = 1 if order_quantity > 0 else -1
+                    order_quantity = sign * (self.max_order_value / price)
                 
                 # 创建订单
                 new_order = Order(
