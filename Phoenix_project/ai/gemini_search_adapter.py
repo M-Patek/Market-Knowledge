@@ -69,18 +69,11 @@ class GeminiSearchAdapter:
                         # Use retrieved_context if available, else fallback to a snippet of the AI's answer
                         "content": getattr(chunk, 'retrieved_context', None) or response.get("text", "")[:200]
                     })
-                    
-            # Fallback/Supplement: If search was conducted but no chunks were parsed (rare), 
-            # or to ensure the AI's synthesis is included.
-            response_text = response.get("text", "")
-            if response_text:
-                # If we have very few results, or just want to ensure the summary is present
-                if not results:
-                     results.append({
-                        "title": "Gemini AI Summary",
-                        "url": "ai://gemini_summary",
-                        "content": response_text
-                    })
+            
+            # [Task 4] Security Fix: Removed the Hallucination Fallback.
+            # We strictly adhere to "No Evidence, No Speak". 
+            # If Google Search returns no grounding chunks, we return empty results
+            # instead of fabricating a "Gemini AI Summary" from potentially hallucinatory internal knowledge.
             
             logger.info(f"Gemini Search found {len(results)} results/sources for '{query}'")
             return {"results": results[:max_results]}
