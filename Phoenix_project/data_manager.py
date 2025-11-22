@@ -139,18 +139,21 @@ class DataManager:
             logger.error(f"Cache JSON serialization error for key {key}: {e}")
 
     async def get_market_data_history(
-        self, symbol: str, start: datetime, end: datetime
+        self, symbol: str, start: datetime, end: datetime, allow_future_lookup: bool = False
     ) -> Optional[pd.DataFrame]:
         """
         Retrieves historical market data, checking cache first,
         then falling back to the temporal DB.
+
+        Args:
+            allow_future_lookup: If True, bypasses the simulation time check (used for backtest preload).
         """
         if not self.temporal_db:
             logger.warning("TemporalDB client not configured. Cannot fetch history.")
             return None
         
-        # [Time Machine] 防止窥探未来
-        if self._simulation_time and end > self._simulation_time:
+        # [Time Machine] 防止窥探未来 (除非显式特权访问)
+        if not allow_future_lookup and self._simulation_time and end > self._simulation_time:
             logger.debug(f"Clamping history request end time from {end} to {self._simulation_time}")
             end = self._simulation_time
 
