@@ -3,6 +3,7 @@
 负责跟踪从信号 -> 订单 -> 成交 -> 持仓 的整个过程。
 计算已实现和未实现的盈亏 (PnL)。
 [Beta FIX] 防止僵尸估值 (Zombie Valuation)
+[Task 3] Atomic Transactions & Write-Ahead Persistence
 """
 from typing import Dict, Optional
 from datetime import datetime
@@ -154,12 +155,13 @@ class TradeLifecycleManager:
 
         logger.info(f"{self.log_prefix} Processing fill for {fill.symbol}: {fill.quantity} @ {fill.price}")
         
-        # 2. 更新内存状态 (Cash)
+        # [Task 3] Atomic Transaction: Phase 1 - Pre-calculate new state (Shadow State)
+        # Do NOT modify self attributes yet.
         trade_cost = fill.price * fill.quantity
-        self.cash -= trade_cost
-        self.cash -= fill.commission
+        new_cash = self.cash - trade_cost - fill.commission
+        new_realized_pnl = self.realized_pnl
         
-        # 3. 更新内存状态 (Positions)
+        # 3. 计算新持仓状态
         current_pos = self.positions.get(
             fill.symbol,
             Position(symbol=fill.symbol, quantity=0.0, average_price=0.0, market_value=0.0, unrealized_pnl=0.0)
@@ -169,26 +171,24 @@ class TradeLifecycleManager:
         current_avg_price = current_pos.average_price
         
         new_qty = current_qty + fill.quantity
+        new_pos: Optional[Position] = None
         
         if abs(new_qty) < 1e-6:
             # 仓位已平仓
             logger.info(f"{self.log_prefix} Position closed for {fill.symbol}")
             # 计算已实现 PnL
             pnl = (fill.price - current_avg_price) * (-current_qty) # -current_qty 是平仓的数量
-            self.realized_pnl += pnl
-            if fill.symbol in self.positions:
-                del self.positions[fill.symbol]
-            # DB: Delete position row
-            if self.tabular_db:
-                await self.tabular_db.query(f"DELETE FROM ledger_positions WHERE symbol = '{fill.symbol}'")
+            new_realized_pnl += pnl
+            new_pos = None # Mark for deletion
             
         elif current_qty * fill.quantity >= 0: 
             # 增加仓位 (同向交易)
             new_avg_price = ((current_avg_price * current_qty) + (fill.price * fill.quantity)) / new_qty
             
-            current_pos.quantity = new_qty
-            current_pos.average_price = new_avg_price
-            self.positions[fill.symbol] = current_pos
+            # Create new position object (immutable style preferred)
+            new_pos = current_pos.model_copy()
+            new_pos.quantity = new_qty
+            new_pos.average_price = new_avg_price
             logger.info(f"{self.log_prefix} Position updated for {fill.symbol}: New Qty={new_qty}, New AvgPx={new_avg_price}")
 
         else:
@@ -196,28 +196,45 @@ class TradeLifecycleManager:
             if abs(fill.quantity) <= abs(current_qty):
                 # 减少仓位
                 pnl = (fill.price - current_avg_price) * abs(fill.quantity)
-                self.realized_pnl += pnl
+                new_realized_pnl += pnl
                 
-                current_pos.quantity = new_qty
+                new_pos = current_pos.model_copy()
+                new_pos.quantity = new_qty
                 # 平均价格不变
-                self.positions[fill.symbol] = current_pos
                 logger.info(f"{self.log_prefix} Position reduced for {fill.symbol}: New Qty={new_qty}, Realized PnL={pnl}")
             else:
                 # 反转仓位 (e.g., 从 +100 到 -50)
                 # 1. 平掉所有旧仓位
                 pnl = (fill.price - current_avg_price) * abs(current_qty)
-                self.realized_pnl += pnl
+                new_realized_pnl += pnl
                 
                 # 2. 建立新仓位
-                current_pos.quantity = new_qty
-                current_pos.average_price = fill.price # 新仓位的成本价是当前成交价
-                self.positions[fill.symbol] = current_pos
+                new_pos = current_pos.model_copy()
+                new_pos.quantity = new_qty
+                new_pos.average_price = fill.price # 新仓位的成本价是当前成交价
                 logger.info(f"{self.log_prefix} Position reversed for {fill.symbol}: New Qty={new_qty}, Realized PnL={pnl}")
 
-        # 4. 持久化更新 (Atomicity via separate steps, assuming no crash in between)
+        # [Task 3] Atomic Transaction: Phase 2 - DB Persistence (Write-Ahead)
         if self.tabular_db:
-            await self._persist_ledger(fill.symbol)
-            await self._record_fill(fill)
+            try:
+                # Pass EXPLICIT calculated values, not self.*
+                await self._persist_transaction(new_cash, new_realized_pnl, new_pos, fill.symbol)
+                await self._record_fill(fill)
+            except Exception as e:
+                # CRITICAL: DB write failed. Do NOT update memory. Halt system.
+                logger.critical(f"{self.log_prefix} LEDGER WRITE FAILED. HALTING to prevent split-brain. Error: {e}")
+                raise
+
+        # [Task 3] Atomic Transaction: Phase 3 - Memory Commit
+        # Only reached if DB write succeeded (or if DB is disabled)
+        self.cash = new_cash
+        self.realized_pnl = new_realized_pnl
+        
+        if new_pos:
+            self.positions[fill.symbol] = new_pos
+        else:
+            # Safe removal
+            self.positions.pop(fill.symbol, None)
 
     async def _is_fill_processed(self, fill_id: str) -> bool:
         """检查 Fill ID 是否已存在于数据库。"""
@@ -225,23 +242,25 @@ class TradeLifecycleManager:
         res = await self.tabular_db.query(f"SELECT fill_id FROM ledger_fills WHERE fill_id = '{fill_id}'")
         return bool(res and "results" in res and res["results"])
 
-    async def _persist_ledger(self, symbol: str):
-        """更新余额和持仓到数据库。"""
+    async def _persist_transaction(self, cash: float, realized_pnl: float, position: Optional[Position], symbol: str):
+        """[Task 3] Atomic DB Update Helper. Uses explicit values."""
         # Update Balance
         await self.tabular_db.upsert_data(
             "ledger_balance", 
-            {"id": 1, "cash": self.cash, "realized_pnl": self.realized_pnl}, 
+            {"id": 1, "cash": cash, "realized_pnl": realized_pnl}, 
             "id"
         )
         
         # Update Position (if exists)
-        if symbol in self.positions:
-            pos = self.positions[symbol]
+        if position:
             await self.tabular_db.upsert_data(
                 "ledger_positions",
-                pos.model_dump(),
+                position.model_dump(),
                 "symbol"
             )
+        else:
+            # Position closed, remove from DB
+            await self.tabular_db.query(f"DELETE FROM ledger_positions WHERE symbol = '{symbol}'")
 
     async def _record_fill(self, fill: Fill):
         """记录 Fill 事件以防止重放。"""
