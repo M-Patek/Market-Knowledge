@@ -3,12 +3,15 @@ Risk Manager for the Phoenix cognitive engine.
 
 Monitors portfolio state, market conditions, and operational metrics
 to enforce risk controls and trigger circuit breakers.
+[Task 5] Persistence and Warm-up
 """
 
 import logging
 from typing import Any, Dict, Optional, List
 from collections import deque
-import numpy as np  # 确保 numpy 已在 requirements.txt 中
+from datetime import datetime, timedelta
+import asyncio
+import numpy as np 
 import redis  # type: ignore
 
 from ..core.schemas.data_schema import MarketData, Position, Portfolio
@@ -24,6 +27,9 @@ from ..core.exceptions import RiskViolationError, CircuitBreakerError
 
 logger = logging.getLogger(__name__)
 
+# Forward declaration or import
+from ..data_manager import DataManager
+
 
 class RiskManager:
     """
@@ -34,6 +40,7 @@ class RiskManager:
         self,
         config: Dict[str, Any],
         redis_client: redis.Redis,
+        data_manager: Optional[DataManager] = None, # [Task 5] Inject DataManager
         initial_capital: float = 100000.0,
     ):
         """
@@ -42,10 +49,12 @@ class RiskManager:
         Args:
             config: Configuration dictionary for risk parameters.
             redis_client: Client for persistent state (e.g., peak_equity).
+            data_manager: DataManager instance for warm-up.
             initial_capital: The starting capital for the portfolio.
         """
         self.config = config.get("risk_manager", {})
         self.redis_client = redis_client
+        self.data_manager = data_manager
         self.initial_capital = initial_capital
         
         # 风险参数
@@ -58,7 +67,8 @@ class RiskManager:
 
         # 内部状态
         self.current_equity: float = initial_capital
-        self.circuit_breaker_tripped: bool = False
+        # [Task 5] Load persistent circuit breaker state
+        self.circuit_breaker_tripped: bool = self._load_circuit_breaker_state()
         self.active_signals: List[RiskSignal] = []
 
         # OPTIMIZED: 从 Redis 加载持久化的峰值权益 (peak_equity)
@@ -71,8 +81,49 @@ class RiskManager:
 
         logger.info("RiskManager initialized.")
         logger.info(f"Loaded Peak Equity: {self.peak_equity}")
+        logger.info(f"Circuit Breaker State: {'TRIPPED' if self.circuit_breaker_tripped else 'OK'}")
         logger.info(f"Max Drawdown: {self.max_drawdown_pct * 100}%")
         logger.info(f"Max Concentration: {self.max_position_concentration_pct * 100}%")
+
+    def _load_circuit_breaker_state(self) -> bool:
+        """[Task 5] Loads circuit breaker state from Redis."""
+        try:
+            state = self.redis_client.get("phoenix:risk:halted")
+            return bool(int(state)) if state else False
+        except Exception as e:
+            logger.error(f"Failed to load circuit breaker state: {e}")
+            return False
+
+    async def initialize(self, symbols: List[str]):
+        """
+        [Task 5] Cold-start Warm-up: Backfill price history for volatility checks.
+        """
+        if not self.data_manager:
+            logger.warning("DataManager not provided. Skipping RiskManager warm-up.")
+            return
+
+        logger.info(f"Warming up RiskManager for {len(symbols)} symbols...")
+        end_time = self.data_manager.get_current_time()
+        # Fetch extra buffer to ensure we have enough data points (skipping holidays/weekends)
+        start_time = end_time - timedelta(days=int(self.volatility_window * 2) + 5)
+
+        async def _fetch_and_fill(sym):
+            try:
+                # Use standard historical fetch (respects simulation time)
+                df = await self.data_manager.get_market_data_history(sym, start_time, end_time)
+                if df is not None and not df.empty:
+                    # Take the last N close prices
+                    closes = df['close'].values[-self.volatility_window:].tolist()
+                    
+                    if sym not in self.price_history:
+                        self.price_history[sym] = deque(maxlen=self.volatility_window)
+                    
+                    self.price_history[sym].extend(closes)
+            except Exception as e:
+                logger.error(f"Failed to warm up risk data for {sym}: {e}")
+
+        await asyncio.gather(*[_fetch_and_fill(s) for s in symbols])
+        logger.info(f"RiskManager warm-up complete.")
 
     def _load_peak_equity(self) -> float:
         """
@@ -105,13 +156,6 @@ class RiskManager:
     ) -> List[RiskSignal]:
         """
         Checks risk before a new trade is executed.
-
-        Args:
-            proposed_position: The position being considered.
-            portfolio: The current state of the portfolio.
-
-        Returns:
-            A list of risk signals. If empty, the trade is compliant.
         """
         if self.circuit_breaker_tripped:
             logger.error("CIRCUIT BREAKER TRIPPED. Pre-trade check failed.")
@@ -144,12 +188,6 @@ class RiskManager:
     def check_post_trade(self, portfolio: Portfolio) -> List[RiskSignal]:
         """
         Checks risk after trades have been executed and the portfolio updated.
-
-        Args:
-            portfolio: The updated portfolio.
-
-        Returns:
-            A list of active risk signals.
         """
         if self.circuit_breaker_tripped:
             return self.active_signals
@@ -161,11 +199,6 @@ class RiskManager:
         drawdown_signal = self.check_drawdown()
         if drawdown_signal:
             self.active_signals.append(drawdown_signal)
-
-        # 2. 检查整体集中度 (以防万一)
-        # (这在 pre-trade 中更重要, 但在这里做个健全性检查)
-        
-        # 3. 检查市场波动性 (在 on_market_data 中处理)
         
         if self.active_signals:
             logger.critical(
@@ -181,12 +214,6 @@ class RiskManager:
     def on_market_data(self, market_data: MarketData) -> Optional[RiskSignal]:
         """
         Processes real-time market data to check for dynamic risks.
-
-        Args:
-            market_data: The latest market data for a symbol.
-
-        Returns:
-            A risk signal if a new risk is detected.
         """
         if self.circuit_breaker_tripped:
             return None
@@ -206,9 +233,6 @@ class RiskManager:
     def update_portfolio_value(self, new_equity: float):
         """
         Updates the current equity and peak equity.
-
-        Args:
-            new_equity: The new total value of the portfolio.
         """
         self.current_equity = new_equity
         if self.current_equity > self.peak_equity:
@@ -260,8 +284,6 @@ class RiskManager:
         final_position_value = existing_value + new_position_value
         
         # 假设投资组合总价值 *不会* 因为这个新头寸而立即改变
-        # (例如, 如果是现金购买, 总价值不变)
-        # 一个更精确的计算可能需要 'new_portfolio_total_value'
         total_portfolio_value = portfolio.total_value
 
         if total_portfolio_value == 0:
@@ -318,8 +340,6 @@ class RiskManager:
             log_returns = np.log(prices[1:] / prices[:-1])
             
             # 年化波动率 (假设数据是每日的)
-            # (这个假设可能不正确, 取决于 market_data 的频率)
-            # 为简单起见, 我们只使用原始的 stddev
             current_volatility = np.std(log_returns)
 
             # 4. 与阈值比较
@@ -335,7 +355,6 @@ class RiskManager:
                     symbol=symbol,
                     current_volatility=current_volatility,
                     volatility_threshold=self.volatility_threshold,
-                    # 可以配置波动性是否触发熔断
                     triggers_circuit_breaker=self.config.get(
                         "volatility_triggers_breaker", False
                     ),
@@ -350,6 +369,8 @@ class RiskManager:
         Trips the system-wide circuit breaker, halting new trades.
         """
         self.circuit_breaker_tripped = True
+        # [Task 5] Persist Halt
+        self.redis_client.set("phoenix:risk:halted", "1")
         self.active_signals.append(
             RiskSignal(
                 type=SignalType.CIRCUIT_BREAKER,
@@ -365,6 +386,8 @@ class RiskManager:
         Resets the circuit breaker (manual intervention usually required).
         """
         self.circuit_breaker_tripped = False
+        # [Task 5] Clear Halt
+        self.redis_client.delete("phoenix:risk:halted")
         self.active_signals = [
             s for s in self.active_signals if s.type != SignalType.CIRCUIT_BREAKER
         ]
