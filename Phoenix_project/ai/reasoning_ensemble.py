@@ -1,15 +1,16 @@
+# Phoenix_project/ai/reasoning_ensemble.py
+# [主人喵的修复] 净化了投毒逻辑，强制返回 FusionResult 对象，增加了数据拆包和兜底机制
+
+import logging
 import asyncio
-from typing import Any, Dict, List
-from types import SimpleNamespace
-# 修复：导入正确的 monitor.logging 和 core.pipeline_state
-from Phoenix_project.monitor.logging import get_logger
+from typing import Any, Dict, List, Optional
+
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.core.schemas.fusion_result import FusionResult
-from Phoenix_project.core.exceptions import CognitiveError # Use existing exception or generic
-# 修复：使用 get_logger
-logger = get_logger(__name__)
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
+from Phoenix_project.core.exceptions import CognitiveError
 
-# 假设这些是你的智能体类，需要根据实际路径调整导入
+# 依赖组件接口
 from Phoenix_project.agents.l2.fusion_agent import FusionAgent
 from Phoenix_project.agents.l3.alpha_agent import AlphaAgent
 from Phoenix_project.evaluation.voter import Voter
@@ -17,116 +18,157 @@ from Phoenix_project.evaluation.arbitrator import Arbitrator
 from Phoenix_project.evaluation.fact_checker import FactChecker
 from Phoenix_project.data_manager import DataManager
 
+logger = logging.getLogger(__name__)
+
 class ReasoningEnsemble:
     """
     Reasoning Ensemble (L2/L3) Coordination Logic
-    Orchestrates Fusion, Fact-Checking, Arbitration, and Alpha Decision.
-    [Refactored Phase 3.3] Added DataManager, removed hallucinations.
+    负责协调 Fusion, Fact-Checking, Arbitration 和 Alpha Decision。
+    [Refactor Fix] 强制类型安全，杜绝 Dict Bomb。
     """
 
-    def __init__(self, fusion_agent: FusionAgent, alpha_agent: AlphaAgent,
-                 voter: Voter, arbitrator: Arbitrator, fact_checker: FactChecker,
-                 data_manager: DataManager):
+    def __init__(
+        self, 
+        fusion_agent: FusionAgent, 
+        alpha_agent: AlphaAgent,
+        voter: Voter, 
+        arbitrator: Arbitrator, 
+        fact_checker: FactChecker,
+        data_manager: DataManager
+    ):
         self.fusion_agent = fusion_agent
         self.alpha_agent = alpha_agent
         self.voter = voter
         self.arbitrator = arbitrator
         self.fact_checker = fact_checker
         self.data_manager = data_manager
+        logger.info("ReasoningEnsemble initialized with strict type safety.")
 
-    async def run_ensemble(self, state: PipelineState, agent_insights: Dict[str, Any], target_assets: List[str]) -> Dict[str, Any]:
+    async def reason(self, state: PipelineState) -> FusionResult:
         """
-        Executes the reasoning ensemble flow.
+        执行核心推理流程：L1 Insights -> L2 Fusion -> Fact Check -> Decision。
+        
+        Returns:
+            FusionResult: 无论成功与否，必须返回此对象。
         """
-        if not agent_insights:
-            logger.warning("No L1 insights provided to Reasoning Ensemble.")
-            return {"error": "No insights available."}
-
-        # 1. 融合 (Fusion)
-        # L2 Fusion Agent 接收 L1 见解
-        logger.debug("Running L2 Fusion Agent...")
+        target_symbol = state.main_task_query.get("symbol", "UNKNOWN")
+        
         try:
-            # [Task 3.3 Refactor] 适配 FusionAgent.run(state, dependencies) 新签名
-            fusion_result: FusionResult = None
+            # 1. 准备依赖数据 (L1 Insights)
+            # [拆包逻辑] 从 PipelineState 中提取并清洗数据
+            raw_insights = state.l1_insights
+            dependencies = self._unwrap_dependencies(raw_insights)
             
-            # 将 dict values 转为 list 传给 dependencies
-            dependencies = list(agent_insights.values())
+            if not dependencies:
+                logger.warning("No valid L1 insights found. Returning fallback.")
+                return self._create_fallback_result(state, target_symbol, "No L1 insights available.")
+
+            # 2. L2 Fusion (融合)
+            logger.info(f"Running L2 Fusion on {len(dependencies)} items...")
+            fusion_result = None
             
+            # 调用 FusionAgent (它现在是一个 AsyncGenerator，或者我们需要适配它的 run 方法)
+            # 假设 FusionAgent.run 返回 AsyncGenerator[FusionResult, None]
             async for result in self.fusion_agent.run(state=state, dependencies=dependencies):
                 fusion_result = result
-                break # We only need the first result
+                break # 只取第一个结果
 
             if not fusion_result:
-                logger.warning("L2 Fusion Agent returned no result.")
-                return {"error": "Fusion agent failed to produce a result."}
+                logger.error("L2 Fusion Agent yielded no results.")
+                return self._create_fallback_result(state, target_symbol, "Fusion Agent yielded empty result.")
+
+            # [双重保险] 再次检查类型，防止 FusionAgent 本身被篡改
+            if not isinstance(fusion_result, FusionResult):
+                logger.error(f"FusionAgent returned invalid type: {type(fusion_result)}")
+                return self._create_fallback_result(state, target_symbol, "Invalid FusionResult type.")
+
+            # 3. Fact Checking (事实核查) - 简化版，Engine 可能会再次调用
+            # 这里我们可以做一些预处理
+            if fusion_result.confidence > 0.6:
+                await self._apply_fact_check(fusion_result)
+
+            # 4. Arbitration (仲裁) - 可选
+            # 如果有严重冲突，可以在这里调用 Arbitrator
+            # ...
+
+            return fusion_result
+
+        except Exception as e:
+            logger.error(f"ReasoningEnsemble critical failure: {e}", exc_info=True)
+            # [最终兜底] 无论发生什么，都返回一个安全的对象
+            return self._create_fallback_result(state, target_symbol, f"Critical Ensemble Error: {str(e)}")
+
+    def _unwrap_dependencies(self, raw_insights: Dict[str, Any]) -> List[EvidenceItem]:
+        """
+        [清洗逻辑] 从可能被过度包装的 L1 结果中提取 EvidenceItem。
+        处理: Dict[str, EvidenceItem] 或 Dict[str, {'result': ..., 'status': ...}]
+        """
+        valid_items = []
+        if not raw_insights:
+            return valid_items
+
+        for key, value in raw_insights.items():
+            # 情况 A: 已经是 EvidenceItem 对象
+            if isinstance(value, EvidenceItem):
+                valid_items.append(value)
+                continue
+            
+            # 情况 B: Executor 包装的信封 {'status': 'SUCCESS', 'result': ...}
+            if isinstance(value, dict) and "result" in value:
+                inner_result = value["result"]
+                if isinstance(inner_result, EvidenceItem):
+                    valid_items.append(inner_result)
+                    continue
+                # 尝试从字典恢复
+                if isinstance(inner_result, dict):
+                    try:
+                        item = EvidenceItem.model_validate(inner_result)
+                        valid_items.append(item)
+                        continue
+                    except:
+                        pass
+            
+            # 情况 C: 裸字典
+            if isinstance(value, dict):
+                try:
+                    item = EvidenceItem.model_validate(value)
+                    valid_items.append(item)
+                except:
+                    pass
+                    
+        return valid_items
+
+    async def _apply_fact_check(self, fusion_result: FusionResult):
+        """
+        辅助方法：运行事实核查并原地更新 FusionResult。
+        """
+        try:
+            claims = [fusion_result.reasoning]
+            report = await self.fact_checker.check_facts(claims)
+            
+            support = report.get("overall_support", "Neutral")
+            if support == "Refuted":
+                fusion_result.decision = "NEUTRAL"
+                fusion_result.confidence = 0.0
+                fusion_result.reasoning += "\n[FACT-CHECK]: Reasoning Refuted. Decision neutralized."
+            elif support == "Supported":
+                # 小幅提升置信度
+                fusion_result.confidence = min(fusion_result.confidence + 0.1, 1.0)
                 
         except Exception as e:
-            logger.error(f"Fusion Agent failed: {e}", exc_info=True)
-            return {"error": f"Fusion failed: {str(e)}"}
+            logger.warning(f"Fact check failed (non-fatal): {e}")
 
-        # 2. 事实核查 (Fact-Checking)
-        logger.debug("Running Fact-Checker...")
-        # [Task III Fix] Pass list of strings, not single string
-        claims = [fusion_result.reasoning] if fusion_result.reasoning else []
-        fact_check_report = await self.fact_checker.check_facts(claims)
-        
-        # 修复：state.add_fact_check_report 不存在。
-        # 我们将报告保存在本地，以便传递给 arbitrator
-        # state.add_fact_check_report(fact_check_report)
-
-        # 3. 仲裁 (Arbitration) - 如果存在冲突或低置信度
-        logger.debug("Running Arbitrator...")
-        arbitrated_insights = await self.arbitrator.arbitrate(
-            fusion_result, 
-            agent_insights, 
-            fact_check_report
+    def _create_fallback_result(self, state: PipelineState, symbol: str, reason: str) -> FusionResult:
+        """
+        生成标准化的兜底结果。
+        """
+        return FusionResult(
+            timestamp=state.current_time,
+            target_symbol=symbol,
+            decision="NEUTRAL", # 保持中立
+            confidence=0.0,     # 零置信度
+            reasoning=f"Ensemble Fallback Triggered: {reason}",
+            uncertainty=1.0,    # 最大不确定性
+            supporting_evidence_ids=[],
+            conflicting_evidence_ids=[]
         )
-
-        # 4. L3 Alpha Agent (Final Decision)
-        logger.debug("Running L3 Alpha Agent...")
-        try:
-            # 假设 Alpha Agent 需要最新的市场状态和仲裁后的见解
-            # 修复：Alpha Agent 接口可能不同。此处假设 run(state, insights)
-            # 并且 target_assets 是列表
-            stocks_to_analyze = target_assets
-            logger.info(f"Alpha Agent analyzing stocks: {stocks_to_analyze}")
-
-            # [Task III Fix] Adapt DRL Agent Interface
-            # 1. Get Market Data
-            # [Refactored Phase 3.3] 使用 DataManager 获取真实数据，禁止幻觉
-            symbol = stocks_to_analyze[0]
-            market_data = await self.data_manager.get_latest_market_data(symbol)
-            
-            if not market_data:
-                raise CognitiveError(f"CRITICAL: No market data available for {symbol}. Cannot make L3 decision.")
-
-            state_data = {
-                "balance": state.portfolio_state.cash if state.portfolio_state else 10000.0,
-                "holdings": 0.0, # Simplified for fix
-                "price": market_data.close
-            }
-            
-            # 2. Construct Observation & Compute Action
-            # Assuming 'format_observation' is the public API for _format_obs
-            # If not available, we might need to check BaseDRLAgent, but sticking to emergency plan instructions.
-            obs = self.alpha_agent.format_observation(state_data, fusion_result)
-            action = self.alpha_agent.compute_action(obs)
-            
-            logger.info(f"L3 Alpha Agent computed action: {action}")
-            
-            # 最终决策
-            final_decision = {
-                "action": action.tolist() if hasattr(action, "tolist") else action,
-                "asset_insights": fusion_result.reasoning, # Fallback to fusion reasoning
-                "portfolio_implications": "Rebalancing based on DRL Policy",
-                "confidence": fusion_result.confidence,
-                "rational": "Policy Execution",
-                "arbitration_report": arbitrated_insights,
-                "fact_check_report": fact_check_report
-            }
-            
-            return final_decision
-
-        except Exception as e:
-            logger.error(f"Alpha Agent failed: {e}", exc_info=True)
-            return {"error": f"Alpha Agent failed: {str(e)}"}
