@@ -1,12 +1,7 @@
 """
 订单管理器 (Order Manager)
 负责处理订单的整个生命周期：发送、监控、取消。
-
-[阶段 1 & 4 重构]
-- 移除了所有模拟执行逻辑 (已迁移到 SimulatedBrokerAdapter)。
-- 实现了 'process_target_portfolio' 作为统一的入口点。
-- 注入了 TradeLifecycleManager 以便在收到成交时更新投资组合。
-- [Code Opt Expert Fix] Task 2 & 4: Deadlock Prevention & Risk Control
+[Beta Final Fix] 集成 Fail-Safe 逻辑，捕获数据完整性错误并执行紧急停止。
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
@@ -232,7 +227,14 @@ class OrderManager:
             market_prices[sym] = md.close
 
         # 2. 获取当前持仓状态 (Using TLM)
-        current_portfolio = self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
+        # [Beta Final Fix] 捕获数据完整性异常并触发紧急停止
+        try:
+            current_portfolio = self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
+        except ValueError as e:
+            logger.critical(f"{self.log_prefix} DATA INTEGRITY ALERT: {e}. Initiating EMERGENCY STOP.")
+            self.cancel_all_open_orders()
+            # 停止本次调仓，等待下个循环数据恢复
+            return 
 
         # 3. 生成订单
         orders = self.generate_orders(current_portfolio, target_portfolio, market_prices)
