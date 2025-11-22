@@ -75,8 +75,11 @@ class PhoenixProject:
         # [Infra] Redis Client (用于 ContextBus, DataManager, EventDistributor)
         redis_host = os.environ.get("REDIS_HOST", "localhost")
         redis_port = int(os.environ.get("REDIS_PORT", 6379))
-        redis_client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True)
-        logger.info(f"Redis client initialized at {redis_host}:{redis_port}")
+        
+        # [Beta FIX] 移除 decode_responses=True，防止二进制数据（如 pickle）损坏
+        # 注意：后续模块读取文本数据时需手动 .decode('utf-8')
+        redis_client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=False)
+        logger.info(f"Redis client initialized at {redis_host}:{redis_port} (Binary Mode)")
     
         # [Infra] ContextBus (状态持久化)
         context_bus = ContextBus(redis_client=redis_client, config=config.get('context_bus'))
