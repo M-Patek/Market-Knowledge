@@ -2,9 +2,11 @@
 订单管理器 (Order Manager)
 负责处理订单的整个生命周期：发送、监控、取消。
 [Beta Final Fix] 集成 Fail-Safe 逻辑，捕获数据完整性错误并执行紧急停止。
+[Task 4] Concurrency Safety & Execution Protection
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
+from collections import defaultdict
 import uuid
 import asyncio
 from .interfaces import IBrokerAdapter
@@ -26,7 +28,7 @@ class OrderManager:
     """
     作为订单和券商适配器之间的中介。
     跟踪所有活动订单的状态。
-    现在是纯粹的异步逻辑：提交订单，并通过回调响应事件。
+    纯异步逻辑：提交订单，并通过回调响应事件。
     """
     
     def __init__(self, broker: IBrokerAdapter, trade_lifecycle_manager: TradeLifecycleManager, data_manager: DataManager):
@@ -36,8 +38,8 @@ class OrderManager:
         - [Task 4.2] Inject DataManager for freshness checks.
         """
         self.broker = broker
-        self.trade_lifecycle_manager = trade_lifecycle_manager # <--- 新增
-        self.data_manager = data_manager # [Task 4.2]
+        self.trade_lifecycle_manager = trade_lifecycle_manager 
+        self.data_manager = data_manager 
         self.active_orders: Dict[str, Order] = {} # key: order_id
         self.lock = asyncio.Lock() # [Task 4.2] Use asyncio.Lock
         
@@ -96,13 +98,14 @@ class OrderManager:
     def generate_orders(self, 
                         current_portfolio: PortfolioState, 
                         target_portfolio: TargetPortfolio, 
-                        market_prices: Dict[str, float]
+                        market_prices: Dict[str, float],
+                        active_orders: Dict[str, Order]
                        ) -> List[Order]:
         """
-        [阶段 4]
-        此方法保持不变。
-        计算当前投资组合和目标投资组合之间的“差异”(diff)，
-        并生成实现该目标所需的市价单。
+        [Task 4]
+        计算当前投资组合和目标投资组合之间的“差异”(diff)。
+        [Optimization] Now calculates 'Effective Position' (Settled + In-flight) to prevent ghost exposure.
+        [Optimization] Generates LIMIT orders instead of MARKET orders.
         """
         logger.info(f"{self.log_prefix} Generating orders to match target portfolio...")
         orders_to_generate: List[Order] = []
@@ -120,11 +123,20 @@ class OrderManager:
                 logger.warning(f"{self.log_prefix} Total portfolio value and cash are zero or negative. Cannot generate orders.")
                 return []
 
-        # 1. 将当前持仓转换为权重字典
-        current_weights: Dict[str, float] = {}
+        # 1. 计算有效持仓 (Settled + Active) 并转换为权重
+        effective_quantities = defaultdict(float)
+        # Add Settled Positions
         for symbol, position in current_portfolio.positions.items():
-            # [修复] 确保 total_value 不为零
-            current_weights[symbol] = position.market_value / total_value if total_value != 0 else 0
+            effective_quantities[symbol] += position.quantity
+        # Add In-flight Orders (Projected)
+        for order in active_orders.values():
+            effective_quantities[order.symbol] += order.quantity
+            
+        current_weights: Dict[str, float] = {}
+        for symbol, qty in effective_quantities.items():
+            price = market_prices.get(symbol, 0)
+            if price > 0 and total_value != 0:
+                 current_weights[symbol] = (qty * price) / total_value
 
         # 2. 将目标持仓转换为权重字典
         target_weights: Dict[str, float] = {}
@@ -153,6 +165,12 @@ class OrderManager:
                     continue
                 
                 order_quantity = target_dollar_value / price
+                
+                # [Task 4] Limit Order Protection (0.5% Slippage Tolerance)
+                # Buy: Price * 1.005, Sell: Price * 0.995
+                slippage_factor = 0.005
+                limit_price = price * (1 + slippage_factor) if order_quantity > 0 else price * (1 - slippage_factor)
+                limit_price = round(limit_price, 2)
 
                 # [Task 1] Fat Finger Protection
                 expected_value = order_quantity * price
@@ -166,7 +184,8 @@ class OrderManager:
                     id=f"order_{symbol}_{uuid.uuid4()}",
                     symbol=symbol,
                     quantity=order_quantity,
-                    order_type="MARKET", # 默认为市价单
+                    price=limit_price,   # [Optimization] Set Limit Price
+                    order_type="LIMIT",  # [Optimization] Change to LIMIT
                     status=OrderStatus.NEW,
                     time_in_force="GTC", # [修复] 为 PaperTrading 添加默认 TIF
                     metadata={
@@ -208,7 +227,6 @@ class OrderManager:
 
         # 1. 获取最新价格并检查时效性 (Data Freshness)
         # 收集所有涉及的 symbol (Target + Current Holdings)
-        # 简化起见，我们只检查 target positions 的 symbol
         symbols = [p.symbol for p in target_portfolio.positions]
         market_prices = {}
         
@@ -237,7 +255,12 @@ class OrderManager:
             return 
 
         # 3. 生成订单
-        orders = self.generate_orders(current_portfolio, target_portfolio, market_prices)
+        # [Optimization] Pass active_orders to calculate effective exposure
+        # Need a snapshot of active orders to avoid async modification issues, though generate_orders is sync.
+        async with self.lock:
+            active_orders_snapshot = self.active_orders.copy()
+            
+        orders = self.generate_orders(current_portfolio, target_portfolio, market_prices, active_orders_snapshot)
         
         if not orders:
             logger.info(f"{self.log_prefix} No orders generated, processing complete.")
@@ -245,47 +268,50 @@ class OrderManager:
 
         logger.info(f"{self.log_prefix} Submitting {len(orders)} orders to broker...")
         
-        # 4. 提交订单到券商 (Async)
-        # [Fix Task 2] Deadlock Prevention: Split logic into Prepare -> Execute (No Lock) -> Update (Lock)
+        # 4. 提交订单到券商 (Safe Async Pattern)
         orders_to_submit = []
+        
+        # Phase 1: Placeholder Registration (Optimistic Locking)
+        # Immediately register orders as PENDING_SUBMISSION to prevent double-generation in next cycle
         async with self.lock:
             for order in orders:
                 if order.id in self.active_orders:
                     logger.warning(f"{self.log_prefix} Attempted to submit duplicate order {order.id}")
                     continue
+                # Register Placeholder
+                order.status = OrderStatus.PENDING_SUBMISSION
+                self.active_orders[order.id] = order
                 orders_to_submit.append(order)
 
-        # Execute outside lock to allow callbacks (e.g., _on_fill) to acquire lock
+        # Phase 2: Network Execution (Outside Lock)
         for order in orders_to_submit:
-            price = market_prices.get(order.symbol)
+            # Use the limit price set in generate_orders, fallback to current if None
+            price = order.price if order.price else market_prices.get(order.symbol)
             try:
                 # [Task 4.2] Async execution via thread for potentially blocking broker calls
                 broker_order_id = await asyncio.to_thread(self.broker.place_order, order, price)
                 
                 async with self.lock:
-                    # 假设 place_order 成功（或至少被接受）
-                    # 注意：SimBroker 会立即将其设置为 FILLED，但 PaperBroker 不会
-                    if order.status == OrderStatus.NEW: # 如果 SimBroker 没有改变它
+                    # Update status only if it hasn't been transitioned (e.g. to FILLED) by a fast callback
+                    current_order_state = self.active_orders.get(order.id)
+                    if current_order_state and current_order_state.status == OrderStatus.PENDING_SUBMISSION:
                         order.status = OrderStatus.PENDING 
-                        
-                    self.active_orders[order.id] = order
+                        # No need to re-insert, just update object state
                 
                 logger.info(f"{self.log_prefix} Submitted order {order.id} (Broker ID: {broker_order_id})")
                 
             except Exception as e:
                 logger.error(f"{self.log_prefix} Failed to place order {order.id}: {e}")
                 async with self.lock:
-                    order.status = OrderStatus.REJECTED # 标记为本地拒绝
+                    # Revert placeholder
+                    order.status = OrderStatus.REJECTED
+                    if order.id in self.active_orders:
+                        del self.active_orders[order.id]
 
     def cancel_all_open_orders(self):
         """
         取消所有活动的订单。
         """
-        # Async context manager not strictly needed here if just iterating, but good for consistency if modifying dict
-        # But this method is sync? If called from async, wrap it.
-        # For now, let's assume it's called synchronously or we need an async version.
-        # Given the async shift, we should probably make this async too or use sync lock if safe.
-        # Let's keep it sync but warn, or assume it's called during shutdown.
         logger.info(f"{self.log_prefix} Cancelling all {len(self.active_orders)} open orders...")
         order_ids = list(self.active_orders.keys())
             
@@ -300,5 +326,4 @@ class OrderManager:
         """
         获取所有活动订单的当前状态。
         """
-        # Should technically be async or use sync lock if not awaited
         return list(self.active_orders.values())
