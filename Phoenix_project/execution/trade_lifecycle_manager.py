@@ -2,13 +2,13 @@
 交易生命周期管理器 (Trade Lifecycle Manager)
 负责跟踪从信号 -> 订单 -> 成交 -> 持仓 的整个过程。
 计算已实现和未实现的盈亏 (PnL)。
+[Beta FIX] 防止僵尸估值 (Zombie Valuation)
 """
 from typing import Dict, Optional
 from datetime import datetime
 import asyncio
 
 # FIX (E2, E4): 从核心模式导入 Order, Fill, Position, PortfolioState
-# 修正：将 'core.schemas...' 转换为 'Phoenix_project.core.schemas...'
 from Phoenix_project.core.schemas.data_schema import Order, Fill, Position, PortfolioState
 
 # 修正：将 'monitor.logging...' 转换为 'Phoenix_project.monitor.logging...'
@@ -43,7 +43,6 @@ class TradeLifecycleManager:
         try:
             logger.info(f"{self.log_prefix} initializing persistent ledger...")
             # 1. 建表 (如果不存在)
-            # 注意：在生产环境中最好使用 alembic/migrations，这里为了闭环直接执行 DDL
             await self._ensure_tables_exist()
 
             # 2. 加载状态
@@ -114,6 +113,7 @@ class TradeLifecycleManager:
     def get_current_portfolio_state(self, current_market_data: Dict[str, float]) -> PortfolioState:
         """
         根据最新的市场价格计算并返回当前的投资组合状态。
+        [Beta FIX] 增加了严格的数据完整性检查。
         :param current_market_data: Dict[symbol, current_price]
         """
         total_value = self.cash
@@ -121,13 +121,18 @@ class TradeLifecycleManager:
         # 更新持仓的市值和未实现盈亏
         for symbol, pos in self.positions.items():
             current_price = current_market_data.get(symbol)
-            if current_price:
-                pos.market_value = pos.quantity * current_price
-                pos.unrealized_pnl = (current_price - pos.average_price) * pos.quantity
-                total_value += pos.market_value
-            else:
-                # logger.debug(f"{self.log_prefix} Missing market data for {symbol}. Using stale value.")
-                total_value += pos.market_value
+            
+            # [Beta FIX] 严禁使用旧值 (Stale Value)
+            # 如果价格缺失或非正数，视为严重的数据完整性破坏，必须熔断。
+            if current_price is None or current_price <= 0:
+                error_msg = f"{self.log_prefix} CRITICAL: Missing or invalid market price for {symbol}. Cannot value portfolio."
+                logger.critical(error_msg)
+                # 抛出异常以触发上层 OrderManager 的熔断机制 (Halt Trading)
+                raise ValueError(error_msg)
+
+            pos.market_value = pos.quantity * current_price
+            pos.unrealized_pnl = (current_price - pos.average_price) * pos.quantity
+            total_value += pos.market_value
                 
         return PortfolioState(
             timestamp=datetime.utcnow(), # 实际应使用事件时间
