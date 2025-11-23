@@ -1,12 +1,12 @@
-from typing import Dict, Any, Optional # <-- [已修改]
+from typing import Dict, Any, Optional
 import numpy as np
-from .base import BaseDRLAgent # <-- [已修改]
+from .base import BaseDRLAgent
 from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.core.schemas.fusion_result import FusionResult # <-- [已添加]
+from Phoenix_project.core.schemas.fusion_result import FusionResult
 
 logger = get_logger(__name__)
 
-class RiskAgent(BaseDRLAgent): # <-- [已修改]
+class RiskAgent(BaseDRLAgent):
     """
     [MARL 重构]
     Risk 智能体，使用 RLLib 基类进行推理。
@@ -18,7 +18,7 @@ class RiskAgent(BaseDRLAgent): # <-- [已修改]
     # [已移除] __init__ 和 execute 方法。
     # 它现在继承 __init__ 和 compute_action from BaseDRLAgent。
     
-    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray: # <-- [已修改]
+    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
         """
         [任务 2.1] 格式化观察值以匹配 TradingEnv 的新 (5-d) 状态空间。
         
@@ -36,11 +36,12 @@ class RiskAgent(BaseDRLAgent): # <-- [已修改]
         price = state_data.get('price', 0.0)
 
         # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
-        if fusion_result and hasattr(fusion_result, 'sentiment_score'):
-            # [任务 1.1] 匹配 trading_env.py
-            # 假设 fusion_result 有一个数值情感得分 (例如 -1.0 到 1.0)
-            sentiment = fusion_result.sentiment_score 
-            confidence = fusion_result.confidence
+        if fusion_result:
+            # [Fix] Map L2 decision string to numeric sentiment for RL observation
+            decision_str = str(getattr(fusion_result, "decision", "HOLD")).upper()
+            score_map = {"STRONG_BUY": 1.0, "BUY": 0.5, "SELL": -0.5, "STRONG_SELL": -1.0}
+            sentiment = score_map.get(decision_str, 0.0)
+            confidence = float(getattr(fusion_result, "confidence", 0.5))
         else:
             # 如果没有 L2 结果 (例如周期开始时)，提供默认值
             sentiment = 0.0  # 中性情感
