@@ -293,7 +293,14 @@ class Orchestrator:
                 # [Task A.2] 确保使用正确的属性名
                 obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_fusion_result)
                 risk_action = self.risk_agent.compute_action(obs)
-                logger.info(f"Risk Agent Action: {risk_action}")
+                
+                # [Fix] Translate Raw DRL Output to Brake Signal
+                # If risk_action is an array/list, take the first element.
+                raw_val = risk_action[0] if (hasattr(risk_action, '__len__') and len(risk_action) > 0) else risk_action
+                
+                # Threshold check: > 0.5 implies active risk intervention (Halt)
+                risk_action = "HALT_TRADING" if float(raw_val) > 0.5 else "CONTINUE"
+                logger.info(f"Risk Agent Action (Translated): {risk_action}")
 
             # 4. Execution Agent Decision (Optional)
             exec_action = None
@@ -308,7 +315,7 @@ class Orchestrator:
                 "type": "DRL_DECISION",
                 "symbol": symbol,
                 "alpha_action": alpha_action.tolist() if hasattr(alpha_action, 'tolist') else alpha_action,
-                "risk_action": risk_action.tolist() if hasattr(risk_action, 'tolist') else risk_action,
+                "risk_action": risk_action,
                 "exec_action": exec_action.tolist() if hasattr(exec_action, 'tolist') else exec_action,
                 "timestamp": datetime.now().isoformat()
             }
