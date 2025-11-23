@@ -2,6 +2,7 @@
 # [主人喵的修复] 重建了缺失的 L1 调用接口，增加了针对 Dict Bomb 的类型防御
 
 import logging
+import uuid
 from typing import List, Dict, Any, Optional
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
@@ -59,31 +60,33 @@ class CognitiveEngine:
         logger.info(f"Starting L1 Cognition on {len(events)} events...")
         
         try:
-            # 委托给 AgentExecutor 执行 L1 Agents
-            # 假设 AgentExecutor 有 execute_l1_layer 方法，或通过 run_parallel 适配
-            # 这里为了兼容性，我们假设 execute_task 循环或批量接口存在。
-            # 如果 executor 没有专门的 execute_l1_layer，这里需要根据 executor 实际能力调整
-            # 暂时假设我们使用 executor.run_parallel 运行配置好的 L1 agents
-            
-            # *注意*: 如果 AgentExecutor API 不同，请在此处适配。
-            # 这里我们假设 Orchestrator 可能已经准备好了 task list，或者由 Engine 生成。
-            # 为了简化，我们假设 agent_executor 提供了一个高级接口，或者我们在这里生成任务。
-            
-            # [模拟] 构造任务列表
             tasks = []
-            # 这里的逻辑通常需要根据 EventDistributor 分发的事件来匹配 Agent
-            # 为了让代码跑通，我们假设 agent_executor 处理了调度细节
-            # 或者我们这里只是简单地返回一个空列表，等待具体实现
-            # 但为了修复报错，我们需要确保它返回 List[EvidenceItem]
+            # [Fix] Auto-discover L1 agents and broadcast events
+            # Identify L1 agents based on naming convention
+            l1_agents = [name for name in self.agent_executor.agents.keys() if name.startswith("l1_")]
             
-            # 实际修复：调用 executor
-            # l1_results = await self.agent_executor.run_parallel(tasks) 
-            # 由于缺少上下文中的任务生成逻辑，我们暂时返回空，但在生产中这里必须有逻辑。
-            # 既然 Orchestrator 调用了这个方法，我们先打个日志。
+            for name in l1_agents:
+                tasks.append({
+                    "agent_name": name,
+                    "task": {
+                        "task_id": f"l1_{name}_{uuid.uuid4().hex[:8]}",
+                        "content": {"events": events},
+                        "context": {}
+                    }
+                })
             
-            logger.info("Dispatching L1 tasks via AgentExecutor...")
-            # 这是一个占位符，直到 Orchestrator 传递明确的任务定义
-            l1_results = [] 
+            logger.info(f"Dispatching L1 tasks to {len(l1_agents)} agents...")
+            executor_results = await self.agent_executor.run_parallel(tasks)
+            
+            # Unpack results from Executor wrappers
+            l1_results = []
+            for res in executor_results:
+                if isinstance(res, dict) and res.get("status") == "SUCCESS":
+                    output = res.get("result")
+                    if isinstance(output, list):
+                        l1_results.extend(output)
+                    elif output:
+                        l1_results.append(output)
 
             # [防御] 数据清洗：确保只返回合法的 EvidenceItem
             valid_evidence = []
@@ -96,7 +99,14 @@ class CognitiveEngine:
                     if isinstance(res, EvidenceItem):
                         valid_evidence.append(res)
                 else:
-                    logger.warning(f"L1 Agent returned invalid type: {type(item)}")
+                    # Add fallback if item is already EvidenceItem but typed as Any
+                    try:
+                        if hasattr(item, 'model_dump'):
+                            valid_evidence.append(item)
+                        else:
+                            logger.warning(f"L1 Agent returned invalid type: {type(item)}")
+                    except:
+                         logger.warning(f"L1 Agent returned invalid type: {type(item)}")
             
             return valid_evidence
 
