@@ -89,6 +89,32 @@ class FusionAgent(L2Agent):
             logger.debug(f"[{self.agent_id}] Received LLM fusion response (raw): {response_str[:200]}...")
             response_data = json.loads(response_str)
             
+            # [Robustness] Fuzzy Parsing & Normalization
+            # 1. Map missing decision from sentiment
+            if "decision" not in response_data:
+                sentiment = response_data.get("overall_sentiment") or response_data.get("sentiment")
+                if sentiment:
+                    s_up = str(sentiment).upper()
+                    if "BULL" in s_up or "POS" in s_up:
+                        response_data["decision"] = "BUY"
+                    elif "BEAR" in s_up or "NEG" in s_up:
+                        response_data["decision"] = "SELL"
+                    else:
+                        response_data["decision"] = "HOLD"
+                else:
+                    response_data["decision"] = "HOLD"
+
+            # 2. Ensure confidence is float
+            if "confidence" in response_data:
+                try:
+                    response_data["confidence"] = float(response_data["confidence"])
+                except (ValueError, TypeError):
+                    response_data["confidence"] = 0.0
+
+            # 3. Defaults for list fields
+            if "supporting_evidence_ids" not in response_data:
+                response_data["supporting_evidence_ids"] = []
+            
             # [Time Machine] 强制使用仿真时间
             if "timestamp" not in response_data:
                 response_data["timestamp"] = state.current_time
