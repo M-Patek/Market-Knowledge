@@ -18,6 +18,7 @@ from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.core.schemas.data_schema import (
     Order, Fill, OrderStatus, PortfolioState, TargetPortfolio, Position
 )
+from Phoenix_project.core.exceptions import RiskViolationError
 
 # 修正：将 'monitor.logging...' 转换为 'Phoenix_project.monitor.logging...'
 from Phoenix_project.monitor.logging import get_logger
@@ -175,9 +176,9 @@ class OrderManager:
                 # [Task 1] Fat Finger Protection
                 expected_value = order_quantity * price
                 if abs(expected_value) > self.max_order_value:
-                    logger.warning(f"{self.log_prefix} Order value {expected_value:.2f} exceeds limit {self.max_order_value}. Truncating order.")
-                    sign = 1 if order_quantity > 0 else -1
-                    order_quantity = sign * (self.max_order_value / price)
+                    error_msg = f"Order value {expected_value:.2f} exceeds limit {self.max_order_value}."
+                    logger.critical(f"{self.log_prefix} FATAL: {error_msg}")
+                    raise RiskViolationError(error_msg)
                 
                 # 创建订单
                 new_order = Order(
@@ -260,7 +261,12 @@ class OrderManager:
         async with self.lock:
             active_orders_snapshot = self.active_orders.copy()
             
-        orders = self.generate_orders(current_portfolio, target_portfolio, market_prices, active_orders_snapshot)
+        try:
+            orders = self.generate_orders(current_portfolio, target_portfolio, market_prices, active_orders_snapshot)
+        except RiskViolationError as e:
+            logger.critical(f"{self.log_prefix} FATAL RISK VIOLATION: {e}. STOPPING ALL TRADING.")
+            self.cancel_all_open_orders()
+            return
         
         if not orders:
             logger.info(f"{self.log_prefix} No orders generated, processing complete.")
