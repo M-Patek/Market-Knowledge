@@ -3,11 +3,48 @@ Defines the Pydantic schema for the output of the L3 RiskAgent.
 
 [主人喵的修复]
 添加 RiskReport schema，供 RiskManager.evaluate_and_adjust 使用。
+[Phase 0] 添加 SignalType 和 RiskSignal 类层次结构。
 """
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List
-from datetime import datetime # [主人喵的修复] 导入 datetime
+from typing import Dict, Any, List, Optional
+from enum import Enum
+from datetime import datetime
 import uuid
+
+class SignalType(str, Enum):
+    MARKET_RISK = "market_risk"
+    CIRCUIT_BREAKER = "circuit_breaker"
+    LIQUIDITY_RISK = "liquidity_risk"
+    OPERATIONAL_RISK = "operational_risk"
+
+class RiskParameter(BaseModel):
+    name: str
+    value: Any
+    threshold: Optional[Any] = None
+
+class RiskSignal(BaseModel):
+    """Base class for risk signals detected by the Risk Manager."""
+    type: SignalType = Field(default=SignalType.MARKET_RISK)
+    description: str
+    triggers_circuit_breaker: bool = Field(default=False)
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class DrawdownSignal(RiskSignal):
+    """Signal for maximum drawdown violations."""
+    current_drawdown: float
+    max_drawdown: float
+
+class ConcentrationSignal(RiskSignal):
+    """Signal for position concentration violations."""
+    symbol: str
+    current_concentration: float
+    max_concentration: float
+
+class VolatilitySignal(RiskSignal):
+    """Signal for excessive volatility."""
+    symbol: str
+    current_volatility: float
+    volatility_threshold: float
 
 class RiskAdjustment(BaseModel):
     """
