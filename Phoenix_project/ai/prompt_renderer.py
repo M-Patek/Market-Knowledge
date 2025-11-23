@@ -1,7 +1,7 @@
 import json
 import os
 from typing import Dict, Any, Union, List
-from string import Template # [任务 B.3] 导入 Template
+# [Task B.3] Removed string.Template
 
 from Phoenix_project.ai.prompt_manager import PromptManager
 from Phoenix_project.monitor.logging import get_logger
@@ -83,8 +83,8 @@ class PromptRenderer:
         # Case 1: 模板部分是字符串 -> 渲染它
         if isinstance(template_part, str):
             try:
-                # 使用 safe_substitute 避免因缺少键而引发 KeyError
-                return Template(template_part).safe_substitute(context)
+                # [Fix B.4] Switch to .format() to match {variable} syntax in JSON templates
+                return template_part.format(**context)
             except Exception as e:
                 logger.warning(f"Error substituting template string: {e}")
                 return template_part # 返回原始字符串
