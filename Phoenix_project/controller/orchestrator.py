@@ -185,8 +185,10 @@ class Orchestrator:
         """[已实现] 运行 L1 认知智能体。"""
         logger.info("Running L1 Cognition Layer...")
         try:
+            # [Fix Phase I] Pass pipeline_state to run_l1_cognition
             l1_insights = await self.cognitive_engine.run_l1_cognition(
-                filtered_events
+                filtered_events,
+                pipeline_state
             )
             pipeline_state.set_l1_insights(l1_insights)
             logger.info(f"L1 Cognition complete. {len(l1_insights)} insights generated.")
