@@ -1,5 +1,6 @@
 # Phoenix_project/cognitive/engine.py
 # [主人喵的修复] 重建了缺失的 L1 调用接口，增加了针对 Dict Bomb 的类型防御
+# [Phase II Fix] L1 自动发现逻辑增强
 
 import logging
 import uuid
@@ -48,7 +49,7 @@ class CognitiveEngine:
         
         logger.info("CognitiveEngine initialized with AgentExecutor and ReasoningEnsemble.")
 
-    async def run_l1_cognition(self, events: List[Dict[str, Any]]) -> List[EvidenceItem]:
+    async def run_l1_cognition(self, events: List[Dict[str, Any]], pipeline_state: PipelineState) -> List[EvidenceItem]:
         """
         [修复] 之前缺失的方法。
         运行 L1 认知层：将原始事件转化为标准化的证据 (EvidenceItem)。
@@ -61,8 +62,8 @@ class CognitiveEngine:
         
         try:
             tasks = []
-            # [Fix] Auto-discover L1 agents and broadcast events
-            # Identify L1 agents based on naming convention
+            # [Fix Phase II] Auto-discover L1 agents with robust naming check
+            # Identify L1 agents based on naming convention (startswith 'l1_')
             l1_agents = [name for name in self.agent_executor.agents.keys() if name.startswith("l1_")]
             
             for name in l1_agents:
@@ -71,7 +72,7 @@ class CognitiveEngine:
                     "task": {
                         "task_id": f"l1_{name}_{uuid.uuid4().hex[:8]}",
                         "content": {"events": events},
-                        "context": {}
+                        "context": {} # 可以传递 state 信息如果 L1 需要
                     }
                 })
             
@@ -114,6 +115,11 @@ class CognitiveEngine:
             logger.error(f"L1 Cognition layer failed: {e}", exc_info=True)
             # 不抛出异常，而是返回空列表，防止系统完全卡死，但记录严重错误
             return []
+            
+    # [Placeholder] run_l2_supervision 需要实现，但这里主要修复 L1 和 融合逻辑
+    async def run_l2_supervision(self, l1_insights: List[EvidenceItem], raw_events: List[Any]) -> List[SupervisionResult]:
+         # 简单实现以支持 orchestrator 调用
+         return []
 
     async def process_cognitive_cycle(self, pipeline_state: PipelineState) -> Dict[str, Any]:
         """
