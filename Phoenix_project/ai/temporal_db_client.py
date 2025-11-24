@@ -205,21 +205,40 @@ class TemporalDBClient:
                 }
             }
             
-            # 使用 size=10000 暂时满足需求，后续可升级为 Scroll API
-            response = await self.es.search(
-                index=self.index_name,
-                query=query,
-                size=10000,
-                sort=[{"timestamp": "asc"}],
-                _source=columns if columns else True
-            )
+            # [Task 2.2] Implement Pagination using search_after to prevent truncation
+            all_source_data = []
+            sort_criteria = [{"timestamp": "asc"}, {"_id": "asc"}] # Use _id as tie-breaker
+            last_sort_values = None
+            batch_size = 1000
             
-            hits = response.get('hits', {}).get('hits', [])
-            if not hits:
-                return pd.DataFrame()
+            while True:
+                kwargs = {
+                    "index": self.index_name, 
+                    "query": query, 
+                    "size": batch_size,
+                    "sort": sort_criteria, 
+                    "_source": columns if columns else True
+                }
+                if last_sort_values:
+                    kwargs["search_after"] = last_sort_values
+
+                response = await self.es.search(**kwargs)
+                hits = response.get('hits', {}).get('hits', [])
                 
-            data = [hit['_source'] for hit in hits]
-            df = pd.DataFrame(data)
+                if not hits:
+                    break
+                    
+                for hit in hits:
+                    all_source_data.append(hit['_source'])
+                
+                last_sort_values = hits[-1]['sort']
+                if len(hits) < batch_size:
+                    break
+
+            if not all_source_data:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(all_source_data)
             
             if 'timestamp' in df.columns:
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -273,7 +292,9 @@ class TemporalDBClient:
                     doc['timestamp'] = doc['timestamp'].isoformat()
                 actions.append({"_index": self.index_name, "_source": doc})
             
-            await async_bulk(self.es, actions, refresh=True)
+            # [Task 2.2] Optimize: Remove refresh=True per bulk, do it once manually
+            await async_bulk(self.es, actions)
+            await self.es.indices.refresh(index=self.index_name)
             return True
         except Exception as e:
             logger.error(f"Error writing dataframe to TemporalDB: {e}", exc_info=True)
