@@ -29,6 +29,7 @@ class TradeLifecycleManager:
         self.realized_pnl = 0.0
         self.tabular_db = tabular_db
         self.log_prefix = "TradeLifecycleManager:"
+        self._lock = asyncio.Lock()
         logger.info(f"{self.log_prefix} Initialized. DB Connected: {self.tabular_db is not None}")
 
     async def initialize(self):
@@ -148,93 +149,109 @@ class TradeLifecycleManager:
         [Task 4.1] 异步处理 Fill 事件。
         包含幂等性检查和持久化。
         """
-        # 1. 幂等性检查
-        if await self._is_fill_processed(fill.id):
-            logger.warning(f"{self.log_prefix} Skipping duplicate fill {fill.id}")
-            return
+        async with self._lock:
+            # 1. 幂等性检查
+            if await self._is_fill_processed(fill.id):
+                logger.warning(f"{self.log_prefix} Skipping duplicate fill {fill.id}")
+                return
 
-        logger.info(f"{self.log_prefix} Processing fill for {fill.symbol}: {fill.quantity} @ {fill.price}")
-        
-        # [Task 3] Atomic Transaction: Phase 1 - Pre-calculate new state (Shadow State)
-        # Do NOT modify self attributes yet.
-        trade_cost = fill.price * fill.quantity
-        new_cash = self.cash - trade_cost - fill.commission
-        new_realized_pnl = self.realized_pnl
-        
-        # 3. 计算新持仓状态
-        current_pos = self.positions.get(
-            fill.symbol,
-            Position(symbol=fill.symbol, quantity=0.0, average_price=0.0, market_value=0.0, unrealized_pnl=0.0)
-        )
-        
-        current_qty = current_pos.quantity
-        current_avg_price = current_pos.average_price
-        
-        new_qty = current_qty + fill.quantity
-        new_pos: Optional[Position] = None
-        
-        if abs(new_qty) < 1e-6:
-            # 仓位已平仓
-            logger.info(f"{self.log_prefix} Position closed for {fill.symbol}")
-            # 计算已实现 PnL
-            pnl = (fill.price - current_avg_price) * (-current_qty) # -current_qty 是平仓的数量
-            new_realized_pnl += pnl
-            new_pos = None # Mark for deletion
+            logger.info(f"{self.log_prefix} Processing fill for {fill.symbol}: {fill.quantity} @ {fill.price}")
             
-        elif current_qty * fill.quantity >= 0: 
-            # 增加仓位 (同向交易)
-            new_avg_price = ((current_avg_price * current_qty) + (fill.price * fill.quantity)) / new_qty
+            # [Task 3] Atomic Transaction: Phase 1 - Pre-calculate new state (Shadow State)
+            # Do NOT modify self attributes yet.
+            trade_cost = fill.price * fill.quantity
+            new_cash = self.cash - trade_cost - fill.commission
+            new_realized_pnl = self.realized_pnl
             
-            # Create new position object (immutable style preferred)
-            new_pos = current_pos.model_copy()
-            new_pos.quantity = new_qty
-            new_pos.average_price = new_avg_price
-            logger.info(f"{self.log_prefix} Position updated for {fill.symbol}: New Qty={new_qty}, New AvgPx={new_avg_price}")
+            # 3. 计算新持仓状态
+            current_pos = self.positions.get(
+                fill.symbol,
+                Position(symbol=fill.symbol, quantity=0.0, average_price=0.0, market_value=0.0, unrealized_pnl=0.0)
+            )
+            
+            current_qty = current_pos.quantity
+            current_avg_price = current_pos.average_price
+            
+            new_qty = current_qty + fill.quantity
+            new_pos: Optional[Position] = None
+            
+            if abs(new_qty) < 1e-6:
+                # 仓位已平仓
+                logger.info(f"{self.log_prefix} Position closed for {fill.symbol}")
+                # 计算已实现 PnL (Fix: Direction specific)
+                qty_closed = abs(current_qty)
+                if current_qty > 0:
+                    pnl = (fill.price - current_avg_price) * qty_closed
+                else:
+                    pnl = (current_avg_price - fill.price) * qty_closed
 
-        else:
-            # 减少仓位或反转仓位 (异向交易)
-            if abs(fill.quantity) <= abs(current_qty):
-                # 减少仓位
-                pnl = (fill.price - current_avg_price) * abs(fill.quantity)
                 new_realized_pnl += pnl
+                new_pos = None # Mark for deletion
                 
+            elif current_qty * fill.quantity >= 0: 
+                # 增加仓位 (同向交易)
+                new_avg_price = ((current_avg_price * current_qty) + (fill.price * fill.quantity)) / new_qty
+                
+                # Create new position object (immutable style preferred)
                 new_pos = current_pos.model_copy()
                 new_pos.quantity = new_qty
-                # 平均价格不变
-                logger.info(f"{self.log_prefix} Position reduced for {fill.symbol}: New Qty={new_qty}, Realized PnL={pnl}")
+                new_pos.average_price = new_avg_price
+                logger.info(f"{self.log_prefix} Position updated for {fill.symbol}: New Qty={new_qty}, New AvgPx={new_avg_price}")
+
             else:
-                # 反转仓位 (e.g., 从 +100 到 -50)
-                # 1. 平掉所有旧仓位
-                pnl = (fill.price - current_avg_price) * abs(current_qty)
-                new_realized_pnl += pnl
-                
-                # 2. 建立新仓位
-                new_pos = current_pos.model_copy()
-                new_pos.quantity = new_qty
-                new_pos.average_price = fill.price # 新仓位的成本价是当前成交价
-                logger.info(f"{self.log_prefix} Position reversed for {fill.symbol}: New Qty={new_qty}, Realized PnL={pnl}")
+                # 减少仓位或反转仓位 (异向交易)
+                if abs(fill.quantity) <= abs(current_qty):
+                    # 减少仓位
+                    qty_closed = abs(fill.quantity)
+                    if current_qty > 0:
+                        pnl = (fill.price - current_avg_price) * qty_closed
+                    else:
+                        pnl = (current_avg_price - fill.price) * qty_closed
+                    
+                    new_realized_pnl += pnl
+                    
+                    new_pos = current_pos.model_copy()
+                    new_pos.quantity = new_qty
+                    # 平均价格不变
+                    logger.info(f"{self.log_prefix} Position reduced for {fill.symbol}: New Qty={new_qty}, Realized PnL={pnl}")
+                else:
+                    # 反转仓位 (e.g., 从 +100 到 -50)
+                    # 1. 平掉所有旧仓位
+                    qty_closed = abs(current_qty)
+                    if current_qty > 0:
+                        pnl = (fill.price - current_avg_price) * qty_closed
+                    else:
+                        pnl = (current_avg_price - fill.price) * qty_closed
+                    
+                    new_realized_pnl += pnl
+                    
+                    # 2. 建立新仓位
+                    new_pos = current_pos.model_copy()
+                    new_pos.quantity = new_qty
+                    new_pos.average_price = fill.price # 新仓位的成本价是当前成交价
+                    logger.info(f"{self.log_prefix} Position reversed for {fill.symbol}: New Qty={new_qty}, Realized PnL={pnl}")
 
-        # [Task 3] Atomic Transaction: Phase 2 - DB Persistence (Write-Ahead)
-        if self.tabular_db:
-            try:
-                # Pass EXPLICIT calculated values, not self.*
-                await self._persist_transaction(new_cash, new_realized_pnl, new_pos, fill.symbol)
-                await self._record_fill(fill)
-            except Exception as e:
-                # CRITICAL: DB write failed. Do NOT update memory. Halt system.
-                logger.critical(f"{self.log_prefix} LEDGER WRITE FAILED. HALTING to prevent split-brain. Error: {e}")
-                raise
+            # [Task 3] Atomic Transaction: Phase 2 - DB Persistence (Write-Ahead)
+            if self.tabular_db:
+                try:
+                    # Pass EXPLICIT calculated values, not self.*
+                    await self._persist_transaction(new_cash, new_realized_pnl, new_pos, fill.symbol)
+                    await self._record_fill(fill)
+                except Exception as e:
+                    # CRITICAL: DB write failed. Do NOT update memory. Halt system.
+                    logger.critical(f"{self.log_prefix} LEDGER WRITE FAILED. HALTING to prevent split-brain. Error: {e}")
+                    raise
 
-        # [Task 3] Atomic Transaction: Phase 3 - Memory Commit
-        # Only reached if DB write succeeded (or if DB is disabled)
-        self.cash = new_cash
-        self.realized_pnl = new_realized_pnl
-        
-        if new_pos:
-            self.positions[fill.symbol] = new_pos
-        else:
-            # Safe removal
-            self.positions.pop(fill.symbol, None)
+            # [Task 3] Atomic Transaction: Phase 3 - Memory Commit
+            # Only reached if DB write succeeded (or if DB is disabled)
+            self.cash = new_cash
+            self.realized_pnl = new_realized_pnl
+            
+            if new_pos:
+                self.positions[fill.symbol] = new_pos
+            else:
+                # Safe removal
+                self.positions.pop(fill.symbol, None)
 
     async def _is_fill_processed(self, fill_id: str) -> bool:
         """检查 Fill ID 是否已存在于数据库。"""
