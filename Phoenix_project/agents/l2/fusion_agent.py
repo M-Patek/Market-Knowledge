@@ -104,6 +104,16 @@ class FusionAgent(L2Agent):
                 else:
                     response_data["decision"] = "HOLD"
 
+            # [Fix Phase II] Synthesize numeric sentiment from decision if missing
+            # 防止 L3 看到 "0.0" 的情感值即使决策是 "STRONG BUY"
+            if "sentiment" not in response_data:
+                d = response_data.get("decision", "HOLD").upper()
+                if "STRONG_BUY" in d: response_data["sentiment"] = 1.0
+                elif "BUY" in d: response_data["sentiment"] = 0.5
+                elif "STRONG_SELL" in d: response_data["sentiment"] = -1.0
+                elif "SELL" in d: response_data["sentiment"] = -0.5
+                else: response_data["sentiment"] = 0.0
+
             # 2. Ensure confidence is float
             if "confidence" in response_data:
                 try:
