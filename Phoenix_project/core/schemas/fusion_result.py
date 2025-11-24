@@ -18,6 +18,7 @@ class FusionResult(BaseModel):
     
     decision: str = Field(..., description="The final, unified decision (e.g., 'STRONG_BUY', 'SELL', 'HOLD', 'NEUTRAL').")
     confidence: float = Field(..., description="The overall confidence in this unified decision (0.0 to 1.0).", ge=0.0, le=1.0)
+    sentiment_score: float = Field(default=0.0, description="Normalized sentiment score (-1.0 to 1.0) for numerical consumption by L3.", ge=-1.0, le=1.0)
     
     reasoning: str = Field(..., description="A summary of the reasoning, including how L1 evidence was synthesized and conflicts resolved.")
     uncertainty: float = Field(..., description="A quantified score of the overall uncertainty in the decision.", ge=0.0, le=1.0)
@@ -27,4 +28,4 @@ class FusionResult(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Other metadata, e.g., uncertainty dimensions, source L2 criticism IDs.")
 
     class Config:
-        frozen = True
+        frozen = False
