@@ -2,15 +2,16 @@
 # [主人喵的修复 11.11] 实现了 FIXME (TBD 风险管理逻辑)。
 # [主人喵的修复 11.12] 实现了 TBD (从 DataManager 加载初始投资组合)。
 # [Code Opt Expert Fix] Task 3: Clean Architecture / Remove ContextBus Communication
+# [Phase III Fix] Risk Gating & Signal Mapping
 
 import logging
 from omegaconf import DictConfig
-from cognitive.risk_manager import RiskManager
+from Phoenix_project.cognitive.risk_manager import RiskManager
 from Phoenix_project.sizing.base import IPositionSizer
-from core.pipeline_state import PipelineState
-from core.schemas.risk_schema import RiskReport
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.risk_schema import RiskReport
 from Phoenix_project.core.schemas.data_schema import TargetPortfolio, TargetPosition
-from context_bus import ContextBus
+from Phoenix_project.context_bus import ContextBus
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +62,38 @@ class PortfolioConstructor:
         """
         logger.info("Starting portfolio construction...")
         
+        # [Phase 3 Fix] Risk Gate: Check L3 Risk Decision
+        # 如果 L3 Risk Agent 发出熔断指令，立即中止
+        if pipeline_state.l3_decision:
+            risk_action = pipeline_state.l3_decision.get("risk_action", "CONTINUE")
+            if risk_action == "HALT_TRADING":
+                logger.warning("Portfolio Construction ABORTED by L3 Risk Agent (HALT_TRADING).")
+                return None
+        
         # 1. 获取 L3 Alpha 信号 (目标权重)
         alpha_signals = pipeline_state.l3_alpha_signal
+        
         if not alpha_signals:
-            logger.warning("No L3 alpha signals (target weights) found in pipeline_state. No construction possible.")
-            # (我们仍然发布一个空的目标组合吗？还是什么都不做？)
-            # (最好是什么都不做)
+            # [Phase 3 Fix] Signal Mapping: Try to extract from l3_decision
+            # 如果没有明确的 alpha_signal 字典，尝试从 decision 中提取原始动作
+            if pipeline_state.l3_decision and pipeline_state.l3_decision.get("alpha_action") is not None:
+                l3_d = pipeline_state.l3_decision
+                sym = l3_d.get("symbol")
+                raw_act = l3_d.get("alpha_action")
+                
+                # Handle list or scalar
+                # 通常 Alpha Agent 输出一个连续值 (权重)
+                weight = raw_act[0] if isinstance(raw_act, list) and len(raw_act) > 0 else raw_act
+                
+                try:
+                    # 将单一信号映射为 {Symbol: Weight}
+                    alpha_signals = {sym: float(weight)}
+                    logger.info(f"Mapped L3 Alpha Signal: {sym} -> {weight}")
+                except (ValueError, TypeError):
+                    logger.warning(f"Failed to map L3 alpha action: {raw_act}")
+
+        if not alpha_signals:
+            logger.warning("No L3 alpha signals (target weights) found. No construction possible.")
             return None
 
         # 2. 获取当前市场数据 (用于风险评估和规模计算)
