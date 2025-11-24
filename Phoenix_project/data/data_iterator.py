@@ -5,7 +5,7 @@
 import pandas as pd
 import asyncio
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Generator, Optional # 修复：导入 Optional
+from typing import List, Dict, Any, Optional # 修复：导入 Optional
 
 # FIX (E1): 导入统一后的核心模式
 # 修正：将 'core.schemas...' 转换为 'Phoenix_project.core.schemas...'
@@ -108,105 +108,11 @@ class DataIterator:
 
         self.current_chunk_end = end_cursor
 
-    def __iter__(self):
+    def __aiter__(self):
+        """ 
+        异步迭代器协议入口 (Fix 1.2: Standard Sync def) 
+        Returns self as the async iterator.
         """
-        [修复] __iter__ 现在返回 self，因为 __next__ 中有迭代逻辑。
-        """
-        if self.current_time is None or self.date_range is None:
-             raise RuntimeError("DataIterator must be configured with setup() before iteration.")
-             
-        # 重置迭代器
-        self.current_time = self.start_date
-        self._internal_date_iterator = iter(self.date_range)
-        return self
-
-    def __next__(self) -> Generator[Dict[str, List[Any]], None, None]:
-        """
-        [修复] __next__ 现在包含迭代逻辑。
-        [Sync Compatibility] Includes blocking bridge for async loading.
-        """
-        
-        try:
-            # 1. 获取下一个时间戳 "tick"
-            current_tick = next(self._internal_date_iterator)
-            self.current_time = current_tick
-            
-            # [Memory Opt] Check if we crossed the chunk boundary
-            if self.current_time > self.current_chunk_end:
-                new_end = min(self.current_time + self.chunk_size, self.end_date)
-                
-                # Sync Bridge: Determine how to run the async load
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        # Dangerous: Running sync blocking code inside async loop.
-                        # Ideally, user should use __anext__. But for compatibility:
-                        import threading
-                        if threading.current_thread() is threading.main_thread():
-                             # We can't block main thread loop. Warn user.
-                             print("WARNING: Using synchronous __next__ inside async loop triggers blocking I/O.")
-                             # This might freeze if not handled, but we assume external sync runner
-                    else:
-                        loop.run_until_complete(self._load_data_chunk(self.current_time, new_end))
-                except RuntimeError:
-                    # No event loop, safe to run
-                    asyncio.run(self._load_data_chunk(self.current_time, new_end))
-
-        except StopIteration:
-            raise StopIteration # 迭代结束
-
-        # 2. 准备该 "tick" 的数据批次
-        batch_data = {
-            "timestamp": self.current_time, # [修复] 包含当前时间戳
-            "market_data": [],
-            "news_data": []
-        }
-        
-        # 3. 检索市场数据
-        # (我们查找在 [current_tick - step, current_tick] 之间的数据)
-        window_start = self.current_time - self.step
-        
-        for symbol, df in self.market_data_iters.items():
-            # 修复：使用 .loc 进行基于时间戳的切片
-            data_slice = df.loc[window_start:self.current_time]
-            if not data_slice.empty:
-                # (我们只取这个窗口中的最后一条记录，以模拟 "tick")
-                latest_row = data_slice.iloc[-1]
-                
-                batch_data["market_data"].append(
-                    MarketData(
-                        symbol=symbol,
-                        timestamp=latest_row.name, # 索引是时间戳
-                        open=latest_row['open'],
-                        high=latest_row['high'],
-                        low=latest_row['low'],
-                        close=latest_row['close'],
-                        volume=latest_row['volume']
-                    )
-                )
-
-        # 4. 检索新闻数据
-        if self.news_data is not None:
-            # 修复：使用 .loc 进行基于时间戳的切片
-            news_slice = self.news_data.loc[window_start:self.current_time]
-            if not news_slice.empty:
-                for ts, row in news_slice.iterrows():
-                    batch_data["news_data"].append(
-                        NewsData(
-                            id=row.get('id', str(ts)),
-                            source=row.get('source'),
-                            timestamp=ts,
-                            symbols=row.get('symbols', []),
-                            content=row.get('content'),
-                            headline=row.get('headline')
-                        )
-                    )
-        
-        # 5. 始终 yield，即使批次为空 (模拟时间的流逝)
-        return batch_data
-    
-    async def __aiter__(self):
-        """ 异步迭代器 (包装同步迭代器) """
         if self.current_time is None or self.date_range is None:
              raise RuntimeError("DataIterator must be configured with setup() before iteration.")
              
