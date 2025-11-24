@@ -272,25 +272,43 @@ class DataManager:
         
         cached = self._get_from_cache(cache_key)
         if cached:
-            return FundamentalData(**cached)
+            data = FundamentalData(**cached)
+            # [Task 2.1] Time Barrier: Invalidate cache if it contains future data relative to sim time
+            if self._simulation_time and data.timestamp > self._simulation_time:
+                logger.debug(f"Cache invalidated for {symbol}: Future data detected.")
+            else:
+                return data
 
         # 从表格数据库 (Tabular DB) 获取
         logger.info(f"Fetching fundamentals for {symbol} from TabularDB.")
         try:
-            # 使用 SQL agent 查询
-            query = f"Find the latest fundamental data for {symbol}, including market cap, P/E ratio, and sector."
+            # [Task 2.1] Prevent Time Travel: Use structured SQL with time barrier
+            cutoff_time = self.get_current_time()
+            safe_symbol = symbol.replace("'", "''") # Basic Input Sanitization
+            
+            query = f"""
+                SELECT * FROM fundamentals 
+                WHERE symbol = '{safe_symbol}' 
+                AND timestamp <= '{cutoff_time}' 
+                ORDER BY timestamp DESC 
+                LIMIT 1
+            """
+            
             result = await self.tabular_db.query(query)
             
-            if result.get("results"):
-                # 假设 agent 返回了所需的数据
+            if result and result.get("results"):
                 fund_data_dict = result["results"][0]
                 fund_data = FundamentalData(
                     symbol=symbol,
-                    timestamp=self.get_current_time(), # [Time Machine] 使用统一时间
+                    # Use actual data timestamp, fallback to cutoff only if missing
+                    timestamp=fund_data_dict.get("timestamp") or cutoff_time,
                     market_cap=fund_data_dict.get("market_cap"),
                     pe_ratio=fund_data_dict.get("pe_ratio"),
                     sector=fund_data_dict.get("sector"),
-                    #... 其他字段
+                    industry=fund_data_dict.get("industry"),
+                    dividend_yield=fund_data_dict.get("dividend_yield"),
+                    eps=fund_data_dict.get("eps"),
+                    beta=fund_data_dict.get("beta")
                 )
                 self._set_to_cache(cache_key, fund_data)
                 return fund_data
