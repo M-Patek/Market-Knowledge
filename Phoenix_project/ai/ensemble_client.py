@@ -4,7 +4,6 @@ AI 集成客户端
 """
 import asyncio 
 from typing import List, Dict, Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import json
 from datetime import datetime
@@ -123,15 +122,14 @@ class EnsembleClient:
             logger.error(f"{self.log_prefix} run_chain_structured: JSON parse failed: {e}. Text: {response_text}")
             return None
 
-    # --- V2 逻辑 (同步执行, 内部使用线程池) ---
+    # --- V2 逻辑 (异步执行) ---
     
-    def execute_ensemble_v2(self, state: PipelineState) -> List[AgentDecision]:
+    async def execute_ensemble_v2(self, state: PipelineState) -> List[AgentDecision]:
         """
         (V2) 执行基于 Python 类的智能体集成。
-        这是一个同步方法，它在内部使用 ThreadPoolExecutor 来实现并行。
+        [Refactor 1.3] Async implementation using asyncio.gather.
         """
         tasks = []
-        results = []
         
         # 仅从配置中获取 V2 分析师智能体的 *名称*
         analyst_agents = [
@@ -141,40 +139,34 @@ class EnsembleClient:
 
         logger.info(f"{self.log_prefix} Executing ensemble V2 with {len(analyst_agents)} agents...")
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交 V2 任务
-            for agent_config in analyst_agents:
-                agent_name = agent_config["name"]
-                
-                tasks.append(
-                    executor.submit(
-                        self._run_agent_inference_v2,
-                        state=state,
-                        agent_name=agent_name
-                    )
-                )
+        for agent_config in analyst_agents:
+            agent_name = agent_config["name"]
+            tasks.append(
+                self._run_agent_inference_v2(state, agent_name)
+            )
 
-            # 收集 V2 结果
-            for future in as_completed(tasks):
-                try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                except Exception as e:
-                    logger.error(f"{self.log_prefix} Agent inference V2 failed: {e}", exc_info=True)
+        # Gather results with error handling
+        results_raw = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        results = []
+        for res in results_raw:
+            if isinstance(res, Exception):
+                logger.error(f"{self.log_prefix} Agent inference V2 failed: {res}")
+            elif res:
+                results.append(res)
                     
         logger.info(f"{self.log_prefix} Ensemble execution V2 finished. Received {len(results)} decisions.")
         return results
 
-    def _run_agent_inference_v2(self, state: PipelineState, agent_name: str) -> Optional[AgentDecision]:
-        """ (V2) 运行单个基于 Python 的智能体 (同步) """
+    async def _run_agent_inference_v2(self, state: PipelineState, agent_name: str) -> Optional[AgentDecision]:
+        """ (V2) Run single python-based agent (Async Wrapper). """
         try:
             start_time = time.time()
             
             # --- (FIX 1.3) 移除内部导入，使用注入的 registry ---
             # from Phoenix_project.registry import registry 
             # agent_instance = registry.resolve(agent_name)
-            agent_instance = self.global_registry.resolve(agent_name)
+            agent_instance = self.global_registry.get_component(agent_name)
             # --- (FIX 1.3 结束) ---
             
             if not agent_instance:
@@ -186,7 +178,8 @@ class EnsembleClient:
                 logger.error(f"{self.log_prefix} Agent '{agent_name}' (V2) has no 'run' method.")
                 return None
 
-            decision: AgentDecision = agent_instance.run(state)
+            # Run in thread to avoid blocking event loop if sync
+            decision: AgentDecision = await asyncio.to_thread(agent_instance.run, state)
             
             duration = time.time() - start_time
             logger.info(f"{self.log_prefix} Agent '{agent_name}' (V2) completed in {duration:.2f}s")
