@@ -12,7 +12,7 @@ from collections import deque
 from datetime import datetime, timedelta
 import asyncio
 import numpy as np 
-import redis  # type: ignore
+import redis.asyncio as redis  # type: ignore
 
 from ..core.schemas.data_schema import MarketData, Position, Portfolio
 from ..core.schemas.risk_schema import (
@@ -64,31 +64,32 @@ class RiskManager:
         )
         self.volatility_threshold = self.config.get("volatility_threshold", 0.05)
         self.volatility_window = self.config.get("volatility_window", 30) # 用于计算标准差的窗口大小
+        # [Task 3.3] Annualization factor (e.g., 252 for daily, 252*390 for minute)
+        self.frequency_factor = self.config.get("frequency_factor", 252)
 
         # 内部状态
         self.current_equity: float = initial_capital
         # [Task 5] Load persistent circuit breaker state
-        self.circuit_breaker_tripped: bool = self._load_circuit_breaker_state()
+        self.circuit_breaker_tripped: bool = False # Loaded in initialize()
         self.active_signals: List[RiskSignal] = []
 
         # OPTIMIZED: 从 Redis 加载持久化的峰值权益 (peak_equity)
         # 替换原有的 TODO
-        self.peak_equity: float = self._load_peak_equity()
+        self.peak_equity: float = initial_capital # Loaded in initialize()
 
         # OPTIMIZED: 为波动性计算保留价格历史
         # 使用 deque 实现一个高效的滚动窗口
         self.price_history: Dict[str, deque] = {} # Key: symbol, Value: deque of prices
 
         logger.info("RiskManager initialized.")
-        logger.info(f"Loaded Peak Equity: {self.peak_equity}")
-        logger.info(f"Circuit Breaker State: {'TRIPPED' if self.circuit_breaker_tripped else 'OK'}")
         logger.info(f"Max Drawdown: {self.max_drawdown_pct * 100}%")
         logger.info(f"Max Concentration: {self.max_position_concentration_pct * 100}%")
 
-    def _load_circuit_breaker_state(self) -> bool:
+    async def _load_circuit_breaker_state(self) -> bool:
         """[Task 5] Loads circuit breaker state from Redis."""
         try:
-            state = self.redis_client.get("phoenix:risk:halted")
+            if not self.redis_client: return False
+            state = await self.redis_client.get("phoenix:risk:halted")
             return bool(int(state)) if state else False
         except Exception as e:
             logger.error(f"Failed to load circuit breaker state: {e}")
@@ -98,6 +99,12 @@ class RiskManager:
         """
         [Task 5] Cold-start Warm-up: Backfill price history for volatility checks.
         """
+        # Load persistent state asynchronously
+        self.circuit_breaker_tripped = await self._load_circuit_breaker_state()
+        self.peak_equity = await self._load_peak_equity()
+        logger.info(f"Loaded Peak Equity: {self.peak_equity}")
+        logger.info(f"Circuit Breaker State: {'TRIPPED' if self.circuit_breaker_tripped else 'OK'}")
+
         if not self.data_manager:
             logger.warning("DataManager not provided. Skipping RiskManager warm-up.")
             return
@@ -125,12 +132,13 @@ class RiskManager:
         await asyncio.gather(*[_fetch_and_fill(s) for s in symbols])
         logger.info(f"RiskManager warm-up complete.")
 
-    def _load_peak_equity(self) -> float:
+    async def _load_peak_equity(self) -> float:
         """
         OPTIMIZED: Loads the peak equity from persistent storage (Redis).
         """
         try:
-            peak_equity_raw = self.redis_client.get("phoenix:risk:peak_equity")
+            if not self.redis_client: return self.initial_capital
+            peak_equity_raw = await self.redis_client.get("phoenix:risk:peak_equity")
             if peak_equity_raw:
                 peak_equity = float(peak_equity_raw)
                 logger.info(f"Loaded peak_equity from Redis: {peak_equity}")
@@ -142,12 +150,13 @@ class RiskManager:
             logger.error(f"Failed to load peak_equity from Redis: {e}. Defaulting.")
             return self.initial_capital
 
-    def _save_peak_equity(self):
+    async def _save_peak_equity(self):
         """
         OPTIMIZED: Saves the current peak equity to persistent storage (Redis).
         """
         try:
-            self.redis_client.set("phoenix:risk:peak_equity", self.peak_equity)
+            if self.redis_client:
+                await self.redis_client.set("phoenix:risk:peak_equity", self.peak_equity)
         except Exception as e:
             logger.error(f"Failed to save peak_equity to Redis: {e}")
 
@@ -185,7 +194,7 @@ class RiskManager:
         logger.debug(f"Pre-trade check passed for {proposed_position.symbol}")
         return signals
 
-    def check_post_trade(self, portfolio: Portfolio) -> List[RiskSignal]:
+    async def check_post_trade(self, portfolio: Portfolio) -> List[RiskSignal]:
         """
         Checks risk after trades have been executed and the portfolio updated.
         """
@@ -195,7 +204,7 @@ class RiskManager:
         self.active_signals = []
 
         # 1. 更新权益并检查回撤
-        self.update_portfolio_value(portfolio.total_value)
+        await self.update_portfolio_value(portfolio.total_value)
         drawdown_signal = self.check_drawdown()
         if drawdown_signal:
             self.active_signals.append(drawdown_signal)
@@ -205,13 +214,13 @@ class RiskManager:
                 f"Post-trade risk violations detected: {self.active_signals}"
             )
             if any(s.triggers_circuit_breaker for s in self.active_signals):
-                self.trip_circuit_breaker(
+                await self.trip_circuit_breaker(
                     f"Violation: {self.active_signals[0].description}"
                 )
 
         return self.active_signals
 
-    def on_market_data(self, market_data: MarketData) -> Optional[RiskSignal]:
+    async def on_market_data(self, market_data: MarketData) -> Optional[RiskSignal]:
         """
         Processes real-time market data to check for dynamic risks.
         """
@@ -225,12 +234,12 @@ class RiskManager:
             # 可以在此处决定是否将波动性信号添加到 active_signals
             # 或触发熔断
             if vol_signal.triggers_circuit_breaker:
-                self.trip_circuit_breaker(vol_signal.description)
+                await self.trip_circuit_breaker(vol_signal.description)
             return vol_signal
         
         return None
 
-    def update_portfolio_value(self, new_equity: float):
+    async def update_portfolio_value(self, new_equity: float):
         """
         Updates the current equity and peak equity.
         """
@@ -238,7 +247,7 @@ class RiskManager:
         if self.current_equity > self.peak_equity:
             self.peak_equity = self.current_equity
             # OPTIMIZED: 持久化更新后的 peak_equity
-            self._save_peak_equity()
+            await self._save_peak_equity()
         
         logger.debug(
             f"Equity updated: Current={self.current_equity}, Peak={self.peak_equity}"
@@ -339,8 +348,9 @@ class RiskManager:
             # (prices[1:] - prices[:-1]) / prices[:-1]
             log_returns = np.log(prices[1:] / prices[:-1])
             
-            # 年化波动率 (假设数据是每日的)
-            current_volatility = np.std(log_returns)
+            # [Task 3.3] Annualize volatility: std * sqrt(frequency)
+            # Prevents underestimation in high-frequency contexts
+            current_volatility = np.std(log_returns) * np.sqrt(self.frequency_factor)
 
             # 4. 与阈值比较
             if current_volatility > self.volatility_threshold:
@@ -364,13 +374,14 @@ class RiskManager:
         
         return None
 
-    def trip_circuit_breaker(self, reason: str):
+    async def trip_circuit_breaker(self, reason: str):
         """
         Trips the system-wide circuit breaker, halting new trades.
         """
         self.circuit_breaker_tripped = True
         # [Task 5] Persist Halt
-        self.redis_client.set("phoenix:risk:halted", "1")
+        if self.redis_client:
+            await self.redis_client.set("phoenix:risk:halted", "1")
         self.active_signals.append(
             RiskSignal(
                 type=SignalType.CIRCUIT_BREAKER,
@@ -381,13 +392,14 @@ class RiskManager:
         logger.critical(f"CIRCUIT BREAKER TRIPPED. Reason: {reason}")
         # 可以在此处添加通知逻辑 (例如, 发送警报)
 
-    def reset_circuit_breaker(self):
+    async def reset_circuit_breaker(self):
         """
         Resets the circuit breaker (manual intervention usually required).
         """
         self.circuit_breaker_tripped = False
         # [Task 5] Clear Halt
-        self.redis_client.delete("phoenix:risk:halted")
+        if self.redis_client:
+            await self.redis_client.delete("phoenix:risk:halted")
         self.active_signals = [
             s for s in self.active_signals if s.type != SignalType.CIRCUIT_BREAKER
         ]
