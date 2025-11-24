@@ -44,13 +44,23 @@ class OrderManager:
         self.active_orders: Dict[str, Order] = {} # key: order_id
         self.lock = asyncio.Lock() # [Task 4.2] Use asyncio.Lock
         
+        # [Task 3.2] Strict State Transition Logic
+        self.valid_transitions = {
+            OrderStatus.NEW: {OrderStatus.PENDING_SUBMISSION, OrderStatus.REJECTED, OrderStatus.CANCELLED},
+            OrderStatus.PENDING_SUBMISSION: {OrderStatus.PENDING, OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.CANCELLED},
+            OrderStatus.PENDING: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED},
+            OrderStatus.PARTIALLY_FILLED: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED},
+            # Terminal states (FILLED, CANCELLED, REJECTED) have no valid outgoing transitions
+        }
+        
         # [Task 1] Risk Control Limits
         self.max_order_value = 100000.0  # Max value per order
         self.max_notional_exposure = 1000000.0 # Max total exposure
         
         # 订阅券商的回调
-        self.broker.subscribe_fills(self._on_fill)
-        self.broker.subscribe_order_status(self._on_order_status_update)
+        if self.broker:
+            self.broker.subscribe_fills(self._on_fill)
+            self.broker.subscribe_order_status(self._on_order_status_update)
         
         self.log_prefix = "OrderManager:"
         logger.info(f"{self.log_prefix} Initialized.")
@@ -70,6 +80,8 @@ class OrderManager:
                 # 即使订单未知，也可能需要转发 Fill
                 
             # [阶段 4] 将 Fill 转发给 TLM
+            # Implicit state update via Fill amount is handled by Broker callback logic usually, 
+            # but we explicitly check state consistency here if needed.
             try:
                 await self.trade_lifecycle_manager.on_fill(fill)
             except Exception as e:
@@ -84,6 +96,12 @@ class OrderManager:
             if not order or not order.id or not order.status:
                 logger.warning(f"{self.log_prefix} Received invalid order status update: {order}")
                 return
+
+            # [Task 3.2] Strict State Transition Validation
+            current_order = self.active_orders.get(order.id)
+            if current_order and not self._can_transition(current_order.status, order.status):
+                logger.error(f"{self.log_prefix} INVALID STATE TRANSITION: {current_order.status} -> {order.status} for order {order.id}. Ignoring update.")
+                return
                 
             logger.info(f"{self.log_prefix} Status Update: Order {order.id} is now {order.status}")
             
@@ -95,6 +113,16 @@ class OrderManager:
             else:
                 # 更新活动订单的状态
                 self.active_orders[order.id] = order
+
+    def _can_transition(self, current_status: str, new_status: str) -> bool:
+        """
+        [Task 3.2] Validates if a state transition is allowed in the order lifecycle.
+        """
+        if current_status == new_status:
+            return True
+        
+        allowed = self.valid_transitions.get(current_status, set())
+        return new_status in allowed
 
     def generate_orders(self, 
                         current_portfolio: PortfolioState, 
@@ -188,7 +216,7 @@ class OrderManager:
                     price=limit_price,   # [Optimization] Set Limit Price
                     order_type="LIMIT",  # [Optimization] Change to LIMIT
                     status=OrderStatus.NEW,
-                    time_in_force="GTC", # [修复] 为 PaperTrading 添加默认 TIF
+                    time_in_force="DAY", # [Task 3.2] Safe Default: Use DAY to reduce overnight risk
                     metadata={
                         "target_weight": target_w,
                         "current_weight": current_w,
@@ -244,6 +272,10 @@ class OrderManager:
                 continue
                 
             market_prices[sym] = md.close
+            
+        # [Task 3.2] Reconcile active orders before generating new ones (Purge Zombies)
+        # This ensures we don't double-count orders that the broker dropped.
+        await self._reconcile_active_orders()
 
         # 2. 获取当前持仓状态 (Using TLM)
         # [Beta Final Fix] 捕获数据完整性异常并触发紧急停止
@@ -295,7 +327,10 @@ class OrderManager:
             price = order.price if order.price else market_prices.get(order.symbol)
             try:
                 # [Task 4.2] Async execution via thread for potentially blocking broker calls
-                broker_order_id = await asyncio.to_thread(self.broker.place_order, order, price)
+                if self.broker:
+                    broker_order_id = await asyncio.to_thread(self.broker.place_order, order, price)
+                else:
+                    broker_order_id = "MOCK_" + order.id
                 
                 async with self.lock:
                     # Update status only if it hasn't been transitioned (e.g. to FILLED) by a fast callback
@@ -314,6 +349,34 @@ class OrderManager:
                     if order.id in self.active_orders:
                         del self.active_orders[order.id]
 
+    async def _reconcile_active_orders(self):
+        """
+        [Task 3.2] Fetches open orders from Broker and closes local zombies.
+        """
+        if not self.broker:
+            return
+
+        try:
+            # Assume sync call wrapped in thread for safety
+            broker_open_orders = await asyncio.to_thread(self.broker.get_open_orders)
+            broker_order_ids = {o.id for o in broker_open_orders}
+            
+            async with self.lock:
+                local_ids = list(self.active_orders.keys())
+                for oid in local_ids:
+                    order = self.active_orders[oid]
+                    # Skip NEW/PENDING_SUBMISSION as they haven't reached broker yet
+                    if order.status in {OrderStatus.NEW, OrderStatus.PENDING_SUBMISSION}:
+                        continue
+                        
+                    if oid not in broker_order_ids:
+                        logger.warning(f"{self.log_prefix} Zombie Order Detected: {oid} (Status: {order.status}) not found on broker. marking REJECTED.")
+                        order.status = OrderStatus.REJECTED # Or CANCELED, treating as "Gone"
+                        del self.active_orders[oid]
+                        
+        except Exception as e:
+            logger.error(f"{self.log_prefix} Failed to reconcile active orders: {e}")
+
     def cancel_all_open_orders(self):
         """
         取消所有活动的订单。
@@ -323,7 +386,8 @@ class OrderManager:
             
         for order_id in order_ids:
             try:
-                self.broker.cancel_order(order_id)
+                if self.broker:
+                    self.broker.cancel_order(order_id)
                 logger.info(f"{self.log_prefix} Cancel request sent for {order_id}")
             except Exception as e:
                 logger.error(f"{self.log_prefix} Failed to cancel order {order_id}: {e}")
