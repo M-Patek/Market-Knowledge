@@ -11,12 +11,14 @@ class RiskAgent(BaseDRLAgent):
     [MARL 重构]
     Risk 智能体，使用 RLLib 基类进行推理。
     负责决定 (批准/否决)。
-    
-    [主人喵的提示] 此文件已更新，以匹配 alpha_agent.py 的 5D 状态。
     """
     
-    # [已移除] __init__ 和 execute 方法。
-    # 它现在继承 __init__ 和 compute_action from BaseDRLAgent。
+    def get_safe_action(self) -> np.ndarray:
+        """
+        [Safety] Default to HALT (1.0) on failure.
+        Action Space: Discrete(2) or Continuous(1) -> >0.5 means HALT.
+        """
+        return np.array([1.0])
     
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
         """
@@ -30,7 +32,6 @@ class RiskAgent(BaseDRLAgent):
             np.ndarray: 匹配 TradingEnv.observation_space 的 5-d 状态向量。
         """
         # 1. 从 state_data 中提取市场状态
-        # [已修改] 使用 alpha_agent 的 .get() 键
         balance = state_data.get('balance', 0.0)
         holdings = state_data.get('holdings', 0.0)
         price = state_data.get('price', 0.0)
