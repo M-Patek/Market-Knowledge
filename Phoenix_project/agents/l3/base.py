@@ -1,5 +1,6 @@
 # agents/l3/base.py
 from abc import ABC, abstractmethod
+import asyncio
 import numpy as np
 from typing import Optional, Type
 
@@ -16,7 +17,7 @@ class BaseDRLAgent(ABC):
     
     [任务 4.1] 更新:
     - __init__ 现在存储加载的 RLLib Algorithm。
-    - 实现了 compute_action 方法。
+    - 实现了 compute_action 方法 (Task 0.2 Async)。
     """
     
     def __init__(self, algorithm: Algorithm):
@@ -45,17 +46,19 @@ class BaseDRLAgent(ABC):
         """
         return self._format_obs(state_data, fusion_result)
 
-    def compute_action(self, observation: np.ndarray) -> np.ndarray:
+    async def compute_action(self, observation: np.ndarray) -> np.ndarray:
         """
-        [任务 4.1] 完成“神经连接”。
+        [任务 4.1 & 0.2] 完成“神经连接”。
         使用加载的 RLLib 算法计算确定性动作。
         
-        (由 Orchestrator 在 [任务 2.3] 中调用)
+        [Fix 0.2] 使用 asyncio.to_thread 防止阻塞主事件循环。
+        (由 Orchestrator 调用)
         """
         try:
             # explore=False 确保我们在生产 (Inference) 模式下
             # 获取确定性动作，而不是随机探索。
-            action = self.algorithm.compute_single_action(
+            action = await asyncio.to_thread(
+                self.algorithm.compute_single_action,
                 observation,
                 explore=False
             )
@@ -81,7 +84,7 @@ class DRLAgentLoader:
     ) -> Optional[BaseDRLAgent]:
         """
         [任务 4.1] 实现加载器。
-        (由 registry.py 在 [任务 2.2] 中调用)
+        (由 registry.py 在 [任务 1.1] 中调用)
         
         Args:
             agent_class: 要实例化的智能体类 (例如 AlphaAgent)。
