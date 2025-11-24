@@ -1,12 +1,10 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Any, AsyncGenerator
+from typing import List, Any, AsyncGenerator, TYPE_CHECKING
 
-# 确保导入 Task 类型（即使是作为类型提示）
-try:
-    from Phoenix_project.core.schemas.task_schema import Task
-except ImportError:
-    Task = Any # Fallback
+# [Phase I Fix] 解决循环导入并使用 PipelineState
+if TYPE_CHECKING:
+    from Phoenix_project.core.pipeline_state import PipelineState
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +33,13 @@ class L2Agent(ABC):
         logger.info(f"L2 Agent {self.agent_id} (Type: {type(self).__name__}) initialized.")
 
     @abstractmethod
-    async def run(self, task: "Task", dependencies: List[Any]) -> AsyncGenerator[Any, None]:
+    async def run(self, state: "PipelineState", dependencies: List[Any]) -> AsyncGenerator[Any, None]:
         """
         异步运行智能体。
-        L2 智能体接收 'dependencies' (来自 L1 的输出) 而不是 'context'。
+        [Phase I Fix] 更新签名以接收 PipelineState 而不是 Task。
         
         参数:
-            task (Task): 当前任务。
+            state (PipelineState): 当前管道状态。
             dependencies (List[Any]): 来自上游智能体（L1）的输出列表。
             
         收益:
