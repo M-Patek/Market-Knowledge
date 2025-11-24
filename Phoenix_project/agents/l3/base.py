@@ -38,6 +38,14 @@ class BaseDRLAgent(ABC):
         它将 Phoenix 状态 转换为 匹配 TradingEnv 的 np.ndarray。
         """
         pass
+    
+    @abstractmethod
+    def get_safe_action(self) -> np.ndarray:
+        """
+        [Safety Phase II] Returns a safe fallback action in case of inference failure.
+        Must be implemented by subclasses.
+        """
+        pass
 
     def format_observation(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
         """
@@ -66,8 +74,8 @@ class BaseDRLAgent(ABC):
         
         except Exception as e:
             self.logger.error(f"Error during compute_single_action: {e}", exc_info=True)
-            # (根据 agent 类型返回一个安全的默认动作)
-            return np.array([0.0]) # (例如 0.0 权重 / 0.0 风险 / 'Hold' 动作)
+            # [Safety Phase II] Use agent-specific safe fallback
+            return self.get_safe_action()
 
 
 # [任务 4.1] DRLAgentLoader (由 registry.py 使用)
