@@ -4,6 +4,7 @@
 计算已实现和未实现的盈亏 (PnL)。
 [Beta FIX] 防止僵尸估值 (Zombie Valuation)
 [Task 3] Atomic Transactions & Write-Ahead Persistence
+[Phase III Fix] Valuation Resilience (Limp Mode)
 """
 from typing import Dict, Optional
 from datetime import datetime
@@ -116,6 +117,7 @@ class TradeLifecycleManager:
         """
         根据最新的市场价格计算并返回当前的投资组合状态。
         [Beta FIX] 增加了严格的数据完整性检查。
+        [Phase III Fix] Valuation Resilience (Limp Mode)
         :param current_market_data: Dict[symbol, current_price]
         """
         total_value = self.cash
@@ -124,13 +126,11 @@ class TradeLifecycleManager:
         for symbol, pos in self.positions.items():
             current_price = current_market_data.get(symbol)
             
-            # [Beta FIX] 严禁使用旧值 (Stale Value)
-            # 如果价格缺失或非正数，视为严重的数据完整性破坏，必须熔断。
+            # [Phase III Fix] Resilience: Warn and use fallback (Cost Basis) instead of crashing
+            # 如果价格缺失或非正数，降级为警告，并使用成本价估值
             if current_price is None or current_price <= 0:
-                error_msg = f"{self.log_prefix} CRITICAL: Missing or invalid market price for {symbol}. Cannot value portfolio."
-                logger.critical(error_msg)
-                # 抛出异常以触发上层 OrderManager 的熔断机制 (Halt Trading)
-                raise ValueError(error_msg)
+                logger.warning(f"{self.log_prefix} Missing/Invalid price for {symbol}. Using Cost Basis (Avg Price) as fallback.")
+                current_price = pos.average_price
 
             pos.market_value = pos.quantity * current_price
             pos.unrealized_pnl = (current_price - pos.average_price) * pos.quantity
