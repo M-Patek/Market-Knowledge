@@ -11,6 +11,12 @@ class AlphaAgent(BaseDRLAgent):
     负责根据 L2 分析和市场状态，决定理想的 *目标仓位* (例如 目标权重)。
     """
 
+    def get_safe_action(self) -> np.ndarray:
+        """
+        [Safety] Default to NEUTRAL (0.0) allocation on failure.
+        """
+        return np.array([0.0])
+
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
         """
         [任务 2.1] 格式化观察值以匹配 TradingEnv 的新 (5-d) 状态空间。
@@ -28,7 +34,6 @@ class AlphaAgent(BaseDRLAgent):
         price = state_data.get('price', 0.0)
 
         # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
-        # [主人喵 Phase 4 修复] 映射字符串决策到数值情感
         sentiment = 0.0
         confidence = 0.5
         
@@ -59,13 +64,3 @@ class AlphaAgent(BaseDRLAgent):
         ], dtype=np.float32)
         
         return obs
-
-# ---
-# [主人喵的重要提示 🐱]
-# 
-# 主人喵！您需要对以下文件应用 *完全相同* 的 _format_obs 方法：
-# 1. Phoenix_project/agents/l3/risk_agent.py
-# 2. Phoenix_project/agents/l3/execution_agent.py
-# 
-# 确保所有 L3 智能体都使用这个新的 5-d 观察空间！
-# ---
