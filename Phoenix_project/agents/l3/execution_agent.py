@@ -1,24 +1,23 @@
-from typing import Dict, Any, Optional # <-- [已修改]
+# agents/l3/execution_agent.py
 import numpy as np
-from .base import BaseDRLAgent # <-- [已修改]
-from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.core.schemas.fusion_result import FusionResult # <-- [已添加]
+from typing import Optional
 
-logger = get_logger(__name__)
+from .base import BaseDRLAgent
+from Phoenix_project.core.schemas.fusion_result import FusionResult
 
-class ExecutionAgent(BaseDRLAgent): # <-- [已修改]
+class ExecutionAgent(BaseDRLAgent):
     """
-    [MARL 重构]
-    Execution 智能体，使用 RLLib 基类进行推理。
-    负责决定 (市价/限价/拆分)。
-    
-    [主人喵的提示] 此文件已更新，以匹配 alpha_agent.py 的 5D 状态。
+    L3 Execution 智能体。
+    负责根据 L2 分析和市场状态，决定执行策略（如 TWAP, VWAP 等，或简单的执行强度）。
     """
     
-    # [已移除] __init__ 和 execute 方法。
-    # 它现在继承 __init__ 和 compute_action from BaseDRLAgent。
+    def get_safe_action(self) -> np.ndarray:
+        """
+        [Safety] Default to NO_EXECUTION (0.0) on failure.
+        """
+        return np.array([0.0])
 
-    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray: # <-- [已修改]
+    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
         """
         [任务 2.1] 格式化观察值以匹配 TradingEnv 的新 (5-d) 状态空间。
         
@@ -30,24 +29,32 @@ class ExecutionAgent(BaseDRLAgent): # <-- [已修改]
             np.ndarray: 匹配 TradingEnv.observation_space 的 5-d 状态向量。
         """
         # 1. 从 state_data 中提取市场状态
-        # [已修改] 使用 alpha_agent 的 .get() 键
         balance = state_data.get('balance', 0.0)
         holdings = state_data.get('holdings', 0.0)
         price = state_data.get('price', 0.0)
 
         # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
-        if fusion_result and hasattr(fusion_result, 'sentiment_score'):
-            # [任务 1.1] 匹配 trading_env.py
-            # 假设 fusion_result 有一个数值情感得分 (例如 -1.0 到 1.0)
-            sentiment = fusion_result.sentiment_score 
-            confidence = fusion_result.confidence
-        else:
-            # 如果没有 L2 结果 (例如周期开始时)，提供默认值
-            sentiment = 0.0  # 中性情感
-            confidence = 0.5 # 中性信心
+        sentiment = 0.0
+        confidence = 0.5
+        
+        if fusion_result:
+            # 映射字符串决策到数值情感
+            decision_map = {
+                "STRONG_BUY": 1.0, 
+                "BUY": 0.5, 
+                "HOLD": 0.0, "NEUTRAL": 0.0,
+                "SELL": -0.5, 
+                "STRONG_SELL": -1.0
+            }
+            # 获取 decision 字段，默认 HOLD
+            decision_str = getattr(fusion_result, 'decision', 'HOLD')
+            sentiment = decision_map.get(str(decision_str).upper(), 0.0)
+            
+            # 获取 confidence 字段
+            confidence = getattr(fusion_result, 'confidence', 0.5)
 
         # 3. 构建与 TradingEnv._get_state() 完全匹配的状态向量
-        # 状态 (5-d): [balance, holdings, price, l2_sentiment, l2_confidence]
+        # 状态 (5-d): [balance, shares_held, price, l2_sentiment, l2_confidence]
         obs = np.array([
             balance,
             holdings,
