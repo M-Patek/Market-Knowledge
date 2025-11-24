@@ -105,20 +105,26 @@ class AgentFactory:
         module_path, class_name = category_map[key]
         agent_cls = AgentFactory._import_agent_class(module_path, class_name)
         
-        # [Adapter Pattern] 根据类名注入特定的依赖
-        # 标准基础依赖: (ensemble, prompt, audit)
-        args = [container.ensemble_client, container.prompt_manager, container.audit_manager]
+        # [Fix 1.1] 注入 agent_id 和核心依赖
+        # Base Signature expected: (agent_id, llm_client, data_manager, ...)
+        # We prepend 'key' as agent_id and ensure DataManager is passed.
+        base_args = [key, container.ensemble_client, container.data_manager]
+        
+        # Optional/Extra args for specific agents that might need them (e.g. L1, some L2s)
+        # Note: We append these to support agents that extend the base signature
+        extra_args = [container.prompt_manager, container.audit_manager]
         
         if key == "technical_analyst":
-            return agent_cls(*args, container.data_adapter, container.embedding_client)
+            return agent_cls(*base_args, *extra_args, container.data_adapter, container.embedding_client)
         elif key in ["fundamental_analyst", "geopolitical_analyst", "innovation_tracker", "macro_strategist", "supply_chain_intelligence", "critic"]:
              # 分析师和批评家需要 Retriever
-            return agent_cls(*args, container.retriever)
+            return agent_cls(*base_args, *extra_args, container.retriever)
         elif key == "fusion":
-            return agent_cls(*args, container.knowledge_graph_service, container.source_credibility)
+            # Fusion agent specific signature adjustments
+            return agent_cls(*base_args, container.knowledge_graph_service, container.source_credibility)
         else:
             # 默认 (Catalyst, Planner, Metacognitive, Adversary)
-            return agent_cls(*args)
+            return agent_cls(*base_args, *extra_args)
 
     @staticmethod
     def create_l3_agent(key: str, config: DictConfig, container: DependencyContainer) -> Any:
