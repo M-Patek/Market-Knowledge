@@ -242,6 +242,23 @@ class TabularDBClient:
         except SQLAlchemyError as e:
             logger.error(f"Error during fallback ILIKE search: {e}")
             return []
+    
+    @retry_with_exponential_backoff(exceptions_to_retry=(SQLAlchemyError,))
+    async def execute_sql(self, sql: str, params: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """
+        [Security Fix] Executes a raw SQL query with parameter binding.
+        Safe alternative to running the agent for known structured queries.
+        """
+        if not self.engine:
+             raise ValueError("DB engine not initialized.")
+        
+        def _exec():
+            with self.engine.connect() as conn:
+                # SQLAlchemy text() handles parameter binding safely
+                result = conn.execute(text(sql), params or {})
+                return [dict(row._mapping) for row in result.fetchall()]
+        
+        return await asyncio.to_thread(_exec)
 
     async def query(self, query: str) -> Dict[str, Any]:
         """
