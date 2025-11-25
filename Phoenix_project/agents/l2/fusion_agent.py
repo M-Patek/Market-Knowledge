@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import List, Any, AsyncGenerator, Optional
 
 from Phoenix_project.agents.l2.base import L2Agent
@@ -87,7 +88,15 @@ class FusionAgent(L2Agent):
 
             # 5. 解析和验证 FusionResult
             logger.debug(f"[{self.agent_id}] Received LLM fusion response (raw): {response_str[:200]}...")
-            response_data = json.loads(response_str)
+            
+            # [Robustness] Clean Markdown code blocks and extract JSON
+            clean_str = response_str.strip()
+            # Regex to find the JSON object between braces, ignoring surrounding text/markdown
+            match = re.search(r"(\{[\s\S]*\})", clean_str)
+            if match:
+                clean_str = match.group(1)
+
+            response_data = json.loads(clean_str)
             
             # [Robustness] Fuzzy Parsing & Normalization
             # 1. Map missing decision from sentiment
