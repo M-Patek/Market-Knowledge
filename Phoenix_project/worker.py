@@ -65,6 +65,7 @@ from Phoenix_project.ai.gnn_inferencer import GNNInferencer # [Task 5A] Import f
 from Phoenix_project.context_bus import ContextBus # [Task 8] Import ContextBus
 
 import json
+import asyncio # [Fix] Asyncio bridge for Celery tasks
 
 # --- [主人喵的修复 2] ---
 # 导入动态加载所需的模块
@@ -355,25 +356,36 @@ def build_orchestrator() -> Orchestrator:
             config=system_config.get("cognitive_engine", {}) # [修复]
         )
             
-        # 7. Portfolio
+        # 7. Portfolio (Sizer Loading)
         sizer_config = system_config.get("portfolio", {}).get("sizer", {})
-        sizer_type_name = sizer_config.get("type", "FixedFractionSizer")
-        sizer_params = sizer_config.get("params", {})
+        
+        # [Fix Configuration Schema Mismatch]
+        # Adapt to hierarchical structure: sizer -> default_method -> {params}
+        method_key = sizer_config.get("default_method", "fixed_fraction")
+        sizer_params = sizer_config.get(method_key, {})
+        
+        # Construct names dynamically: "fixed_fraction" -> "FixedFractionSizer"
+        # e.g., "volatility_parity" -> "VolatilityParity"
+        class_name_base = "".join(x.title() for x in method_key.split('_'))
+        sizer_type_name = f"{class_name_base}Sizer"
+        module_name = method_key
+
         sizer: IPositionSizer
         try:
-            module_name = pydash.snake_case(sizer_type_name.replace("Sizer", ""))
+            # e.g., Phoenix_project.sizing.fixed_fraction
             module = importlib.import_module(f"Phoenix_project.sizing.{module_name}")
             SizerClass = getattr(module, sizer_type_name)
             
-            if sizer_type_name == "FixedFractionSizer" and not sizer_params:
+            # Apply defaults if params are empty
+            if method_key == "fixed_fraction" and not sizer_params:
                  sizer_params = {"fraction_per_position": 0.05}
-            elif sizer_type_name == "VolatilityParitySizer" and not sizer_params:
+            elif method_key == "volatility_parity" and not sizer_params:
                  sizer_params = {"volatility_period": 20}
 
             sizer = SizerClass(**sizer_params)
             logger.info(f"成功从配置加载 Sizer: {sizer_type_name} (Params: {sizer_params})")
         except (ImportError, AttributeError, TypeError) as e:
-            logger.error(f"无法从配置加载 sizer '{sizer_type_name}' (Params: {sizer_params}): {e}。回退到 FixedFractionSizer。")
+            logger.error(f"无法从配置加载 sizer '{sizer_type_name}' (Module: {module_name}, Params: {sizer_params}): {e}。回退到 FixedFractionSizer。")
             sizer = FixedFractionSizer(fraction_per_position=0.05)
         
         # [Task 8] Fix RiskManager and PortfolioConstructor dependency order and params
@@ -439,8 +451,8 @@ def run_main_cycle_task():
         logger.info("Task: run_main_cycle_task started...")
         orchestrator = build_orchestrator()
         
-        # [阶段 4] run_main_cycle 是同步的
-        orchestrator.run_main_cycle() 
+        # [阶段 4 修复] run_main_cycle 是异步的 (async def)，必须由事件循环驱动
+        asyncio.run(orchestrator.run_main_cycle())
         
         logger.info("Task: run_main_cycle_task finished.")
         
@@ -483,7 +495,6 @@ def run_gnn_inference_task(graph_data: dict):
         # (Note: .infer() is async, so we run it in a loop if needed, 
         # but since this is a Celery task, we can just run it. 
         # However, GNNInferencer.infer is async def. We need a loop.)
-        import asyncio
         return asyncio.run(inferencer.infer(graph_data))
         
     except Exception as e:
