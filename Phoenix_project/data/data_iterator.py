@@ -102,9 +102,21 @@ class DataIterator:
         self.market_data_iters = {sym: df for sym, df in zip(self.symbols, results) if df is not None}
 
         # 4. Fetch News Data
-        # Note: For now, we assume get_news_data is optimized or we fetch a reasonable limit.
-        # In a full implementation, news should also be fetched by range.
-        self.news_data = await self.data_manager.get_news_data(limit=1000) 
+        # [Fix] Pass explicit time range to avoid "News Black Hole" (future/missing news)
+        news_list = await self.data_manager.get_news_data(
+            limit=1000,
+            start_date=fetch_start,
+            end_date=fetch_end
+        )
+        
+        # [Fix] Convert List[NewsData] to DataFrame for internal usage
+        # This matches the expectation in __anext__
+        if news_list:
+            df = pd.DataFrame([n.model_dump() for n in news_list])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+            self.news_data = df.set_index('timestamp').sort_index()
+        else:
+            self.news_data = None
 
         self.current_chunk_end = end_cursor
 
