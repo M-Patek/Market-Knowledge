@@ -22,6 +22,7 @@ from ..core.schemas.risk_schema import (
     VolatilitySignal,
     DrawdownSignal,
     ConcentrationSignal,
+    RiskReport,
 )
 from ..core.exceptions import RiskViolationError, CircuitBreakerError
 
@@ -404,6 +405,45 @@ class RiskManager:
             s for s in self.active_signals if s.type != SignalType.CIRCUIT_BREAKER
         ]
         logger.info("RiskManager circuit breaker has been reset.")
+
+    async def evaluate(self, portfolio: Portfolio) -> RiskReport:
+        """
+        [Task 8] Evaluates a target portfolio against risk rules.
+        Used by PortfolioConstructor to validate target portfolios.
+        """
+        metrics = {
+            "peak_equity": self.peak_equity,
+            "current_equity": self.current_equity
+        }
+        adjustments = []
+        passed = True
+
+        if self.circuit_breaker_tripped:
+            return RiskReport(
+                passed=False,
+                adjustments_made=["CIRCUIT_BREAKER_ACTIVE"],
+                portfolio_risk_metrics=metrics
+            )
+
+        # Check Drawdown
+        dd_signal = self.check_drawdown()
+        if dd_signal:
+            adjustments.append(f"DRAWDOWN_VIOLATION: {dd_signal.description}")
+            passed = False
+
+        # Check Concentration (Use shadow portfolio to prevent double-counting self)
+        shadow_portfolio = portfolio.model_copy(update={"positions": {}})
+        for symbol, pos in portfolio.positions.items():
+            conc_signal = self.check_concentration(pos, shadow_portfolio)
+            if conc_signal:
+                adjustments.append(f"CONCENTRATION_VIOLATION: {conc_signal.description}")
+                passed = False
+
+        return RiskReport(
+            passed=passed,
+            adjustments_made=adjustments,
+            portfolio_risk_metrics=metrics
+        )
 
     def get_status(self) -> Dict[str, Any]:
         """
