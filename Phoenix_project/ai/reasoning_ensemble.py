@@ -144,14 +144,20 @@ class ReasoningEnsemble:
         """
         try:
             claims = [fusion_result.reasoning]
-            report = await self.fact_checker.check_facts(claims)
+            results = await self.fact_checker.check_facts(claims)
             
-            support = report.get("overall_support", "Neutral")
-            if support == "Refuted":
+            if not results:
+                return
+
+            # [Fix] Handle List[FactCheckResult] return type
+            main_report = results[0]
+            is_verified = getattr(main_report, "verified", False)
+
+            if not is_verified:
                 fusion_result.decision = "NEUTRAL"
                 fusion_result.confidence = 0.0
-                fusion_result.reasoning += "\n[FACT-CHECK]: Reasoning Refuted. Decision neutralized."
-            elif support == "Supported":
+                fusion_result.reasoning += "\n[FACT-CHECK]: Reasoning Unverified/Refuted. Decision neutralized."
+            else:
                 # 小幅提升置信度
                 fusion_result.confidence = min(fusion_result.confidence + 0.1, 1.0)
                 
