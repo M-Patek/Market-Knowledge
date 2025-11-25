@@ -375,6 +375,29 @@ class RiskManager:
         
         return None
 
+    async def validate_allocations(
+        self, target_weights: Dict[str, float], current_portfolio: Any, market_data: Any
+    ) -> RiskReport:
+        """
+        [Task 5] Validates proposed target weights against risk limits.
+        Does not raise exceptions; returns a failed RiskReport on violation.
+        """
+        violations = []
+        for symbol, weight in target_weights.items():
+            if weight > self.max_position_concentration_pct:
+                violations.append(
+                    f"Concentration limit exceeded for {symbol}: {weight:.2%} (Limit: {self.max_position_concentration_pct:.2%})"
+                )
+
+        if violations:
+            return RiskReport(
+                passed=False,
+                adjustments_made=violations,
+                portfolio_risk_metrics={"violation_count": len(violations)}
+            )
+        
+        return RiskReport(passed=True)
+
     async def trip_circuit_breaker(self, reason: str):
         """
         Trips the system-wide circuit breaker, halting new trades.
