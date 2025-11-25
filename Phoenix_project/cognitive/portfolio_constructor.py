@@ -49,13 +49,16 @@ class PortfolioConstructor:
                 logger.info(f"Loaded initial portfolio from DataManager: {len(current_portfolio['positions'])} positions.")
                 return current_portfolio
             else:
-                logger.warning("DataManager returned no initial portfolio or data was malformed. Starting with empty.")
-                return {"cash": self.config.get("initial_cash", 1_000_000), "positions": {}}
+                # [Safety Fix] Phantom Initialization Prevention
+                err_msg = "DataManager returned no initial portfolio or data was malformed. Cannot safely start."
+                logger.critical(err_msg)
+                raise RuntimeError(err_msg)
         except Exception as e:
-            logger.error(f"Failed to load initial portfolio from DataManager: {e}. Starting with empty.", exc_info=True)
-            return {"cash": self.config.get("initial_cash", 1_000_000), "positions": {}}
+            # [Safety Fix] Prevent starting with phantom zero positions if data service is down
+            logger.critical(f"Failed to load initial portfolio from DataManager: {e}. System HALT.", exc_info=True)
+            raise RuntimeError(f"Critical Data Failure: {e}")
 
-    def construct_portfolio(self, pipeline_state: PipelineState):
+    async def construct_portfolio(self, pipeline_state: PipelineState):
         """
         [已实现] 
         根据 L3 Alpha 信号和风险约束生成目标投资组合。
@@ -102,39 +105,28 @@ class PortfolioConstructor:
             logger.warning("No market data batch found in pipeline_state. Cannot construct portfolio.")
             return None
         
-        # 3. [FIXME 已修复]
-        # (将提议的权重传递给 RiskManager 并获取调整)
-        
-        target_weights = alpha_signals # 初始提议
-        adjusted_weights = target_weights
-        risk_report = None
+        # 3. [Safety Fix] Validate Allocations (Async & Type Safe)
+        target_weights = alpha_signals
         
         try:
-            logger.debug(f"Evaluating target weights with RiskManager: {target_weights}")
-            # [实现] risk_manager.evaluate 接受提议的权重、当前组合和市场数据
-            risk_report = self.risk_manager.evaluate(
-                target_weights, 
-                self.current_portfolio, 
+            logger.debug(f"Validating target weights with RiskManager: {target_weights}")
+            risk_report = await self.risk_manager.validate_allocations(
+                target_weights,
+                self.current_portfolio,
                 market_data
             )
             
-            if risk_report.adjustments_made:
-                logger.info(f"RiskManager evaluation triggered adjustments. Reason: {risk_report.reason}")
-                adjusted_weights = risk_report.adjusted_weights
-            else:
-                logger.info("RiskManager evaluation passed. Using original target weights.")
-                adjusted_weights = risk_report.adjusted_weights # (即使没有调整，也使用报告中的版本)
+            if not risk_report.passed:
+                logger.warning(f"Risk validation failed: {risk_report.adjustments_made}. HALTING construction.")
+                return None
+
+            # Pass-through if validated
+            adjusted_weights = target_weights
             
         except Exception as e:
-            logger.error(f"RiskManager evaluation failed: {e}. Falling back to zero weights.", exc_info=True)
-            # [安全模式] 风险管理失败，清空所有目标头寸
-            adjusted_weights = {asset: 0.0 for asset in target_weights}
-            risk_report = RiskReport(
-                passed=False, 
-                adjustments_made=True, 
-                adjusted_weights=adjusted_weights, 
-                reason=f"RiskManager FAILED: {str(e)}"
-            )
+            logger.error(f"RiskManager validation error: {e}. Aborting construction.", exc_info=True)
+            # [Safety Fix] Do NOT return zero weights (Liquidation Risk). Return None (Halt).
+            return None
 
         # 4. [已实现] 计算目标投资组合 (从权重到股数/规模)
         
