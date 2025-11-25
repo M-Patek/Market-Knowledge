@@ -250,13 +250,14 @@ class DataManager:
         # Only return if ALL data is present
         return {sym: res for sym, res in zip(symbols, results)}
 
-    async def get_news_data(self, query: str = "", limit: int = 10) -> List[NewsData]:
+    async def get_news_data(self, query: str = "", limit: int = 10, start_date: datetime = None, end_date: datetime = None) -> List[NewsData]:
         """
         [Task 2.1] DataIterator 适配器接口。
+        [Fix] 支持时间范围过滤，解决回测中的“新闻黑洞”问题。
         """
         # 简单的包装现有的 fetch_news_data
         # 注意：这里未来可以扩展为从 Redis 流 (REDIS_KEY_NEWS_STREAM) 读取实时新闻
-        return await self.fetch_news_data(query=query)
+        return await self.fetch_news_data(query=query, limit=limit, start_date=start_date, end_date=end_date)
 
     async def get_fundamental_data(
         self, symbol: str
@@ -284,20 +285,22 @@ class DataManager:
         try:
             # [Task 2.1] Prevent Time Travel: Use structured SQL with time barrier
             cutoff_time = self.get_current_time()
-            safe_symbol = symbol.replace("'", "''") # Basic Input Sanitization
             
-            query = f"""
+            # [Security Fix] 使用参数化查询替代 f-string
+            query = """
                 SELECT * FROM fundamentals 
-                WHERE symbol = '{safe_symbol}' 
-                AND timestamp <= '{cutoff_time}' 
+                WHERE symbol = :symbol 
+                AND timestamp <= :cutoff_time 
                 ORDER BY timestamp DESC 
                 LIMIT 1
             """
+            params = {"symbol": symbol, "cutoff_time": cutoff_time}
             
-            result = await self.tabular_db.query(query)
+            # 使用安全的执行方法
+            rows = await self.tabular_db.execute_sql(query, params)
             
-            if result and result.get("results"):
-                fund_data_dict = result["results"][0]
+            if rows:
+                fund_data_dict = rows[0]
                 fund_data = FundamentalData(
                     symbol=symbol,
                     # Use actual data timestamp, fallback to cutoff only if missing
@@ -321,13 +324,18 @@ class DataManager:
             return None
 
     async def fetch_news_data(
-        self, query: str, force_refresh: bool = False
+        self, query: str, limit: int = 10, start_date: datetime = None, end_date: datetime = None, force_refresh: bool = False
     ) -> List[NewsData]:
         """
         OPTIMIZED: Fetches news data from an external API,
         using caching. Replaces the mock.
+        [Fix] Supports time range filtering for accurate backtesting.
         """
         cache_key = self._get_cache_key("news", query)
+        
+        # 如果提供了时间范围，将时间加入缓存键，防止不同时间段的查询混淆
+        if start_date or end_date:
+            cache_key = self._get_cache_key("news", f"{query}_{start_date}_{end_date}")
         
         if not force_refresh:
             cached = self._get_from_cache(cache_key)
@@ -346,10 +354,14 @@ class DataManager:
         params = {
             "q": query,
             "apiKey": news_api_key,
-            "pageSize": self.config.get("news_fetch_limit", 20),
+            "pageSize": limit,
             "language": "en",
             "sortBy": "publishedAt",
+            "from": start_date.isoformat() if start_date else None,
+            "to": end_date.isoformat() if end_date else None,
         }
+        # 移除值为 None 的参数
+        params = {k: v for k, v in params.items() if v is not None}
         
         try:
             async with httpx.AsyncClient() as client: # [Task 3.1] Use httpx
