@@ -100,7 +100,8 @@ class Orchestrator:
                 logger.warning("TradeLifecycleManager not available. Running with potentially stale/empty portfolio state.")
 
             # 1. 从事件分发器（Redis）获取新事件
-            new_events = self.event_distributor.get_new_events()
+            # [Safety] Wrap blocking Redis call & fix method name (get_pending_events)
+            new_events = await asyncio.to_thread(self.event_distributor.get_pending_events)
             if not new_events:
                 logger.info("No new events retrieved. Cycle complete.")
                 return
@@ -137,6 +138,11 @@ class Orchestrator:
 
             # 5. 运行 L3 决策层 (Reasoning Ensemble -> DRL)
             await self._run_l3_decision(pipeline_state)
+            
+            # [Safety] Risk Blockade
+            if pipeline_state.l3_decision and pipeline_state.l3_decision.get("risk_action") == "HALT_TRADING":
+                logger.critical("HALT_TRADING triggered by L3 Risk Agent. Aborting cycle.")
+                return
             
             if not pipeline_state.l3_decision:
                 logger.warning("L3 DRL Agents did not produce a decision. Cycle ending.")
@@ -306,14 +312,15 @@ class Orchestrator:
         """[已实现] 运行投资组合构建。"""
         logger.info("Running PortfolioConstructor...")
         try:
-            target_portfolio = self.portfolio_constructor.construct_portfolio(
+            # [Fix] Await async construct_portfolio
+            target_portfolio = await self.portfolio_constructor.construct_portfolio(
                 pipeline_state
             )
-            pipeline_state.set_target_portfolio(target_portfolio)
             if target_portfolio:
+                pipeline_state.set_target_portfolio(target_portfolio)
                 logger.info("PortfolioConstructor complete. Target portfolio generated.")
             else:
-                 logger.warning("PortfolioConstructor did not generate a target portfolio.")
+                 logger.warning("PortfolioConstructor returned None (Risk Halt). Execution skipped.")
         except Exception as e:
             raise PipelineError(f"PortfolioConstructor failed: {e}") from e
 
