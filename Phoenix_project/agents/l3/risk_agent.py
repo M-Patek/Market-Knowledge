@@ -48,12 +48,16 @@ class RiskAgent(BaseDRLAgent):
             sentiment = 0.0  # 中性情感
             confidence = 0.5 # 中性信心
 
+        # [Task 2.1] Normalize Inputs to prevent gradient vanishing
+        norm_balance = np.log(balance + 1.0)
+        norm_price = np.log(price + 1e-9) if price > 0 else 0.0
+
         # 3. 构建与 TradingEnv._get_state() 完全匹配的状态向量
-        # 状态 (5-d): [balance, holdings, price, l2_sentiment, l2_confidence]
+        # 状态 (5-d): [norm_balance, holdings, norm_price, sentiment, confidence]
         obs = np.array([
-            balance,
+            norm_balance,
             holdings,
-            price,
+            norm_price,
             sentiment,
             confidence
         ], dtype=np.float32)
