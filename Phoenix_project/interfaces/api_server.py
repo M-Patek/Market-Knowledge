@@ -123,37 +123,9 @@ class APIServer:
                 self.logger.log_error(f"Failed to inject event: {e}", exc_info=True)
                 return jsonify({"error": "Failed to process event"}), 500
 
-        @self.app.route("/api/v1/control", methods=["POST"])
-        def manual_override():
-            """
-            Endpoint for manual control/override of system components.
-            Publishes a control message to the ContextBus.
-            """
-            try:
-                control_data = ManualOverrideInput(**request.json)
-            except ValidationError as e:
-                self.logger.log_warning(f"Invalid control payload received: {e}")
-                return jsonify({"error": "Invalid payload", "details": e.errors()}), 400
-
-            try:
-                topic = f"control_{control_data.component}"
-                message = {
-                    "action": control_data.action,
-                    "parameters": control_data.parameters
-                }
-                
-                # Run the async publish in the main event loop
-                future = asyncio.run_coroutine_threadsafe(
-                    self.context_bus.publish(topic, message),
-                    self.main_loop
-                )
-                future.result(timeout=5)
-
-                self.logger.log_info(f"Manual control command '{control_data.action}' sent to '{control_data.component}'")
-                return jsonify({"status": "command_sent", "topic": topic, "action": control_data.action}), 200
-            except Exception as e:
-                self.logger.log_error(f"Failed to send control command: {e}", exc_info=True)
-                return jsonify({"error": "Failed to process command"}), 500
+        # [Security Fix] RCE Vulnerability Removed
+        # The unauthenticated /api/v1/control endpoint has been removed to prevent command injection.
+        # Future implementation should use a secure, authenticated channel for admin controls.
 
         @self.app.route("/api/v1/audit", methods=["GET"])
         def get_audit_logs():
