@@ -22,14 +22,14 @@ class RiskAgent(BaseDRLAgent):
     
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
         """
-        [任务 2.1] 格式化观察值以匹配 TradingEnv 的新 (5-d) 状态空间。
+        [任务 2.1] 格式化观察值以匹配 TradingEnv 的新 (6-d) 状态空间。
         
         Args:
             state_data (dict): 包含 {'balance', 'holdings', 'price'} 的实时数据。
             fusion_result (FusionResult): 来自 L2 认知引擎的分析结果。
 
         Returns:
-            np.ndarray: 匹配 TradingEnv.observation_space 的 5-d 状态向量。
+            np.ndarray: 匹配 TradingEnv.observation_space 的 6-d 状态向量。
         """
         # 1. 从 state_data 中提取市场状态
         balance = state_data.get('balance', 0.0)
@@ -37,7 +37,9 @@ class RiskAgent(BaseDRLAgent):
         price = state_data.get('price', 0.0)
 
         # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
+        is_valid = 0.0
         if fusion_result:
+            is_valid = 1.0
             # [Fix] Map L2 decision string to numeric sentiment for RL observation
             decision_str = str(getattr(fusion_result, "decision", "HOLD")).upper()
             score_map = {"STRONG_BUY": 1.0, "BUY": 0.5, "SELL": -0.5, "STRONG_SELL": -1.0}
@@ -53,13 +55,14 @@ class RiskAgent(BaseDRLAgent):
         norm_price = np.log(price + 1e-9) if price > 0 else 0.0
 
         # 3. 构建与 TradingEnv._get_state() 完全匹配的状态向量
-        # 状态 (5-d): [norm_balance, holdings, norm_price, sentiment, confidence]
+        # 状态 (6-d): [norm_balance, holdings, norm_price, sentiment, confidence, is_valid]
         obs = np.array([
             norm_balance,
             holdings,
             norm_price,
             sentiment,
-            confidence
+            confidence,
+            is_valid
         ], dtype=np.float32)
         
         return obs
