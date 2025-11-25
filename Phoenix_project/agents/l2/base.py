@@ -1,4 +1,5 @@
 import logging
+import json
 from abc import ABC, abstractmethod
 from typing import List, Any, AsyncGenerator, TYPE_CHECKING
 
@@ -31,6 +32,28 @@ class L2Agent(ABC):
         self.llm_client = llm_client
         self.data_manager = data_manager
         logger.info(f"L2 Agent {self.agent_id} (Type: {type(self).__name__}) initialized.")
+
+    def _safe_prepare_context(self, data: Any, max_tokens: int = 15000) -> str:
+        """
+        [Safety] Safely serializes data to JSON, truncating to prevent context window explosion (DoS).
+        """
+        try:
+            json_str = json.dumps(data, default=str)
+            if len(json_str) <= max_tokens:
+                return json_str
+            
+            # Truncation Strategy to preserve partial valid JSON
+            if isinstance(data, list) and len(data) > 0:
+                # Rough estimation to keep valid JSON structure
+                ratio = max_tokens / len(json_str)
+                safe_count = max(1, int(len(data) * ratio))
+                logger.warning(f"[{self.agent_id}] Context overflow ({len(json_str)} chars). Truncating list from {len(data)} to {safe_count} items.")
+                return json.dumps(data[:safe_count], default=str)
+            
+            return json_str[:max_tokens] + "... [TRUNCATED]"
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] Context serialization failed: {e}")
+            return "[]"
 
     @abstractmethod
     async def run(self, state: "PipelineState", dependencies: List[Any]) -> AsyncGenerator[Any, None]:
