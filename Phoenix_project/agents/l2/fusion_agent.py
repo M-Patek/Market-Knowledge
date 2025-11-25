@@ -47,8 +47,8 @@ class FusionAgent(L2Agent):
                     # 尝试从字典恢复 (如果被序列化过)
                     try:
                         evidence_items.append(EvidenceItem(**item))
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[{self.agent_id}] Failed to recover evidence item: {e}")
 
         if not evidence_items:
             logger.warning(f"[{self.agent_id}] No valid EvidenceItems found. Yielding fallback result.")
@@ -61,12 +61,8 @@ class FusionAgent(L2Agent):
 
         try:
             # 3. 准备 Prompt 上下文
-            # [关键] 序列化整个证据列表。
-            # 我们使用 .model_dump() 并设置 default=str 来处理 UUID 和 datetime
-            evidence_json_list = json.dumps(
-                [item.model_dump() for item in evidence_items], 
-                default=str
-            )
+            # [Safety] Use _safe_prepare_context to prevent context explosion
+            evidence_json_list = self._safe_prepare_context([item.model_dump() for item in evidence_items])
             
             context_map = {
                 "symbols_list_str": target_symbol,
