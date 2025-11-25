@@ -344,12 +344,45 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         return value
 
     def _get_obs_dict(self) -> Dict[str, Any]:
-        """(TBD) 为每个智能体构建观察空间。"""
-        # 必须包含 L2 知识 (sentiment, confidence)
-        # 必须包含当前仓位 (self.current_allocation)
-        # 必须包含风险状态 (self.current_drawdown)
-        obs = np.random.rand(5).astype(np.float32) # 占位符
-        return {agent: obs for agent in self.agents}
+        """
+        [Task 10] Constructs a real observation vector from environment state.
+        Vector Shape (5,): [Balance, Holdings, LogPrice, Sentiment, Confidence]
+        """
+        # Default state (e.g., for reset before data)
+        norm_balance = self.balance / self.initial_balance if self.initial_balance > 0 else 1.0
+        holdings = 0.0
+        norm_price = 0.0
+        sentiment = 0.0
+        confidence = 0.5 # Default uncertainty
+
+        # Identify primary symbol (Simulated Single-Asset Focus for DRL)
+        target_symbol = None
+        if self.current_prices:
+            target_symbol = sorted(list(self.current_prices.keys()))[0]
+        elif self.l2_knowledge:
+            target_symbol = sorted(list(self.l2_knowledge.keys()))[0]
+
+        if target_symbol:
+            holdings = self.current_allocation.get(target_symbol, 0.0)
+            
+            price = self.current_prices.get(target_symbol, 0.0)
+            if price <= 0 and target_symbol in self.l2_knowledge:
+                price = self.l2_knowledge[target_symbol].get('price_t', 0.0)
+            norm_price = np.log(price + 1e-9) if price > 0 else 0.0
+            
+            l2 = self.l2_knowledge.get(target_symbol, {})
+            sentiment = l2.get('l2_sentiment', 0.0)
+            confidence = l2.get('l2_confidence', 0.5)
+
+        obs_vector = np.array([
+            norm_balance,
+            holdings,
+            norm_price,
+            sentiment,
+            confidence
+        ], dtype=np.float32)
+        
+        return {agent: obs_vector for agent in self.agents}
 
     def _get_info_dict(self, r_alpha_cost=0, r_risk=0, r_total=0) -> Dict[str, Any]:
         """(TBD) 返回调试信息。"""
