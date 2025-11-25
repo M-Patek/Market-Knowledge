@@ -32,8 +32,8 @@ class CriticAgent(L2Agent):
                 elif isinstance(item, dict) and "content" in item:
                     try:
                         evidence_items.append(EvidenceItem(**item))
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[{self.agent_id}] Skipping invalid evidence item: {e}")
 
         if not evidence_items:
             logger.warning(f"[{self.agent_id}] No evidence to critique. Yielding fallback.")
@@ -44,10 +44,7 @@ class CriticAgent(L2Agent):
 
         try:
             # 2. 准备 Prompt
-            evidence_json_list = json.dumps(
-                [item.model_dump() for item in evidence_items], 
-                default=str
-            )
+            evidence_json_list = self._safe_prepare_context([item.model_dump() for item in evidence_items])
             
             context_map = {
                 "target_symbol": target_symbol,
@@ -85,9 +82,9 @@ class CriticAgent(L2Agent):
         return CriticResult(
             timestamp=state.current_time,
             target_symbol=symbol,
-            is_valid=True, # 默认放行，以免阻塞
-            critique_summary=f"System Fallback: {reason}",
-            score=0.5, # 中立分数
+            is_valid=False, # [Safety] Default to REJECT on failure
+            critique_summary=f"System Fallback (Validation Failed): {reason}",
+            score=0.0, # Penalize score
             flaws_found=[],
             suggestions=[]
         )
