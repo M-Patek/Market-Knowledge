@@ -148,6 +148,8 @@ class CognitiveEngine:
             raise CognitiveError(f"ReasoningEnsemble failed: {e}") from e
             
         pipeline_state.update_value("last_fusion_result", fusion_result)
+        # [Fix] Ensure the guard sees the result
+        pipeline_state.fusion_result = fusion_result
         
         # 2. Fact-check (如果置信度足够)
         fact_check_report = None
@@ -171,21 +173,27 @@ class CognitiveEngine:
         
         # 3. Apply Uncertainty Guardrail
         try:
-            guarded_decision = self.uncertainty_guard.apply_guardrail(
-                fusion_result,
-                threshold=self.uncertainty_threshold
-            )
-            pipeline_state.update_value("last_guarded_decision", guarded_decision)
+            # [Fix] Use correct API: validate_uncertainty(state) -> Optional[str]
+            error_msg = self.uncertainty_guard.validate_uncertainty(pipeline_state)
+            
+            if error_msg:
+                logger.warning(f"Uncertainty Guardrail triggered: {error_msg}")
+                # Downgrade decision
+                fusion_result.decision = "NEUTRAL"
+                fusion_result.confidence = 0.0
+                fusion_result.reasoning = f"Guardrail Block: {error_msg}"
+            
+            pipeline_state.update_value("last_guarded_decision", fusion_result)
+            
         except Exception as e:
             logger.error(f"Uncertainty guardrail failed: {e}", exc_info=True)
-            # 降级处理
-            guarded_decision = fusion_result
-            guarded_decision.decision = "ERROR_HOLD"
-            guarded_decision.confidence = 0.0
+            # Fail safe
+            fusion_result.decision = "ERROR_HOLD"
+            fusion_result.confidence = 0.0
 
-        logger.info(f"Cognitive cycle complete. Final decision: {guarded_decision.decision}")
+        logger.info(f"Cognitive cycle complete. Final decision: {fusion_result.decision}")
         
         return {
-            "final_decision": guarded_decision,
+            "final_decision": fusion_result,
             "fact_check_report": fact_check_report
         }
