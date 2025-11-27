@@ -17,8 +17,8 @@ logger = get_logger(__name__)
 # Gemini 1.5 Flash: 15 QPM
 
 DEFAULT_QPM_LIMITS = {
-    "gemini-1.5-pro": 5,
-    "gemini-1.5-flash": 15,
+    "gemini-3.0-pro": 5,
+    "gemini-2.5-flash": 15,
     "gemini-pro": 15, 
     "default": 10
 }
