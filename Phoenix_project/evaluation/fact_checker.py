@@ -122,6 +122,10 @@ class FactChecker:
                 # tool_config={"tool_choice": "search_documents"}
             )
             
+            # [Fix] Wrap single dict response in list for type safety
+            if isinstance(response_json, dict):
+                response_json = [response_json]
+
             # 假设 LLM 返回一个 FactCheckResult 列表
             # e.g., [{"claim": "...", "verified": true, "evidence": "...", "source": "..."}]
             if not isinstance(response_json, list):
