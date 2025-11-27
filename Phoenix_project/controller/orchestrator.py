@@ -2,6 +2,7 @@
 # [主人喵的修复 11.11] 实现了 L2->L3 的数据流 TODO。
 # [主人喵的修复 11.12] 实现了 TBD-1 (事件过滤) 和 TBD-5 (审计)
 # [Code Opt Expert Fix] Task 0.2: Async L3 & Task 1.1: Registry Integration
+# [Safety Patch] Implemented Fail-Closed logic for Ledger and Risk Agents.
 
 import logging
 import asyncio
@@ -92,12 +93,14 @@ class Orchestrator:
             # [Task 1 Fix] State Sync: Active sync from Ledger (Brain-Body Connection)
             tlm = self.trade_lifecycle_manager or (self.order_manager.trade_lifecycle_manager if hasattr(self.order_manager, 'trade_lifecycle_manager') else None)
             
+            # [Fail-Closed Patch] The Zombie Portfolio Fix
             if tlm:
                 real_portfolio = tlm.get_current_portfolio_state({}) 
                 pipeline_state.update_portfolio_state(real_portfolio)
                 logger.info(f"Synced portfolio state from Ledger: {len(real_portfolio.positions)} positions.")
             else:
-                logger.warning("TradeLifecycleManager not available. Running with potentially stale/empty portfolio state.")
+                # CRITICAL: Do not run without a ledger.
+                raise RuntimeError("TradeLifecycleManager (Ledger) not available. Critical system dependency missing.")
 
             # 1. 从事件分发器（Redis）获取新事件
             # [Safety] Wrap blocking Redis call & fix method name (get_pending_events)
@@ -273,7 +276,8 @@ class Orchestrator:
                 logger.info(f"Alpha Agent Action: {alpha_action}")
 
             # 3. Risk Agent Decision (Async)
-            risk_action = None
+            # [Fail-Closed Patch] The Ghost Risk Agent Fix
+            risk_action = "HALT_TRADING" # FAIL-SAFE: Default to HALT
             if self.risk_agent:
                 obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_fusion_result)
                 # [Fix 0.2] Use await
