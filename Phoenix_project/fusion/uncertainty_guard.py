@@ -45,11 +45,12 @@ class UncertaintyGuard:
             return None  # No result to check
 
         uncertainty_score = state.fusion_result.uncertainty_score
+        
+        # [Fail-Closed Patch] The Null Bypass Fix
         if uncertainty_score is None:
-            self.logger.log_warning(
-                f"Fusion result for event {state.fusion_result.event_id} has no uncertainty score. Allowing passage."
-            )
-            return None  # Cannot check, allow passage
+            error_msg = f"CRITICAL: Uncertainty calculation failed/missing for event {state.fusion_result.event_id}."
+            self.logger.log_error(error_msg)
+            return error_msg  # FAIL-CLOSED: Block passage
 
         if uncertainty_score > self.uncertainty_threshold:
             error_msg = (
