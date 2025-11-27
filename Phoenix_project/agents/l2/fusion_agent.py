@@ -88,7 +88,8 @@ class FusionAgent(L2Agent):
             # [Robustness] Clean Markdown code blocks and extract JSON
             clean_str = response_str.strip()
             # Regex to find the JSON object between braces, ignoring surrounding text/markdown
-            match = re.search(r"(\{[\s\S]*\})", clean_str)
+            # [Fix] Non-greedy match to avoid capturing too much
+            match = re.search(r"(\{[\s\S]*?\})", clean_str)
             if match:
                 clean_str = match.group(1)
 
@@ -99,7 +100,7 @@ class FusionAgent(L2Agent):
             if "decision" not in response_data:
                 sentiment = response_data.get("overall_sentiment") or response_data.get("sentiment")
                 if sentiment:
-                    s_up = str(sentiment).upper()
+                    s_up = str(sentiment).upper().replace(" ", "_")
                     if "BULL" in s_up or "POS" in s_up:
                         response_data["decision"] = "BUY"
                     elif "BEAR" in s_up or "NEG" in s_up:
@@ -135,8 +136,6 @@ class FusionAgent(L2Agent):
                 response_data["timestamp"] = state.current_time
             
             fusion_result = FusionResult.model_validate(response_data)
-            # 再次确保时间一致性 (防止 model_validate 使用默认的 utcnow)
-            object.__setattr__(fusion_result, 'timestamp', state.current_time)
             
             logger.info(f"[{self.agent_id}] Successfully generated FusionResult. Decision: {fusion_result.decision}")
             
