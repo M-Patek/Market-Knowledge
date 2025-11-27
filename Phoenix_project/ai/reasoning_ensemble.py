@@ -158,8 +158,8 @@ class ReasoningEnsemble:
                 fusion_result.confidence = 0.0
                 fusion_result.reasoning += "\n[FACT-CHECK]: Reasoning Unverified/Refuted. Decision neutralized."
             else:
-                # 小幅提升置信度
-                fusion_result.confidence = min(fusion_result.confidence + 0.1, 1.0)
+                # [Optimization] Removed magic number boosting (+0.1) for purity
+                pass
                 
         except Exception as e:
             logger.warning(f"Fact check failed (non-fatal): {e}")
