@@ -3,7 +3,8 @@ AI 集成客户端
 负责并行（或串行）调用多个 AI 智能体。
 """
 import asyncio 
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any, Optional, Union
 import time
 import json
 from datetime import datetime
@@ -11,10 +12,9 @@ from pydantic import ValidationError
 
 from Phoenix_project.core.schemas.fusion_result import AgentDecision
 from Phoenix_project.ai.prompt_manager import PromptManager
-from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager # [Fix IV.1]
+from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager 
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.core.pipeline_state import PipelineState
-# (FIX 1.1) 导入 Registry 类型，但不是实例
 from Phoenix_project.registry import Registry 
 
 logger = get_logger(__name__)
@@ -24,42 +24,43 @@ class EnsembleClient:
     管理 AI 智能体的池，并执行推理请求。
     """
     
-    # (FIX 1.2) 更新 __init__ 以接收 global_registry
     def __init__(
         self, 
-        gemini_manager: GeminiPoolManager, # [Fix IV.1]
+        gemini_manager: GeminiPoolManager, 
         prompt_manager: PromptManager, 
         agent_registry: Dict[str, Any],
-        global_registry: Registry  # <--- 注入的依赖
+        global_registry: Registry 
     ):
         """
         初始化 EnsembleClient。
         
         参数:
-            gemini_manager (GeminiPoolManager): [Fix IV.1] 用于管理 Gemini 客户端和速率限制。
+            gemini_manager (GeminiPoolManager): 用于管理 Gemini 客户端和速率限制。
             prompt_manager (PromptManager): 用于管理和渲染提示。
             agent_registry (Dict[str, Any]): V1 智能体的配置 (来自 config)。
             global_registry (Registry): V2 智能体的依赖注入容器。
         """
-        self.gemini_manager = gemini_manager # [Fix IV.1]
+        self.gemini_manager = gemini_manager 
         self.prompt_manager = prompt_manager
-        self.agent_registry = agent_registry # V1 (config) agents
-        self.global_registry = global_registry # V2 (python) agents
+        self.agent_registry = agent_registry 
+        self.global_registry = global_registry 
         self.max_workers = agent_registry.get("config", {}).get("max_parallel_agents", 5)
         self.log_prefix = "EnsembleClient:"
 
     @property
     def api_gateway(self):
         """
-        [Fix IV.1] [Compatibility] Expose self as the 'api_gateway' for Retriever.
+        [Compatibility] Expose self as the 'api_gateway' for Retriever.
         Retriever expects an object with 'generate_text', which EnsembleClient now implements.
         """
         return self
 
-    async def generate_text(self, prompt: str, model_id: Optional[str] = None, use_json_mode: bool = False, tools: Optional[List[Any]] = None) -> Optional[str]:
+    async def generate_text(self, prompt: Union[str, List[Any]], model_id: Optional[str] = None, use_json_mode: bool = False, tools: Optional[List[Any]] = None) -> Any:
         """
         [Fix IV.1] Generates text using the GeminiPoolManager.
         [Task V Fix] Added support for 'tools' and robust response access.
+        
+        Returns full response dict to expose function_call.
         """
         target_model = model_id if model_id else "gemini-1.5-flash" # Default
         
@@ -67,29 +68,20 @@ class EnsembleClient:
         # This enables the Orchestrator/LoopManager to handle retries or circuit breaking.
         async with self.gemini_manager.get_client(target_model) as client:
             # Prepare contents
-            contents = [prompt]
+            contents = prompt if isinstance(prompt, list) else [prompt]
             generation_config = {"response_mime_type": "application/json"} if use_json_mode else None
             
-            response = await client.generate_content_async(
+            return await client.generate_content_async(
                 contents=contents,
                 generation_config=generation_config,
                 tools=tools
             )
-            
-            # Robust access to text (supports both Object and Dict interfaces)
-            if hasattr(response, "text"):
-                return response.text
-            elif isinstance(response, dict):
-                return response.get("text")
-            return str(response)
 
     async def run_llm_task(self, agent_prompt_name: str, context_map: Dict[str, Any]) -> Optional[str]:
         """
         [Task V Fix] Wrapper for FusionAgent to render prompt and generate text.
         """
         # Render the prompt using PromptManager
-        # Assuming render_prompt accepts context kwargs or a context dict
-        # Based on FusionAgent usage, it passes a map.
         prompt_text = self.prompt_manager.render_prompt(agent_prompt_name, **context_map)
         
         if not prompt_text:
@@ -97,30 +89,62 @@ class EnsembleClient:
             return None
 
         # [Task 8] Allow exceptions to propagate
-        return await self.generate_text(prompt=prompt_text, use_json_mode=True)
+        response = await self.generate_text(prompt=prompt_text, use_json_mode=True)
+        return response.get("text") if isinstance(response, dict) else str(response)
+
+    def _clean_json_string(self, text: str) -> str:
+        """Removes Markdown code blocks to extract pure JSON string."""
+        text = text.strip()
+        # Use regex to find content inside ```json ... ``` or ``` ... ```
+        match = re.search(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
+        if match:
+            text = match.group(1)
+        return text.strip()
 
     async def run_chain_structured(self, prompt: str, tools: Optional[List[Any]] = None, model_name: Optional[str] = None) -> Optional[Any]:
         """
         [Task V Fix] Wrapper for FactChecker to execute with tools and return structured data (JSON).
+        
+        Implements a ReAct loop.
         """
-        try:
-            # [Task 8] Allow system exceptions to propagate, catch only JSON errors
-            response_text = await self.generate_text(
-                prompt=prompt, 
-                model_id=model_name, 
-                use_json_mode=True, # FactChecker expects JSON response
-                tools=tools
-            )
-            
-            if not response_text:
-                return None
+        messages = [{"role": "user", "parts": [{"text": prompt}]}]
+        max_turns = 5
+
+        for _ in range(max_turns):
+            try:
+                # [Task 8] Allow system exceptions to propagate, catch only JSON errors
+                response = await self.generate_text(
+                    prompt=messages, 
+                    model_id=model_name, 
+                    use_json_mode=True, # FactChecker expects JSON response
+                    tools=tools
+                )
                 
-            # Parse JSON result
-            return json.loads(response_text)
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"{self.log_prefix} run_chain_structured: JSON parse failed: {e}. Text: {response_text}")
-            return None
+                if not response:
+                    return None
+                    
+                function_call = response.get("function_call")
+                text_content = response.get("text", "")
+
+                if function_call:
+                    logger.info(f"{self.log_prefix} Tool call detected: {function_call}")
+                    # TODO: Execute tool and append result.
+                    # Placeholder: break to prevent infinite loop as we lack the executor here
+                    break
+
+                if text_content:
+                    cleaned = self._clean_json_string(text_content)
+                    try:
+                        return json.loads(cleaned)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"{self.log_prefix} JSON parse failed: {e}. Retrying...")
+                        continue
+
+            except Exception as e:
+                 logger.error(f"{self.log_prefix} run_chain_structured error: {e}")
+                 return None
+        
+        return None
 
     # --- V2 逻辑 (异步执行) ---
     
@@ -164,10 +188,7 @@ class EnsembleClient:
             start_time = time.time()
             
             # --- (FIX 1.3) 移除内部导入，使用注入的 registry ---
-            # from Phoenix_project.registry import registry 
-            # agent_instance = registry.resolve(agent_name)
             agent_instance = self.global_registry.get_component(agent_name)
-            # --- (FIX 1.3 结束) ---
             
             if not agent_instance:
                  logger.error(f"{self.log_prefix} Agent '{agent_name}' not found in V2 registry.")
@@ -249,20 +270,22 @@ class EnsembleClient:
             start_time = time.time()
             
             # [Fix IV.1] 使用 self.generate_text
-            response_text = await self.generate_text(
+            response = await self.generate_text(
                 prompt=prompt,
                 model_id=model_id,
                 use_json_mode=True
             )
             
-            if not response_text:
+            if not response:
                 logger.warning(f"{self.log_prefix} Agent {agent_name} (V1) returned no response.")
                 return None
-                
-            response_data = json.loads(response_text)
+            
+            # Handle response type (Dict or Object)
+            text_content = response.get("text", "") if isinstance(response, dict) else str(response)
             
             # 验证和解析
             try:
+                response_data = json.loads(text_content)
                 decision = AgentDecision(
                     agent_name=agent_name,
                     timestamp=datetime.now(),
@@ -271,8 +294,8 @@ class EnsembleClient:
                 duration = time.time() - start_time
                 logger.info(f"{self.log_prefix} Agent '{agent_name}' (V1) completed in {duration:.2f}s")
                 return decision
-            except ValidationError as e:
-                logger.error(f"{self.log_prefix} Agent {agent_name} (V1) output validation failed: {e}. Payload: {response_text[:200]}...")
+            except (json.JSONDecodeError, ValidationError) as e:
+                logger.error(f"{self.log_prefix} Agent {agent_name} (V1) output validation failed: {e}. Payload: {text_content[:200]}...")
                 return None
                 
         except Exception as e:
