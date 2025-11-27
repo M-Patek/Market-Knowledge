@@ -113,12 +113,14 @@ class TradeLifecycleManager:
                 )
             logger.info(f"{self.log_prefix} Restored {len(self.positions)} positions.")
 
-    def get_current_portfolio_state(self, current_market_data: Dict[str, float]) -> PortfolioState:
+    def get_current_portfolio_state(self, current_market_data: Dict[str, float], timestamp: Optional[datetime] = None) -> PortfolioState:
         """
         根据最新的市场价格计算并返回当前的投资组合状态。
         [Beta FIX] 增加了严格的数据完整性检查。
         [Phase III Fix] Valuation Resilience (Limp Mode)
+        [Phase IV Fix] Time Machine Support: Accept simulation timestamp.
         :param current_market_data: Dict[symbol, current_price]
+        :param timestamp: Optional simulation timestamp (for backtesting consistency)
         """
         total_value = self.cash
         
@@ -135,9 +137,12 @@ class TradeLifecycleManager:
             pos.market_value = pos.quantity * current_price
             pos.unrealized_pnl = (current_price - pos.average_price) * pos.quantity
             total_value += pos.market_value
-                
+        
+        # Determine timestamp: Use provided simulation time or UTC now
+        state_timestamp = timestamp if timestamp else datetime.utcnow()
+
         return PortfolioState(
-            timestamp=datetime.utcnow(), # 实际应使用事件时间
+            timestamp=state_timestamp,
             cash=self.cash,
             total_value=total_value,
             positions=self.positions.copy(),
