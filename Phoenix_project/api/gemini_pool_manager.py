@@ -57,81 +57,88 @@ class GeminiClient:
         Generates content from the model via REST API, respecting rate limits.
         
         Returns:
-            Dict[str, Any]: A dictionary containing the 'text' response and optional 'grounding_metadata'.
+            Dict[str, Any]: A dictionary containing the 'text' response, 'function_call', and optional 'grounding_metadata'.
         """
+        # [Optimized Concurrency] Calculate sleep time inside lock, sleep outside to prevent chained blocking
         async with self.semaphore:
-            # Enforce time-based rate limit
             now = asyncio.get_event_loop().time()
-            time_since_last_call = now - self.last_call_time
+            # Reserve slot: Current time or last slot + rate
+            start_time = max(now, self.last_call_time + self.semaphore_rate)
+            sleep_time = start_time - now
+            self.last_call_time = start_time
+
+        if sleep_time > 0:
+            logger.debug(f"Rate limiting {self.model_id} ({request_id}). Sleeping for {sleep_time:.2f}s.")
+            await asyncio.sleep(sleep_time)
             
-            if time_since_last_call < self.semaphore_rate:
-                sleep_time = self.semaphore_rate - time_since_last_call
-                logger.debug(f"Rate limiting {self.model_id} ({request_id}). Sleeping for {sleep_time:.2f}s.")
-                await asyncio.sleep(sleep_time)
+        try:
+            logger.info(f"Sending request {request_id} to {self.model_id}")
             
-            self.last_call_time = asyncio.get_event_loop().time()
+            # Switch to REST API via httpx to eliminate global state race conditions
+            base_url = "https://generativelanguage.googleapis.com/v1beta/models"
+            url = f"{base_url}/{self.model_id}:generateContent?key={self.api_key}"
             
-            try:
-                logger.info(f"Sending request {request_id} to {self.model_id}")
-                
-                # MODIFICATION: Switch to REST API via httpx to eliminate global state race conditions
-                base_url = "https://generativelanguage.googleapis.com/v1beta/models"
-                url = f"{base_url}/{self.model_id}:generateContent?key={self.api_key}"
-                
-                # Adapter for contents to ensure JSON compatibility
-                formatted_contents = contents
-                if isinstance(contents, str):
-                    formatted_contents = [{"role": "user", "parts": [{"text": contents}]}]
-                elif isinstance(contents, list) and contents and isinstance(contents[0], str):
-                    formatted_contents = [{"role": "user", "parts": [{"text": c}]} for c in contents]
+            # Adapter for contents to ensure JSON compatibility
+            formatted_contents = contents
+            if isinstance(contents, str):
+                formatted_contents = [{"role": "user", "parts": [{"text": contents}]}]
+            elif isinstance(contents, list) and contents and isinstance(contents[0], str):
+                formatted_contents = [{"role": "user", "parts": [{"text": c}]} for c in contents]
 
-                payload = {
-                    "contents": formatted_contents,
-                    "generationConfig": generation_config or {},
-                    "safetySettings": safety_settings or []
-                }
-                if tools:
-                    payload["tools"] = tools
+            payload = {
+                "contents": formatted_contents,
+                "generationConfig": generation_config or {},
+                "safetySettings": safety_settings or []
+            }
+            if tools:
+                payload["tools"] = tools
 
-                async with httpx.AsyncClient() as client:
-                    # Using a new client per request ensures isolation, though less efficient than a session.
-                    # Given the low QPM, this overhead is negligible compared to safety.
-                    response = await client.post(url, json=payload, timeout=60.0)
+            async with httpx.AsyncClient() as client:
+                # Using a new client per request ensures isolation
+                response = await client.post(url, json=payload, timeout=60.0)
 
-                if response.status_code != 200:
-                    logger.error(f"Gemini API Error ({response.status_code}): {response.text}")
-                    raise ValueError(f"Gemini API call failed with status {response.status_code}: {response.text}")
+            if response.status_code != 200:
+                logger.error(f"Gemini API Error ({response.status_code}): {response.text}")
+                raise ValueError(f"Gemini API call failed with status {response.status_code}: {response.text}")
 
-                response_data = response.json()
-                
-                # Basic error handling for prompt feedback (safety blocks)
-                prompt_feedback = response_data.get("promptFeedback", {})
-                if prompt_feedback.get("blockReason"):
-                     block_reason = prompt_feedback.get("blockReason")
-                     logger.warning(f"Request {request_id} blocked. Reason: {block_reason}")
-                     raise ValueError(f"Content generation blocked: {block_reason}")
+            response_data = response.json()
+            
+            # Basic error handling for prompt feedback (safety blocks)
+            prompt_feedback = response_data.get("promptFeedback", {})
+            if prompt_feedback.get("blockReason"):
+                    block_reason = prompt_feedback.get("blockReason")
+                    logger.warning(f"Request {request_id} blocked. Reason: {block_reason}")
+                    raise ValueError(f"Content generation blocked: {block_reason}")
 
-                candidates = response_data.get("candidates", [])
-                if not candidates:
-                     raise ValueError(f"Model response ({request_id}) contained no candidates.")
+            candidates = response_data.get("candidates", [])
+            if not candidates:
+                    raise ValueError(f"Model response ({request_id}) contained no candidates.")
 
-                first_candidate = candidates[0]
-                # Extract text safely
-                parts = first_candidate.get("content", {}).get("parts", [])
-                response_text = parts[0].get("text", "") if parts else ""
-                
-                # Extract grounding metadata if available
-                grounding_metadata = first_candidate.get('groundingMetadata')
+            first_candidate = candidates[0]
+            parts = first_candidate.get("content", {}).get("parts", [])
+            
+            # [Fixed Swallow Bug] Iterate through parts to capture both text and function calls
+            response_text = ""
+            function_call = None
+            for part in parts:
+                if "text" in part:
+                    response_text += part["text"]
+                if "functionCall" in part:
+                    function_call = part["functionCall"]
+            
+            # Extract grounding metadata if available
+            grounding_metadata = first_candidate.get('groundingMetadata')
 
-                # Return dictionary compatible with APIGateway
-                return {
-                    "text": response_text,
-                    "grounding_metadata": grounding_metadata
-                }
+            # Return dictionary compatible with APIGateway, correctly exposing function calls
+            return {
+                "text": response_text,
+                "function_call": function_call,
+                "grounding_metadata": grounding_metadata
+            }
 
-            except Exception as e:
-                logger.error(f"Error calling Gemini API ({self.model_id}) for {request_id}: {e}", exc_info=True)
-                raise
+        except Exception as e:
+            logger.error(f"Error calling Gemini API ({self.model_id}) for {request_id}: {e}", exc_info=True)
+            raise
 
 class GeminiPoolManager:
     """
