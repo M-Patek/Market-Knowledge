@@ -76,10 +76,10 @@ class PhoenixProject:
         redis_host = os.environ.get("REDIS_HOST", "localhost")
         redis_port = int(os.environ.get("REDIS_PORT", 6379))
         
-        # [Beta FIX] Re-enabled decode_responses=True for ContextBus string channels
+        # [Beta FIX] Re-enabled decode_responses=False for binary support (Pickle)
         # Note: Binary data must be handled explicitly if introduced later
-        redis_client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True)
-        logger.info(f"Redis client initialized at {redis_host}:{redis_port} (Text Mode)")
+        redis_client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=False)
+        logger.info(f"Redis client initialized at {redis_host}:{redis_port} (Binary Mode)")
     
         # [Infra] ContextBus (状态持久化)
         context_bus = ContextBus(redis_client=redis_client, config=config.get('context_bus'))
@@ -379,10 +379,13 @@ class PhoenixProject:
             trade_lifecycle_manager = self.systems["trade_lifecycle_manager"]
             
             # 暂时使用 APIServer (Flask) 作为主 API
-            api_server = APIServer(
+            self.api_server = APIServer(
                 audit_manager=self.systems["audit_manager"],
                 orchestrator=orchestrator 
             )
+
+            # Start API Server explicitly [Fixed Dormant API]
+            api_task = asyncio.create_task(self.api_server.start())
 
             # --- 4. 启动后台任务 (Loops) ---
             logger.info("Starting background processing loops...")
@@ -401,7 +404,7 @@ class PhoenixProject:
                 frequency_sec=self.cfg.controller.get('l3_loop_frequency_sec', 300)
             ))
 
-            tasks = [l0_l1_task, l2_task, l3_task]
+            tasks = [l0_l1_task, l2_task, l3_task, api_task]
             
             # --- 5. (优雅关闭) ---
             await asyncio.gather(*tasks) # 等待所有循环完成
@@ -417,6 +420,9 @@ class PhoenixProject:
         finally:
             # [Code Opt Expert Fix] Task 6: Ensure cleanup uses self.services and runs in finally block
             logger.info("Cleaning up resources...")
+            if hasattr(self, 'api_server'):
+                await self.api_server.stop()
+
             if hasattr(self, 'services'):
                 if "graph_db" in self.services:
                     await self.services["graph_db"].close()
