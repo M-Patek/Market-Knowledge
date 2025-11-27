@@ -3,6 +3,7 @@
 负责处理订单的整个生命周期：发送、监控、取消。
 [Beta Final Fix] 集成 Fail-Safe 逻辑，捕获数据完整性错误并执行紧急停止。
 [Task 4] Concurrency Safety & Execution Protection
+[Phase IV Fix] Time Machine Support
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
@@ -80,8 +81,6 @@ class OrderManager:
                 # 即使订单未知，也可能需要转发 Fill
                 
             # [阶段 4] 将 Fill 转发给 TLM
-            # Implicit state update via Fill amount is handled by Broker callback logic usually, 
-            # but we explicitly check state consistency here if needed.
             try:
                 await self.trade_lifecycle_manager.on_fill(fill)
             except Exception as e:
@@ -266,7 +265,8 @@ class OrderManager:
                 continue
             
             # Freshness Check (e.g., 1 min tolerance)
-            time_diff = state.current_time - md.timestamp.replace(tzinfo=None) # Ensure tz-naive/aware match
+            # Use sim time from state for comparison
+            time_diff = state.current_time - md.timestamp.replace(tzinfo=None) 
             if abs(time_diff) > timedelta(minutes=1):
                 logger.error(f"Skipping {sym}: Data too old ({time_diff}). Price: {md.timestamp}, SimTime: {state.current_time}")
                 continue
@@ -274,13 +274,16 @@ class OrderManager:
             market_prices[sym] = md.close
             
         # [Task 3.2] Reconcile active orders before generating new ones (Purge Zombies)
-        # This ensures we don't double-count orders that the broker dropped.
         await self._reconcile_active_orders()
 
         # 2. 获取当前持仓状态 (Using TLM)
         # [Beta Final Fix] 捕获数据完整性异常并触发紧急停止
         try:
-            current_portfolio = self.trade_lifecycle_manager.get_current_portfolio_state(market_prices)
+            # [Phase IV Fix] Pass state.current_time (simulation time) to ledger
+            current_portfolio = self.trade_lifecycle_manager.get_current_portfolio_state(
+                market_prices, 
+                timestamp=state.current_time
+            )
         except ValueError as e:
             logger.critical(f"{self.log_prefix} DATA INTEGRITY ALERT: {e}. Initiating EMERGENCY STOP.")
             self.cancel_all_open_orders()
@@ -289,7 +292,6 @@ class OrderManager:
 
         # 3. 生成订单
         # [Optimization] Pass active_orders to calculate effective exposure
-        # Need a snapshot of active orders to avoid async modification issues, though generate_orders is sync.
         async with self.lock:
             active_orders_snapshot = self.active_orders.copy()
             
@@ -310,7 +312,6 @@ class OrderManager:
         orders_to_submit = []
         
         # Phase 1: Placeholder Registration (Optimistic Locking)
-        # Immediately register orders as PENDING_SUBMISSION to prevent double-generation in next cycle
         async with self.lock:
             for order in orders:
                 if order.id in self.active_orders:
@@ -323,7 +324,6 @@ class OrderManager:
 
         # Phase 2: Network Execution (Outside Lock)
         for order in orders_to_submit:
-            # Use the limit price set in generate_orders, fallback to current if None
             price = order.price if order.price else market_prices.get(order.symbol)
             try:
                 # [Task 4.2] Async execution via thread for potentially blocking broker calls
@@ -333,7 +333,6 @@ class OrderManager:
                     broker_order_id = "MOCK_" + order.id
                 
                 async with self.lock:
-                    # Update status only if it hasn't been transitioned (e.g. to FILLED) by a fast callback
                     current_order_state = self.active_orders.get(order.id)
                     if current_order_state and current_order_state.status == OrderStatus.PENDING_SUBMISSION:
                         order.status = OrderStatus.PENDING 
