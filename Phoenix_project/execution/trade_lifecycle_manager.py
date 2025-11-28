@@ -5,6 +5,8 @@
 [Beta FIX] 防止僵尸估值 (Zombie Valuation)
 [Task 3] Atomic Transactions & Write-Ahead Persistence
 [Phase III Fix] Valuation Resilience (Limp Mode)
+[Phase II Fix] Decimal Precision & Atomic Transactions
+[Phase V Fix] SQL Injection Protection
 """
 from typing import Dict, Optional
 from datetime import datetime
@@ -64,8 +66,8 @@ class TradeLifecycleManager:
         await self.tabular_db.query("""
             CREATE TABLE IF NOT EXISTS ledger_balance (
                 id SERIAL PRIMARY KEY,
-                cash FLOAT NOT NULL,
-                realized_pnl FLOAT NOT NULL,
+                cash NUMERIC(20, 10) NOT NULL,
+                realized_pnl NUMERIC(20, 10) NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -73,10 +75,10 @@ class TradeLifecycleManager:
         await self.tabular_db.query("""
             CREATE TABLE IF NOT EXISTS ledger_positions (
                 symbol VARCHAR(20) PRIMARY KEY,
-                quantity FLOAT NOT NULL,
-                average_price FLOAT NOT NULL,
-                market_value FLOAT NOT NULL,
-                unrealized_pnl FLOAT NOT NULL,
+                quantity NUMERIC(20, 10) NOT NULL,
+                average_price NUMERIC(20, 10) NOT NULL,
+                market_value NUMERIC(20, 10) NOT NULL,
+                unrealized_pnl NUMERIC(20, 10) NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -86,8 +88,8 @@ class TradeLifecycleManager:
                 fill_id VARCHAR(64) PRIMARY KEY,
                 order_id VARCHAR(64),
                 symbol VARCHAR(20),
-                quantity FLOAT,
-                price FLOAT,
+                quantity NUMERIC(20, 10),
+                price NUMERIC(20, 10),
                 timestamp TIMESTAMP
             );
         """)
@@ -272,15 +274,19 @@ class TradeLifecycleManager:
     async def _is_fill_processed(self, fill_id: str) -> bool:
         """检查 Fill ID 是否已存在于数据库。"""
         if not self.tabular_db: return False
-        res = await self.tabular_db.query(f"SELECT fill_id FROM ledger_fills WHERE fill_id = '{fill_id}'")
-        return bool(res and "results" in res and res["results"])
+        # [Task 5.1] Security Fix: Use parameterized query via execute_sql instead of f-string
+        res = await self.tabular_db.execute_sql(
+            "SELECT fill_id FROM ledger_fills WHERE fill_id = :fill_id",
+            {"fill_id": fill_id}
+        )
+        return bool(res)
 
     async def _persist_transaction(self, cash: Decimal, realized_pnl: Decimal, position: Optional[Position], symbol: str, conn=None):
         """[Task 3] Atomic DB Update Helper. Uses explicit values."""
         # Update Balance
         await self.tabular_db.upsert_data(
             "ledger_balance", 
-            {"id": 1, "cash": float(cash), "realized_pnl": float(realized_pnl)}, 
+            {"id": 1, "cash": str(cash), "realized_pnl": str(realized_pnl)}, 
             "id",
             connection=conn
         )
