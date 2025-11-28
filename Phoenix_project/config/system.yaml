@@ -2,6 +2,11 @@ Phoenix (Market Knowledge) 系统配置文件 (system.yaml)
 
 [RAG 架构]：此文件定义了 RAG 架构图中所有组件的配置。
 
+# [Phase I Fix] 全局运行模式配置 (Environment Isolation)
+# 用于物理隔离 Redis 中的 Key (e.g., phx:dev:..., phx:prod:...)
+[Global Config]
+run_mode: "DEV" # Options: PROD, BACKTEST, DEV
+
 1. 控制器 (Controller) & 循环 (Loops)
 
 controller:
