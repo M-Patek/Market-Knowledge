@@ -16,6 +16,11 @@ class AdversaryResult(BaseModel):
     target_evidence_id: str = Field(..., description="The 'id' of the L1 EvidenceItem that was tested.")
     
     counter_argument: str = Field(..., description="The textual counter-argument or alternative scenario.")
+    
+    # [Task 2.3] New Validation Metrics
+    challenge_quality: float = Field(default=0.0, description="Quality of the counter-argument (0.0-1.0).")
+    counter_evidence_strength: float = Field(default=0.0, description="Strength of the opposing facts (0.0-1.0).")
+    
     is_challenge_successful: bool = Field(..., description="Whether the counter-argument successfully invalidates or weakens the original evidence.")
     confidence_impact: float = Field(..., description="A suggested impact factor on the original evidence's confidence (e.g., -0.2 for a 20% reduction).")
     
