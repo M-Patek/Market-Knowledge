@@ -15,15 +15,15 @@ class RiskAgent(BaseDRLAgent):
     
     def get_safe_action(self) -> np.ndarray:
         """
-        [Safety] Return None to signal Orchestrator to HALT/HOLD.
-        Prevents unintended approvals during system failure.
+        [Safety] Returns neutral zero vector.
+        Fixed: Must return np.ndarray, not None.
         """
-        return None
+        return np.array([0.0], dtype=np.float32)
     
-    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
+    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
         """
-        [Task 3.3] Format observation to match TradingEnv (6-d).
-        Vector: [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence]
+        [Task 6.1] Format observation to match TradingEnv (7-d).
+        Vector: [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence, MarketRegime]
         
         Args:
             state_data (dict): {'balance', 'initial_balance', 'position_weight', 'price', 'prev_price', 'volume'}
@@ -60,14 +60,22 @@ class RiskAgent(BaseDRLAgent):
             
         log_volume = np.log(volume + 1.0)
 
-        # 3. Construct 6-d State Vector
+        # [Task 6.1] Macro Feature
+        regime_val = 0.0
+        if market_state:
+            regime = str(market_state.get('regime', 'NEUTRAL')).upper()
+            if 'BULL' in regime: regime_val = 1.0
+            elif 'BEAR' in regime: regime_val = -1.0
+
+        # 3. Construct 7-d State Vector
         obs = np.array([
             norm_balance,
             position_weight,
             log_return,
             log_volume,
             sentiment,
-            confidence
+            confidence,
+            regime_val
         ], dtype=np.float32)
         
         return obs
