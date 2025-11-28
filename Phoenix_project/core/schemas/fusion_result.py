@@ -3,8 +3,15 @@ Defines the L2 output schema: FusionResult.
 """
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
+from enum import Enum
 from datetime import datetime
 import uuid
+
+# [Phase III Fix] System Status Enum for Zero Trap Prevention
+class SystemStatus(str, Enum):
+    OK = "OK"
+    DEGRADED = "DEGRADED"
+    HALT = "HALT"
 
 class FusionResult(BaseModel):
     """
@@ -22,6 +29,9 @@ class FusionResult(BaseModel):
     
     reasoning: str = Field(..., description="A summary of the reasoning, including how L1 evidence was synthesized and conflicts resolved.")
     uncertainty: float = Field(..., description="A quantified score of the overall uncertainty in the decision.", ge=0.0, le=1.0)
+    
+    # [Phase III Fix] Added system_status to signal engine health
+    system_status: SystemStatus = Field(default=SystemStatus.OK, description="Operational status of the inference engine (OK, DEGRADED, HALT).")
     
     supporting_evidence_ids: List[str] = Field(default_factory=list, description="List of IDs from the L1 EvidenceItems that support this decision.")
     conflicting_evidence_ids: List[str] = Field(default_factory=list, description="List of IDs from L1 EvidenceItems that conflict with this decision.")
