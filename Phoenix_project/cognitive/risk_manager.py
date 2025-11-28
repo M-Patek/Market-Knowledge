@@ -4,6 +4,7 @@ Risk Manager for the Phoenix cognitive engine.
 Monitors portfolio state, market conditions, and operational metrics
 to enforce risk controls and trigger circuit breakers.
 [Task 5] Persistence and Warm-up
+[Task 6.3] Direction-Aware Risk Control
 """
 
 import logging
@@ -69,7 +70,9 @@ class RiskManager:
         self.frequency_factor = self.config.get("frequency_factor", 252)
 
         # 内部状态
-        self.current_equity: float = initial_capital
+        # [Task 4.2] Initialize from persistence or default
+        self.current_equity: float = initial_capital 
+        
         # [Task 5] Load persistent circuit breaker state
         self.circuit_breaker_tripped: bool = False # Loaded in initialize()
         self.active_signals: List[RiskSignal] = []
@@ -103,7 +106,11 @@ class RiskManager:
         # Load persistent state asynchronously
         self.circuit_breaker_tripped = await self._load_circuit_breaker_state()
         self.peak_equity = await self._load_peak_equity()
+        # [Task 4.2] Restore current equity to prevent drawdown miscalculation
+        self.current_equity = await self._load_current_equity()
+        
         logger.info(f"Loaded Peak Equity: {self.peak_equity}")
+        logger.info(f"Loaded Current Equity: {self.current_equity}")
         logger.info(f"Circuit Breaker State: {'TRIPPED' if self.circuit_breaker_tripped else 'OK'}")
 
         if not self.data_manager:
@@ -160,6 +167,24 @@ class RiskManager:
                 await self.redis_client.set("phoenix:risk:peak_equity", self.peak_equity)
         except Exception as e:
             logger.error(f"Failed to save peak_equity to Redis: {e}")
+
+    async def _load_current_equity(self) -> float:
+        """[Task 4.2] Loads current equity from Redis."""
+        try:
+            if not self.redis_client: return self.initial_capital
+            val = await self.redis_client.get("phoenix:risk:current_equity")
+            return float(val) if val else self.initial_capital
+        except Exception as e:
+            logger.error(f"Failed to load current_equity: {e}")
+            return self.initial_capital
+
+    async def _save_current_equity(self):
+        """[Task 4.2] Saves current equity to Redis."""
+        try:
+            if self.redis_client:
+                await self.redis_client.set("phoenix:risk:current_equity", self.current_equity)
+        except Exception as e:
+            logger.error(f"Failed to save current_equity: {e}")
 
     def check_pre_trade(
         self, proposed_position: Position, portfolio: Portfolio
@@ -245,6 +270,10 @@ class RiskManager:
         Updates the current equity and peak equity.
         """
         self.current_equity = new_equity
+        
+        # [Task 4.2] Persist current equity immediately
+        await self._save_current_equity()
+        
         if self.current_equity > self.peak_equity:
             self.peak_equity = self.current_equity
             # OPTIMIZED: 持久化更新后的 peak_equity
@@ -279,25 +308,37 @@ class RiskManager:
     ) -> Optional[ConcentrationSignal]:
         """
         Checks if a new position would violate concentration limits.
+        [Task 6.3] Direction-Aware: Allows risk-reducing trades even if overweight.
         """
         symbol = proposed_position.symbol
-        # 假设 proposed_position.market_value 是新头寸的名义价值
-        new_position_value = proposed_position.market_value
         
-        # 查找现有头寸 (如果存在)
-        existing_value = 0.0
-        if symbol in portfolio.positions:
-            existing_value = portfolio.positions[symbol].market_value
+        # 1. Get Quantities (Signed)
+        existing_pos = portfolio.positions.get(symbol)
+        existing_qty = existing_pos.quantity if existing_pos else 0.0
+        trade_qty = proposed_position.quantity
+        
+        final_qty = existing_qty + trade_qty
+        
+        # 2. Check for Risk Reduction (Unwinding)
+        # If absolute exposure decreases, we ALLOW the trade regardless of current level.
+        if existing_qty != 0 and abs(final_qty) < abs(existing_qty) - 1e-9:
+            logger.info(f"Risk reduction detected for {symbol} (Qty {existing_qty} -> {final_qty}). Allowing trade.")
+            return None
 
-        # 计算新头寸之后的总价值
-        # (注意: 假设 'market_value' 为正)
-        final_position_value = existing_value + new_position_value
+        # 3. Calculate Final Value (Estimated)
+        # We need a price estimate. Use existing position avg price or implied price from trade.
+        price = 0.0
+        if existing_pos and existing_pos.market_value > 0 and abs(existing_qty) > 0:
+            price = existing_pos.market_value / abs(existing_qty)
+        elif proposed_position.market_value > 0 and abs(trade_qty) > 0:
+            price = proposed_position.market_value / abs(trade_qty)
+            
+        final_position_value = abs(final_qty) * price
         
-        # 假设投资组合总价值 *不会* 因为这个新头寸而立即改变
+        # 4. Check Concentration against Portfolio
         total_portfolio_value = portfolio.total_value
-
         if total_portfolio_value == 0:
-            return None # 避免除以零
+            return None
 
         concentration = final_position_value / total_portfolio_value
         
