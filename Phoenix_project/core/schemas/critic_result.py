@@ -16,8 +16,15 @@ class CriticResult(BaseModel):
     
     is_valid: bool = Field(..., description="Whether the evidence passed the critique (True/False).")
     critique: str = Field(..., description="The textual critique, highlighting flaws, biases, or supporting facts.")
-    confidence_adjustment: float = Field(..., description="A suggested adjustment factor for the evidence's confidence (e.g., 0.8 for 20% reduction).")
+    confidence_adjustment: float = Field(default=0.0, description="A suggested adjustment factor for the evidence's confidence (e.g., -0.1).")
     
+    # [Task 2.2] New Score Fields
+    quality_score: float = Field(default=0.0, description="Quality of the evidence (0.0-1.0).")
+    clarity_score: float = Field(default=0.0, description="Clarity of the evidence (0.0-1.0).")
+    bias_score: float = Field(default=0.0, description="Bias assessment (0.0-1.0).")
+    relevance_score: float = Field(default=0.0, description="Relevance to query (0.0-1.0).")
+    suggestions: str = Field(default="", description="Suggestions for improvement.")
+
     flags: List[str] = Field(default_factory=list, description="List of detected issues (e.g., 'BIAS', 'DATA_MISSING', 'LOGIC_FLAW').")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Other metadata, e.g., prompt used.")
 
