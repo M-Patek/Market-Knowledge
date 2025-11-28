@@ -150,8 +150,19 @@ class BacktestEngine:
             trade_value = abs(qty_delta * price)
             cost = trade_value * (COMMISSION_RATE + SLIPPAGE_RATE)
             
+            # [Task 7.2] Margin Check: Prevent Infinite Leverage
+            total_debit = (qty_delta * price) + cost
+            
+            if qty_delta > 0: # Buying
+                if current_pf.cash < total_debit:
+                    self.logger.warning(
+                        f"MARGIN CALL: Insufficient funds for {symbol}. "
+                        f"Req: {total_debit:.2f}, Avail: {current_pf.cash:.2f}. Order REJECTED."
+                    )
+                    continue
+            
             current_pf.positions[symbol].quantity += qty_delta
-            current_pf.cash -= (qty_delta * price) + cost # Buy: -Cash, Sell: +Cash (delta is negative) - Cost
+            current_pf.cash -= total_debit # Buy: -Cash, Sell: +Cash (delta is negative) - Cost
             
         self.pending_orders.clear()
             
