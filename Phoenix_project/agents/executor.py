@@ -63,14 +63,9 @@ class AgentExecutor:
                 logger.warning(f"No state provided for L1 Agent {agent.agent_name}. Using task_content as dependencies only.")
                 state = PipelineState() # Initialize empty/default state
             
-            # [Beta Fix] 优先检查并调用 safe_run 方法
-            # 这确保了 BaseL1Agent 中定义的错误捕获逻辑生效
-            target_method = getattr(agent, "safe_run", agent.run)
-            
-            if asyncio.iscoroutinefunction(target_method):
-                return await target_method(state=state, dependencies=task_content)
-            else:
-                return await asyncio.to_thread(target_method, state=state, dependencies=task_content)
+            # [Task 2.1] L1 Agents are now natively async. 
+            # Direct await allows non-deterministic errors to bubble up to tenacity retry.
+            return await agent.safe_run(state=state, dependencies=task_content)
 
         # Default behavior for other agents (L2/L3) or non-BaseL1 agents
         # 检查是否缺少 run 方法
