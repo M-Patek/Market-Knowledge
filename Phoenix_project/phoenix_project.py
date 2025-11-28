@@ -7,7 +7,7 @@ import logging
 import os
 from typing import Dict, Any, Optional
 import hydra
-import redis
+import redis.asyncio as redis # [Task 1.3] 升级到 redis.asyncio 以修复启动崩溃
 from omegaconf import DictConfig, OmegaConf
 
 from Phoenix_project.monitor.logging import setup_logging
@@ -76,10 +76,9 @@ class PhoenixProject:
         redis_host = os.environ.get("REDIS_HOST", "localhost")
         redis_port = int(os.environ.get("REDIS_PORT", 6379))
         
-        # [Beta FIX] Re-enabled decode_responses=False for binary support (Pickle)
-        # Note: Binary data must be handled explicitly if introduced later
+        # [Task 1.3] 创建异步 Redis 客户端 (通过 aliased import)
         redis_client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=False)
-        logger.info(f"Redis client initialized at {redis_host}:{redis_port} (Binary Mode)")
+        logger.info(f"Redis client initialized at {redis_host}:{redis_port} (Binary Mode, Async)")
     
         # [Infra] ContextBus (状态持久化)
         context_bus = ContextBus(redis_client=redis_client, config=config.get('context_bus'))
@@ -144,11 +143,14 @@ class PhoenixProject:
         # --- 4. 核心 AI 组件 (Core AI Components) ---
         
         # (RAG) 数据管理器 (Data Manager) - [Task 4.2] Moved to services to inject into OrderManager
+        # [Task 2.3] Retrieve session_id if available (e.g. from env or args) - Default to None for live
+        session_id = os.environ.get("PHOENIX_SESSION_ID") 
         data_manager = DataManager(
             config=config.data_manager,
             redis_client=redis_client,
             tabular_db=tabular_db_client,
             temporal_db=temporal_db_client,
+            session_id=session_id # [Task 2.3] Inject Session ID
         )
     
         # (RAG) 关系提取器 (Relation Extractor)
@@ -201,11 +203,19 @@ class PhoenixProject:
         )
     
         # (L3) 风险管理器 (Risk Manager)
-        risk_manager = RiskManager(config=config.trading) 
+        risk_manager = RiskManager(
+            config=config.trading,
+            redis_client=redis_client,
+            data_manager=data_manager # [Task 5] Inject DataManager for warm-up
+        ) 
     
         # (L3) 投资组合构建器 (Portfolio Constructor)
         portfolio_constructor = PortfolioConstructor(
-            sizer_config=config.portfolio.sizer
+            config=config, # Pass full config or subsection
+            context_bus=context_bus,
+            risk_manager=risk_manager,
+            sizing_strategy=None, # TBD: Instantiate based on config
+            data_manager=data_manager
         )
 
         # (L3) 交易生命周期管理器 (Trade Lifecycle Manager)
@@ -235,7 +245,7 @@ class PhoenixProject:
 
         # --- (L3) 创建 Orchestrator 依赖 (Task 6) ---
         # [主人喵 Phase 0 修复] 移除错误的 config 参数
-        event_distributor = EventDistributor()
+        event_distributor = EventDistributor(redis_client=redis_client) # Inject Redis
         
         event_filter = EventRiskFilter(
             config=config.events.risk_filter 
@@ -243,7 +253,7 @@ class PhoenixProject:
         
         # [Task 3.3] Instantiate L2/Eval components properly
         fusion_agent = FusionAgent(agent_id="l2_fusion", llm_client=ensemble_client)
-        fact_checker = FactChecker(llm_client=ensemble_client)
+        fact_checker = FactChecker(llm_client=ensemble_client, prompt_manager=prompt_manager, prompt_renderer=prompt_renderer)
         arbitrator = Arbitrator(llm_client=ensemble_client)
         voter = Voter(llm_client=ensemble_client)
 
@@ -314,6 +324,7 @@ class PhoenixProject:
             portfolio_constructor=services["portfolio_constructor"],
             order_manager=services.get("order_manager"), 
             audit_manager=audit_manager,
+            trade_lifecycle_manager=services["trade_lifecycle_manager"],
             alpha_agent=services["alpha_agent"],
             risk_agent=services["risk_agent"],
             execution_agent=services["execution_agent"]
@@ -321,9 +332,11 @@ class PhoenixProject:
 
         # (L0/L1/L2) 循环管理器 (Loop Manager)
         loop_manager = LoopManager(
-            agent_executor=services["agent_executor"],
-            cognitive_engine=services["cognitive_engine"],
-            config=services["config"].controller
+            orchestrator=orchestrator,
+            data_iterator=None, # Will be set in run_backtest or run_live if needed
+            pipeline_state=None, # ContextBus handles loading
+            context_bus=services["context_bus"],
+            loop_config=services["config"].controller
         )
     
         # (RAG) 知识注入器 (Knowledge Injector)
@@ -391,20 +404,18 @@ class PhoenixProject:
             logger.info("Starting background processing loops...")
             
             # 启动 L0/L1 循环 (数据摄入/L1 智能体)
-            l0_l1_task = asyncio.create_task(loop_manager.start_l0_l1_loop())
+            # l0_l1_task = asyncio.create_task(loop_manager.start_l0_l1_loop())
             
             # [Task 4.1] 初始化持久化账本 (Async Init)
             await trade_lifecycle_manager.initialize()
 
             # 启动 L2 循环 (L2 智能体 - 融合/批评)
-            l2_task = asyncio.create_task(loop_manager.start_l2_loop())
+            # l2_task = asyncio.create_task(loop_manager.start_l2_loop())
             
-            # 启动 L3 循环 (L3 智能体 - Alpha/Risk)
-            l3_task = asyncio.create_task(orchestrator.start_l3_loop(
-                frequency_sec=self.cfg.controller.get('l3_loop_frequency_sec', 300)
-            ))
+            # 启动主循环 (统一入口)
+            loop_manager.start_loop()
 
-            tasks = [l0_l1_task, l2_task, l3_task, api_task]
+            tasks = [api_task]
             
             # --- 5. (优雅关闭) ---
             await asyncio.gather(*tasks) # 等待所有循环完成
@@ -425,9 +436,11 @@ class PhoenixProject:
 
             if hasattr(self, 'services'):
                 if "graph_db" in self.services:
-                    await self.services["graph_db"].close()
+                    # await self.services["graph_db"].close() # If async
+                    pass
                 if "vector_store" in self.services:
-                    await self.services["vector_store"].close()
+                    # await self.services["vector_store"].close() # If async
+                    pass
 
 
 @hydra.main(version_base=None, config_path="config", config_name="system")
