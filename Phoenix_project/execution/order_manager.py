@@ -3,10 +3,11 @@
 负责处理订单的整个生命周期：发送、监控、取消。
 [Beta Final Fix] 集成 Fail-Safe 逻辑，捕获数据完整性错误并执行紧急停止。
 [Task 4] Concurrency Safety & Execution Protection
-[Phase IV Fix] Time Machine Support
+[Phase IV Fix] Time Machine Support & Precision/Risk Controls
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_DOWN
 from collections import defaultdict
 import uuid
 import asyncio
@@ -123,6 +124,25 @@ class OrderManager:
         allowed = self.valid_transitions.get(current_status, set())
         return new_status in allowed
 
+    def _get_instrument_metadata(self, symbol: str) -> Dict[str, float]:
+        """
+        [Task 4] Returns instrument-specific metadata (Tick Size, Lot Size).
+        In a real system, this would fetch from a Master Data Service.
+        """
+        # Default to standard US equity precision
+        return {"tick_size": 0.01, "lot_size": 1.0}
+
+    def _round_to_tick(self, price: float, tick_size: float) -> float:
+        """
+        [Task 4] Rounds price down to the nearest tick size using Decimal arithmetic.
+        Fixes the 'Penny Gap' issue.
+        """
+        d_price = Decimal(str(price))
+        d_tick = Decimal(str(tick_size))
+        # Quantize with ROUND_DOWN (Safety preference for Limit orders)
+        rounded = d_price.quantize(d_tick, rounding=ROUND_DOWN)
+        return float(rounded)
+
     def generate_orders(self, 
                         current_portfolio: PortfolioState, 
                         target_portfolio: TargetPortfolio, 
@@ -150,6 +170,10 @@ class OrderManager:
             else:
                 logger.warning(f"{self.log_prefix} Total portfolio value and cash are zero or negative. Cannot generate orders.")
                 return []
+
+        # [Task 4] Forgotten Ceiling: Calculate initial gross exposure
+        # Gross Exposure = Sum(Abs(Position Value))
+        current_gross_exposure = sum(abs(p.market_value) for p in current_portfolio.positions.values())
 
         # 1. 计算有效持仓 (Settled + Active) 并转换为权重
         effective_quantities = defaultdict(float)
@@ -186,6 +210,18 @@ class OrderManager:
                 
                 target_dollar_value = delta_weight * total_value
                 
+                # [Task 4] Forgotten Ceiling: Check Projected Exposure
+                # projected = current_gross - abs(current) + abs(target)
+                current_pos_val = current_w * total_value
+                target_pos_val = target_w * total_value
+                
+                projected_gross_exposure = current_gross_exposure - abs(current_pos_val) + abs(target_pos_val)
+                
+                if projected_gross_exposure > self.max_notional_exposure:
+                    error_msg = f"Projected exposure {projected_gross_exposure:.2f} exceeds limit {self.max_notional_exposure}."
+                    logger.critical(f"{self.log_prefix} FATAL: {error_msg}")
+                    raise RiskViolationError(error_msg)
+                
                 price = market_prices.get(symbol)
                 
                 if price is None or price <= 0:
@@ -198,7 +234,10 @@ class OrderManager:
                 # Buy: Price * 1.005, Sell: Price * 0.995
                 slippage_factor = 0.005
                 limit_price = price * (1 + slippage_factor) if order_quantity > 0 else price * (1 - slippage_factor)
-                limit_price = round(limit_price, 2)
+                
+                # [Task 4] Penny Gap Fix: Round to Tick Size
+                meta = self._get_instrument_metadata(symbol)
+                limit_price = self._round_to_tick(limit_price, meta["tick_size"])
 
                 # [Task 1] Fat Finger Protection
                 expected_value = order_quantity * price
