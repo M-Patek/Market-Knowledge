@@ -2,7 +2,7 @@
 from abc import ABC, abstractmethod
 import asyncio
 import numpy as np
-from typing import Optional, Type
+from typing import Optional, Type, List, Any
 
 # [任务 4.1] 导入 RLLib 核心组件
 from ray.rllib.algorithms.algorithm import Algorithm
@@ -29,6 +29,14 @@ class BaseDRLAgent(ABC):
         self.algorithm = algorithm
         self.logger = get_logger(self.__class__.__name__)
         self.logger.info(f"DRL Agent ({self.__class__.__name__}) initialized with algorithm.")
+        
+        # [Task 3.1] Initialize Internal Memory (Hidden States)
+        # Required for LSTM/GRU to maintain context across time steps.
+        try:
+            self.internal_state = self.algorithm.get_policy().get_initial_state()
+        except Exception as e:
+            self.logger.warning(f"State initialization failed (defaulting to stateless): {e}")
+            self.internal_state = []
 
     @abstractmethod
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
@@ -65,12 +73,22 @@ class BaseDRLAgent(ABC):
         try:
             # explore=False 确保我们在生产 (Inference) 模式下
             # 获取确定性动作，而不是随机探索。
-            action = await asyncio.to_thread(
+            # [Task 3.1] Enable Stateful Inference (Pass & Update Hidden States)
+            result = await asyncio.to_thread(
                 self.algorithm.compute_single_action,
                 observation,
+                state=self.internal_state,
                 explore=False
             )
-            return action
+            
+            # Unpack Result: (action, state_out, extra_info)
+            if isinstance(result, tuple) and len(result) >= 3:
+                action, state_out, _ = result
+                self.internal_state = state_out
+                return action
+            
+            # Fallback: Stateless model returns just action
+            return result
         
         except Exception as e:
             self.logger.error(f"Error during compute_single_action: {e}", exc_info=True)
