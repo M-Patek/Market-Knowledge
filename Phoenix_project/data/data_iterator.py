@@ -153,35 +153,52 @@ class DataIterator:
                 await self._load_data_chunk(self.current_time, new_end)
             
             # 3. Prepare batch (Logic duplicated from __next__ for thread-safety and performance)
-            batch_data = {
+            # [Task 1.3] Refactored to prevent Time Travel.
+            # We strictly separate T-1 (Facts) from T (Opportunity).
+            snapshot = {
                 "timestamp": self.current_time,
-                "market_data": [],
+                "market_snapshots": {}, # Changed structure: Dict[str, Dict]
                 "news_data": []
             }
             
             window_start = self.current_time - self.step
             
             for symbol, df in self.market_data_iters.items():
-                data_slice = df.loc[window_start:self.current_time]
-                if not data_slice.empty:
-                    latest_row = data_slice.iloc[-1]
-                    batch_data["market_data"].append(
-                        MarketData(
-                            symbol=symbol,
-                            timestamp=latest_row.name,
-                            open=latest_row['open'],
-                            high=latest_row['high'],
-                            low=latest_row['low'],
-                            close=latest_row['close'],
-                            volume=latest_row['volume']
-                        )
+                # A. Past Candle (Strictly < T) -> The "Fact"
+                past_slice = df.loc[:self.current_time - pd.Timedelta(seconds=1)]
+                past_candle = None
+                if not past_slice.empty:
+                    row_prev = past_slice.iloc[-1]
+                    # Only include if it's recent enough (within lookback) to be relevant?
+                    # For now, we take the last known candle.
+                    past_candle = MarketData(
+                        symbol=symbol,
+                        timestamp=row_prev.name,
+                        open=row_prev['open'],
+                        high=row_prev['high'],
+                        low=row_prev['low'],
+                        close=row_prev['close'],
+                        volume=row_prev['volume']
                     )
+
+                # B. Current Open (At T) -> The "Opportunity"
+                current_open = None
+                # Check if T exists in the index (it might be a holiday/weekend gap in data)
+                if self.current_time in df.index:
+                    current_open = df.loc[self.current_time]['open']
+
+                # Pack into snapshot
+                if past_candle or current_open is not None:
+                    snapshot["market_snapshots"][symbol] = {
+                        "past_candle": past_candle,
+                        "current_open": current_open
+                    }
 
             if self.news_data is not None:
                 news_slice = self.news_data.loc[window_start:self.current_time]
                 if not news_slice.empty:
                     for ts, row in news_slice.iterrows():
-                        batch_data["news_data"].append(
+                        snapshot["news_data"].append(
                             NewsData(
                                 id=row.get('id', str(ts)),
                                 source=row.get('source'),
@@ -192,7 +209,7 @@ class DataIterator:
                             )
                         )
             
-            return batch_data
+            return snapshot
 
         except StopIteration:
             raise StopAsyncIteration
