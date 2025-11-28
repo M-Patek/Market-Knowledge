@@ -43,7 +43,16 @@ class GeminiClient:
         self.semaphore = asyncio.Semaphore(1) # Controls access
         self.last_call_time = 0
         
+        # [Task 8.3] Persistent HTTP client for connection pooling
+        self.http_client = httpx.AsyncClient(timeout=30.0)
+        
         logger.info(f"GeminiClient for {model_id} initialized with QPM limit {qpm_limit} (Rate: {self.semaphore_rate:.2f}s/query)")
+
+    async def close(self):
+        """
+        [Task 8.3] Cleanup resources.
+        """
+        await self.http_client.aclose()
 
     async def generate_content_async(
         self,
@@ -93,9 +102,8 @@ class GeminiClient:
             if tools:
                 payload["tools"] = tools
 
-            async with httpx.AsyncClient() as client:
-                # Using a new client per request ensures isolation
-                response = await client.post(url, json=payload, timeout=60.0)
+            # [Task 8.3] Use persistent client
+            response = await self.http_client.post(url, json=payload)
 
             if response.status_code != 200:
                 logger.error(f"Gemini API Error ({response.status_code}): {response.text}")
@@ -166,8 +174,9 @@ class GeminiPoolManager:
         # 2. 为每个模型ID设置独立的轮询计数器
         self.model_counters: Dict[str, int] = defaultdict(int)
 
-        # 3. 为每个【密钥】缓存一个【GeminiClient】实例
-        self.client_cache: Dict[str, GeminiClient] = {}
+        # 3. 为每个【密钥+模型ID】组合缓存一个【GeminiClient】实例
+        # Key: (api_key, model_id) -> Value: GeminiClient
+        self.client_cache: Dict[tuple, GeminiClient] = {}
         
         # 4. 需要一个锁来保护 client_cache 的写入，防止竞态
         self.cache_lock = asyncio.Lock()
@@ -190,14 +199,15 @@ class GeminiPoolManager:
         # 步骤 2: 更新该 model_id 的计数器（循环）
         self.model_counters[model_id] = (current_index + 1) % len(self.shared_key_pool)
 
-        # 步骤 3: 检查此【密钥】是否已有缓存的客户端
-        client = self.client_cache.get(key_to_use)
+        # 步骤 3: 检查此【密钥 + 模型ID】组合是否已有缓存的客户端
+        cache_key = (key_to_use, model_id)
+        client = self.client_cache.get(cache_key)
 
         if client is None:
             # 步骤 4: 如果没有，加锁并创建客户端
             async with self.cache_lock:
                 # 再次检查，防止在等待锁时其他协程已创建
-                client = self.client_cache.get(key_to_use)
+                client = self.client_cache.get(cache_key)
                 if client is None:
                     # 获取此模型（或默认）的 QPM 限制
                     qpm_limit = self.qpm_limits.get(model_id, self.qpm_limits['default'])
@@ -211,8 +221,8 @@ class GeminiPoolManager:
                         qpm_limit=qpm_limit
                     )
                     
-                    # 缓存这个【密钥】的客户端
-                    self.client_cache[key_to_use] = client
+                    # 缓存这个【密钥 + 模型ID】的客户端
+                    self.client_cache[cache_key] = client
 
         # 步骤 5: 产出客户端供 'async with' 使用
         try:
