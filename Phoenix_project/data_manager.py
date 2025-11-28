@@ -4,6 +4,8 @@ DataManager for the Phoenix project.
 Handles loading, caching, and refreshing of all data sources required
 by the cognitive engine and agents (e.g., market data, news, fundamentals).
 [Phase I Fix] Environment Isolation & Time Travel Prevention
+[Phase II Fix] Cache Isolation & Session ID
+[Phase IV Fix] Async Locking (Thundering Herd)
 """
 
 import logging
@@ -12,10 +14,11 @@ import requests
 import asyncio
 import httpx # [Task 3.1] Import httpx for async I/O
 import os # [Task 2] 导入 os
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 import pandas as pd  # type: ignore
-import redis  # type: ignore
+import redis.asyncio as redis  # type: ignore
 
 from Phoenix_project.core.schemas.data_schema import MarketData, NewsData, FundamentalData
 from Phoenix_project.ai.tabular_db_client import TabularDBClient
@@ -37,6 +40,7 @@ class DataManager:
         redis_client: redis.Redis,
         tabular_db: Optional[TabularDBClient] = None,
         temporal_db: Optional[TemporalDBClient] = None,
+        session_id: Optional[str] = None, # [Task 2.3] Session ID for cache isolation
     ):
         """
         Initializes the DataManager.
@@ -46,6 +50,7 @@ class DataManager:
             redis_client: Client for Redis cache.
             tabular_db: (Optional) Client for tabular (SQL) data.
             temporal_db: (Optional) Client for time-series data.
+            session_id: (Optional) Unique ID for the current run session.
         """
         # [Phase I Fix] Extract run_mode for key isolation
         self.run_mode = config.get("run_mode", "DEV").lower()
@@ -54,7 +59,11 @@ class DataManager:
         self.redis_client = redis_client
         self.tabular_db = tabular_db
         self.temporal_db = temporal_db
+        self.session_id = session_id
         self._simulation_time: Optional[datetime] = None
+        
+        # [Task 4.4] Async locks for request coalescing (Thundering Herd protection)
+        self._request_locks = defaultdict(asyncio.Lock)
 
         # 加载数据目录 (Data Catalog)
         self.data_catalog = self._load_data_catalog(
@@ -103,12 +112,16 @@ class DataManager:
     def _get_cache_key(self, prefix: str, identifier: str) -> str:
         """Generates a standardized Redis cache key."""
         # [Phase I Fix] Apply namespace isolation
+        # [Task 2.3] Add session_id to key if in backtest mode to prevent collisions
+        if self.run_mode == "backtest" and self.session_id:
+            return f"phx:{self.run_mode}:{self.session_id}:cache:{prefix}:{identifier}"
+            
         return f"phx:{self.run_mode}:cache:{prefix}:{identifier}"
 
-    def _get_from_cache(self, key: str) -> Optional[Any]:
+    async def _get_from_cache(self, key: str) -> Optional[Any]:
         """Retrieves and deserializes data from Redis cache."""
         try:
-            cached_data = self.redis_client.get(key)
+            cached_data = await self.redis_client.get(key) # [Fix] await for async client
             if cached_data:
                 logger.debug(f"Cache HIT for key: {key}")
                 return json.loads(cached_data)
@@ -121,7 +134,7 @@ class DataManager:
             logger.error(f"Cache JSON decode error for key {key}: {e}")
             return None # 缓存数据已损坏
 
-    def _set_to_cache(self, key: str, data: Any):
+    async def _set_to_cache(self, key: str, data: Any):
         """Serializes and stores data in Redis cache with a TTL."""
         try:
             # 确保 data 可以被 JSON 序列化
@@ -133,9 +146,9 @@ class DataManager:
             else:
                 data_json = json.dumps(data, default=str) # [Task 2] 添加 default=str
                 
-            self.redis_client.setex(
+            await self.redis_client.setex(
                 key, self.cache_ttl_sec, data_json
-            )
+            ) # [Fix] await for async client
             logger.debug(f"Cache SET for key: {key}")
         except redis.RedisError as e:
             logger.error(f"Redis SET error for key {key}: {e}")
@@ -166,7 +179,7 @@ class DataManager:
             "market_history", f"{symbol}_{start.isoformat()}_{end.isoformat()}"
         )
         
-        cached = self._get_from_cache(cache_key)
+        cached = await self._get_from_cache(cache_key)
         if cached:
             return pd.DataFrame(cached)
 
@@ -185,7 +198,7 @@ class DataManager:
             
             if df is not None and not df.empty:
                 # 缓存结果 (DataFrame -> dict -> JSON)
-                self._set_to_cache(cache_key, df.to_dict(orient="records"))
+                await self._set_to_cache(cache_key, df.to_dict(orient="records"))
             
             return df
         
@@ -220,7 +233,7 @@ class DataManager:
         live_key = f"phx:{self.run_mode}:market_data:live:{symbol}"
         
         try:
-            data_json = self.redis_client.get(live_key)
+            data_json = await self.redis_client.get(live_key) # [Fix] await
             
             if data_json:
                 # 使用 model_validate_json 自动处理 datetime 和类型转换
@@ -275,7 +288,7 @@ class DataManager:
         
         cache_key = self._get_cache_key("fundamentals", symbol)
         
-        cached = self._get_from_cache(cache_key)
+        cached = await self._get_from_cache(cache_key)
         if cached:
             data = FundamentalData(**cached)
             # [Task 2.1] Time Barrier: Invalidate cache if it contains future data relative to sim time
@@ -291,7 +304,7 @@ class DataManager:
             fund_data = await self._get_historical_fundamentals(symbol, self.get_current_time())
             
             if fund_data:
-                self._set_to_cache(cache_key, fund_data)
+                await self._set_to_cache(cache_key, fund_data)
                 return fund_data
             else:
                 logger.warning(f"No fundamental data found in TabularDB for {symbol}")
@@ -340,6 +353,7 @@ class DataManager:
         OPTIMIZED: Fetches news data from an external API,
         using caching. Replaces the mock.
         [Fix] Supports time range filtering for accurate backtesting.
+        [Task 4.4] Implements Double-Checked Locking to prevent Thundering Herd.
         """
         cache_key = self._get_cache_key("news", query)
         
@@ -347,65 +361,77 @@ class DataManager:
         if start_date or end_date:
             cache_key = self._get_cache_key("news", f"{query}_{start_date}_{end_date}")
         
+        # 1. First Check (Fast Path)
         if not force_refresh:
-            cached = self._get_from_cache(cache_key)
+            cached = await self._get_from_cache(cache_key)
             if cached:
                 return [NewsData(**item) for item in cached]
         
-        # 从 API 获取
-        logger.info(f"Fetching news from API for query: {query}")
-        
-        # 检查 API 密钥
-        news_api_key = self.api_keys.get("news_api")
-        if not news_api_key:
-            logger.error("News API key (api_keys.news_api) not configured.")
-            return []
-            
-        params = {
-            "q": query,
-            "apiKey": news_api_key,
-            "pageSize": limit,
-            "language": "en",
-            "sortBy": "publishedAt",
-            "from": start_date.isoformat() if start_date else None,
-            "to": end_date.isoformat() if end_date else None,
-        }
-        # 移除值为 None 的参数
-        params = {k: v for k, v in params.items() if v is not None}
-        
-        try:
-            async with httpx.AsyncClient() as client: # [Task 3.1] Use httpx
-                response = await client.get(self.news_api_url, params=params, timeout=10.0)
-            response.raise_for_status() # 如果是 4xx/5xx 则抛出异常
-            
-            articles = response.json().get("articles", [])
-            news_list = []
-            
-            for article in articles:
-                news_item = NewsData(
-                    id=article.get("url"), # 使用 URL 作为唯一 ID
-                    symbol=query, # 粗略地将查询词作为 symbol
-                    headline=article.get("title"),
-                    summary=article.get("description"),
-                    content=article.get("content"),
-                    url=article.get("url"),
-                    source=article.get("source", {}).get("name"),
-                    timestamp=datetime.fromisoformat(article.get("publishedAt").replace("Z", "+00:00")),
-                )
-                news_list.append(news_item)
-            
-            if news_list:
-                # 缓存结果
-                self._set_to_cache(cache_key, news_list)
-            
-            return news_list
+        # 2. Acquire Lock (Slow Path)
+        lock_key = f"news_lock:{cache_key}"
+        async with self._request_locks[lock_key]:
+            # 3. Second Check (Double-Checked Locking)
+            # Check if another thread populated the cache while we waited
+            if not force_refresh:
+                cached = await self._get_from_cache(cache_key)
+                if cached:
+                    logger.debug(f"Cache hit on second check for {query} (Request Coalesced)")
+                    return [NewsData(**item) for item in cached]
 
-        except (requests.exceptions.RequestException, httpx.HTTPError) as e:
-            logger.error(f"Failed to fetch news from API: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Error processing news data: {e}")
-            return []
+            # 从 API 获取
+            logger.info(f"Fetching news from API for query: {query}")
+            
+            # 检查 API 密钥
+            news_api_key = self.api_keys.get("news_api")
+            if not news_api_key:
+                logger.error("News API key (api_keys.news_api) not configured.")
+                return []
+                
+            params = {
+                "q": query,
+                "apiKey": news_api_key,
+                "pageSize": limit,
+                "language": "en",
+                "sortBy": "publishedAt",
+                "from": start_date.isoformat() if start_date else None,
+                "to": end_date.isoformat() if end_date else None,
+            }
+            # 移除值为 None 的参数
+            params = {k: v for k, v in params.items() if v is not None}
+            
+            try:
+                async with httpx.AsyncClient() as client: # [Task 3.1] Use httpx
+                    response = await client.get(self.news_api_url, params=params, timeout=10.0)
+                response.raise_for_status() # 如果是 4xx/5xx 则抛出异常
+                
+                articles = response.json().get("articles", [])
+                news_list = []
+                
+                for article in articles:
+                    news_item = NewsData(
+                        id=article.get("url"), # 使用 URL 作为唯一 ID
+                        symbol=query, # 粗略地将查询词作为 symbol
+                        headline=article.get("title"),
+                        summary=article.get("description"),
+                        content=article.get("content"),
+                        url=article.get("url"),
+                        source=article.get("source", {}).get("name"),
+                        timestamp=datetime.fromisoformat(article.get("publishedAt").replace("Z", "+00:00")),
+                    )
+                    news_list.append(news_item)
+                
+                if news_list:
+                    # 缓存结果
+                    await self._set_to_cache(cache_key, news_list)
+                
+                return news_list
+
+            except (requests.exceptions.RequestException, httpx.HTTPError) as e:
+                logger.error(f"Failed to fetch news from API: {e}")
+                return []
+            except Exception as e:
+                logger.error(f"Error processing news data: {e}")
+                return []
 
     # --- 内部辅助方法 (用于 refresh_data_sources) ---
 
