@@ -71,11 +71,41 @@ class AdversaryAgent(L2Agent):
             if "timestamp" not in response_data:
                 response_data["timestamp"] = state.current_time
 
-            result = AdversaryResult.model_validate(response_data)
-            object.__setattr__(result, 'timestamp', state.current_time)
+            # [Task 2.3] Logic Implementation & Schema Mapping
+            # Handle potential list response or single object
+            raw_items = response_data if isinstance(response_data, list) else [response_data]
+            
+            for raw in raw_items:
+                # 1. Map & Calculate Metrics
+                # Prompt 'confidence' (0.0-1.0) maps to counter_evidence_strength
+                c_strength = float(raw.get("confidence", 0.0))
+                
+                # Map 'risk_level' string to numeric challenge_quality
+                risk_map = {"HIGH": 0.9, "MEDIUM": 0.6, "LOW": 0.3}
+                risk_str = str(raw.get("risk_level", "LOW")).upper()
+                c_quality = risk_map.get(risk_str, 0.3)
+                
+                # 2. Derive Boolean Logic & Impact
+                is_successful = c_strength > 0.6
+                
+                # Formula: Negative impact scaled by strength
+                # e.g., Strength 0.8 -> Impact -0.4
+                conf_impact = -1.0 * (c_strength * 0.5)
 
-            logger.info(f"[{self.agent_id}] Generated counter-arguments. Threat Level: {result.threat_level}")
-            yield result
+                result = AdversaryResult(
+                    agent_id=self.agent_id,
+                    target_evidence_id=raw.get("original_evidence_id", "UNKNOWN"),
+                    counter_argument=raw.get("counter_argument", "No argument provided."),
+                    is_challenge_successful=is_successful,
+                    confidence_impact=conf_impact,
+                    challenge_quality=c_quality,
+                    counter_evidence_strength=c_strength,
+                    metadata=raw.get("metadata", {})
+                )
+                object.__setattr__(result, 'timestamp', state.current_time)
+
+                logger.info(f"[{self.agent_id}] Counter-argument generated. Success: {is_successful} (Impact: {conf_impact:.2f})")
+                yield result
 
         except Exception as e:
             logger.error(f"[{self.agent_id}] Error: {e}", exc_info=True)
@@ -84,11 +114,11 @@ class AdversaryAgent(L2Agent):
     def _create_fallback_result(self, state: PipelineState, symbol: str, reason: str) -> AdversaryResult:
         """创建兜底的对抗结果 (LOW threat)。"""
         return AdversaryResult(
-            timestamp=state.current_time,
-            target_symbol=symbol,
+            agent_id=self.agent_id,
+            target_evidence_id="UNKNOWN",
             counter_argument=f"System Fallback: {reason}",
-            threat_level="LOW",
-            confidence=0.0,
-            attack_vectors=[],
-            challenged_evidence_ids=[]
+            is_challenge_successful=False,
+            confidence_impact=0.0,
+            challenge_quality=0.0,
+            counter_evidence_strength=0.0
         )
