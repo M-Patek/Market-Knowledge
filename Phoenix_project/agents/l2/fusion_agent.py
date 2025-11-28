@@ -5,7 +5,8 @@ from typing import List, Any, AsyncGenerator, Optional
 
 from Phoenix_project.agents.l2.base import L2Agent
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
-from Phoenix_project.core.schemas.fusion_result import FusionResult
+# [Phase III Fix] Import SystemStatus
+from Phoenix_project.core.schemas.fusion_result import FusionResult, SystemStatus
 from Phoenix_project.core.pipeline_state import PipelineState
 from pydantic import ValidationError
 
@@ -134,6 +135,16 @@ class FusionAgent(L2Agent):
             # [Time Machine] 强制使用仿真时间
             if "timestamp" not in response_data:
                 response_data["timestamp"] = state.current_time
+
+            # [Phase III Fix] The Zero Trap Logic
+            # Dynamically set system status based on confidence
+            conf = response_data.get("confidence", 0.0)
+            if conf < 0.1:
+                response_data["system_status"] = SystemStatus.HALT
+            elif conf < 0.3:
+                response_data["system_status"] = SystemStatus.DEGRADED
+            else:
+                response_data["system_status"] = SystemStatus.OK
             
             fusion_result = FusionResult.model_validate(response_data)
             
@@ -165,6 +176,8 @@ class FusionAgent(L2Agent):
             confidence=0.0,
             reasoning=f"System Fallback: {reason}",
             uncertainty=1.0,
+            # [Phase III Fix] Explicitly signal HALT on fallback
+            system_status=SystemStatus.HALT,
             supporting_evidence_ids=[],
             conflicting_evidence_ids=[]
         )
