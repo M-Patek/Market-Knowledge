@@ -2,7 +2,7 @@
 from abc import ABC, abstractmethod
 import asyncio
 import numpy as np
-from typing import Optional, Type, List, Any
+from typing import Optional, Type, List, Any, Dict
 
 # [任务 4.1] 导入 RLLib 核心组件
 from ray.rllib.algorithms.algorithm import Algorithm
@@ -39,11 +39,12 @@ class BaseDRLAgent(ABC):
             self.internal_state = []
 
     @abstractmethod
-    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
+    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
         """
         (抽象方法)
         子类 (Alpha, Risk, Exec) 必须实现此方法。
         它将 Phoenix 状态 转换为 匹配 TradingEnv 的 np.ndarray。
+        [Task 6.1] Added market_state for macro awareness.
         """
         pass
     
@@ -55,12 +56,12 @@ class BaseDRLAgent(ABC):
         """
         pass
 
-    def format_observation(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
+    def format_observation(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
         """
         (公共包装器)
         调用子类的 _format_obs 方法。
         """
-        return self._format_obs(state_data, fusion_result)
+        return self._format_obs(state_data, fusion_result, market_state)
 
     async def compute_action(self, observation: np.ndarray) -> np.ndarray:
         """
@@ -93,7 +94,17 @@ class BaseDRLAgent(ABC):
         except Exception as e:
             self.logger.error(f"Error during compute_single_action: {e}", exc_info=True)
             # [Safety Phase II] Use agent-specific safe fallback
-            return self.get_safe_action()
+            safe_action = self.get_safe_action()
+            
+            # [Task 1.1] Critical Type Safety Check
+            if not isinstance(safe_action, np.ndarray):
+                self.logger.critical(
+                    f"FATAL: get_safe_action() returned {type(safe_action)} instead of np.ndarray. "
+                    "Forcing zero-vector fallback to prevent crash."
+                )
+                return np.array([0.0], dtype=np.float32)
+                
+            return safe_action
 
 
 # [任务 4.1] DRLAgentLoader (由 registry.py 使用)
