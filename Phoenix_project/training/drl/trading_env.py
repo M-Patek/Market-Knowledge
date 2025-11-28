@@ -62,7 +62,8 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         # (这需要根据您的 L3 智能体的实际输入/输出进行详细定义)
         # (这里使用简化的占位符)
         # [主人喵 Phase 4 修复] 对齐 AlphaAgent 的 5 维输出
-        self._obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
+        # [Task 3.2] Added Volume feature -> Shape (6,)
+        self._obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32)
         # 示例：动作空间 {asset_id: target_allocation}
         self._action_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32) # 假设 5 种资产
 
@@ -96,6 +97,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
 
         # [主人喵 Phase 3] 缓存当前时间步的价格 map {symbol: price}
         self.current_prices = {}
+        self.current_volumes = {} # [Task 3.2] Volume tracking
         # [Phase III Fix] For Log Return calculation (Stationarity)
         self.prev_prices = {} 
         
@@ -124,6 +126,11 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             # 解析当前价格
             self.current_prices = {
                 md.symbol: md.close 
+                for md in batch_data.get("market_data", [])
+            }
+            # [Task 3.2] Extract Volume
+            self.current_volumes = {
+                md.symbol: md.volume
                 for md in batch_data.get("market_data", [])
             }
             # (TBD: 此处应调用 Orchestrator 运行 L1/L2，暂保留占位符)
@@ -324,12 +331,13 @@ class PhoenixMultiAgentEnvV7(gym.Env):
     def _get_obs_dict(self) -> Dict[str, Any]:
         """
         [Task 10] Constructs a stationary observation vector.
-        Vector Shape (5,): [NormBalance, PositionWeight, LogReturn, Sentiment, Confidence]
+        Vector Shape (6,): [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence]
         """
         # Default state (e.g., for reset before data)
         norm_balance = self.balance / self.initial_balance if self.initial_balance > 0 else 1.0
         position_weight = 0.0
         log_return = 0.0
+        log_volume = 0.0
         sentiment = 0.0
         confidence = 0.5 # Default uncertainty
 
@@ -354,6 +362,10 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             if price > 0 and prev_price > 0:
                 log_return = np.log(price / prev_price)
             
+            # [Task 3.2] Log Volume Feature
+            volume = self.current_volumes.get(target_symbol, 0.0)
+            log_volume = np.log(volume + 1.0) if volume >= 0 else 0.0
+            
             l2 = self.l2_knowledge.get(target_symbol, {})
             sentiment = l2.get('l2_sentiment', 0.0)
             confidence = l2.get('l2_confidence', 0.5)
@@ -362,6 +374,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             norm_balance,
             position_weight,
             log_return,
+            log_volume,
             sentiment,
             confidence
         ], dtype=np.float32)
