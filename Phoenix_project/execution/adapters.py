@@ -5,7 +5,8 @@ from abc import ABC, abstractmethod
 import os
 
 from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.execution.interfaces import IMarketData, IExecutionBroker
+from Phoenix_project.execution.interfaces import IBrokerAdapter
+from Phoenix_project.core.schemas.data_schema import Order, OrderStatus
 
 # [任务 B.2] 导入 Alpaca 客户端
 from alpaca.trading.client import TradingClient
@@ -19,7 +20,7 @@ logger = get_logger(__name__)
 
 # --- 市场数据接口 ---
 
-class AlpacaAdapter(IMarketData, IExecutionBroker):
+class AlpacaAdapter(IBrokerAdapter):
     """
     Adapter for Alpaca serving as both a market data provider
     and an execution broker.
@@ -135,6 +136,46 @@ class AlpacaAdapter(IMarketData, IExecutionBroker):
             return {}
 
     # --- IExecutionBroker 实现 ---
+
+    def connect(self) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        pass
+
+    def subscribe_fills(self, callback) -> None:
+        pass
+
+    def subscribe_order_status(self, callback) -> None:
+        pass
+
+    def get_all_open_orders(self) -> List[Order]:
+        return []
+
+    def get_portfolio_value(self) -> float:
+        return 0.0
+
+    def get_cash_balance(self) -> float:
+        return 0.0
+
+    def get_position(self, symbol: str) -> float:
+        return 0.0
+
+    def place_order(self, order: Order, price: Optional[float] = None) -> str:
+        """
+        [Task 1.2] Adapter method to conform to IBrokerAdapter interface.
+        Delegates to existing submit_order.
+        """
+        order_data = {
+            "symbol": order.symbol,
+            "quantity": order.quantity,
+            "order_type": order.order_type.lower(),
+            "limit_price": order.limit_price
+        }
+        result = self.submit_order(order_data)
+        if result.get("status") == "success":
+            return str(result.get("order_id"))
+        raise RuntimeError(f"Alpaca placement failed: {result.get('message')}")
 
     def submit_order(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
         """
