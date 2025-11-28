@@ -1,6 +1,6 @@
 # agents/l3/execution_agent.py
 import numpy as np
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from .base import BaseDRLAgent
 from Phoenix_project.core.schemas.fusion_result import FusionResult
@@ -13,21 +13,23 @@ class ExecutionAgent(BaseDRLAgent):
     
     def get_safe_action(self) -> np.ndarray:
         """
-        [Safety] Return None to signal Orchestrator to HALT/HOLD.
+        [Safety] Returns neutral zero vector.
+        Fixed: Must return np.ndarray, not None.
         """
-        return None
+        return np.array([0.0], dtype=np.float32)
 
-    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
+    def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
         """
-        [Task 3.3] Format observation to match TradingEnv (6-d).
-        Vector: [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence]
+        [Task 6.2] Format observation to match TradingEnv (9-d).
+        Includes Micro-structure features (Spread, Depth Imbalance).
+        Vector: [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence, MarketRegime, Spread, Imbalance]
         
         Args:
-            state_data (dict): {'balance', 'initial_balance', 'position_weight', 'price', 'prev_price', 'volume'}
+            state_data (dict): {'balance', 'initial_balance', 'position_weight', 'price', 'prev_price', 'volume', 'spread', 'depth_imbalance'}
             fusion_result (FusionResult): 来自 L2 认知引擎的分析结果。
 
         Returns:
-            np.ndarray: (6,) float32 vector.
+            np.ndarray: (9,) float32 vector.
         """
         # 1. 从 state_data 中提取市场状态
         balance = state_data.get('balance', 0.0)
@@ -36,6 +38,10 @@ class ExecutionAgent(BaseDRLAgent):
         price = state_data.get('price', 0.0)
         prev_price = state_data.get('prev_price', price)
         volume = state_data.get('volume', 0.0)
+        
+        # [Task 6.2] Extract Micro-structure
+        spread = state_data.get('spread', 0.0)
+        depth_imbalance = state_data.get('depth_imbalance', 0.0)
 
         # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
         sentiment = 0.0
@@ -66,14 +72,24 @@ class ExecutionAgent(BaseDRLAgent):
             
         log_volume = np.log(volume + 1.0)
 
-        # 3. Construct 6-d State Vector
+        # [Task 6.1] Macro Feature
+        regime_val = 0.0
+        if market_state:
+            regime = str(market_state.get('regime', 'NEUTRAL')).upper()
+            if 'BULL' in regime: regime_val = 1.0
+            elif 'BEAR' in regime: regime_val = -1.0
+
+        # 3. Construct 9-d State Vector
         obs = np.array([
             norm_balance,
             position_weight,
             log_return,
             log_volume,
             sentiment,
-            confidence
+            confidence,
+            regime_val,
+            spread,           # [Task 6.2]
+            depth_imbalance   # [Task 6.2]
         ], dtype=np.float32)
         
         return obs
