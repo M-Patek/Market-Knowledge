@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 import logging
 import traceback
+import asyncio
+from pydantic import ValidationError
 from Phoenix_project.core.pipeline_state import PipelineState
 # [修复] 引入标准数据契约
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceType
@@ -30,14 +32,14 @@ class BaseL1Agent(ABC):
         self.llm_client = llm_client
 
     @abstractmethod
-    def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> EvidenceItem:
+    async def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> EvidenceItem:
         """
         The main execution method for the agent.
         Must return an EvidenceItem.
         """
         pass
 
-    def safe_run(self, state: PipelineState, dependencies: Dict[str, Any]) -> EvidenceItem:
+    async def safe_run(self, state: PipelineState, dependencies: Dict[str, Any]) -> EvidenceItem:
         """
         [Beta FIX] A defensive wrapper around the abstract run method.
         Handles exceptions and returns a valid ERROR EvidenceItem if the agent crashes.
@@ -49,7 +51,7 @@ class BaseL1Agent(ABC):
             if not dependencies and state is None:
                  logger.warning(f"Agent {self.agent_id} received empty state and dependencies.")
 
-            result = self.run(state, dependencies)
+            result = await self.run(state, dependencies)
             
             # [双重检查] 确保子类实现返回了正确的类型
             if not isinstance(result, EvidenceItem):
@@ -64,7 +66,9 @@ class BaseL1Agent(ABC):
                 
             return result
 
-        except Exception as e:
+        except (ValueError, KeyError, TypeError, AttributeError, ValidationError) as e:
+            # [Task 2.1] Catch deterministic Business Logic Errors only.
+            # System/Network errors (RuntimeError, ConnectionError) will bubble up for Retry.
             error_msg = str(e)
             stack_trace = traceback.format_exc()
             logger.error(f"Agent {self.agent_id} CRASHED: {error_msg}\n{stack_trace}")
