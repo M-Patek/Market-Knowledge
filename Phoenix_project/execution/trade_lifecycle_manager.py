@@ -8,6 +8,7 @@
 """
 from typing import Dict, Optional
 from datetime import datetime
+from decimal import Decimal
 import asyncio
 
 # FIX (E2, E4): 从核心模式导入 Order, Fill, Position, PortfolioState
@@ -23,11 +24,13 @@ class TradeLifecycleManager:
     """
     [Refactored Phase 4.1] 持久化账本管理器。
     维护投资组合状态 (持仓和现金)，并同步到 TabularDB 以防止状态丢失。
+    [Phase II Fix] Decimal Precision & Atomic Transactions
     """
     def __init__(self, initial_cash: float, tabular_db: Optional[TabularDBClient] = None):
         self.positions: Dict[str, Position] = {} # key: symbol
-        self.cash = initial_cash
-        self.realized_pnl = 0.0
+        # [Phase II Fix] Use Decimal for financial precision (The "Penny Gap")
+        self.cash = Decimal(str(initial_cash))
+        self.realized_pnl = Decimal("0.0")
         self.tabular_db = tabular_db
         self.log_prefix = "TradeLifecycleManager:"
         self._lock = asyncio.Lock()
@@ -95,8 +98,9 @@ class TradeLifecycleManager:
         res = await self.tabular_db.query("SELECT cash, realized_pnl FROM ledger_balance ORDER BY id DESC LIMIT 1")
         if res and "results" in res and res["results"]:
             row = res["results"][0]
-            self.cash = float(row["cash"])
-            self.realized_pnl = float(row["realized_pnl"])
+            # [Phase II Fix] Restore as Decimal
+            self.cash = Decimal(str(row["cash"]))
+            self.realized_pnl = Decimal(str(row["realized_pnl"]))
             logger.info(f"{self.log_prefix} Restored balance: Cash={self.cash}, PnL={self.realized_pnl}")
 
         # Load Positions
@@ -128,25 +132,27 @@ class TradeLifecycleManager:
         for symbol, pos in self.positions.items():
             current_price = current_market_data.get(symbol)
             
-            # [Phase III Fix] Resilience: Warn and use fallback (Cost Basis) instead of crashing
-            # 如果价格缺失或非正数，降级为警告，并使用成本价估值
+            # [Phase II Fix] Zombie Valuation: Fail Fast instead of using stale data
             if current_price is None or current_price <= 0:
-                logger.warning(f"{self.log_prefix} Missing/Invalid price for {symbol}. Using Cost Basis (Avg Price) as fallback.")
-                current_price = pos.average_price
+                # Critical valuation error - do not guess
+                raise ValueError(f"Valuation Error: Missing market data for {symbol}")
 
-            pos.market_value = pos.quantity * current_price
-            pos.unrealized_pnl = (current_price - pos.average_price) * pos.quantity
-            total_value += pos.market_value
+            # Calculate in Decimal for safety, though Position model might enforce float
+            # Note: Explicit casting Decimal -> float for schema compatibility
+            pos.market_value = float(Decimal(str(pos.quantity)) * Decimal(str(current_price)))
+            pos.unrealized_pnl = float((Decimal(str(current_price)) - Decimal(str(pos.average_price))) * Decimal(str(pos.quantity)))
+            
+            total_value += Decimal(str(pos.market_value))
         
         # Determine timestamp: Use provided simulation time or UTC now
         state_timestamp = timestamp if timestamp else datetime.utcnow()
 
         return PortfolioState(
             timestamp=state_timestamp,
-            cash=self.cash,
-            total_value=total_value,
+            cash=float(self.cash), # Convert back to float for Schema
+            total_value=float(total_value),
             positions=self.positions.copy(),
-            realized_pnl=self.realized_pnl
+            realized_pnl=float(self.realized_pnl)
         )
 
     async def on_fill(self, fill: Fill):
@@ -163,9 +169,13 @@ class TradeLifecycleManager:
             logger.info(f"{self.log_prefix} Processing fill for {fill.symbol}: {fill.quantity} @ {fill.price}")
             
             # [Task 3] Atomic Transaction: Phase 1 - Pre-calculate new state (Shadow State)
-            # Do NOT modify self attributes yet.
-            trade_cost = fill.price * fill.quantity
-            new_cash = self.cash - trade_cost - fill.commission
+            # Use Decimal for high precision arithmetic
+            fill_qty = Decimal(str(fill.quantity))
+            fill_price = Decimal(str(fill.price))
+            fill_comm = Decimal(str(fill.commission))
+            
+            trade_cost = fill_price * fill_qty
+            new_cash = self.cash - trade_cost - fill_comm
             new_realized_pnl = self.realized_pnl
             
             # 3. 计算新持仓状态
@@ -174,49 +184,49 @@ class TradeLifecycleManager:
                 Position(symbol=fill.symbol, quantity=0.0, average_price=0.0, market_value=0.0, unrealized_pnl=0.0)
             )
             
-            current_qty = current_pos.quantity
-            current_avg_price = current_pos.average_price
+            current_qty = Decimal(str(current_pos.quantity))
+            current_avg_price = Decimal(str(current_pos.average_price))
             
-            new_qty = current_qty + fill.quantity
+            new_qty = current_qty + fill_qty
             new_pos: Optional[Position] = None
             
-            if abs(new_qty) < 1e-6:
+            if abs(new_qty) < Decimal("1e-6"):
                 # 仓位已平仓
                 logger.info(f"{self.log_prefix} Position closed for {fill.symbol}")
                 # 计算已实现 PnL (Fix: Direction specific)
                 qty_closed = abs(current_qty)
                 if current_qty > 0:
-                    pnl = (fill.price - current_avg_price) * qty_closed
+                    pnl = (fill_price - current_avg_price) * qty_closed
                 else:
-                    pnl = (current_avg_price - fill.price) * qty_closed
+                    pnl = (current_avg_price - fill_price) * qty_closed
 
                 new_realized_pnl += pnl
                 new_pos = None # Mark for deletion
                 
-            elif current_qty * fill.quantity >= 0: 
+            elif current_qty * Decimal(str(fill.quantity)) >= 0: 
                 # 增加仓位 (同向交易)
-                new_avg_price = ((current_avg_price * current_qty) + (fill.price * fill.quantity)) / new_qty
+                new_avg_price = ((current_avg_price * current_qty) + (fill_price * fill_qty)) / new_qty
                 
                 # Create new position object (immutable style preferred)
                 new_pos = current_pos.model_copy()
-                new_pos.quantity = new_qty
-                new_pos.average_price = new_avg_price
+                new_pos.quantity = float(new_qty)
+                new_pos.average_price = float(new_avg_price)
                 logger.info(f"{self.log_prefix} Position updated for {fill.symbol}: New Qty={new_qty}, New AvgPx={new_avg_price}")
 
             else:
                 # 减少仓位或反转仓位 (异向交易)
-                if abs(fill.quantity) <= abs(current_qty):
+                if abs(fill_qty) <= abs(current_qty):
                     # 减少仓位
-                    qty_closed = abs(fill.quantity)
+                    qty_closed = abs(fill_qty)
                     if current_qty > 0:
-                        pnl = (fill.price - current_avg_price) * qty_closed
+                        pnl = (fill_price - current_avg_price) * qty_closed
                     else:
-                        pnl = (current_avg_price - fill.price) * qty_closed
+                        pnl = (current_avg_price - fill_price) * qty_closed
                     
                     new_realized_pnl += pnl
                     
                     new_pos = current_pos.model_copy()
-                    new_pos.quantity = new_qty
+                    new_pos.quantity = float(new_qty)
                     # 平均价格不变
                     logger.info(f"{self.log_prefix} Position reduced for {fill.symbol}: New Qty={new_qty}, Realized PnL={pnl}")
                 else:
@@ -224,24 +234,25 @@ class TradeLifecycleManager:
                     # 1. 平掉所有旧仓位
                     qty_closed = abs(current_qty)
                     if current_qty > 0:
-                        pnl = (fill.price - current_avg_price) * qty_closed
+                        pnl = (fill_price - current_avg_price) * qty_closed
                     else:
-                        pnl = (current_avg_price - fill.price) * qty_closed
+                        pnl = (current_avg_price - fill_price) * qty_closed
                     
                     new_realized_pnl += pnl
                     
                     # 2. 建立新仓位
                     new_pos = current_pos.model_copy()
-                    new_pos.quantity = new_qty
-                    new_pos.average_price = fill.price # 新仓位的成本价是当前成交价
+                    new_pos.quantity = float(new_qty)
+                    new_pos.average_price = float(fill_price) # 新仓位的成本价是当前成交价
                     logger.info(f"{self.log_prefix} Position reversed for {fill.symbol}: New Qty={new_qty}, Realized PnL={pnl}")
 
             # [Task 3] Atomic Transaction: Phase 2 - DB Persistence (Write-Ahead)
             if self.tabular_db:
                 try:
-                    # Pass EXPLICIT calculated values, not self.*
-                    await self._persist_transaction(new_cash, new_realized_pnl, new_pos, fill.symbol)
-                    await self._record_fill(fill)
+                    # [Phase II Fix] ATOMICITY: Wrap ledger and fill record in a single DB transaction
+                    async with self.tabular_db.transaction() as conn:
+                        await self._persist_transaction(new_cash, new_realized_pnl, new_pos, fill.symbol, conn)
+                        await self._record_fill(fill, conn)
                 except Exception as e:
                     # CRITICAL: DB write failed. Do NOT update memory. Halt system.
                     logger.critical(f"{self.log_prefix} LEDGER WRITE FAILED. HALTING to prevent split-brain. Error: {e}")
@@ -264,13 +275,14 @@ class TradeLifecycleManager:
         res = await self.tabular_db.query(f"SELECT fill_id FROM ledger_fills WHERE fill_id = '{fill_id}'")
         return bool(res and "results" in res and res["results"])
 
-    async def _persist_transaction(self, cash: float, realized_pnl: float, position: Optional[Position], symbol: str):
+    async def _persist_transaction(self, cash: Decimal, realized_pnl: Decimal, position: Optional[Position], symbol: str, conn=None):
         """[Task 3] Atomic DB Update Helper. Uses explicit values."""
         # Update Balance
         await self.tabular_db.upsert_data(
             "ledger_balance", 
-            {"id": 1, "cash": cash, "realized_pnl": realized_pnl}, 
-            "id"
+            {"id": 1, "cash": float(cash), "realized_pnl": float(realized_pnl)}, 
+            "id",
+            connection=conn
         )
         
         # Update Position (if exists)
@@ -278,17 +290,20 @@ class TradeLifecycleManager:
             await self.tabular_db.upsert_data(
                 "ledger_positions",
                 position.model_dump(),
-                "symbol"
+                "symbol",
+                connection=conn
             )
         else:
             # Position closed, remove from DB
-            await self.tabular_db.query(f"DELETE FROM ledger_positions WHERE symbol = '{symbol}'")
+            # Use execute_sql with conn for atomic delete
+            await self.tabular_db.execute_sql(f"DELETE FROM ledger_positions WHERE symbol = :symbol", {"symbol": symbol}, connection=conn)
 
-    async def _record_fill(self, fill: Fill):
+    async def _record_fill(self, fill: Fill, conn=None):
         """记录 Fill 事件以防止重放。"""
         await self.tabular_db.upsert_data(
             "ledger_fills",
             {"fill_id": fill.id, "order_id": fill.order_id, "symbol": fill.symbol, 
              "quantity": fill.quantity, "price": fill.price, "timestamp": fill.timestamp},
-            "fill_id"
+            "fill_id",
+            connection=conn
         )
