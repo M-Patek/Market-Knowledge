@@ -3,6 +3,8 @@
 # [主人喵的修复 11.12] 实现了 TBD-1 (事件过滤) 和 TBD-5 (审计)
 # [Code Opt Expert Fix] Task 0.2: Async L3 & Task 1.1: Registry Integration
 # [Safety Patch] Implemented Fail-Closed logic for Ledger and Risk Agents.
+# [Task 6.1] Macro Regime Injection
+# [Task 6.2] Micro-structure Injection (Spread, Imbalance)
 
 import logging
 import asyncio
@@ -254,6 +256,14 @@ class Orchestrator:
             
             price = market_data.close if market_data else 0.0
             
+            # [Task 6.2] Micro-structure approximations
+            spread = 0.0
+            if market_data and market_data.close > 0:
+                # Proxy spread using volatility (High-Low range) relative to price
+                spread = (market_data.high - market_data.low) / market_data.close
+            
+            depth_imbalance = 0.0 # Placeholder for L2 data
+            
             pf_state = pipeline_state.portfolio_state
             balance = pf_state.cash if pf_state else 0.0
             holdings = 0.0
@@ -264,13 +274,16 @@ class Orchestrator:
                 "balance": balance,
                 "holdings": holdings,
                 "price": price,
-                "symbol": symbol
+                "symbol": symbol,
+                "spread": spread,           # [Task 6.2]
+                "depth_imbalance": depth_imbalance # [Task 6.2]
             }
 
             # 2. Alpha Agent Decision (Async)
             alpha_action = None
             if self.alpha_agent:
-                obs = self.alpha_agent.format_observation(state_data, pipeline_state.l2_fusion_result) 
+                # [Task 6.1] Inject market_state for macro awareness
+                obs = self.alpha_agent.format_observation(state_data, pipeline_state.l2_fusion_result, pipeline_state.market_state) 
                 # [Fix 0.2] Use await
                 alpha_action = await self.alpha_agent.compute_action(obs)
                 logger.info(f"Alpha Agent Action: {alpha_action}")
@@ -279,7 +292,7 @@ class Orchestrator:
             # [Fail-Closed Patch] The Ghost Risk Agent Fix
             risk_action = "HALT_TRADING" # FAIL-SAFE: Default to HALT
             if self.risk_agent:
-                obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_fusion_result)
+                obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_fusion_result, pipeline_state.market_state)
                 # [Fix 0.2] Use await
                 risk_action = await self.risk_agent.compute_action(obs)
                 
@@ -290,7 +303,7 @@ class Orchestrator:
             # 4. Execution Agent Decision (Async)
             exec_action = None
             if self.execution_agent:
-                obs = self.execution_agent.format_observation(state_data, pipeline_state.l2_fusion_result)
+                obs = self.execution_agent.format_observation(state_data, pipeline_state.l2_fusion_result, pipeline_state.market_state)
                 # [Fix 0.2] Use await
                 exec_action = await self.execution_agent.compute_action(obs)
                 logger.info(f"Execution Agent Action: {exec_action}")
@@ -306,6 +319,20 @@ class Orchestrator:
             }
             
             pipeline_state.set_l3_decision(l3_decision)
+            
+            # [Task 3.2] Populate formalized fields for PortfolioConstructor consistency
+            if alpha_action is not None:
+                # Convert scalar/array to weight
+                try:
+                    val = float(alpha_action) if not hasattr(alpha_action, '__len__') else float(alpha_action[0])
+                    pipeline_state.set_l3_alpha_signal({symbol: val})
+                except (ValueError, TypeError, IndexError):
+                    logger.warning(f"Could not convert alpha_action {alpha_action} to signal.")
+
+            if market_data:
+                # Wrap in list to match DataIterator batch format
+                pipeline_state.set_market_data_batch([market_data])
+            
             logger.info(f"L3 Decision complete. Result: {l3_decision}")
             
         except Exception as e:
