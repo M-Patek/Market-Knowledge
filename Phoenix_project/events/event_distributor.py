@@ -3,9 +3,9 @@
 
 [主人喵的修复 2]
 这个类现在是一个基于 Redis List 的可靠事件队列。
-- StreamProcessor (生产者) 使用 rpush (publish) 将事件推入列表。
-- Orchestrator (消费者) 使用 lrange/ltrim (get_pending_events) 批量拉取事件。
-这比 Pub/Sub 更适合 Celery worker 的离散工作模式。
+- StreamProcessor (生产者) 使用 lpush (publish) 将事件推入列表头部。
+- Orchestrator (消费者) 使用 rpoplpush (get_pending_events) 从尾部安全消费。
+[Phase I Fix] 实现了 RPOPLPUSH 可靠队列模式，消除了“破坏性读取”数据丢失风险。
 """
 import redis
 import json
@@ -26,9 +26,12 @@ class EventDistributor:
                 host=os.environ.get('REDIS_HOST', 'redis'),
                 port=int(os.environ.get('REDIS_PORT', 6379)),
                 db=0,
-                decode_responses=True # <-- 重要：将
+                decode_responses=True 
             )
             self.queue_name = os.environ.get('PHOENIX_EVENT_QUEUE', 'phoenix_events')
+            # [Phase I Fix] 定义处理中队列 (Processing Queue) 名称
+            self.processing_queue_name = f"{self.queue_name}:processing"
+            
             self.redis_client.ping()
             logger.info(f"EventDistributor connected to Redis at {self.redis_client.connection_pool.connection_kwargs.get('host')}:{self.redis_client.connection_pool.connection_kwargs.get('port')}")
         except redis.exceptions.ConnectionError as e:
@@ -37,16 +40,17 @@ class EventDistributor:
 
     def publish(self, event_data: Dict[str, Any]) -> bool:
         """
-        (生产者调用) 将一个新事件发布 (RPUSH) 到事件队列。
+        (生产者调用) 将一个新事件发布到事件队列头部 (LPUSH)。
         """
         if not self.redis_client:
             logger.error("Cannot publish event, Redis client is not connected.")
             return False
             
         try:
-            # 将字典序列化为 JSON 字符串
-            event_json = json.dumps(event_data)
-            self.redis_client.rpush(self.queue_name, event_json)
+            # [Phase I Fix] 序列化安全：支持 datetime 等对象
+            event_json = json.dumps(event_data, default=str)
+            # [Phase I Fix] 切换为 LPUSH，因为消费端使用 RPOP (从右侧取)
+            self.redis_client.lpush(self.queue_name, event_json)
             logger.debug(f"Published event to '{self.queue_name}': {event_data.get('id', 'N/A')}")
             return True
         except json.JSONDecodeError as e:
@@ -58,8 +62,9 @@ class EventDistributor:
 
     def get_pending_events(self, max_events: int = 100) -> List[Dict[str, Any]]:
         """
-        (消费者调用) 以非阻塞方式批量获取所有待处理事件（最多 max_events）。
-        这是一个原子操作 (LRANGE + LTRIM)，确保事件不会被重复处理。
+        (消费者调用) 获取待处理事件。
+        [Phase I Fix] 使用 RPOPLPUSH 实现“可靠队列”模式。
+        事件被原子地移动到 :processing 队列，防止在处理崩溃时丢失。
         """
         if not self.redis_client:
             logger.error("Cannot get events, Redis client is not connected.")
@@ -67,28 +72,22 @@ class EventDistributor:
             
         events = []
         try:
-            # 1. (原子) 获取当前批次的事件...
-            pipe = self.redis_client.pipeline()
-            pipe.lrange(self.queue_name, 0, max_events - 1)
-            # 2. ...并立即从列表中修剪 (trim) 它们。
-            pipe.ltrim(self.queue_name, max_events, -1)
-            
-            results = pipe.execute()
-            
-            event_json_list = results[0] # lrange 的结果
-            
-            if not event_json_list:
-                logger.debug("No pending events found in queue.")
-                return []
+            # 循环 pop 每一个事件
+            for _ in range(max_events):
+                # 原子操作：从主队列尾部取出，放入处理队列头部，并返回元素
+                raw_event = self.redis_client.rpoplpush(self.queue_name, self.processing_queue_name)
                 
-            for event_json in event_json_list:
+                if not raw_event:
+                    break # 队列空了
+                
                 try:
                     # 反序列化回字典
-                    events.append(json.loads(event_json))
+                    events.append(json.loads(raw_event))
                 except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to deserialize event from queue, discarding: {e}. Data: {event_json[:50]}...")
+                    logger.warning(f"Failed to deserialize event from queue: {e}")
             
-            logger.info(f"Retrieved and trimmed {len(events)} events from '{self.queue_name}'.")
+            if events:
+                logger.info(f"Retrieved {len(events)} events from '{self.queue_name}' (Moved to processing queue).")
             return events
 
         except redis.exceptions.RedisError as e:
@@ -97,3 +96,23 @@ class EventDistributor:
         except Exception as e:
             logger.error(f"Unexpected error in get_pending_events: {e}", exc_info=True)
             return []
+
+    def ack_events(self, events: List[Dict[str, Any]]):
+        """
+        (Commit) 确认事件已成功处理。
+        从 :processing 队列中移除这些事件。
+        """
+        if not self.redis_client or not events:
+            return
+        try:
+            pipe = self.redis_client.pipeline()
+            for event in events:
+                # 重新序列化以进行匹配移除 (Redis LREM 需要完全匹配的内容)
+                # 注意：这要求序列化是确定性的。生产环境中最好使用 event ID。
+                event_json = json.dumps(event, default=str)
+                pipe.lrem(self.processing_queue_name, 1, event_json)
+            
+            pipe.execute()
+            logger.debug(f"Acknowledged {len(events)} events (Removed from processing queue).")
+        except redis.exceptions.RedisError as e:
+            logger.error(f"Failed to ack events: {e}", exc_info=True)
