@@ -1,13 +1,11 @@
 import os
 import asyncio
-import re
 from neo4j import AsyncGraphDatabase
 from typing import List, Dict, Any, Optional, Tuple # [Task 3] 导入 Tuple
 from uuid import UUID
 
 # 导入 Phoenix 项目的日志记录器
 from Phoenix_project.monitor.logging import get_logger
-from ..core.exceptions import QuerySafetyError
 from ..utils.retry import retry_with_exponential_backoff
 
 logger = get_logger(__name__)
@@ -40,27 +38,6 @@ class GraphDBClient:
         except Exception as e:
             logger.error(f"{self.log_prefix} 初始化 Neo4j 驱动程序失败: {e}", exc_info=True)
             self.driver = None
-
-    @staticmethod
-    def validate_cypher_query(query: str):
-        """
-        [Task 2A] 验证 Cypher 查询是否为只读。
-        检查是否存在 CREATE, SET, DELETE, MERGE 关键字。
-        
-        Args:
-            query (str): 要验证的 Cypher 查询语句。
-            
-        Raises:
-            QuerySafetyError: 如果检测到任何写入/修改关键字。
-        """
-        # \b 确保我们匹配的是整个单词
-        # re.IGNORECASE 使其不区分大小写
-        forbidden_keywords = r'\b(CREATE|SET|DELETE|MERGE)\b'
-        if re.search(forbidden_keywords, query, re.IGNORECASE):
-            logger.warning(f"QuerySafetyError: 检测到潜在的不安全查询。Query: '{query}'")
-            raise QuerySafetyError(f"Query validation failed: Detected forbidden write/modify operation.")
-        
-        logger.debug(f"Cypher query validated successfully.")
 
     @retry_with_exponential_backoff()
     async def verify_connectivity(self):
