@@ -13,38 +13,35 @@ class ExecutionAgent(BaseDRLAgent):
     
     def get_safe_action(self) -> np.ndarray:
         """
-        [Safety] Default to NO_EXECUTION (0.0) on failure.
-        TODO: Confirm with Environment if 0.0 means 'Halt' or 'Liquidate'. Assuming Halt/Intensity=0.
+        [Safety] Return None to signal Orchestrator to HALT/HOLD.
         """
-        return np.array([0.0])
+        return None
 
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult]) -> np.ndarray:
         """
-        [任务 2.1] 格式化观察值以匹配 TradingEnv 的新 (6-d) 状态空间。
+        [Task 3.3] Format observation to match TradingEnv (6-d).
+        Vector: [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence]
         
         Args:
-            state_data (dict): 包含 {'balance', 'holdings', 'price'} 的实时数据。
+            state_data (dict): {'balance', 'initial_balance', 'position_weight', 'price', 'prev_price', 'volume'}
             fusion_result (FusionResult): 来自 L2 认知引擎的分析结果。
 
         Returns:
-            np.ndarray: 匹配 TradingEnv.observation_space 的 6-d 状态向量。
+            np.ndarray: (6,) float32 vector.
         """
         # 1. 从 state_data 中提取市场状态
         balance = state_data.get('balance', 0.0)
-        holdings = state_data.get('holdings', 0.0)
+        initial_balance = state_data.get('initial_balance', balance)
+        position_weight = state_data.get('position_weight', 0.0)
         price = state_data.get('price', 0.0)
+        prev_price = state_data.get('prev_price', price)
+        volume = state_data.get('volume', 0.0)
 
         # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
-        # [Fix] Normalize inputs (Log space) to match RiskAgent and prevent gradient issues
-        norm_balance = np.log(balance + 1.0)
-        norm_price = np.log(price + 1e-9) if price > 0 else 0.0
-
         sentiment = 0.0
         confidence = 0.5
-        is_valid = 0.0
         
         if fusion_result:
-            is_valid = 1.0
             # 映射字符串决策到数值情感
             decision_map = {
                 "STRONG_BUY": 1.0, 
@@ -60,15 +57,23 @@ class ExecutionAgent(BaseDRLAgent):
             # 获取 confidence 字段
             confidence = getattr(fusion_result, 'confidence', 0.5)
 
-        # 3. 构建与 TradingEnv._get_state() 完全匹配的状态向量
-        # 状态 (6-d): [norm_balance, holdings, norm_price, sentiment, confidence, is_valid]
+        # [Task 3.3] Feature Engineering
+        norm_balance = (balance / initial_balance) if initial_balance > 0 else 1.0
+        
+        log_return = 0.0
+        if price > 0 and prev_price > 0:
+            log_return = np.log(price / prev_price)
+            
+        log_volume = np.log(volume + 1.0)
+
+        # 3. Construct 6-d State Vector
         obs = np.array([
             norm_balance,
-            holdings,
-            norm_price,
+            position_weight,
+            log_return,
+            log_volume,
             sentiment,
-            confidence,
-            is_valid
+            confidence
         ], dtype=np.float32)
         
         return obs
