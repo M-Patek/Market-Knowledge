@@ -66,12 +66,43 @@ class CriticAgent(L2Agent):
             
             if "timestamp" not in response_data:
                 response_data["timestamp"] = state.current_time
+            
+            # [Task 2.2] Explicit Mapping & Logic Layer
+            # Handle potential list response or single object
+            raw_items = response_data if isinstance(response_data, list) else [response_data]
+            
+            for raw in raw_items:
+                # 1. Map Scores
+                q_score = float(raw.get("quality_score", 0.0))
+                c_score = float(raw.get("clarity_score", 0.0))
+                b_score = float(raw.get("bias_score", 0.0))
+                r_score = float(raw.get("relevance_score", 0.0))
+                
+                # 2. Derive Logic
+                # Simple Average for validation (Assumption: bias_score is 'Low Bias' or handled positively)
+                avg_score = (q_score + c_score + b_score + r_score) / 4.0
+                is_valid = avg_score > 0.70
+                
+                # Derive Confidence Adjustment (Center at 0.5: >0.5 boosts, <0.5 penalizes)
+                conf_adj = (avg_score - 0.5) * 0.4
 
-            result = CriticResult.model_validate(response_data)
-            object.__setattr__(result, 'timestamp', state.current_time)
+                result = CriticResult(
+                    agent_id=self.agent_id,
+                    target_evidence_id=raw.get("original_evidence_id", "UNKNOWN"),
+                    is_valid=is_valid,
+                    critique=raw.get("critique", "No critique provided."),
+                    confidence_adjustment=conf_adj,
+                    quality_score=q_score,
+                    clarity_score=c_score,
+                    bias_score=b_score,
+                    relevance_score=r_score,
+                    suggestions=raw.get("suggestions_for_improvement", "")
+                )
+                # Inject timestamp for pipeline tracing
+                object.__setattr__(result, 'timestamp', state.current_time)
 
-            logger.info(f"[{self.agent_id}] Critique complete. Valid: {result.is_valid}")
-            yield result
+                logger.info(f"[{self.agent_id}] Critique complete. Valid: {is_valid} (Avg: {avg_score:.2f})")
+                yield result
 
         except Exception as e:
             logger.error(f"[{self.agent_id}] Error: {e}", exc_info=True)
@@ -80,11 +111,11 @@ class CriticAgent(L2Agent):
     def _create_fallback_result(self, state: PipelineState, symbol: str, reason: str) -> CriticResult:
         """创建兜底的批评结果 (默认为有效，但标记为弱)。"""
         return CriticResult(
-            timestamp=state.current_time,
-            target_symbol=symbol,
-            is_valid=False, # [Safety] Default to REJECT on failure
-            critique_summary=f"System Fallback (Validation Failed): {reason}",
-            score=0.0, # Penalize score
-            flaws_found=[],
-            suggestions=[]
+            agent_id=self.agent_id,
+            target_evidence_id="UNKNOWN",
+            is_valid=False,
+            critique=f"System Fallback: {reason}",
+            confidence_adjustment=-0.5,
+            suggestions="Check System Logs",
+            flags=["SYSTEM_ERROR"]
         )
