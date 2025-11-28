@@ -41,6 +41,10 @@ class PipelineState(BaseModel):
     market_state: Dict[str, Any] = Field(default_factory=dict)
     raw_events: List[Dict[str, Any]] = Field(default_factory=list)
     l3_decision: Dict[str, Any] = Field(default_factory=dict)
+    
+    # [Task 3.2] Formalize monkey-patched fields
+    market_data_batch: Optional[Any] = None # List[MarketData] or Dict
+    l3_alpha_signal: Optional[Dict[str, float]] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -70,6 +74,13 @@ class PipelineState(BaseModel):
 
     def set_l3_decision(self, decision: Dict[str, Any]):
         self.l3_decision = decision
+
+    # [Task 3.2] Setters for formalized fields
+    def set_market_data_batch(self, batch: Any):
+        self.market_data_batch = batch
+
+    def set_l3_alpha_signal(self, signal: Dict[str, float]):
+        self.l3_alpha_signal = signal
 
     def update_ai_outputs(self, fusion_result: FusionResult):
         """
