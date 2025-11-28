@@ -2,6 +2,7 @@
 # [凤凰 V7 迭代] - 统一效用与务实权衡
 # 最终的、无幻觉的 DRL 环境。
 # 替代所有 V1-V6 的幻觉设计。
+# [Phase III Fix] Echo Chamber Removal & Feature/Position Unification
 
 import numpy as np
 import gymnasium as gym
@@ -95,6 +96,8 @@ class PhoenixMultiAgentEnvV7(gym.Env):
 
         # [主人喵 Phase 3] 缓存当前时间步的价格 map {symbol: price}
         self.current_prices = {}
+        # [Phase III Fix] For Log Return calculation (Stationarity)
+        self.prev_prices = {} 
         
         self.current_step = 0
         
@@ -112,6 +115,9 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         """
         self.current_step += 1
         
+        # [Phase III Fix] Archive prices for return calculation (Stationarity)
+        self.prev_prices = self.current_prices
+        
         # 1. [主人喵 Phase 3 修复] 获取真实市场数据 (t 时刻)
         try:
             batch_data = next(self.data_iterator)
@@ -125,11 +131,11 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         except StopIteration:
             return self._terminate_episode()
         
-        # (使用占位符数据进行模拟)
-        self.l2_knowledge = {
-            'AAPL': {'price_t': 150.0, 'price_t1': 150.1, 'l2_sentiment': 0.6, 'l2_confidence': 0.8},
-            'MSFT': {'price_t': 300.0, 'price_t1': 299.8, 'l2_sentiment': -0.3, 'l2_confidence': 0.5}
-        }
+        # [Phase III Fix] Removed Hallucinated Mock Data.
+        # L2 knowledge must come from the orchestrator or dataset.
+        # If not available, we assume empty knowledge rather than fake signals.
+        if not self.l2_knowledge:
+            self.l2_knowledge = {}
 
         # 2. 执行交易 (t -> t+1)
         # V7 哲学：L3 团队 (Alpha, Risk, Exec) 共同决定一个动作
@@ -185,37 +191,9 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         # 2. (无幻觉) 计算*实际*的成本惩罚
         R_cost_penalty_t1 = - (costs.get('slippage', 0.0) + costs.get('fees', 0.0))
 
-        # 3. (V7 核心) 计算“知识调整因子” (L2 Factor)
-        # L2_Factor = (1.0 + (l2_sentiment * l2_confidence * sign(Position)))
-        # 我们必须计算投资组合的*加权平均*知识因子
-        
-        l2_factor_total = 0.0
-        total_abs_allocation = 0.0001 # 避免除以零
-        
-        for asset_id, alloc in self.current_allocation.items():
-            l2_info = self.l2_knowledge.get(asset_id)
-            if not l2_info:
-                continue
-            
-            alloc_abs = abs(alloc)
-            total_abs_allocation += alloc_abs
-            
-            pos_sign = np.sign(alloc)
-            l2_sent = l2_info['l2_sentiment']
-            l2_conf = l2_info['l2_confidence']
-            
-            # (1.0 + (sent * conf * sign))
-            factor = 1.0 + (l2_sent * l2_conf * pos_sign)
-            
-            l2_factor_total += (factor * alloc_abs)
-
-        # 加权平均 L2 因子
-        avg_l2_factor_t = l2_factor_total / total_abs_allocation
-
-        # 4. 组合 Alpha 组件
-        # (如果 PnL 为正，且符合知识，则放大；如果 PnL 为负，且符合知识，则惩罚放大)
-        # (如果 PnL 为正，但不符合知识，则抑制)
-        R_alpha = delta_pnl_t1 * avg_l2_factor_t
+        # [Phase III Fix] Echo Chamber Removal
+        # Reward must be pure PnL-based. No multiplier for agreeing with L2.
+        R_alpha = delta_pnl_t1
         
         return R_alpha + R_cost_penalty_t1
 
@@ -345,13 +323,13 @@ class PhoenixMultiAgentEnvV7(gym.Env):
 
     def _get_obs_dict(self) -> Dict[str, Any]:
         """
-        [Task 10] Constructs a real observation vector from environment state.
-        Vector Shape (5,): [Balance, Holdings, LogPrice, Sentiment, Confidence]
+        [Task 10] Constructs a stationary observation vector.
+        Vector Shape (5,): [NormBalance, PositionWeight, LogReturn, Sentiment, Confidence]
         """
         # Default state (e.g., for reset before data)
         norm_balance = self.balance / self.initial_balance if self.initial_balance > 0 else 1.0
-        holdings = 0.0
-        norm_price = 0.0
+        position_weight = 0.0
+        log_return = 0.0
         sentiment = 0.0
         confidence = 0.5 # Default uncertainty
 
@@ -363,12 +341,18 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             target_symbol = sorted(list(self.l2_knowledge.keys()))[0]
 
         if target_symbol:
-            holdings = self.current_allocation.get(target_symbol, 0.0)
+            # [Position Unification] Use normalized weight, not shares
+            position_weight = self.current_allocation.get(target_symbol, 0.0)
             
             price = self.current_prices.get(target_symbol, 0.0)
+            prev_price = self.prev_prices.get(target_symbol, price) # Default to 0 return if start
+            
             if price <= 0 and target_symbol in self.l2_knowledge:
                 price = self.l2_knowledge[target_symbol].get('price_t', 0.0)
-            norm_price = np.log(price + 1e-9) if price > 0 else 0.0
+            
+            # [Feature Unification] Use Log Returns (Stationary) instead of Absolute Price
+            if price > 0 and prev_price > 0:
+                log_return = np.log(price / prev_price)
             
             l2 = self.l2_knowledge.get(target_symbol, {})
             sentiment = l2.get('l2_sentiment', 0.0)
@@ -376,8 +360,8 @@ class PhoenixMultiAgentEnvV7(gym.Env):
 
         obs_vector = np.array([
             norm_balance,
-            holdings,
-            norm_price,
+            position_weight,
+            log_return,
             sentiment,
             confidence
         ], dtype=np.float32)
