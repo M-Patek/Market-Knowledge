@@ -47,10 +47,22 @@ class EventRiskFilter:
             
         # FIX (E1): 过滤 NewsData
         if "news_data" in data_batch:
-            filtered_batch["news_data"] = [
-                data for data in data_batch["news_data"]
-                if self._filter_news_data(data)
-            ]
+            # [Task 5.2] Filter AND Sanitize (Anti-Injection)
+            sanitized_news = []
+            for data in data_batch["news_data"]:
+                if self._filter_news_data(data):
+                    # Sanitize content to neutralize XML/Prompt Injection attacks
+                    clean_content = self.sanitize_for_prompt(data.content)
+                    clean_headline = self.sanitize_for_prompt(data.headline)
+                    
+                    # Create a safe copy (NewsData is immutable/frozen)
+                    safe_data = data.model_copy(update={
+                        "content": clean_content,
+                        "headline": clean_headline
+                    })
+                    sanitized_news.append(safe_data)
+                    
+            filtered_batch["news_data"] = sanitized_news
         
         # 保留其他数据类型
         for key, value in data_batch.items():
@@ -92,3 +104,17 @@ class EventRiskFilter:
             return False
             
         return True
+
+    def sanitize_for_prompt(self, text: str) -> str:
+        """
+        [Task 5.2] Anti-Injection: Escape XML/HTML tags to prevent prompt hijacking.
+        """
+        if not text:
+            return ""
+            
+        # Log potential attack patterns
+        if "<system>" in text or "<user>" in text:
+             print(f"{self.log_prefix} WARNING: Potential Prompt Injection tags detected.")
+             
+        # Escape critical characters
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
