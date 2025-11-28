@@ -1,6 +1,7 @@
-# Phoenix_project/registry.py
 import logging
 import importlib
+import os
+import redis
 from omegaconf import DictConfig
 from types import SimpleNamespace
 from typing import Dict, Any, Optional, Type
@@ -20,6 +21,7 @@ from Phoenix_project.ai.data_adapter import DataAdapter
 from Phoenix_project.ai.relation_extractor import RelationExtractor
 from Phoenix_project.ai.graph_db_client import GraphDBClient
 from Phoenix_project.ai.source_credibility import SourceCredibility
+from Phoenix_project.api.gemini_pool_manager import GeminiPoolManager
 from Phoenix_project.knowledge_graph_service import KnowledgeGraphService
 from Phoenix_project.audit_manager import AuditManager
 
@@ -43,6 +45,7 @@ class DependencyContainer:
     def __init__(self):
         self.context_bus: Optional[ContextBus] = None
         self.data_manager: Optional[DataManager] = None
+        self.gemini_manager: Optional[GeminiPoolManager] = None  # Added
         self.embedding_client: Optional[EmbeddingClient] = None
         self.ensemble_client: Optional[EnsembleClient] = None
         self.prompt_manager: Optional[PromptManager] = None
@@ -164,17 +167,27 @@ class Registry:
         """Builds components that are shared across the system."""
         logger.info("Building core components...")
         
+        # [Task 1.2] Fail Fast Initialization: Verify Nervous System Connections
+        if not os.getenv("GEMINI_API_KEYS"):
+            raise RuntimeError("CRITICAL: GEMINI_API_KEYS not found. System cannot start without AI backend.")
+        
+        self.container.gemini_manager = GeminiPoolManager(self.config.get("api", {}))
+        
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        try:
+            redis_client = redis.from_url(redis_url)
+            redis_client.ping()
+        except Exception as e:
+            raise RuntimeError(f"CRITICAL: Redis connection failed at {redis_url}. Cause: {str(e)}")
+
         # 1. 核心通信
         self.container.context_bus = ContextBus()
         
         # 2. 核心 AI / 数据服务
         self.container.embedding_client = EmbeddingClient(self.config.models.embedding)
-        # 注意: EnsembleClient 现在需要注入 registry 本身 (Task 1.3), 但为了打破鸡生蛋问题，
-        # 我们可能需要稍微调整 EnsembleClient 或在此处传递 self (如果 EnsembleClient 支持)
-        # 假设 EnsembleClient 已经被 patched 以支持 DependencyContainer 或稍后设置
-        # 为简单起见，这里按原样初始化，如果 EC 需要 registry，建议 setter 注入
+        
         self.container.ensemble_client = EnsembleClient(
-            gemini_manager=None, # TBD: Wired up in main
+            gemini_manager=self.container.gemini_manager,
             prompt_manager=None, # Will be set next
             agent_registry=self.config.agents,
             global_registry=self # 注入 self
@@ -190,7 +203,7 @@ class Registry:
         self.container.graph_db_client = GraphDBClient(self.config.memory.graph_database)
 
         # 4. 核心数据管理
-        self.container.data_manager = DataManager(self.config.data, redis_client=None) # Redis TBD via wiring
+        self.container.data_manager = DataManager(self.config.data, redis_client=redis_client)
 
         # 5. 核心审计
         self.container.audit_manager = AuditManager(self.config.audit, self.container.cot_database)
@@ -251,7 +264,7 @@ class Registry:
         
         risk_manager = RiskManager(
             config=config.cognitive.risk, 
-            redis_client=None, # TBD
+            redis_client=c.data_manager.redis_client, # Pass the connected client
             data_manager=c.data_manager
         )
 
