@@ -88,11 +88,27 @@ class FusionAgent(L2Agent):
             
             # [Robustness] Clean Markdown code blocks and extract JSON
             clean_str = response_str.strip()
-            # Regex to find the JSON object between braces, ignoring surrounding text/markdown
-            # [Fix] Non-greedy match to avoid capturing too much
-            match = re.search(r"(\{[\s\S]*?\})", clean_str)
-            if match:
-                clean_str = match.group(1)
+            
+            # [Task 5.3] Fix: Replace naive regex with stack-based extractor to handle nested objects
+            json_str = None
+            brace_count = 0
+            start_index = -1
+            
+            for i, char in enumerate(clean_str):
+                if char == '{':
+                    if start_index == -1:
+                        start_index = i
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0 and start_index != -1:
+                        json_str = clean_str[start_index : i+1]
+                        break
+            
+            # Fallback: if stack parsing failed (e.g. incomplete json), try loading original cleaned string
+            # or rely on json.loads to catch it later.
+            if json_str:
+                clean_str = json_str
 
             response_data = json.loads(clean_str)
             
