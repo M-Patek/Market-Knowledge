@@ -3,6 +3,7 @@ DataManager for the Phoenix project.
 
 Handles loading, caching, and refreshing of all data sources required
 by the cognitive engine and agents (e.g., market data, news, fundamentals).
+[Phase I Fix] Environment Isolation & Time Travel Prevention
 """
 
 import logging
@@ -46,6 +47,8 @@ class DataManager:
             tabular_db: (Optional) Client for tabular (SQL) data.
             temporal_db: (Optional) Client for time-series data.
         """
+        # [Phase I Fix] Extract run_mode for key isolation
+        self.run_mode = config.get("run_mode", "DEV").lower()
         self.config = config.get("data_manager", {})
         self.api_keys = config.get("api_keys", {})
         self.redis_client = redis_client
@@ -64,7 +67,7 @@ class DataManager:
         self.news_api_url = self.config.get("news_api_url", "https://newsapi.org/v2/everything")
         self.market_data_api_url = self.config.get("market_data_api_url", "https://api.polygon.io/v2/aggs/ticker")
         
-        logger.info("DataManager initialized.")
+        logger.info(f"DataManager initialized (Run Mode: {self.run_mode}).")
 
     def set_simulation_time(self, sim_time: Optional[datetime]):
         """
@@ -99,7 +102,8 @@ class DataManager:
 
     def _get_cache_key(self, prefix: str, identifier: str) -> str:
         """Generates a standardized Redis cache key."""
-        return f"phoenix:cache:{prefix}:{identifier}"
+        # [Phase I Fix] Apply namespace isolation
+        return f"phx:{self.run_mode}:cache:{prefix}:{identifier}"
 
     def _get_from_cache(self, key: str) -> Optional[Any]:
         """Retrieves and deserializes data from Redis cache."""
@@ -212,8 +216,8 @@ class DataManager:
             return await self._get_historical_latest(symbol, self._simulation_time)
 
         # --- Live Mode (Redis) ---
-        # [主人喵 Phase 2 修复] 使用标准 Key 模板和 Pydantic 验证
-        live_key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=symbol)
+        # [Phase I Fix] Apply namespace isolation
+        live_key = f"phx:{self.run_mode}:market_data:live:{symbol}"
         
         try:
             data_json = self.redis_client.get(live_key)
@@ -283,36 +287,10 @@ class DataManager:
         # 从表格数据库 (Tabular DB) 获取
         logger.info(f"Fetching fundamentals for {symbol} from TabularDB.")
         try:
-            # [Task 2.1] Prevent Time Travel: Use structured SQL with time barrier
-            cutoff_time = self.get_current_time()
+            # [Phase I Fix] Explicit PIT Retrieval
+            fund_data = await self._get_historical_fundamentals(symbol, self.get_current_time())
             
-            # [Security Fix] 使用参数化查询替代 f-string
-            query = """
-                SELECT * FROM fundamentals 
-                WHERE symbol = :symbol 
-                AND timestamp <= :cutoff_time 
-                ORDER BY timestamp DESC 
-                LIMIT 1
-            """
-            params = {"symbol": symbol, "cutoff_time": cutoff_time}
-            
-            # 使用安全的执行方法
-            rows = await self.tabular_db.execute_sql(query, params)
-            
-            if rows:
-                fund_data_dict = rows[0]
-                fund_data = FundamentalData(
-                    symbol=symbol,
-                    # Use actual data timestamp, fallback to cutoff only if missing
-                    timestamp=fund_data_dict.get("timestamp") or cutoff_time,
-                    market_cap=fund_data_dict.get("market_cap"),
-                    pe_ratio=fund_data_dict.get("pe_ratio"),
-                    sector=fund_data_dict.get("sector"),
-                    industry=fund_data_dict.get("industry"),
-                    dividend_yield=fund_data_dict.get("dividend_yield"),
-                    eps=fund_data_dict.get("eps"),
-                    beta=fund_data_dict.get("beta")
-                )
+            if fund_data:
                 self._set_to_cache(cache_key, fund_data)
                 return fund_data
             else:
@@ -322,6 +300,38 @@ class DataManager:
         except Exception as e:
             logger.error(f"Failed to fetch fundamentals from TabularDB for {symbol}: {e}")
             return None
+
+    async def _get_historical_fundamentals(self, symbol: str, pit_date: datetime) -> Optional[FundamentalData]:
+        """
+        Helper: Executes Point-in-Time (PIT) query against TabularDB.
+        [Phase I Fix] Encapsulated PIT logic.
+        """
+        query = """
+            SELECT * FROM fundamentals 
+            WHERE symbol = :symbol 
+            AND timestamp <= :pit_date 
+            ORDER BY timestamp DESC 
+            LIMIT 1
+        """
+        params = {"symbol": symbol, "pit_date": pit_date}
+        
+        rows = await self.tabular_db.execute_sql(query, params)
+        
+        if rows:
+            fund_data_dict = rows[0]
+            return FundamentalData(
+                symbol=symbol,
+                # Use actual data timestamp, fallback to pit_date only if missing
+                timestamp=fund_data_dict.get("timestamp") or pit_date,
+                market_cap=fund_data_dict.get("market_cap"),
+                pe_ratio=fund_data_dict.get("pe_ratio"),
+                sector=fund_data_dict.get("sector"),
+                industry=fund_data_dict.get("industry"),
+                dividend_yield=fund_data_dict.get("dividend_yield"),
+                eps=fund_data_dict.get("eps"),
+                beta=fund_data_dict.get("beta")
+            )
+        return None
 
     async def fetch_news_data(
         self, query: str, limit: int = 10, start_date: datetime = None, end_date: datetime = None, force_refresh: bool = False
@@ -454,6 +464,12 @@ class DataManager:
         [Task 2] 已实现
         Helper: Fetches fundamental data from Alpha Vantage and stores it in TabularDB.
         """
+        # [Phase I Fix] Time Travel Prevention
+        # Snapshot APIs cannot be used in Backtest mode
+        if self.run_mode == "backtest":
+            logger.warning("Skipping fundamental fetch: Alpha Vantage API is snapshot-only and cannot be used in BACKTEST mode.")
+            return
+
         symbol = config.get("symbol")
         if not symbol or not self.tabular_db:
             logger.warning(f"Skipping fundamentals: Symbol ({symbol}) or TabularDB ({self.tabular_db}) missing.")
