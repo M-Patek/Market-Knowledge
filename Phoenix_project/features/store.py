@@ -1,6 +1,7 @@
 """
 特征存储 (Feature Store)
 用于存储、检索和管理用于模型训练和推理的特征。
+[Task 7.4] Bi-Temporal Storage (Event Time + Knowledge Time)
 """
 from typing import List, Dict, Any, Optional
 import pandas as pd
@@ -31,10 +32,12 @@ class FeatureStore(IFeatureStore):
         feature_set_name: str,
         entity_ids: List[str],
         start_time: datetime,
-        end_time: datetime
+        end_time: datetime,
+        as_of_time: Optional[datetime] = None # [Task 7.4] PIT Retrieval
     ) -> Optional[pd.DataFrame]:
         """
         检索一个特征集。支持按时间和实体(Symbol)切片。
+        [Task 7.4] Supports Point-In-Time (PIT) retrieval using as_of_time.
         """
         # 构建文件路径
         file_path = os.path.join(self.base_path, f"{feature_set_name}.parquet")
@@ -45,10 +48,23 @@ class FeatureStore(IFeatureStore):
             
         try:
             # 1. Load dataset
-            # (Optimization Note: For huge files, use pyarrow.parquet.read_table with filters)
             df = pd.read_parquet(file_path)
             
-            # 2. Filter by Time
+            # [Task 7.4] Point-In-Time (PIT) Filtering
+            # Ensure knowledge_timestamp exists (backward compatibility)
+            if 'knowledge_timestamp' in df.columns:
+                # Default to now if not simulating
+                cutoff = as_of_time if as_of_time else datetime.utcnow()
+                # A. Filter out future knowledge
+                df = df[df['knowledge_timestamp'] <= cutoff]
+                # B. Sort by knowledge time to prepare for latest version selection
+                df = df.sort_values('knowledge_timestamp')
+                # C. Deduplicate to get the "As-Of" version for each (timestamp, symbol) tuple
+                # This keeps the last row (latest knowledge) for each data point
+                if 'timestamp' in df.columns and 'symbol' in df.columns:
+                    df = df.drop_duplicates(subset=['timestamp', 'symbol'], keep='last')
+
+            # 2. Filter by Event Time
             # Standardize index to datetime for filtering
             if 'timestamp' in df.columns:
                 df = df.set_index('timestamp')
@@ -80,11 +96,17 @@ class FeatureStore(IFeatureStore):
     def ingest_features(self, feature_set_name: str, data: pd.DataFrame):
         """
         将新的特征数据写入存储 (增量更新/Upsert)。
+        [Task 7.4] Implements Append-Only Log with Knowledge Time for Bi-Temporal support.
         """
         file_path = os.path.join(self.base_path, f"{feature_set_name}.parquet")
         print(f"Ingesting {len(data)} rows into {feature_set_name}...")
         
         try:
+            # [Task 7.4] Inject Knowledge Timestamp (Ingestion Time)
+            # This allows us to track WHEN we knew this data point.
+            if 'knowledge_timestamp' not in data.columns:
+                data['knowledge_timestamp'] = datetime.utcnow()
+
             final_df = data
             
             # [Task 10] Incremental Upsert Logic
@@ -92,20 +114,9 @@ class FeatureStore(IFeatureStore):
                 existing_df = pd.read_parquet(file_path)
                 final_df = pd.concat([existing_df, data])
                 
-                # Deduplicate based on index and symbol to allow re-runs
-                if 'symbol' in final_df.columns:
-                    # Reset index to use timestamp in duplicate check
-                    if isinstance(final_df.index, pd.DatetimeIndex):
-                         final_df = final_df.reset_index()
-                         final_df = final_df.drop_duplicates(subset=['timestamp', 'symbol'], keep='last')
-                         final_df = final_df.set_index('timestamp')
-                    else:
-                         # Assuming 'timestamp' is a column if not index
-                         if 'timestamp' in final_df.columns:
-                            final_df = final_df.drop_duplicates(subset=['timestamp', 'symbol'], keep='last')
-                else:
-                     # Basic deduplication
-                     final_df = final_df.drop_duplicates(keep='last')
+                # [Task 7.4] Removed destructive deduplication on (timestamp, symbol).
+                # We now keep history. Only drop EXACT duplicates (rows that are identical in every way).
+                final_df = final_df.drop_duplicates()
             
             final_df.to_parquet(file_path)
             print(f"Successfully ingested features into {file_path}. Total rows: {len(final_df)}")
