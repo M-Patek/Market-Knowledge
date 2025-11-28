@@ -47,21 +47,15 @@ class FactChecker:
             }
         }
         
-        # --- 优化：更新提示 ---
-        # 加载 'l2_critic' 提示，与核心 L2 CriticAgent 保持一致
-        # 旧值: "fact_checker"
-        self.prompt = copy.deepcopy(self.prompt_manager.get_prompt("l2_critic")) # [Task 2.1] Use deepcopy
-        # --- 结束优化 ---
+        # Load 'l2_critic' prompt to align with core L2 CriticAgent
+        # [Task 5.2] Fix: Use deepcopy to prevent global prompt pollution when modifying system instructions below
+        self.prompt = copy.deepcopy(self.prompt_manager.get_prompt("l2_critic"))
         
         if not self.prompt:
              logger.error("Failed to load 'l2_critic' prompt for FactChecker. Check prompts directory.", exc_info=True)
              raise FileNotFoundError("FactChecker prompt 'l2_critic' not found.")
         
-        # --- 优化：保留系统提示强化 ---
-        # 我们在初始化时修改加载的系统提示，
-        # 明确指示模型必须使用搜索工具。
-        # 这比在运行时动态修改用户提示更清晰、更健壮。
-        
+        # Modify system prompt to mandate search tool usage
         search_instruction = (
             "\n\n---\n"
             "MANDATORY INSTRUCTION: You MUST use the 'search_documents' tool "
@@ -76,7 +70,6 @@ class FactChecker:
             self.prompt["system"] = search_instruction.strip()
             
         logger.info("FactChecker initialized with 'l2_critic' prompt and modified to enforce search tool usage.")
-        # --- 结束优化 ---
 
     async def check_facts(self, claims: List[str]) -> List[FactCheckResult]:
         """
@@ -107,11 +100,6 @@ class FactChecker:
                 self.prompt, **prompt_context
             )
             
-            # --- 优化：移除了 HACK ---
-            # 之前的 HACK 逻辑（在运行时修改用户提示）已被移除，
-            # 因为我们在 __init__ 中强化了系统提示。
-            # --- 结束优化 ---
-
             # 我们希望LLM返回结构化数据
             # 假设 run_chain_structured 能够处理工具调用和返回JSON
             response_json = await self.llm_client.run_chain_structured(
