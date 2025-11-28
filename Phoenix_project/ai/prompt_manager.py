@@ -28,7 +28,13 @@ class PromptManager:
         """
         私有辅助方法：加载并解析指定名称的提示 JSON 文件。
         """
-        file_path = os.path.join(self.prompts_dir, f"{prompt_name}.json")
+        # [Task 5.2] Path Traversal Defense
+        # Strictly enforce that the file comes from the prompts directory
+        safe_prompt_name = os.path.basename(prompt_name)
+        if safe_prompt_name != prompt_name:
+            print(f"Warning: Path traversal attempt detected. Sanitized '{prompt_name}' to '{safe_prompt_name}'")
+            
+        file_path = os.path.join(self.prompts_dir, f"{safe_prompt_name}.json")
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
