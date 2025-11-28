@@ -18,12 +18,15 @@ class ContextBus:
     上下文总线 (Context Bus) & 状态持久化适配器。
     1. 负责 PipelineState 的 Redis 持久化。
     2. [Fix] 负责基于 Redis Pub/Sub 的组件间异步通信。
+    3. [Phase I Fix] 实现环境隔离 (run_mode) 和动态 EventLoop 捕获。
     """
 
     def __init__(self, redis_client: redis.Redis, config: Optional[Dict[str, Any]] = None):
         self.redis = redis_client
         self.config = config or {}
         self.ttl = self.config.get("state_ttl_sec", 86400)
+        # [Phase I Fix] 提取运行模式，用于 Key 隔离
+        self.run_mode = self.config.get("run_mode", "DEV").lower()
         
         # 管理订阅线程
         self._listening = False
@@ -31,11 +34,8 @@ class ContextBus:
         self._pubsub = self.redis.pubsub()
         self._handlers: Dict[str, Callable] = {}
         
-        # 获取当前运行的主循环，用于线程间调度
-        try:
-            self._main_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._main_loop = None # 稍后在 subscribe 时尝试获取或由调用者注入
+        # [Phase I Fix] 移除在 __init__ 中捕获 loop，避免 "Zombie Loop" 问题
+        self._main_loop = None 
 
     # --- 核心通信功能 (修复点) ---
 
@@ -59,21 +59,22 @@ class ContextBus:
     def subscribe_async(self, channel: str, handler: Callable[[Dict], Any]):
         """
         异步订阅接口。当收到消息时，会在主 EventLoop 中调度执行 handler (coroutine)。
+        [Phase I Fix] 动态捕获当前运行的 loop，修复“耳聋”问题。
         """
         logger.info(f"Subscribing (Async) to channel: {channel}")
         
-        # 确保我们引用了主循环
-        if not self._main_loop:
-            try:
-                self._main_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                logger.warning("ContextBus could not capture running event loop. Async callbacks might fail if loop isn't set manually.")
+        # [Phase I Fix] 动态获取 Loop
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.error(f"Cannot subscribe_async to {channel}: No running event loop detected.")
+            return
 
         def _wrapper(message_data):
             # 这是一个在线程中运行的同步 wrapper
             # 需要将 async handler 调度回主循环
-            if self._main_loop and not self._main_loop.is_closed():
-                asyncio.run_coroutine_threadsafe(handler(message_data), self._main_loop)
+            if loop and not loop.is_closed():
+                asyncio.run_coroutine_threadsafe(handler(message_data), loop)
             else:
                 logger.error("Cannot dispatch async handler: Event loop is missing or closed.")
 
@@ -138,22 +139,17 @@ class ContextBus:
         for message in self._pubsub.listen():
             if not self._listening:
                 break
-            # redis-py's pubsub.listen() yields messages, the callback logic 
-            # is handled by the 'subscribe' call if we strictly followed redis-py callback pattern,
-            # BUT here we iterate manually. 
-            # Note: If using handlers with .subscribe(**{channel: handler}), listen() still yields.
-            # The handler is called *inside* the listen() loop processing implicitly if run_in_thread is used,
-            # but here we are just keeping the thread alive and consuming the stream.
             pass
 
     # --- 状态持久化功能 (保持原样) ---
 
     def save_state(self, state: PipelineState) -> bool:
         try:
-            key = f"phoenix:state:{state.run_id}"
+            # [Phase I Fix] Apply Run Mode Namespacing
+            key = f"phx:{self.run_mode}:state:{state.run_id}"
             json_data = state.model_dump_json()
             self.redis.setex(key, self.ttl, json_data)
-            self.redis.set("phoenix:state:latest_run_id", state.run_id)
+            self.redis.set(f"phx:{self.run_mode}:state:latest_run_id", state.run_id)
             return True
         except Exception as e:
             logger.error(f"Failed to save state: {e}", exc_info=True)
@@ -161,7 +157,8 @@ class ContextBus:
 
     def load_state(self, run_id: str) -> Optional[PipelineState]:
         try:
-            key = f"phoenix:state:{run_id}"
+            # [Phase I Fix] Apply Run Mode Namespacing
+            key = f"phx:{self.run_mode}:state:{run_id}"
             data = self.redis.get(key)
             if not data: return None
             return PipelineState.model_validate_json(data)
@@ -171,7 +168,8 @@ class ContextBus:
 
     def load_latest_state(self) -> Optional[PipelineState]:
         try:
-            run_id = self.redis.get("phoenix:state:latest_run_id")
+            # [Phase I Fix] Apply Run Mode Namespacing
+            run_id = self.redis.get(f"phx:{self.run_mode}:state:latest_run_id")
             if run_id:
                 if isinstance(run_id, bytes): run_id = run_id.decode('utf-8')
                 return self.load_state(run_id)
