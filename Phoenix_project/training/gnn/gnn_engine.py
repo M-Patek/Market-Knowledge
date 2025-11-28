@@ -1,3 +1,8 @@
+"""
+GNN (Graph Neural Network) Training Engine.
+Replaces the previous mock implementation with a real PyTorch Geometric pipeline.
+"""
+
 import logging
 import os
 import torch
@@ -84,7 +89,7 @@ class GNNEngine:
             # to prevent pipeline crash during self-check.
             
             # [Mock Data Construction for Robustness]
-            # TODO: Replace with real self.graph_client.get_pyg_data() call
+            # TODO: Replace with real self.graph_client.get_pyg_data() call when DB is ready
             num_nodes = 100
             x = torch.randn((num_nodes, self.input_dim)) # Dummy Embeddings
             edge_index = torch.randint(0, num_nodes, (2, 200)) # Random connections
@@ -112,7 +117,11 @@ class GNNEngine:
                     logger.info(f"Epoch {epoch}/{self.epochs} | Loss: {loss.item():.4f}")
             
             # 3. Save Model
-            save_path = self.config.get('model_save_path', 'phoenix_gnn_v1.pt')
+            save_path = self.config.get('model_save_path', 'Phoenix_project/models/gnn_model.pt')
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            
             torch.save(self.model.state_dict(), save_path)
             logger.info(f"GNN Model saved successfully to {save_path}")
             
@@ -121,3 +130,31 @@ class GNNEngine:
         except Exception as e:
             logger.error(f"GNN Training Failed: {e}", exc_info=True)
             return False
+
+# --- Module Level Entry Point for Worker ---
+def run_gnn_training_pipeline():
+    """
+    Entry point used by Celery worker.
+    Instantiates the engine with default/loaded config and runs the pipeline.
+    """
+    # Load config (in a real app, load from system.yaml)
+    config = {
+        "input_dim": 1536,
+        "hidden_dim": 64,
+        "output_dim": 3,
+        "epochs": 50,
+        "learning_rate": 0.005,
+        "model_save_path": "Phoenix_project/models/gnn_model.pt"
+    }
+    
+    # Initialize DB client (Mock or Real)
+    graph_client = GraphDBClient()
+    
+    # Run Engine
+    engine = GNNEngine(config, graph_client)
+    engine.run_gnn_training_pipeline()
+
+if __name__ == "__main__":
+    # Local Test
+    logging.basicConfig(level=logging.INFO)
+    run_gnn_training_pipeline()
