@@ -1,6 +1,9 @@
 """
 数据迭代器
 负责按时间顺序模拟数据流，用于回测。
+[Phase II Fix] Data Structure Mismatch (Dict -> List)
+[Phase VII Fix] News Black Hole (Time-Slicing)
+[Phase VII Fix] Zombie Data Misguidance (Staleness Check)
 """
 import pandas as pd
 import asyncio
@@ -39,6 +42,10 @@ class DataIterator:
         # [Memory Opt] Chunking configuration
         self.chunk_size = pd.Timedelta(self.config.get('chunk_days', 30), unit='d')
         self.lookback_window = pd.Timedelta(self.config.get('lookback_days', 10), unit='d')
+        
+        # [Task 7.3] Staleness Threshold: Data older than this is "Zombie" and untradeable.
+        # Default 4 days covers Friday Close -> Monday Open (3 days) + Buffer.
+        self.max_staleness = pd.Timedelta(days=self.config.get('max_staleness_days', 4))
         
         self.start_date: Optional[datetime] = None
         self.end_date: Optional[datetime] = None
@@ -101,18 +108,35 @@ class DataIterator:
         results = await asyncio.gather(*tasks)
         self.market_data_iters = {sym: df for sym, df in zip(self.symbols, results) if df is not None}
 
-        # 4. Fetch News Data
-        # [Fix] Pass explicit time range to avoid "News Black Hole" (future/missing news)
-        news_list = await self.data_manager.get_news_data(
-            limit=1000,
-            start_date=fetch_start,
-            end_date=fetch_end
-        )
+        # 4. Fetch News Data (Time-Sliced to avoid Black Hole)
+        # Iterate day-by-day to ensure we don't hit the limit=1000 cap for the whole chunk
+        all_news = []
+        current_day = fetch_start
+        day_step = pd.Timedelta(days=1)
         
+        # Limit concurrency to avoid rate limits, or sequential is fine for robustness
+        while current_day < fetch_end:
+            next_day = min(current_day + day_step, fetch_end)
+            try:
+                daily_news = await self.data_manager.get_news_data(
+                    limit=1000, # Per day limit is safer
+                    start_date=current_day,
+                    end_date=next_day
+                )
+                if daily_news:
+                    all_news.extend(daily_news)
+            except Exception as e:
+                # Log but don't crash backtest on partial news failure
+                print(f"DataIterator warning: Failed to fetch news for {current_day}: {e}")
+            
+            current_day = next_day
+
         # [Fix] Convert List[NewsData] to DataFrame for internal usage
-        # This matches the expectation in __anext__
-        if news_list:
-            df = pd.DataFrame([n.model_dump() for n in news_list])
+        if all_news:
+            # Dedup based on ID if needed, but set_index handles it mostly
+            df = pd.DataFrame([n.model_dump() for n in all_news])
+            # Ensure unique index if IDs overlap across boundaries
+            df = df.drop_duplicates(subset=['id'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
             self.news_data = df.set_index('timestamp').sort_index()
         else:
@@ -157,7 +181,7 @@ class DataIterator:
             # We strictly separate T-1 (Facts) from T (Opportunity).
             snapshot = {
                 "timestamp": self.current_time,
-                "market_snapshots": {}, # Changed structure: Dict[str, Dict]
+                "market_data": [], # [Task 2.2] Standardized List[MarketData]
                 "news_data": []
             }
             
@@ -166,12 +190,19 @@ class DataIterator:
             for symbol, df in self.market_data_iters.items():
                 # A. Past Candle (Strictly < T) -> The "Fact"
                 past_slice = df.loc[:self.current_time - pd.Timedelta(seconds=1)]
-                past_candle = None
+                
                 if not past_slice.empty:
                     row_prev = past_slice.iloc[-1]
-                    # Only include if it's recent enough (within lookback) to be relevant?
-                    # For now, we take the last known candle.
-                    past_candle = MarketData(
+                    
+                    # [Task 7.3] Check for Zombie Data
+                    data_age = self.current_time - row_prev.name
+                    if data_age > self.max_staleness:
+                        # Skip stale data (simulating suspension/delisting or lack of liquidity)
+                        # Agents will see no data for this symbol and likely HOLD.
+                        continue
+
+                    # [Task 2.2] Construct MarketData object
+                    market_data_obj = MarketData(
                         symbol=symbol,
                         timestamp=row_prev.name,
                         open=row_prev['open'],
@@ -180,19 +211,7 @@ class DataIterator:
                         close=row_prev['close'],
                         volume=row_prev['volume']
                     )
-
-                # B. Current Open (At T) -> The "Opportunity"
-                current_open = None
-                # Check if T exists in the index (it might be a holiday/weekend gap in data)
-                if self.current_time in df.index:
-                    current_open = df.loc[self.current_time]['open']
-
-                # Pack into snapshot
-                if past_candle or current_open is not None:
-                    snapshot["market_snapshots"][symbol] = {
-                        "past_candle": past_candle,
-                        "current_open": current_open
-                    }
+                    snapshot["market_data"].append(market_data_obj)
 
             if self.news_data is not None:
                 news_slice = self.news_data.loc[window_start:self.current_time]
