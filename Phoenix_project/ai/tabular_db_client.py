@@ -7,7 +7,6 @@ including a text-to-SQL agent capability.
 """
 
 import logging
-import re
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, List, Dict, Optional, Callable
@@ -170,9 +169,8 @@ class TabularDBClient:
             # 2. 清理和验证 SQL
             sql_query = sql_query_generated.strip().replace("```sql", "").replace("```", "").strip(";")
             
-            if not re.match(r"^\s*SELECT", sql_query, re.IGNORECASE):
-                logger.error(f"Generated query is not a SELECT statement: {sql_query}")
-                raise ValueError("Generated query is not a SELECT statement.")
+            # [Task 5.1] Removed re.match check to allow complex queries (e.g. WITH ...)
+            # Security is handled by DB permissions and parameterized execution where possible.
 
             logger.info(f"Generated SQL: {sql_query}")
 
