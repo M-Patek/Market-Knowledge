@@ -3,11 +3,13 @@ Tabular DB Client for Phoenix.
 
 This module provides a client for interacting with tabular (SQL) databases,
 including a text-to-SQL agent capability.
+[Phase II Fix] Atomic Transactions & Connection Management
 """
 
 import logging
 import re
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Any, List, Dict, Optional, Callable
 
 import sqlalchemy  # type: ignore
@@ -244,21 +246,25 @@ class TabularDBClient:
             return []
     
     @retry_with_exponential_backoff(exceptions_to_retry=(SQLAlchemyError,))
-    async def execute_sql(self, sql: str, params: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    async def execute_sql(self, sql: str, params: Dict[str, Any] = None, connection=None) -> List[Dict[str, Any]]:
         """
         [Security Fix] Executes a raw SQL query with parameter binding.
+        [Phase II Fix] Added optional connection for atomic transactions.
         Safe alternative to running the agent for known structured queries.
         """
         if not self.engine:
              raise ValueError("DB engine not initialized.")
         
-        def _exec():
-            with self.engine.connect() as conn:
-                # SQLAlchemy text() handles parameter binding safely
+        def _exec(conn):
+            if conn:
                 result = conn.execute(text(sql), params or {})
                 return [dict(row._mapping) for row in result.fetchall()]
+            else:
+                with self.engine.connect() as new_conn:
+                    result = new_conn.execute(text(sql), params or {})
+                    return [dict(row._mapping) for row in result.fetchall()]
         
-        return await asyncio.to_thread(_exec)
+        return await asyncio.to_thread(_exec, connection)
 
     async def query(self, query: str) -> Dict[str, Any]:
         """
@@ -287,14 +293,16 @@ class TabularDBClient:
             }
 
     @retry_with_exponential_backoff(exceptions_to_retry=(SQLAlchemyError,))
-    async def upsert_data(self, table_name: str, data: Dict[str, Any], unique_key: str) -> bool:
+    async def upsert_data(self, table_name: str, data: Dict[str, Any], unique_key: str, connection=None) -> bool:
         """
         [Task 2] 插入或更新 (Upsert) 一行数据到指定的表格。
+        [Phase II Fix] Added optional connection for atomic transactions.
         
         Args:
             table_name (str): 目标表名 (例如 'fundamentals')。
             data (Dict[str, Any]): 要插入的数据 (列名 -> 值)。
             unique_key (str): 用于冲突判断的主键 (例如 'symbol')。
+            connection (Optional): Existing SQLAlchemy connection for transaction.
         """
         if not self.engine:
             logger.error(f"Upsert failed: DB engine not initialized.")
@@ -331,19 +339,41 @@ class TabularDBClient:
         """)
         
         try:
-            # Upsert 是一个 I/O 操作，在异步方法中应在线程中运行
-            def _execute_sync():
-                with self.engine.connect() as connection:
-                    connection.execute(sql, data)
-                    connection.commit()
+            # Upsert is an I/O operation
+            def _execute_sync(conn):
+                if conn:
+                    conn.execute(sql, data)
+                    # Do not commit here, let the transaction manager handle it
+                else:
+                    with self.engine.connect() as new_conn:
+                        new_conn.execute(sql, data)
+                        new_conn.commit()
             
-            await asyncio.to_thread(_execute_sync)
+            await asyncio.to_thread(_execute_sync, connection)
             
             logger.info(f"Successfully upserted data into '{table_name}' for key {data.get(unique_key)}")
             return True
         except SQLAlchemyError as e:
             logger.error(f"Failed to upsert data into {table_name}: {e}", exc_info=True)
             raise e # Re-raise for the decorator to handle
+
+    @asynccontextmanager
+    async def transaction(self):
+        """
+        [Phase II Fix] Provides an atomic transaction context.
+        Yields a raw SQLAlchemy connection to be passed to execute_sql or upsert_data.
+        Ensures strict ACID compliance for multi-step writes.
+        """
+        conn = await asyncio.to_thread(self.engine.connect)
+        trans = await asyncio.to_thread(conn.begin)
+        try:
+            yield conn
+            await asyncio.to_thread(trans.commit)
+        except Exception:
+            await asyncio.to_thread(trans.rollback)
+            raise
+        finally:
+            await asyncio.to_thread(conn.close)
 
     def close(self):
         """Closes the database engine connection pool."""
