@@ -10,15 +10,16 @@ class RiskAgent(BaseDRLAgent):
     """
     [MARL 重构]
     Risk 智能体，使用 RLLib 基类进行推理。
-    负责决定 (批准/否决)。
+    负责决定 (批准/否决/紧急停止)。
     """
     
     def get_safe_action(self) -> np.ndarray:
         """
-        [Safety] Returns neutral zero vector.
+        [Safety Phase II] Returns HALT signal (1.0).
         Fixed: Must return np.ndarray, not None.
+        If the agent fails/crashes, we default to HALT (Fail-Closed).
         """
-        return np.array([0.0], dtype=np.float32)
+        return np.array([1.0], dtype=np.float32)
     
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
         """
@@ -28,9 +29,10 @@ class RiskAgent(BaseDRLAgent):
         Args:
             state_data (dict): {'balance', 'initial_balance', 'position_weight', 'price', 'prev_price', 'volume'}
             fusion_result (FusionResult): 来自 L2 认知引擎的分析结果。
+            market_state (dict): Macro regime info.
 
         Returns:
-            np.ndarray: (6,) float32 vector.
+            np.ndarray: (7,) float32 vector.
         """
         # 1. 从 state_data 中提取市场状态
         balance = state_data.get('balance', 0.0)
@@ -60,7 +62,7 @@ class RiskAgent(BaseDRLAgent):
             
         log_volume = np.log(volume + 1.0)
 
-        # [Task 6.1] Macro Feature
+        # [Task 6.1] Macro Feature: Market Regime
         regime_val = 0.0
         if market_state:
             regime = str(market_state.get('regime', 'NEUTRAL')).upper()
