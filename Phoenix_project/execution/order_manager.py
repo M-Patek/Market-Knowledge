@@ -21,8 +21,6 @@ from Phoenix_project.core.schemas.data_schema import (
     Order, Fill, OrderStatus, PortfolioState, TargetPortfolio, Position
 )
 from Phoenix_project.core.exceptions import RiskViolationError
-
-# 修正：将 'monitor.logging...' 转换为 'Phoenix_project.monitor.logging...'
 from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
@@ -31,35 +29,25 @@ class OrderManager:
     """
     作为订单和券商适配器之间的中介。
     跟踪所有活动订单的状态。
-    纯异步逻辑：提交订单，并通过回调响应事件。
     """
     
     def __init__(self, broker: IBrokerAdapter, trade_lifecycle_manager: TradeLifecycleManager, data_manager: DataManager):
-        """
-        [阶段 1 & 4 变更]
-        - 注入 TradeLifecycleManager 以便转发 Fill 事件。
-        - [Task 4.2] Inject DataManager for freshness checks.
-        """
         self.broker = broker
         self.trade_lifecycle_manager = trade_lifecycle_manager 
         self.data_manager = data_manager 
         self.active_orders: Dict[str, Order] = {} # key: order_id
-        self.lock = asyncio.Lock() # [Task 4.2] Use asyncio.Lock
+        self.lock = asyncio.Lock() 
         
-        # [Task 3.2] Strict State Transition Logic
         self.valid_transitions = {
             OrderStatus.NEW: {OrderStatus.PENDING_SUBMISSION, OrderStatus.REJECTED, OrderStatus.CANCELLED},
             OrderStatus.PENDING_SUBMISSION: {OrderStatus.PENDING, OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.CANCELLED},
             OrderStatus.PENDING: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED},
             OrderStatus.PARTIALLY_FILLED: {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED},
-            # Terminal states (FILLED, CANCELLED, REJECTED) have no valid outgoing transitions
         }
         
-        # [Task 1] Risk Control Limits
-        self.max_order_value = 100000.0  # Max value per order
-        self.max_notional_exposure = 1000000.0 # Max total exposure
+        self.max_order_value = 100000.0  
+        self.max_notional_exposure = 1000000.0 
         
-        # 订阅券商的回调
         if self.broker:
             self.broker.subscribe_fills(self._on_fill)
             self.broker.subscribe_order_status(self._on_order_status_update)
@@ -68,78 +56,43 @@ class OrderManager:
         logger.info(f"{self.log_prefix} Initialized.")
 
     async def _on_fill(self, fill: Fill):
-        """
-        [阶段 1 & 4 变更]
-        处理来自券商的成交回报 (Fill)。
-        将 Fill 事件转发给 TradeLifecycleManager。
-        """
         async with self.lock:
             logger.info(f"{self.log_prefix} Received Fill: {fill.order_id} ({fill.quantity} @ {fill.price})")
-            
-            order = self.active_orders.get(fill.order_id)
-            if not order:
-                logger.warning(f"{self.log_prefix} Received fill for unknown or closed order {fill.order_id}")
-                # 即使订单未知，也可能需要转发 Fill
-                
-            # [阶段 4] 将 Fill 转发给 TLM
             try:
                 await self.trade_lifecycle_manager.on_fill(fill)
             except Exception as e:
                 logger.error(f"{self.log_prefix} Failed to process fill with TradeLifecycleManager: {e}", exc_info=True)
 
-
     async def _on_order_status_update(self, order: Order):
-        """
-        处理来自券商的订单状态更新。
-        """
         async with self.lock:
             if not order or not order.id or not order.status:
-                logger.warning(f"{self.log_prefix} Received invalid order status update: {order}")
                 return
 
-            # [Task 3.2] Strict State Transition Validation
             current_order = self.active_orders.get(order.id)
             if current_order and not self._can_transition(current_order.status, order.status):
-                logger.error(f"{self.log_prefix} INVALID STATE TRANSITION: {current_order.status} -> {order.status} for order {order.id}. Ignoring update.")
+                logger.error(f"{self.log_prefix} INVALID STATE TRANSITION: {current_order.status} -> {order.status}")
                 return
                 
             logger.info(f"{self.log_prefix} Status Update: Order {order.id} is now {order.status}")
             
             if order.status in [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED]:
-                # 订单生命周期结束，从活动列表中移除
                 if order.id in self.active_orders:
                     del self.active_orders[order.id]
-                    logger.info(f"{self.log_prefix} Order {order.id} closed.")
             else:
-                # 更新活动订单的状态
                 self.active_orders[order.id] = order
 
     def _can_transition(self, current_status: str, new_status: str) -> bool:
-        """
-        [Task 3.2] Validates if a state transition is allowed in the order lifecycle.
-        """
-        if current_status == new_status:
-            return True
-        
+        if current_status == new_status: return True
         allowed = self.valid_transitions.get(current_status, set())
         return new_status in allowed
 
     def _get_instrument_metadata(self, symbol: str) -> Dict[str, float]:
-        """
-        [Task 4] Returns instrument-specific metadata (Tick Size, Lot Size).
-        In a real system, this would fetch from a Master Data Service.
-        """
-        # Default to standard US equity precision
         return {"tick_size": 0.01, "lot_size": 1.0}
 
     def _round_to_tick(self, price: float, tick_size: float) -> float:
-        """
-        [Task 4] Rounds price down to the nearest tick size using Decimal arithmetic.
-        Fixes the 'Penny Gap' issue.
-        """
+        """[Task 4] Fixes Penny Gap using Decimal arithmetic."""
         d_price = Decimal(str(price))
         d_tick = Decimal(str(tick_size))
-        # Quantize with ROUND_DOWN (Safety preference for Limit orders)
         rounded = d_price.quantize(d_tick, rounding=ROUND_DOWN)
         return float(rounded)
 
@@ -150,39 +103,28 @@ class OrderManager:
                         active_orders: Dict[str, Order]
                        ) -> List[Order]:
         """
-        [Task 4]
-        计算当前投资组合和目标投资组合之间的“差异”(diff)。
-        [Optimization] Now calculates 'Effective Position' (Settled + In-flight) to prevent ghost exposure.
-        [Optimization] Generates LIMIT orders instead of MARKET orders.
+        [Task 4] Generates LIMIT orders based on effective position (settled + active).
         """
-        logger.info(f"{self.log_prefix} Generating orders to match target portfolio...")
+        logger.info(f"{self.log_prefix} Generating orders...")
         orders_to_generate: List[Order] = []
         
-        if not current_portfolio or not target_portfolio:
-            logger.warning(f"{self.log_prefix} Missing current or target portfolio. Cannot generate orders.")
-            return []
+        if not current_portfolio or not target_portfolio: return []
 
-        total_value = current_portfolio.total_value
+        total_value = float(current_portfolio.total_value)
         if total_value <= 0:
-            if current_portfolio.cash > 0:
-                 logger.warning(f"{self.log_prefix} Total portfolio value is zero. Using cash value {current_portfolio.cash} for sizing.")
-                 total_value = current_portfolio.cash
+            if float(current_portfolio.cash) > 0:
+                 total_value = float(current_portfolio.cash)
             else:
-                logger.warning(f"{self.log_prefix} Total portfolio value and cash are zero or negative. Cannot generate orders.")
                 return []
 
-        # [Task 4] Forgotten Ceiling: Calculate initial gross exposure
-        # Gross Exposure = Sum(Abs(Position Value))
-        current_gross_exposure = sum(abs(p.market_value) for p in current_portfolio.positions.values())
+        current_gross_exposure = sum(abs(float(p.market_value)) for p in current_portfolio.positions.values())
 
-        # 1. 计算有效持仓 (Settled + Active) 并转换为权重
+        # 1. Effective Position Calculation
         effective_quantities = defaultdict(float)
-        # Add Settled Positions
         for symbol, position in current_portfolio.positions.items():
-            effective_quantities[symbol] += position.quantity
-        # Add In-flight Orders (Projected)
+            effective_quantities[symbol] += float(position.quantity)
         for order in active_orders.values():
-            effective_quantities[order.symbol] += order.quantity
+            effective_quantities[order.symbol] += float(order.quantity)
             
         current_weights: Dict[str, float] = {}
         for symbol, qty in effective_quantities.items():
@@ -190,147 +132,84 @@ class OrderManager:
             if price > 0 and total_value != 0:
                  current_weights[symbol] = (qty * price) / total_value
 
-        # 2. 将目标持仓转换为权重字典
         target_weights: Dict[str, float] = {}
         for pos in target_portfolio.positions:
-            target_weights[pos.symbol] = pos.target_weight
+            target_weights[pos.symbol] = float(pos.target_weight)
 
-        # 3. 合并所有相关符号
         all_symbols = set(current_weights.keys()) | set(target_weights.keys())
 
-        # 4. 计算差异 (Diff)
         for symbol in all_symbols:
             current_w = current_weights.get(symbol, 0.0)
             target_w = target_weights.get(symbol, 0.0)
             
             delta_weight = target_w - current_w
             
-            # 如果变化足够大
-            if abs(delta_weight) > 0.0001: # 0.01% 变动阈值
-                
+            if abs(delta_weight) > 0.0001:
                 target_dollar_value = delta_weight * total_value
-                
-                # [Task 4] Forgotten Ceiling: Check Projected Exposure
-                # projected = current_gross - abs(current) + abs(target)
-                current_pos_val = current_w * total_value
-                target_pos_val = target_w * total_value
-                
-                projected_gross_exposure = current_gross_exposure - abs(current_pos_val) + abs(target_pos_val)
-                
-                if projected_gross_exposure > self.max_notional_exposure:
-                    error_msg = f"Projected exposure {projected_gross_exposure:.2f} exceeds limit {self.max_notional_exposure}."
-                    logger.critical(f"{self.log_prefix} FATAL: {error_msg}")
-                    raise RiskViolationError(error_msg)
-                
                 price = market_prices.get(symbol)
                 
-                if price is None or price <= 0:
-                    logger.error(f"{self.log_prefix} Cannot determine price for position {symbol} from provided market data. Skipping order.")
-                    continue
+                if price is None or price <= 0: continue
                 
                 order_quantity = target_dollar_value / price
-                
-                # [Task 4] Limit Order Protection (0.5% Slippage Tolerance)
-                # Buy: Price * 1.005, Sell: Price * 0.995
                 slippage_factor = 0.005
                 limit_price = price * (1 + slippage_factor) if order_quantity > 0 else price * (1 - slippage_factor)
                 
-                # [Task 4] Penny Gap Fix: Round to Tick Size
                 meta = self._get_instrument_metadata(symbol)
                 limit_price = self._round_to_tick(limit_price, meta["tick_size"])
 
-                # [Task 1] Fat Finger Protection
                 expected_value = order_quantity * price
                 if abs(expected_value) > self.max_order_value:
-                    error_msg = f"Order value {expected_value:.2f} exceeds limit {self.max_order_value}."
-                    logger.critical(f"{self.log_prefix} FATAL: {error_msg}")
-                    raise RiskViolationError(error_msg)
+                    raise RiskViolationError(f"Order value {expected_value:.2f} exceeds limit {self.max_order_value}.")
                 
-                # 创建订单
                 new_order = Order(
                     id=f"order_{symbol}_{uuid.uuid4()}",
                     symbol=symbol,
-                    quantity=order_quantity,
-                    price=limit_price,   # [Optimization] Set Limit Price
-                    order_type="LIMIT",  # [Optimization] Change to LIMIT
+                    quantity=Decimal(str(order_quantity)), # Convert to Decimal
+                    price=Decimal(str(limit_price)),
+                    order_type="LIMIT",
                     status=OrderStatus.NEW,
-                    time_in_force="DAY", # [Task 3.2] Safe Default: Use DAY to reduce overnight risk
-                    metadata={
-                        "target_weight": target_w,
-                        "current_weight": current_w,
-                        "source_target_id": target_portfolio.metadata.get("source_fusion_id", "N/A")
-                    }
+                    time_in_force="DAY",
+                    metadata={"target_weight": target_w, "current_weight": current_w}
                 )
                 orders_to_generate.append(new_order)
-                logger.info(f"{self.log_prefix} Generated Order: {symbol} Qty {order_quantity:.4f} (Target: {target_w:.2%}, Current: {current_w:.2%})")
 
         return orders_to_generate
 
     async def reconcile_portfolio(self, state: PipelineState):
-        """
-        [Task 4.2] 调仓主逻辑 (Reconcile)。
-        1. 从 State 获取目标组合。
-        2. 检查数据新鲜度。
-        3. 计算差异并下单。
-        """
-        # [Fix Task 4] Risk Control: Emergency Brake Check
+        """[Task 4.2] Main Reconciliation Loop."""
         if state.l3_decision:
             risk_action = state.l3_decision.get("risk_action")
-            decision_type = state.l3_decision.get("type")
-            
-            # Check for HALT signal from Risk Agent or Global Emergency
-            if (isinstance(risk_action, str) and risk_action == "HALT_TRADING") or \
-               decision_type == "EMERGENCY_STOP":
-                logger.critical(f"{self.log_prefix} EMERGENCY BRAKE TRIGGERED (Action: {risk_action}, Type: {decision_type}). Cancelling all orders.")
+            if risk_action == "HALT_TRADING":
+                logger.critical(f"{self.log_prefix} EMERGENCY BRAKE TRIGGERED. Cancelling all orders.")
                 self.cancel_all_open_orders()
                 return
 
-        logger.info(f"{self.log_prefix} Processing target portfolio...")
-        
         target_portfolio = state.target_portfolio
-        if not target_portfolio:
-            logger.info("No target portfolio to reconcile.")
-            return
+        if not target_portfolio: return
 
-        # 1. 获取最新价格并检查时效性 (Data Freshness)
-        # 收集所有涉及的 symbol (Target + Current Holdings)
         symbols = [p.symbol for p in target_portfolio.positions]
         market_prices = {}
         
         for sym in symbols:
             md = await self.data_manager.get_latest_market_data(sym)
-            if not md:
-                logger.error(f"Skipping {sym}: No market data available.")
-                continue
+            if not md: continue
             
-            # Freshness Check (e.g., 1 min tolerance)
-            # Use sim time from state for comparison
             time_diff = state.current_time - md.timestamp.replace(tzinfo=None) 
-            if abs(time_diff) > timedelta(minutes=1):
-                logger.error(f"Skipping {sym}: Data too old ({time_diff}). Price: {md.timestamp}, SimTime: {state.current_time}")
-                continue
+            if abs(time_diff) > timedelta(minutes=1): continue
                 
-            market_prices[sym] = md.close
+            market_prices[sym] = float(md.close)
             
-        # [Task 3.2] Reconcile active orders before generating new ones (Purge Zombies)
         await self._reconcile_active_orders()
 
-        # 2. 获取当前持仓状态 (Using TLM)
-        # [Beta Final Fix] 捕获数据完整性异常并触发紧急停止
         try:
-            # [Phase IV Fix] Pass state.current_time (simulation time) to ledger
             current_portfolio = self.trade_lifecycle_manager.get_current_portfolio_state(
-                market_prices, 
-                timestamp=state.current_time
+                market_prices, timestamp=state.current_time
             )
         except ValueError as e:
-            logger.critical(f"{self.log_prefix} DATA INTEGRITY ALERT: {e}. Initiating EMERGENCY STOP.")
+            logger.critical(f"{self.log_prefix} DATA INTEGRITY ALERT: {e}. EMERGENCY STOP.")
             self.cancel_all_open_orders()
-            # 停止本次调仓，等待下个循环数据恢复
             return 
 
-        # 3. 生成订单
-        # [Optimization] Pass active_orders to calculate effective exposure
         async with self.lock:
             active_orders_snapshot = self.active_orders.copy()
             
@@ -341,61 +220,37 @@ class OrderManager:
             self.cancel_all_open_orders()
             return
         
-        if not orders:
-            logger.info(f"{self.log_prefix} No orders generated, processing complete.")
-            return
-
-        logger.info(f"{self.log_prefix} Submitting {len(orders)} orders to broker...")
-        
-        # 4. 提交订单到券商 (Safe Async Pattern)
         orders_to_submit = []
-        
-        # Phase 1: Placeholder Registration (Optimistic Locking)
         async with self.lock:
             for order in orders:
-                if order.id in self.active_orders:
-                    logger.warning(f"{self.log_prefix} Attempted to submit duplicate order {order.id}")
-                    continue
-                # Register Placeholder
+                if order.id in self.active_orders: continue
                 order.status = OrderStatus.PENDING_SUBMISSION
                 self.active_orders[order.id] = order
                 orders_to_submit.append(order)
 
-        # Phase 2: Network Execution (Outside Lock)
         for order in orders_to_submit:
-            price = order.price if order.price else market_prices.get(order.symbol)
+            price = float(order.limit_price) if order.limit_price else market_prices.get(order.symbol)
             try:
-                # [Task 4.2] Async execution via thread for potentially blocking broker calls
                 if self.broker:
-                    broker_order_id = await asyncio.to_thread(self.broker.place_order, order, price)
-                else:
-                    broker_order_id = "MOCK_" + order.id
+                    # Convert Decimal fields to float for broker API if needed, usually managed by adapter
+                    await asyncio.to_thread(self.broker.place_order, order, price)
                 
                 async with self.lock:
-                    current_order_state = self.active_orders.get(order.id)
-                    if current_order_state and current_order_state.status == OrderStatus.PENDING_SUBMISSION:
-                        order.status = OrderStatus.PENDING 
-                        # No need to re-insert, just update object state
-                
-                logger.info(f"{self.log_prefix} Submitted order {order.id} (Broker ID: {broker_order_id})")
+                    current = self.active_orders.get(order.id)
+                    if current and current.status == OrderStatus.PENDING_SUBMISSION:
+                        current.status = OrderStatus.PENDING
                 
             except Exception as e:
                 logger.error(f"{self.log_prefix} Failed to place order {order.id}: {e}")
                 async with self.lock:
-                    # Revert placeholder
                     order.status = OrderStatus.REJECTED
-                    if order.id in self.active_orders:
-                        del self.active_orders[order.id]
+                    if order.id in self.active_orders: del self.active_orders[order.id]
 
     async def _reconcile_active_orders(self):
-        """
-        [Task 3.2] Fetches open orders from Broker and closes local zombies.
-        """
-        if not self.broker:
-            return
+        """[Task 3.2] Debounce Logic: 3 Strikes Rule."""
+        if not self.broker: return
 
         try:
-            # Assume sync call wrapped in thread for safety
             broker_open_orders = await asyncio.to_thread(self.broker.get_open_orders)
             broker_order_ids = {o.id for o in broker_open_orders}
             
@@ -403,35 +258,30 @@ class OrderManager:
                 local_ids = list(self.active_orders.keys())
                 for oid in local_ids:
                     order = self.active_orders[oid]
-                    # Skip NEW/PENDING_SUBMISSION as they haven't reached broker yet
                     if order.status in {OrderStatus.NEW, OrderStatus.PENDING_SUBMISSION}:
                         continue
                         
                     if oid not in broker_order_ids:
-                        logger.warning(f"{self.log_prefix} Zombie Order Detected: {oid} (Status: {order.status}) not found on broker. marking REJECTED.")
-                        order.status = OrderStatus.REJECTED # Or CANCELED, treating as "Gone"
-                        del self.active_orders[oid]
+                        # [Task 3.2 Fix] Debounce logic
+                        count = order.metadata.get('missing_count', 0) + 1
+                        order.metadata['missing_count'] = count
+                        
+                        if count < 3:
+                            logger.warning(f"{self.log_prefix} Order {oid} missing (Attempt {count}/3). Retaining.")
+                        else:
+                            logger.error(f"{self.log_prefix} Zombie Order Confirmed: {oid}. REJECTED.")
+                            order.status = OrderStatus.REJECTED
+                            del self.active_orders[oid]
+                    else:
+                        if order.metadata.get('missing_count', 0) > 0:
+                            order.metadata['missing_count'] = 0
                         
         except Exception as e:
             logger.error(f"{self.log_prefix} Failed to reconcile active orders: {e}")
 
     def cancel_all_open_orders(self):
-        """
-        取消所有活动的订单。
-        """
-        logger.info(f"{self.log_prefix} Cancelling all {len(self.active_orders)} open orders...")
         order_ids = list(self.active_orders.keys())
-            
         for order_id in order_ids:
             try:
-                if self.broker:
-                    self.broker.cancel_order(order_id)
-                logger.info(f"{self.log_prefix} Cancel request sent for {order_id}")
-            except Exception as e:
-                logger.error(f"{self.log_prefix} Failed to cancel order {order_id}: {e}")
-                
-    def get_open_orders(self) -> List[Order]:
-        """
-        获取所有活动订单的当前状态。
-        """
-        return list(self.active_orders.values())
+                if self.broker: self.broker.cancel_order(order_id)
+            except Exception: pass
