@@ -5,9 +5,10 @@ Phoenix Project (Market Knowledge) - 主入口点
 import asyncio
 import logging
 import os
+import signal
 from typing import Dict, Any, Optional
 import hydra
-import redis.asyncio as redis # [Task 1.3] 升级到 redis.asyncio 以修复启动崩溃
+import redis.asyncio as redis
 from omegaconf import DictConfig, OmegaConf
 
 from Phoenix_project.monitor.logging import setup_logging
@@ -16,6 +17,7 @@ from Phoenix_project.ai.gemini_search_adapter import GeminiSearchAdapter
 from Phoenix_project.memory.vector_store import VectorStore
 from Phoenix_project.memory.cot_database import CoTDatabase
 from Phoenix_project.context_bus import ContextBus
+from Phoenix_project.factory import PhoenixFactory # [Task 8] Import Factory
 from Phoenix_project.ai.graph_db_client import GraphDBClient
 from Phoenix_project.ai.tabular_db_client import TabularDBClient
 from Phoenix_project.ai.temporal_db_client import TemporalDBClient
@@ -70,31 +72,20 @@ class PhoenixProject:
 
     def _create_services(self, config: DictConfig) -> Dict[str, Any]:
         logger.info("Initializing core services...")
-        # --- 1. 基础管理器与工具 (Managers & Utils) ---
-
-        # [Infra] Redis Client (用于 ContextBus, DataManager, EventDistributor)
-        redis_host = os.environ.get("REDIS_HOST", "localhost")
-        redis_port = int(os.environ.get("REDIS_PORT", 6379))
         
-        # [Task 1.3] 创建异步 Redis 客户端 (通过 aliased import)
-        redis_client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=False)
-        logger.info(f"Redis client initialized at {redis_host}:{redis_port} (Binary Mode, Async)")
-    
-        # [Infra] ContextBus (状态持久化)
-        context_bus = ContextBus(redis_client=redis_client, config=config.get('context_bus'))
-    
-        # [Fix IV.1] 将 PromptManager 移至顶部，作为 EnsembleClient 的依赖项
-        prompt_manager = PromptManager(prompt_directory="prompts")
-        prompt_renderer = PromptRenderer(prompt_manager=prompt_manager)
+        # --- 1. 基础管理器与工具 (Managers & Utils) ---
+        # [Task 8] Use Factory for Infrastructure
+        common_services = PhoenixFactory.create_common_services(config)
+        redis_client = common_services["redis_client"]
+        context_bus = common_services["context_bus"]
+        prompt_manager = common_services["prompt_manager"]
+        prompt_renderer = common_services["prompt_renderer"]
+        gemini_manager = common_services["gemini_manager"]
 
         # [Fix IV.1] 全局 Registry (用于 V2 智能体)
         global_registry = Registry()
 
         # --- 2. API 客户端与 LLM (Clients & LLM) ---
-    
-        # [Fix IV.1] 替换 APIGateway (Server) 为 GeminiPoolManager (Client)
-        gemini_manager = GeminiPoolManager(config=config.api_gateway)
-
         # [Fix IV.1] 直接从 env 获取 API 密钥
         gemini_api_key_list = os.environ.get("GEMINI_API_KEYS", "").split(',')
         gemini_api_key = gemini_api_key_list[0].strip() if gemini_api_key_list else None
@@ -132,7 +123,13 @@ class PhoenixProject:
         graph_db_client = GraphDBClient()
     
         # (RAG) 表格数据库 (Tabular DB)
-        tabular_db_client = TabularDBClient(config=config.data_manager.tabular_db, llm_client=gemini_manager, prompt_manager=prompt_manager, prompt_renderer=prompt_renderer)
+        tabular_db_client = TabularDBClient(
+            db_uri=config.data_manager.tabular_db.uri, # Explicitly pass URI
+            config=config.data_manager.tabular_db, 
+            llm_client=gemini_manager, 
+            prompt_manager=prompt_manager, 
+            prompt_renderer=prompt_renderer
+        )
     
         # (RAG) 时序数据库 (Temporal DB)
         temporal_db_client = TemporalDBClient(config=config.data_manager.temporal_db)
@@ -203,10 +200,12 @@ class PhoenixProject:
         )
     
         # (L3) 风险管理器 (Risk Manager)
+        initial_capital = config.trading.get('initial_capital', 100000.0)
         risk_manager = RiskManager(
             config=config.trading,
             redis_client=redis_client,
-            data_manager=data_manager # [Task 5] Inject DataManager for warm-up
+            data_manager=data_manager, # [Task 5] Inject DataManager for warm-up
+            initial_capital=initial_capital
         ) 
     
         # (L3) 投资组合构建器 (Portfolio Constructor)
@@ -219,7 +218,6 @@ class PhoenixProject:
         )
 
         # (L3) 交易生命周期管理器 (Trade Lifecycle Manager)
-        initial_capital = config.trading.get('initial_capital', 100000.0)
         trade_lifecycle_manager = TradeLifecycleManager(
             initial_cash=initial_capital,
             tabular_db=tabular_db_client # [Task 4.1] Inject DB for persistence
@@ -244,8 +242,8 @@ class PhoenixProject:
         execution_agent = ExecutionAgent(config=config.agents.l3.execution) if 'agents' in config and 'l3' in config.agents else None
 
         # --- (L3) 创建 Orchestrator 依赖 (Task 6) ---
-        # [主人喵 Phase 0 修复] 移除错误的 config 参数
-        event_distributor = EventDistributor(redis_client=redis_client) # Inject Redis
+        # [Phase 0 Fix] Inject redis_client
+        event_distributor = EventDistributor(redis_client=redis_client) 
         
         event_filter = EventRiskFilter(
             config=config.events.risk_filter 
@@ -327,6 +325,7 @@ class PhoenixProject:
             trade_lifecycle_manager=services["trade_lifecycle_manager"],
             alpha_agent=services["alpha_agent"],
             risk_agent=services["risk_agent"],
+            risk_manager=services["risk_manager"], # [Phase II Fix] Inject RiskManager
             execution_agent=services["execution_agent"]
         )
 
@@ -377,7 +376,11 @@ class PhoenixProject:
         """
         [CLI/Main] 启动实时交易循环 (同步入口，内部运行异步循环)
         """
-        asyncio.run(self._async_run_live())
+        try:
+            asyncio.run(self._async_run_live())
+        except KeyboardInterrupt:
+            # Main loop cancelled by user (if not caught inside)
+            logger.info("Phoenix Project terminated by user.")
 
     async def _async_run_live(self):
         """
@@ -393,54 +396,72 @@ class PhoenixProject:
             
             # 暂时使用 APIServer (Flask) 作为主 API
             self.api_server = APIServer(
-                audit_manager=self.systems["audit_manager"],
-                orchestrator=orchestrator 
+                host=self.cfg.api_gateway.host,
+                port=self.cfg.api_gateway.port,
+                context_bus=self.services["context_bus"],
+                logger=logger,
+                audit_viewer=None # TBD
             )
 
             # Start API Server explicitly [Fixed Dormant API]
-            api_task = asyncio.create_task(self.api_server.start())
+            # APIServer.run returns a thread, it's non-blocking
+            api_thread = self.api_server.run() 
 
             # --- 4. 启动后台任务 (Loops) ---
             logger.info("Starting background processing loops...")
             
-            # 启动 L0/L1 循环 (数据摄入/L1 智能体)
-            # l0_l1_task = asyncio.create_task(loop_manager.start_l0_l1_loop())
-            
             # [Task 4.1] 初始化持久化账本 (Async Init)
             await trade_lifecycle_manager.initialize()
 
-            # 启动 L2 循环 (L2 智能体 - 融合/批评)
-            # l2_task = asyncio.create_task(loop_manager.start_l2_loop())
-            
             # 启动主循环 (统一入口)
             loop_manager.start_loop()
-
-            tasks = [api_task]
             
-            # --- 5. (优雅关闭) ---
-            await asyncio.gather(*tasks) # 等待所有循环完成
+            # [Phase IV Fix] Graceful Shutdown Handling
+            loop = asyncio.get_running_loop()
+            stop_event = asyncio.Event()
+            
+            def _signal_handler():
+                logger.info("Shutdown signal received. Initiating graceful stop...")
+                stop_event.set()
+                if hasattr(loop_manager, "stop_loop"):
+                    loop_manager.stop_loop()
+            
+            # Register signal handlers
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, _signal_handler)
+                except NotImplementedError:
+                    logger.warning(f"Signal handling for {sig} not supported on this platform.")
+
+            # Create a task that waits for the stop signal
+            logger.info("System running. Press Ctrl+C to stop.")
+            await stop_event.wait()
             
             logger.info("--- Phoenix Project Shutting Down ---")
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
             
+        except asyncio.CancelledError:
+            logger.info("Main loop cancelled.")
         except Exception as e:
             logger.critical(f"Fatal error in main: {e}", exc_info=True)
 
         finally:
             # [Code Opt Expert Fix] Task 6: Ensure cleanup uses self.services and runs in finally block
             logger.info("Cleaning up resources...")
-            if hasattr(self, 'api_server'):
-                await self.api_server.stop()
+            
+            # Stop Loop Manager first
+            if self.systems.get("loop_manager"):
+                self.systems["loop_manager"].stop_loop()
 
             if hasattr(self, 'services'):
-                if "graph_db" in self.services:
+                if "graph_db" in self.services and hasattr(self.services["graph_db"], "close"):
                     # await self.services["graph_db"].close() # If async
                     pass
-                if "vector_store" in self.services:
-                    # await self.services["vector_store"].close() # If async
-                    pass
+                if "tabular_db" in self.services and hasattr(self.services["tabular_db"], "close"):
+                    self.services["tabular_db"].close() # It's synchronous or has internal handling
+
+            # Wait a moment for threads to join if necessary
+            await asyncio.sleep(1)
+            logger.info("Cleanup complete. Goodbye.")
 
 
 @hydra.main(version_base=None, config_path="config", config_name="system")
