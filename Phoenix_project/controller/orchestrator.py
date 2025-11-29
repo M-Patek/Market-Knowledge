@@ -24,7 +24,7 @@ from Phoenix_project.execution.order_manager import OrderManager
 from Phoenix_project.audit_manager import AuditManager
 from Phoenix_project.core.exceptions import CognitiveError, PipelineError
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class Orchestrator:
     """
@@ -48,7 +48,8 @@ class Orchestrator:
         trade_lifecycle_manager: Optional[Any] = None,
         # [Fix II.1] 注入 L3 DRL 智能体
         alpha_agent: Optional[Any] = None,
-        risk_agent: Optional[Any] = None,
+        risk_agent: Optional[Any] = None,  # L3 DRL Agent
+        risk_manager: Optional[Any] = None, # Cognitive Risk Manager
         execution_agent: Optional[Any] = None
     ):
         self.config = config
@@ -65,7 +66,9 @@ class Orchestrator:
         # [Fix II.1] 存储 L3 智能体
         self.alpha_agent = alpha_agent
         self.risk_agent = risk_agent
+        self.risk_manager = risk_manager
         self.execution_agent = execution_agent
+        self.risk_initialized = False
         
         logger.info("Orchestrator initialized.")
 
@@ -81,11 +84,19 @@ class Orchestrator:
         pipeline_state = None
         try:
             # 0. 初始化/恢复状态 [Task 2.3 Refactor]
-            pipeline_state = self.context_bus.load_latest_state()
+            pipeline_state = await self.context_bus.load_latest_state()
             
             if not pipeline_state:
                 logger.info("No previous state found. Creating new PipelineState.")
                 pipeline_state = PipelineState()
+
+            # [Phase II Fix] Lazy Initialize RiskManager (Persistence Loading)
+            if self.risk_manager and not self.risk_initialized:
+                logger.info("Initializing RiskManager (loading persistence & warm-up)...")
+                # Default to system symbol if specific list unavailable
+                symbols = [self.config.get('trading', {}).get('default_symbol', 'BTC/USD')]
+                await self.risk_manager.initialize(symbols)
+                self.risk_initialized = True
             
             # [Time Machine] 关键：使用 DataManager 的时间同步 State
             if self.data_manager:
@@ -97,7 +108,7 @@ class Orchestrator:
             
             # [Fail-Closed Patch] The Zombie Portfolio Fix
             if tlm:
-                real_portfolio = tlm.get_current_portfolio_state({}) 
+                real_portfolio = tlm.get_current_portfolio_state({}, timestamp=pipeline_state.current_time) 
                 pipeline_state.update_portfolio_state(real_portfolio)
                 logger.info(f"Synced portfolio state from Ledger: {len(real_portfolio.positions)} positions.")
             else:
@@ -105,8 +116,8 @@ class Orchestrator:
                 raise RuntimeError("TradeLifecycleManager (Ledger) not available. Critical system dependency missing.")
 
             # 1. 从事件分发器（Redis）获取新事件
-            # [Safety] Wrap blocking Redis call & fix method name (get_pending_events)
-            new_events = await asyncio.to_thread(self.event_distributor.get_pending_events)
+            # [Phase 0 Fix] Use native async call
+            new_events = await self.event_distributor.get_pending_events()
             if not new_events:
                 logger.info("No new events retrieved. Cycle complete.")
                 return
@@ -120,6 +131,8 @@ class Orchestrator:
             
             if not filtered_events:
                 logger.info("No events remaining after filtering. Cycle complete.")
+                # Even if filtered, we should ack the originals to clear them
+                await self.event_distributor.ack_events(new_events)
                 return
             
             logger.info(f"{len(filtered_events)} events remaining after filtering.")
@@ -135,7 +148,6 @@ class Orchestrator:
             await self.cognitive_engine.process_cognitive_cycle(pipeline_state)
             
             # 4. 运行市场状态预测
-            # Note: TBD if predictor is passed or None in registry, check added
             if self.market_state_predictor:
                 await self._run_market_state_prediction(pipeline_state)
             else:
@@ -164,6 +176,10 @@ class Orchestrator:
 
             # 7. 运行执行 (订单管理器)
             await self._run_execution(pipeline_state)
+            
+            # [Phase 0 Fix] CRITICAL: Acknowledge events to clear them from processing queue
+            if new_events:
+                await self.event_distributor.ack_events(new_events)
 
         except CognitiveError as e:
             logger.error(f"CognitiveEngine failed with a known error: {e}", exc_info=True)
@@ -185,7 +201,7 @@ class Orchestrator:
             if pipeline_state:
                 self.audit_manager.log_cycle(pipeline_state)
                 logger.info("Pipeline state logged to AuditManager.")
-                self.context_bus.save_state(pipeline_state)
+                await self.context_bus.save_state(pipeline_state)
                 
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
@@ -254,21 +270,20 @@ class Orchestrator:
             if self.data_manager:
                 market_data = await self.data_manager.get_latest_market_data(symbol)
             
-            price = market_data.close if market_data else 0.0
+            price = float(market_data.close) if market_data else 0.0
             
             # [Task 6.2] Micro-structure approximations
             spread = 0.0
             if market_data and market_data.close > 0:
-                # Proxy spread using volatility (High-Low range) relative to price
-                spread = (market_data.high - market_data.low) / market_data.close
+                spread = float(market_data.high - market_data.low) / float(market_data.close)
             
-            depth_imbalance = 0.0 # Placeholder for L2 data
+            depth_imbalance = 0.0 
             
             pf_state = pipeline_state.portfolio_state
-            balance = pf_state.cash if pf_state else 0.0
+            balance = float(pf_state.cash) if pf_state else 0.0
             holdings = 0.0
             if pf_state and symbol in pf_state.positions:
-                holdings = pf_state.positions[symbol].quantity
+                holdings = float(pf_state.positions[symbol].quantity)
 
             state_data = {
                 "balance": balance,
@@ -282,29 +297,26 @@ class Orchestrator:
             # 2. Alpha Agent Decision (Async)
             alpha_action = None
             if self.alpha_agent:
-                # [Task 6.1] Inject market_state for macro awareness
-                obs = self.alpha_agent.format_observation(state_data, pipeline_state.l2_fusion_result, pipeline_state.market_state) 
-                # [Fix 0.2] Use await
+                obs = self.alpha_agent.format_observation(state_data, pipeline_state.latest_fusion_result, pipeline_state.market_state) 
                 alpha_action = await self.alpha_agent.compute_action(obs)
                 logger.info(f"Alpha Agent Action: {alpha_action}")
 
             # 3. Risk Agent Decision (Async)
             # [Fail-Closed Patch] The Ghost Risk Agent Fix
-            risk_action = "HALT_TRADING" # FAIL-SAFE: Default to HALT
+            risk_action = "HALT_TRADING" 
             if self.risk_agent:
-                obs = self.risk_agent.format_observation(state_data, pipeline_state.l2_fusion_result, pipeline_state.market_state)
-                # [Fix 0.2] Use await
-                risk_action = await self.risk_agent.compute_action(obs)
+                obs = self.risk_agent.format_observation(state_data, pipeline_state.latest_fusion_result, pipeline_state.market_state)
+                raw_risk_action = await self.risk_agent.compute_action(obs)
                 
-                raw_val = risk_action[0] if (hasattr(risk_action, '__len__') and len(risk_action) > 0) else risk_action
+                raw_val = raw_risk_action[0] if (hasattr(raw_risk_action, '__len__') and len(raw_risk_action) > 0) else raw_risk_action
+                # [Phase II Fix] 1.0 = HALT
                 risk_action = "HALT_TRADING" if float(raw_val) > 0.5 else "CONTINUE"
                 logger.info(f"Risk Agent Action (Translated): {risk_action}")
 
             # 4. Execution Agent Decision (Async)
             exec_action = None
             if self.execution_agent:
-                obs = self.execution_agent.format_observation(state_data, pipeline_state.l2_fusion_result, pipeline_state.market_state)
-                # [Fix 0.2] Use await
+                obs = self.execution_agent.format_observation(state_data, pipeline_state.latest_fusion_result, pipeline_state.market_state)
                 exec_action = await self.execution_agent.compute_action(obs)
                 logger.info(f"Execution Agent Action: {exec_action}")
 
@@ -320,9 +332,7 @@ class Orchestrator:
             
             pipeline_state.set_l3_decision(l3_decision)
             
-            # [Task 3.2] Populate formalized fields for PortfolioConstructor consistency
             if alpha_action is not None:
-                # Convert scalar/array to weight
                 try:
                     val = float(alpha_action) if not hasattr(alpha_action, '__len__') else float(alpha_action[0])
                     pipeline_state.set_l3_alpha_signal({symbol: val})
@@ -330,7 +340,6 @@ class Orchestrator:
                     logger.warning(f"Could not convert alpha_action {alpha_action} to signal.")
 
             if market_data:
-                # Wrap in list to match DataIterator batch format
                 pipeline_state.set_market_data_batch([market_data])
             
             logger.info(f"L3 Decision complete. Result: {l3_decision}")
