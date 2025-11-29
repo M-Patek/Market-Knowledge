@@ -71,6 +71,15 @@ class BaseDRLAgent(ABC):
         [Fix 0.2] 使用 asyncio.to_thread 防止阻塞主事件循环。
         (由 Orchestrator 调用)
         """
+        # [Phase III Fix] Input Dimension Validation & Self-Healing
+        EXPECTED_DIM = 7
+        if observation.shape != (EXPECTED_DIM,):
+            self.logger.warning(f"Observation shape mismatch: Expected ({EXPECTED_DIM},), got {observation.shape}. Auto-correcting.")
+            if observation.shape[0] < EXPECTED_DIM:
+                observation = np.pad(observation, (0, EXPECTED_DIM - observation.shape[0]), 'constant')
+            elif observation.shape[0] > EXPECTED_DIM:
+                observation = observation[:EXPECTED_DIM]
+
         try:
             # explore=False 确保我们在生产 (Inference) 模式下
             # 获取确定性动作，而不是随机探索。
