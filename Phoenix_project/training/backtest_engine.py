@@ -4,15 +4,12 @@ Backtest Engine
 - 使用历史数据
 - 评估策略表现
 """
-# 修正：将 'monitor.logging' 转换为 'Phoenix_project.monitor.logging'
 from Phoenix_project.monitor.logging import get_logger
-# 修正：将 'data_manager' 转换为 'Phoenix_project.data_manager'
 from Phoenix_project.data_manager import DataManager
-# 修正：将 'core.pipeline_state' 转换为 'Phoenix_project.core.pipeline_state'
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.core.schemas.data_schema import PortfolioState, Position
-# 修正：将 'cognitive.engine' 转换为 'Phoenix_project.cognitive.engine'
 from Phoenix_project.cognitive.engine import CognitiveEngine
+from Phoenix_project.core.exceptions import RiskViolationError, CircuitBreakerError
 from typing import Dict, Any, List, Optional
 import pandas as pd
 import numpy as np
@@ -22,6 +19,7 @@ import asyncio
 class BacktestEngine:
     """
     用于 Walk-Forward 训练和评估的模拟引擎。
+    [Phase II Fix] 集成 RiskManager 进行预交易检查，防止过拟合。
     """
     
     def __init__(
@@ -30,8 +28,9 @@ class BacktestEngine:
         data_manager: DataManager,
         pipeline_state: PipelineState,
         cognitive_engine: CognitiveEngine,
-        portfolio_constructor: Any = None, # [Dependency Injection]
-        order_manager: Any = None          # [Dependency Injection]
+        portfolio_constructor: Any = None,
+        order_manager: Any = None,
+        risk_manager: Any = None # [Task 4.2 Fix] Inject RiskManager
     ):
         self.config = config
         self.data_manager = data_manager
@@ -39,17 +38,19 @@ class BacktestEngine:
         self.cognitive_engine = cognitive_engine
         self.portfolio_constructor = portfolio_constructor
         self.order_manager = order_manager
+        self.risk_manager = risk_manager
         
         self.logger = get_logger(self.__class__.__name__)
         self.logger.info("BacktestEngine initialized with authentic simulation components.")
         
         self.equity_curve = []   # Track equity over time
         self.trade_log = []      # Track executed trades
-        self.pending_orders = defaultdict(float) # [Task 4.2] Store orders for T+1 execution {symbol: quantity_delta}
+        self.pending_orders = defaultdict(float) # Store orders for T+1 execution
 
-    def run_backtest(self, data_iterator):
+    async def run_backtest(self, data_iterator):
         """
         [Real Implementation] Iterate through data, generate signals, execute trades, track equity.
+        [Phase II Fix] Converted to async to support RiskManager.
         """
         self.logger.info("Starting authentic backtest run...")
         self.equity_curve = []
@@ -72,7 +73,7 @@ class BacktestEngine:
             setattr(self.pipeline_state, 'market_data_batch', market_data_slice)
 
             # [Task 4.2] Step A: Execute Pending Orders from T-1 at Current Open (T)
-            self._execute_pending_orders(market_data_slice)
+            await self._execute_pending_orders(market_data_slice)
 
             # [Task 4.2] Step B: Generate Signals for T (to be executed at T+1)
             target_portfolio = None
@@ -110,8 +111,6 @@ class BacktestEngine:
             price = price_map.get(symbol, 0.0)
             if price <= 0: continue
 
-            # Calculate Target Value -> Quantity
-            # Note: Using Total Value at T to size position for T+1 is standard approximation
             target_val = current_pf.total_value * pos.target_weight
             
             current_qty = 0.0
@@ -124,10 +123,11 @@ class BacktestEngine:
             # Store for T+1 execution
             self.pending_orders[symbol] = qty_delta
 
-    def _execute_pending_orders(self, market_data):
+    async def _execute_pending_orders(self, market_data):
         """
         [Task 4.2] Execute pending orders at the OPEN price of the current bar (T).
         Realism: Fills occur at the first available price of the new period.
+        [Phase II Fix] Enforce Pre-Trade Risk Checks.
         """
         if not self.pending_orders:
             return
@@ -135,34 +135,53 @@ class BacktestEngine:
         current_pf = self.pipeline_state.portfolio_state
         price_map = self._extract_price_map(market_data, price_type='open') # Use OPEN
         
-        # Commission Config
-        COMMISSION_RATE = 0.001 # 10 bps
-        SLIPPAGE_RATE = 0.0005  # 5 bps
+        COMMISSION_RATE = 0.001 
+        SLIPPAGE_RATE = 0.0005  
 
         for symbol, qty_delta in list(self.pending_orders.items()):
             price = price_map.get(symbol, 0.0)
-            if price <= 0: continue # Cannot fill, skip (or carry over?)
+            if price <= 0: continue 
             
+            # [Task 4.2 Fix] Pre-Trade Risk Check
+            if self.risk_manager:
+                try:
+                    # Create a temporary Position object representing the proposed trade
+                    # Note: RiskManager usually expects 'proposed_position' as the FINAL position, 
+                    # but check_pre_trade might interpret it differently based on implementation.
+                    # Assuming check_concentration takes the *change* or the *result*.
+                    # Looking at risk_manager.py: check_concentration takes proposed_position.
+                    # It adds trade_qty to existing_qty. So we pass the DELTA here?
+                    # "trade_qty = proposed_position.quantity" -> Yes, we pass the delta as a 'position' object.
+                    
+                    proposed_trade = Position(
+                        symbol=symbol,
+                        quantity=qty_delta, # Delta
+                        average_price=price,
+                        market_value=abs(qty_delta * price),
+                        unrealized_pnl=0.0
+                    )
+                    # Check Risk
+                    self.risk_manager.check_pre_trade(proposed_trade, current_pf)
+                except (RiskViolationError, CircuitBreakerError) as e:
+                    self.logger.warning(f"Risk Check Failed for {symbol}: {e}. Order REJECTED.")
+                    continue
+
             # Execute
             if symbol not in current_pf.positions:
-                current_pf.positions[symbol] = Position(symbol=symbol, quantity=0.0, current_price=price, market_value=0.0)
+                current_pf.positions[symbol] = Position(symbol=symbol, quantity=0.0, average_price=price, market_value=0.0, unrealized_pnl=0.0)
             
             trade_value = abs(qty_delta * price)
             cost = trade_value * (COMMISSION_RATE + SLIPPAGE_RATE)
             
-            # [Task 7.2] Margin Check: Prevent Infinite Leverage
             total_debit = (qty_delta * price) + cost
             
             if qty_delta > 0: # Buying
                 if current_pf.cash < total_debit:
-                    self.logger.warning(
-                        f"MARGIN CALL: Insufficient funds for {symbol}. "
-                        f"Req: {total_debit:.2f}, Avail: {current_pf.cash:.2f}. Order REJECTED."
-                    )
+                    self.logger.warning(f"MARGIN CALL: Insufficient funds for {symbol}. Req: {total_debit:.2f}, Avail: {current_pf.cash:.2f}. Order REJECTED.")
                     continue
             
             current_pf.positions[symbol].quantity += qty_delta
-            current_pf.cash -= total_debit # Buy: -Cash, Sell: +Cash (delta is negative) - Cost
+            current_pf.cash -= total_debit 
             
         self.pending_orders.clear()
             
@@ -171,13 +190,11 @@ class BacktestEngine:
         pf = self.pipeline_state.portfolio_state
         pos_value = 0.0
         
-        # Build price map
         price_map = self._extract_price_map(market_data, price_type='close')
         
         for sym, pos in pf.positions.items():
-            price = price_map.get(sym, pos.current_price) # Use last known if missing
+            price = price_map.get(sym, pos.average_price) 
             if price > 0:
-                pos.current_price = price
                 pos.market_value = pos.quantity * price
             pos_value += pos.market_value
             
@@ -200,7 +217,6 @@ class BacktestEngine:
         Calculate real performance metrics from the equity curve.
         """
         if not self.equity_curve:
-            self.logger.warning("No equity curve data to analyze.")
             return {}
         
         df = pd.DataFrame(self.equity_curve)
@@ -208,12 +224,10 @@ class BacktestEngine:
         
         total_return = (df['equity'].iloc[-1] - df['equity'].iloc[0]) / df['equity'].iloc[0]
         
-        # Max Drawdown
         cumulative_max = df['equity'].cummax()
         drawdown = (df['equity'] - cumulative_max) / cumulative_max
         max_drawdown = drawdown.min()
         
-        # Sharpe Ratio (assuming daily data, annualized)
         mean_ret = df['returns'].mean()
         std_ret = df['returns'].std()
         sharpe = (mean_ret / std_ret * np.sqrt(252)) if std_ret != 0 else 0.0
@@ -224,5 +238,4 @@ class BacktestEngine:
             "sharpe_ratio": float(sharpe),
             "final_equity": float(df['equity'].iloc[-1])
         }
-        self.logger.info(f"Performance Metrics: {metrics}")
         return metrics
