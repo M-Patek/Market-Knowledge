@@ -110,12 +110,16 @@ class StreamProcessor:
             # --- [阶段 2] 路由逻辑 ---
             
             if topic == "phoenix_news_events":
-                # 阶段 2 逻辑: 推送到 EventDistributor (Redis 队列)
-                success = self.event_distributor.publish(data)
-                if success:
-                    logger.debug(f"Successfully processed and published event {data.get('id', 'N/A')} to distributor.")
+                # 阶段 2 逻辑: 推送到 EventDistributor using SYNC method and local client
+                # [Phase 0 Fix] Use synchronous publish
+                if self.redis_client:
+                    success = self.event_distributor.publish_sync(data, self.redis_client)
+                    if success:
+                        logger.debug(f"Successfully processed and published event {data.get('id', 'N/A')} to distributor.")
+                    else:
+                        logger.error(f"Failed to publish event {data.get('id', 'N/A')} to distributor.")
                 else:
-                    logger.error(f"Failed to publish event {data.get('id', 'N/A')} to distributor.")
+                    logger.error("Cannot publish event: Redis client missing in StreamProcessor.")
             
             elif topic == "phoenix_market_data":
                 # [主人喵 Phase 1 修复] 实施数据契约与全量存储
