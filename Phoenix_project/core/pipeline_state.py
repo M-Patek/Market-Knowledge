@@ -8,7 +8,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 # FIX (E1, E2, E3): 导入统一的模式
-from Phoenix_project.core.schemas.data_schema import PortfolioState
+from Phoenix_project.core.schemas.data_schema import PortfolioState, TargetPortfolio, MarketData
 from Phoenix_project.core.schemas.fusion_result import AgentDecision, FusionResult
 
 from Phoenix_project.monitor.logging import get_logger
@@ -35,15 +35,18 @@ class PipelineState(BaseModel):
     latest_decisions: List[AgentDecision] = Field(default_factory=list)
     latest_fusion_result: Optional[Dict[str, Any]] = None
     latest_final_decision: Optional[Dict[str, Any]] = None
-    target_portfolio: Optional[Any] = None # For OrderManager handoff
+    
+    # [Phase I Fix] Strict Typing for Serialization Safety
+    target_portfolio: Optional[TargetPortfolio] = None 
+    
     l1_insights: Dict[str, Any] = Field(default_factory=dict)
     l2_supervision_results: Dict[str, Any] = Field(default_factory=dict)
     market_state: Dict[str, Any] = Field(default_factory=dict)
     raw_events: List[Dict[str, Any]] = Field(default_factory=list)
     l3_decision: Dict[str, Any] = Field(default_factory=dict)
     
-    # [Task 3.2] Formalize monkey-patched fields
-    market_data_batch: Optional[Any] = None # List[MarketData] or Dict
+    # [Phase I Fix] Strict Typing for formalized fields
+    market_data_batch: Optional[List[MarketData]] = None 
     l3_alpha_signal: Optional[Dict[str, float]] = None
 
     class Config:
@@ -69,14 +72,13 @@ class PipelineState(BaseModel):
     def set_raw_events(self, events: List[Dict[str, Any]]):
         self.raw_events = events
 
-    def set_target_portfolio(self, tp: Any):
+    def set_target_portfolio(self, tp: TargetPortfolio):
         self.target_portfolio = tp
 
     def set_l3_decision(self, decision: Dict[str, Any]):
         self.l3_decision = decision
 
-    # [Task 3.2] Setters for formalized fields
-    def set_market_data_batch(self, batch: Any):
+    def set_market_data_batch(self, batch: List[MarketData]):
         self.market_data_batch = batch
 
     def set_l3_alpha_signal(self, signal: Dict[str, float]):
@@ -124,8 +126,6 @@ class PipelineState(BaseModel):
         if hasattr(self, key):
             setattr(self, key, value)
         else:
-            # For dynamic fields not in schema, Pydantic might ignore or error unless extra='allow'
-            # Here we just log or ignore if strict
             pass
 
     def get_full_context_formatted(self) -> str:
