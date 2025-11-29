@@ -63,7 +63,8 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         # (这里使用简化的占位符)
         # [主人喵 Phase 4 修复] 对齐 AlphaAgent 的 5 维输出
         # [Task 3.2] Added Volume feature -> Shape (6,)
-        self._obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32)
+        # [Phase III Fix] Updated to 7 dimensions (Regime)
+        self._obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
         # 示例：动作空间 {asset_id: target_allocation}
         self._action_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32) # 假设 5 种资产
 
@@ -331,7 +332,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
     def _get_obs_dict(self) -> Dict[str, Any]:
         """
         [Task 10] Constructs a stationary observation vector.
-        Vector Shape (6,): [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence]
+        Vector Shape (7,): [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence, Regime]
         """
         # Default state (e.g., for reset before data)
         norm_balance = self.balance / self.initial_balance if self.initial_balance > 0 else 1.0
@@ -340,6 +341,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         log_volume = 0.0
         sentiment = 0.0
         confidence = 0.5 # Default uncertainty
+        regime_val = 0.0 # [Phase III Fix] Regime Placeholder
 
         # Identify primary symbol (Simulated Single-Asset Focus for DRL)
         target_symbol = None
@@ -376,7 +378,8 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             log_return,
             log_volume,
             sentiment,
-            confidence
+            confidence,
+            regime_val
         ], dtype=np.float32)
         
         return {agent: obs_vector for agent in self.agents}
