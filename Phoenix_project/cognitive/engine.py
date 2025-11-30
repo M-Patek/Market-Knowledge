@@ -1,6 +1,6 @@
 # Phoenix_project/cognitive/engine.py
 # [主人喵的修复] 重建了缺失的 L1 调用接口，增加了针对 Dict Bomb 的类型防御
-# [Phase II Fix] L1 自动发现逻辑增强
+# [Phase II Fix] L1 自动发现逻辑增强 & 逻辑纯化
 
 import logging
 import uuid
@@ -63,7 +63,6 @@ class CognitiveEngine:
         try:
             tasks = []
             # [Fix Phase II] Auto-discover L1 agents with robust naming check
-            # Identify L1 agents based on naming convention (startswith 'l1_')
             l1_agents = [name for name in self.agent_executor.agents.keys() if name.startswith("l1_")]
             
             for name in l1_agents:
@@ -109,12 +108,17 @@ class CognitiveEngine:
                     except:
                          logger.warning(f"L1 Agent returned invalid type: {type(item)}")
             
+            # [Task 1.2 Fix] Fail Loudly: Prevent Zombie Process
+            if not valid_evidence and l1_agents:
+                logger.critical("L1 Cognition produced zero valid evidence despite active agents.")
+                raise CognitiveError("All L1 Agents failed to produce valid evidence.")
+            
             return valid_evidence
 
         except Exception as e:
             logger.error(f"L1 Cognition layer failed: {e}", exc_info=True)
-            # 不抛出异常，而是返回空列表，防止系统完全卡死，但记录严重错误
-            return []
+            # [Task 1.2 Fix] Propagate critical failures
+            raise CognitiveError(f"L1 Cognition Critical Failure: {e}") from e
             
     # [Placeholder] run_l2_supervision 需要实现，但这里主要修复 L1 和 融合逻辑
     async def run_l2_supervision(self, l1_insights: List[EvidenceItem], raw_events: List[Any]) -> List[SupervisionResult]:
@@ -132,7 +136,6 @@ class CognitiveEngine:
             fusion_result = await self.reasoning_ensemble.reason(pipeline_state)
             
             # [致命防御] 检查是否为 Dict Bomb
-            # 尽管 ReasoningEnsemble 已经修复，这里作为双重保险
             if isinstance(fusion_result, dict):
                 logger.critical(f"Dict Bomb Detected! ReasoningEnsemble returned a raw dict: {fusion_result}")
                 if "error" in fusion_result:
@@ -144,12 +147,11 @@ class CognitiveEngine:
 
         except Exception as e:
             logger.error(f"Cognitive cycle failed at Reasoning stage: {e}", exc_info=True)
-            # 抛出特定异常供 Orchestrator 捕获
             raise CognitiveError(f"ReasoningEnsemble failed: {e}") from e
             
         pipeline_state.update_value("last_fusion_result", fusion_result)
         # [Fix] Ensure the guard sees the result
-        pipeline_state.fusion_result = fusion_result
+        pipeline_state.latest_fusion_result = fusion_result.model_dump()
         
         # 2. Fact-check (如果置信度足够)
         fact_check_report = None
@@ -162,12 +164,12 @@ class CognitiveEngine:
                 
                 # 根据事实检查调整置信度
                 support_status = fact_check_report.get("overall_support")
-                if support_status == "Supported":
-                    fusion_result.confidence = min(fusion_result.confidence + 0.1, 1.0)
-                elif support_status == "Refuted":
+                if support_status == "Refuted":
                     logger.warning("Reasoning refuted by fact-checker. Neutralizing decision.")
                     fusion_result.decision = "NEUTRAL"
                     fusion_result.confidence = 0.0
+                # [Task 1.2 Fix] Removed "Supported" magic boost logic
+                    
             except Exception as e:
                 logger.error(f"Fact-checker failed: {e}")
         
