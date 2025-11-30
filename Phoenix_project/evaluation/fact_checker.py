@@ -1,6 +1,6 @@
 import asyncio
 import copy # [Task 2.1] Import copy to prevent prompt pollution
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from ..ai.ensemble_client import EnsembleClient
 from ..ai.prompt_manager import PromptManager
@@ -21,11 +21,15 @@ class FactChecker:
     def __init__(self, 
                  llm_client: EnsembleClient, 
                  prompt_manager: PromptManager, 
-                 prompt_renderer: PromptRenderer):
+                 prompt_renderer: PromptRenderer,
+                 config: Optional[Dict[str, Any]] = None):
         self.llm_client = llm_client
         self.prompt_manager = prompt_manager
         self.prompt_renderer = prompt_renderer
-        self.model_name = "gemini-1.5-flash-latest" # Flash 适用于事实核查
+        self.config = config or {}
+        
+        # [Task 4.1] Configuration Decoupling: Load model from config or fallback
+        self.model_name = self.config.get("evaluation", {}).get("fact_checker", {}).get("model_name", "gemini-1.5-flash-latest")
         
         # 定义搜索工具
         # 注意：工具的实现在 EnsembleClient/GeminiPoolManager 级别处理
@@ -56,11 +60,13 @@ class FactChecker:
              raise FileNotFoundError("FactChecker prompt 'l2_critic' not found.")
         
         # Modify system prompt to mandate search tool usage
+        # [Task 6.1] Anti-Hallucination: Softened prompt to allow honest ignorance
         search_instruction = (
             "\n\n---\n"
-            "MANDATORY INSTRUCTION: You MUST use the 'search_documents' tool "
-            "to find evidence for every claim presented. Do not rely on "
-            "internal knowledge. Your task is to verify claims using external search."
+            "MANDATORY INSTRUCTION: You MUST use the 'search_documents' tool to verify the claims. "
+            "If no evidence is found after searching, you MUST report the claim as 'Unverified' or 'No Evidence Found'. "
+            "Do NOT fabricate sources or evidence to satisfy the request. "
+            "Do not rely on internal knowledge."
             "\n---\n"
         )
         
@@ -69,7 +75,7 @@ class FactChecker:
         else:
             self.prompt["system"] = search_instruction.strip()
             
-        logger.info("FactChecker initialized with 'l2_critic' prompt and modified to enforce search tool usage.")
+        logger.info(f"FactChecker initialized with 'l2_critic' prompt and model '{self.model_name}'.")
 
     async def check_facts(self, claims: List[str]) -> List[FactCheckResult]:
         """
