@@ -4,12 +4,13 @@
 """
 import uuid
 from typing import Dict, Any, List, Optional, Union
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 # FIX (E1, E2, E3): 导入统一的模式
 from Phoenix_project.core.schemas.data_schema import PortfolioState, TargetPortfolio, MarketData
 from Phoenix_project.core.schemas.fusion_result import AgentDecision, FusionResult
+from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 
 from Phoenix_project.monitor.logging import get_logger
 
@@ -23,7 +24,8 @@ class PipelineState(BaseModel):
     # --- 身份与时间 ---
     run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     step_index: int = 0
-    current_time: datetime = Field(default_factory=datetime.utcnow)
+    # [Phase I Fix] Use timezone-aware UTC to prevent offset-naive errors
+    current_time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     # --- 上下文与任务 ---
     main_task_query: Dict[str, Any] = Field(default_factory=dict)
@@ -39,7 +41,8 @@ class PipelineState(BaseModel):
     # [Phase I Fix] Strict Typing for Serialization Safety
     target_portfolio: Optional[TargetPortfolio] = None 
     
-    l1_insights: Dict[str, Any] = Field(default_factory=dict)
+    # [Phase I Fix] Strict Typing: Enforce List[EvidenceItem] to prevent garbage data
+    l1_insights: List[EvidenceItem] = Field(default_factory=list)
     l2_supervision_results: Dict[str, Any] = Field(default_factory=dict)
     market_state: Dict[str, Any] = Field(default_factory=dict)
     raw_events: List[Dict[str, Any]] = Field(default_factory=list)
@@ -51,6 +54,8 @@ class PipelineState(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
+        # [Phase I Fix] Validate assignment to catch type errors immediately
+        validate_assignment = True
 
     def update_time(self, new_time: datetime):
         """更新系统仿真时间。"""
@@ -60,7 +65,7 @@ class PipelineState(BaseModel):
         """更新持仓状态。"""
         self.portfolio_state = new_state
 
-    def set_l1_insights(self, insights: Dict[str, Any]):
+    def set_l1_insights(self, insights: List[EvidenceItem]):
         self.l1_insights = insights
 
     def set_l2_supervision(self, results: Dict[str, Any]):
@@ -92,56 +97,4 @@ class PipelineState(BaseModel):
             self.latest_decisions = fusion_result.agent_decisions
         
         # 序列化 FusionResult 以便存储
-        self.latest_fusion_result = fusion_result.model_dump() if hasattr(fusion_result, 'model_dump') else fusion_result.__dict__
-
-    def add_final_decision(self, decision: Dict[str, Any]):
-        """更新最终裁决 (仅保留最新)。"""
-        self.latest_final_decision = decision
-
-    def get_snapshot(self) -> Dict[str, Any]:
-        """
-        获取当前状态的字典表示 (Pydantic Native)。
-        """
-        return self.model_dump()
-        
-    def get_latest_portfolio_state(self) -> Optional[PortfolioState]:
-        """
-        获取最新的投资组合状态。
-        """
-        return self.portfolio_state
-
-    def get_main_task_query(self) -> Dict[str, Any]:
-        """
-        (FIX) 为 L1/L2 智能体实现缺失的方法。
-        """
-        if not self.main_task_query:
-             return {
-                "symbol": "BTC/USD", # Default
-                "description": "Analyze default symbol."
-             }
-        return self.main_task_query
-
-    def update_value(self, key: str, value: Any):
-        """Generic update for dynamic keys (used by CognitiveEngine)."""
-        if hasattr(self, key):
-            setattr(self, key, value)
-        else:
-            pass
-
-    def get_full_context_formatted(self) -> str:
-        """
-        (FIX) 为 AuditManager 实现缺失的方法。
-        将当前状态序列化为字符串用于日志记录 (无历史)。
-        """
-        context_str = f"--- SYSTEM STATE (Step {self.step_index}) ---\n"
-        context_str += f"Run ID: {self.run_id}\n"
-        context_str += f"Current Time: {self.current_time.isoformat()}\n"
-        
-        if self.portfolio_state:
-            context_str += f"Portfolio: Val={self.portfolio_state.total_value}, Cash={self.portfolio_state.cash}\n"
-            context_str += f"Positions: {len(self.portfolio_state.positions)}\n"
-        
-        if self.latest_decisions:
-            context_str += f"Last Decisions: {len(self.latest_decisions)} agents active.\n"
-            
-        return context_str
+        self.latest_fusion_result = fusion_result.model_dump() if hasattr(fusion_result, 'model
