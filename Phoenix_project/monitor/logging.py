@@ -3,9 +3,11 @@ Observability and Logging Configuration (Layer 12)
 """
 
 import logging
+import logging.handlers
 import sys
 import json
 import contextvars
+import queue
 from typing import Optional, Any, Dict
 from datetime import datetime
 
@@ -43,11 +45,23 @@ class JSONFormatter(logging.Formatter):
             if key not in STANDARD_ATTRS and not key.startswith('_'):
                 log_record[key] = value
 
+        # [Task 0.1] Sanitization
+        self._sanitize(log_record)
+
         # 处理异常堆栈
         if record.exc_info:
             log_record["exc_info"] = self.formatException(record.exc_info)
             
         return json.dumps(log_record, ensure_ascii=False)
+
+    def _sanitize(self, record_dict: Dict[str, Any]):
+        """Recursively mask sensitive keys."""
+        SENSITIVE_KEYS = {'api_key', 'secret', 'token', 'password', 'authorization', 'key'}
+        for k, v in record_dict.items():
+            if k.lower() in SENSITIVE_KEYS:
+                record_dict[k] = "***MASKED***"
+            elif isinstance(v, dict):
+                self._sanitize(v)
 
 class ESLogger:
     """
@@ -66,7 +80,8 @@ class ESLogger:
         """
         self.logger = logging.getLogger(name)
         self.logger.setLevel(level)
-        self.logger.propagate = False # 防止日志向上传播到根记录器
+        # [Task 0.1] Allow propagation so logs reach the Root Logger (QueueHandler)
+        self.logger.propagate = True 
 
         # 注意: 这里不再单独配置 Handler，而是依赖 setup_logging 配置的 Root Handler
         # 这样可以确保输出格式统一为 JSON
@@ -132,6 +147,7 @@ def setup_logging(level=logging.INFO, config=None):
     """
     初始化全局日志配置 (JSON 模式)。
     配置 Root Logger 以使用 JSONFormatter，使所有模块日志结构化。
+    [Task 0.1] Implemented Async Logging via QueueHandler/QueueListener.
     """
     global GLOBAL_LOG_LEVEL
     GLOBAL_LOG_LEVEL = level
@@ -143,10 +159,23 @@ def setup_logging(level=logging.INFO, config=None):
         for h in root_logger.handlers:
             root_logger.removeHandler(h)
             
-    # 使用 JSONFormatter 的 StreamHandler
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JSONFormatter())
-    root_logger.addHandler(handler)
+    # [Task 0.1] Async Logging Setup: QueueHandler -> Queue -> QueueListener -> StreamHandler
+    # 1. Create a queue for logs
+    log_queue = queue.Queue(-1) # Infinite queue size
+    
+    # 2. Create QueueHandler (Non-blocking, writes to queue)
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+    
+    # 3. Create the actual writer (StreamHandler) to stdout
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(JSONFormatter())
+    
+    # 4. Create QueueListener to dispatch logs from queue to console_handler in a separate thread
+    listener = logging.handlers.QueueListener(log_queue, console_handler)
+    listener.start()
+    
+    # 5. Add QueueHandler to root logger
+    root_logger.addHandler(queue_handler)
     
     root_logger.setLevel(level)
     
@@ -155,4 +184,4 @@ def setup_logging(level=logging.INFO, config=None):
     for logger_instance in _loggers.values():
         logger_instance.logger.setLevel(level)
         
-    logging.info(f"Global logging configured (Level: {logging.getLevelName(level)}), JSON output enabled.")
+    logging.info(f"Global logging configured (Level: {logging.getLevelName(level)}), JSON output enabled (Async Mode).")
