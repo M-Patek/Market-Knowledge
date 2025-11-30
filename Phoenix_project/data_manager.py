@@ -6,6 +6,7 @@ by the cognitive engine and agents (e.g., market data, news, fundamentals).
 [Phase I Fix] Environment Isolation & Time Travel Prevention
 [Phase II Fix] Cache Isolation & Session ID
 [Phase IV Fix] Async Locking (Thundering Herd)
+[Phase V Fix] Distributed Redis Lock & Connection Pooling
 """
 
 import logging
@@ -14,7 +15,7 @@ import requests
 import asyncio
 import httpx # [Task 3.1] Import httpx for async I/O
 import os # [Task 2] 导入 os
-from collections import defaultdict
+import redis.exceptions # [Task 4.2] For LockError
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 import pandas as pd  # type: ignore
@@ -62,8 +63,7 @@ class DataManager:
         self.session_id = session_id
         self._simulation_time: Optional[datetime] = None
         
-        # [Task 4.4] Async locks for request coalescing (Thundering Herd protection)
-        self._request_locks = defaultdict(asyncio.Lock)
+        # [Task 4.2 Fix] Removed local _request_locks in favor of Distributed Redis Lock
 
         # 加载数据目录 (Data Catalog)
         self.data_catalog = self._load_data_catalog(
@@ -75,6 +75,10 @@ class DataManager:
         # API URL 配置
         self.news_api_url = self.config.get("news_api_url", "https://newsapi.org/v2/everything")
         self.market_data_api_url = self.config.get("market_data_api_url", "https://api.polygon.io/v2/aggs/ticker")
+        
+        # [Task 5.1] Persistent HTTP Client for Connection Pooling
+        # Enables Keep-Alive to avoid TCP/SSL handshake overhead on every request
+        self.http_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_keepalive_connections=20, max_connections=100))
         
         logger.info(f"DataManager initialized (Run Mode: {self.run_mode}).")
 
@@ -138,7 +142,6 @@ class DataManager:
         """Serializes and stores data in Redis cache with a TTL."""
         try:
             # 确保 data 可以被 JSON 序列化
-            # (例如, Pydantic 模型需要 .model_dump())
             if hasattr(data, 'model_dump_json'):
                 data_json = data.model_dump_json()
             elif isinstance(data, list) and data and hasattr(data[0], 'model_dump'):
@@ -174,7 +177,6 @@ class DataManager:
             logger.debug(f"Clamping history request end time from {end} to {self._simulation_time}")
             end = self._simulation_time
 
-        # 缓存键可以基于 symbol 和时间范围
         cache_key = self._get_cache_key(
             "market_history", f"{symbol}_{start.isoformat()}_{end.isoformat()}"
         )
@@ -187,7 +189,6 @@ class DataManager:
         logger.info(f"Fetching market history for {symbol} from TemporalDB.")
         try:
             # [Contract] 期望 TemporalDBClient 实现 query_range
-            # 这是一个 DataFrame 返回接口
             df = await self.temporal_db.query_range(
                 measurement="market_data",
                 symbol=symbol,
@@ -239,8 +240,6 @@ class DataManager:
                 # 使用 model_validate_json 自动处理 datetime 和类型转换
                 return MarketData.model_validate_json(data_json)
             
-            # Data not found is expected for illiquid assets, verify logic before warning
-            # logger.debug(f"No live market data found in Redis for {symbol}")
             return None
                 
         except redis.RedisError as e:
@@ -253,27 +252,23 @@ class DataManager:
     async def get_market_data(self, symbols: List[str]) -> Dict[str, MarketData]:
         """
         [Task 2.1] 批量获取市场数据。使用 asyncio.gather 并发拉取。
+        [Task 3.1] Fix: Relax suicidal validation. Return partial results.
         """
         tasks = [self.get_latest_market_data(sym) for sym in symbols]
         results = await asyncio.gather(*tasks)
         
-        # [Task 2] Strict Data Integrity Check (All-or-Nothing)
-        # Prevent silent failures that could lead to naked exposure in pair trading
+        # [Task 3.1] Return partial results (Soft Fail)
+        # Prevent partial failure from crashing the entire pipeline
         failed_symbols = [sym for sym, res in zip(symbols, results) if res is None]
-        
         if failed_symbols:
-            raise ValueError(f"Data integrity check failed. Missing market data for symbols: {failed_symbols}")
-            
-        # Only return if ALL data is present
-        return {sym: res for sym, res in zip(symbols, results)}
+            logger.warning(f"Partial data failure. Missing market data for symbols: {failed_symbols}")
+
+        return {sym: res for sym, res in zip(symbols, results) if res is not None}
 
     async def get_news_data(self, query: str = "", limit: int = 10, start_date: datetime = None, end_date: datetime = None) -> List[NewsData]:
         """
         [Task 2.1] DataIterator 适配器接口。
-        [Fix] 支持时间范围过滤，解决回测中的“新闻黑洞”问题。
         """
-        # 简单的包装现有的 fetch_news_data
-        # 注意：这里未来可以扩展为从 Redis 流 (REDIS_KEY_NEWS_STREAM) 读取实时新闻
         return await self.fetch_news_data(query=query, limit=limit, start_date=start_date, end_date=end_date)
 
     async def get_fundamental_data(
@@ -291,7 +286,7 @@ class DataManager:
         cached = await self._get_from_cache(cache_key)
         if cached:
             data = FundamentalData(**cached)
-            # [Task 2.1] Time Barrier: Invalidate cache if it contains future data relative to sim time
+            # [Task 2.1] Time Barrier
             if self._simulation_time and data.timestamp > self._simulation_time:
                 logger.debug(f"Cache invalidated for {symbol}: Future data detected.")
             else:
@@ -317,7 +312,6 @@ class DataManager:
     async def _get_historical_fundamentals(self, symbol: str, pit_date: datetime) -> Optional[FundamentalData]:
         """
         Helper: Executes Point-in-Time (PIT) query against TabularDB.
-        [Phase I Fix] Encapsulated PIT logic.
         """
         query = """
             SELECT * FROM fundamentals 
@@ -334,7 +328,6 @@ class DataManager:
             fund_data_dict = rows[0]
             return FundamentalData(
                 symbol=symbol,
-                # Use actual data timestamp, fallback to pit_date only if missing
                 timestamp=fund_data_dict.get("timestamp") or pit_date,
                 market_cap=fund_data_dict.get("market_cap"),
                 pe_ratio=fund_data_dict.get("pe_ratio"),
@@ -350,14 +343,12 @@ class DataManager:
         self, query: str, limit: int = 10, start_date: datetime = None, end_date: datetime = None, force_refresh: bool = False
     ) -> List[NewsData]:
         """
-        OPTIMIZED: Fetches news data from an external API,
-        using caching. Replaces the mock.
-        [Fix] Supports time range filtering for accurate backtesting.
-        [Task 4.4] Implements Double-Checked Locking to prevent Thundering Herd.
+        OPTIMIZED: Fetches news data from an external API, using caching.
+        [Task 4.2] Uses Distributed Redis Lock to prevent Thundering Herd in distributed env.
+        [Task 5.1] Uses Persistent HTTP Client for connection reuse.
         """
         cache_key = self._get_cache_key("news", query)
         
-        # 如果提供了时间范围，将时间加入缓存键，防止不同时间段的查询混淆
         if start_date or end_date:
             cache_key = self._get_cache_key("news", f"{query}_{start_date}_{end_date}")
         
@@ -367,71 +358,75 @@ class DataManager:
             if cached:
                 return [NewsData(**item) for item in cached]
         
-        # 2. Acquire Lock (Slow Path)
-        lock_key = f"news_lock:{cache_key}"
-        async with self._request_locks[lock_key]:
-            # 3. Second Check (Double-Checked Locking)
-            # Check if another thread populated the cache while we waited
-            if not force_refresh:
-                cached = await self._get_from_cache(cache_key)
-                if cached:
-                    logger.debug(f"Cache hit on second check for {query} (Request Coalesced)")
-                    return [NewsData(**item) for item in cached]
+        # 2. Acquire Distributed Lock (Slow Path)
+        lock_key = f"phx:{self.run_mode}:lock:news_fetch:{query}"
+        
+        try:
+            # [Task 4.2] Distributed Lock with Timeout
+            async with self.redis_client.lock(lock_key, timeout=60, blocking_timeout=10):
+                # 3. Second Check (Double-Checked Locking)
+                if not force_refresh:
+                    cached = await self._get_from_cache(cache_key)
+                    if cached:
+                        logger.debug(f"Cache hit on second check for {query} (Request Coalesced)")
+                        return [NewsData(**item) for item in cached]
 
-            # 从 API 获取
-            logger.info(f"Fetching news from API for query: {query}")
-            
-            # 检查 API 密钥
-            news_api_key = self.api_keys.get("news_api")
-            if not news_api_key:
-                logger.error("News API key (api_keys.news_api) not configured.")
-                return []
+                # Fetch from API
+                logger.info(f"Fetching news from API for query: {query}")
+                news_api_key = self.api_keys.get("news_api")
+                if not news_api_key:
+                    logger.error("News API key not configured.")
+                    return []
+                    
+                params = {
+                    "q": query,
+                    "apiKey": news_api_key,
+                    "pageSize": limit,
+                    "language": "en",
+                    "sortBy": "publishedAt",
+                    "from": start_date.isoformat() if start_date else None,
+                    "to": end_date.isoformat() if end_date else None,
+                }
+                params = {k: v for k, v in params.items() if v is not None}
                 
-            params = {
-                "q": query,
-                "apiKey": news_api_key,
-                "pageSize": limit,
-                "language": "en",
-                "sortBy": "publishedAt",
-                "from": start_date.isoformat() if start_date else None,
-                "to": end_date.isoformat() if end_date else None,
-            }
-            # 移除值为 None 的参数
-            params = {k: v for k, v in params.items() if v is not None}
-            
-            try:
-                async with httpx.AsyncClient() as client: # [Task 3.1] Use httpx
-                    response = await client.get(self.news_api_url, params=params, timeout=10.0)
-                response.raise_for_status() # 如果是 4xx/5xx 则抛出异常
-                
-                articles = response.json().get("articles", [])
-                news_list = []
-                
-                for article in articles:
-                    news_item = NewsData(
-                        id=article.get("url"), # 使用 URL 作为唯一 ID
-                        symbol=query, # 粗略地将查询词作为 symbol
-                        headline=article.get("title"),
-                        summary=article.get("description"),
-                        content=article.get("content"),
-                        url=article.get("url"),
-                        source=article.get("source", {}).get("name"),
-                        timestamp=datetime.fromisoformat(article.get("publishedAt").replace("Z", "+00:00")),
-                    )
-                    news_list.append(news_item)
-                
-                if news_list:
-                    # 缓存结果
-                    await self._set_to_cache(cache_key, news_list)
-                
-                return news_list
+                try:
+                    # [Task 5.1] Use persistent self.http_client
+                    response = await self.http_client.get(self.news_api_url, params=params)
+                    response.raise_for_status()
+                    
+                    articles = response.json().get("articles", [])
+                    news_list = []
+                    
+                    for article in articles:
+                        news_item = NewsData(
+                            id=article.get("url"),
+                            symbol=query,
+                            headline=article.get("title"),
+                            summary=article.get("description"),
+                            content=article.get("content"),
+                            url=article.get("url"),
+                            source=article.get("source", {}).get("name"),
+                            timestamp=datetime.fromisoformat(article.get("publishedAt").replace("Z", "+00:00")),
+                        )
+                        news_list.append(news_item)
+                    
+                    if news_list:
+                        await self._set_to_cache(cache_key, news_list)
+                    
+                    return news_list
 
-            except (requests.exceptions.RequestException, httpx.HTTPError) as e:
-                logger.error(f"Failed to fetch news from API: {e}")
-                return []
-            except Exception as e:
-                logger.error(f"Error processing news data: {e}")
-                return []
+                except (requests.exceptions.RequestException, httpx.HTTPError) as e:
+                    logger.error(f"Failed to fetch news from API: {e}")
+                    return []
+                    
+        except redis.exceptions.LockError:
+            # [Task 4.2] Failed to acquire lock (timeout)
+            logger.warning(f"Failed to acquire distributed lock for {query}. Skipping news fetch.")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error processing news data: {e}")
+            return []
 
     # --- 内部辅助方法 (用于 refresh_data_sources) ---
 
@@ -446,20 +441,18 @@ class DataManager:
 
         logger.info(f"Refreshing market data for {symbol}...")
         
-        # 1. 从 API 获取数据 (例如 Polygon.io)
         market_api_key = self.api_keys.get("polygon_api")
         if not market_api_key:
-            logger.error("Market data API key (api_keys.polygon_api) not configured.")
+            logger.error("Market data API key not configured.")
             return
 
-        # 示例: 获取过去一天的数据
         yesterday = (self.get_current_time() - timedelta(days=1)).strftime('%Y-%m-%d')
         url = f"{self.market_data_api_url}/{symbol}/range/1/day/{yesterday}/{yesterday}"
         params = {"apiKey": market_api_key}
 
         try:
-            async with httpx.AsyncClient() as client: # [Task 3.1] Use httpx
-                response = await client.get(url, params=params, timeout=10.0)
+            # [Task 5.1] Use persistent http_client
+            response = await self.http_client.get(url, params=params)
             response.raise_for_status()
             data = response.json()
 
@@ -467,16 +460,36 @@ class DataManager:
                 # 2. 准备数据
                 df = pd.DataFrame(data["results"])
                 df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "t": "time"})
-                # 将纳秒时间戳转换为 datetime
                 df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
                 df = df.set_index("time")
                 
-                # 3. 写入 TemporalDB
+                # 3. 写入 TemporalDB (历史)
                 await self.temporal_db.write_dataframe(
                     measurement="market_data",
                     df=df,
                     tags={"symbol": symbol}
                 )
+                
+                # [Task 3.1 Fix] Sync to Redis Cache (Live Data)
+                # The TemporalDB write is historical; we must also update the hot cache 
+                # so get_latest_market_data() can find it immediately.
+                try:
+                    latest = df.iloc[-1]
+                    md = MarketData(
+                        symbol=symbol,
+                        timestamp=latest.name, # Index is time
+                        open=latest['open'],
+                        high=latest['high'],
+                        low=latest['low'],
+                        close=latest['close'],
+                        volume=latest['volume']
+                    )
+                    live_key = f"phx:{self.run_mode}:market_data:live:{symbol}"
+                    await self.redis_client.set(live_key, md.model_dump_json())
+                    logger.debug(f"Synced latest market data to Redis for {symbol}")
+                except Exception as e:
+                    logger.error(f"Failed to sync Redis cache for {symbol}: {e}")
+
                 logger.info(f"Successfully refreshed and stored market data for {symbol}")
 
         except (requests.exceptions.RequestException, httpx.HTTPError) as e:
@@ -487,30 +500,22 @@ class DataManager:
 
     async def _fetch_and_store_fundamentals(self, config: Dict[str, Any]):
         """
-        [Task 2] 已实现
         Helper: Fetches fundamental data from Alpha Vantage and stores it in TabularDB.
         """
-        # [Phase I Fix] Time Travel Prevention
-        # Snapshot APIs cannot be used in Backtest mode
         if self.run_mode == "backtest":
             logger.warning("Skipping fundamental fetch: Alpha Vantage API is snapshot-only and cannot be used in BACKTEST mode.")
             return
 
         symbol = config.get("symbol")
         if not symbol or not self.tabular_db:
-            logger.warning(f"Skipping fundamentals: Symbol ({symbol}) or TabularDB ({self.tabular_db}) missing.")
             return
 
         logger.info(f"Refreshing fundamental data for {symbol}...")
         
-        # 1. 从 API 获取数据 (Alpha Vantage)
-        api_key = self.api_keys.get("alpha_vantage") # 假设 'api_keys' 是从 config 加载的
-        if not api_key:
-            # [Task 2] 尝试从 env.example 定义的环境变量回退
-            api_key = os.environ.get("ALPHA_VANTAGE_API_KEY")
+        api_key = self.api_keys.get("alpha_vantage") or os.environ.get("ALPHA_VANTAGE_API_KEY")
 
         if not api_key:
-            logger.error("Alpha Vantage API key not found in config (api_keys.alpha_vantage) or env (ALPHA_VANTAGE_API_KEY).")
+            logger.error("Alpha Vantage API key not found.")
             return
         
         url = "https://www.alphavantage.co/query"
@@ -521,20 +526,18 @@ class DataManager:
         }
 
         try:
-            async with httpx.AsyncClient() as client: # [Task 3.2] Use httpx
-                response = await client.get(url, params=params, timeout=10.0)
+            # [Task 5.1] Use persistent http_client
+            response = await self.http_client.get(url, params=params)
             response.raise_for_status()
             api_data = response.json()
             
-            if not api_data or "Symbol" not in api_data or api_data.get("Symbol") is None:
-                logger.warning(f"Alpha Vantage returned no data or invalid data for {symbol}: {api_data.get('Information')}")
+            if not api_data or "Symbol" not in api_data:
+                logger.warning(f"Alpha Vantage returned no data for {symbol}: {api_data.get('Information')}")
                 return
 
-            # 2. 准备要写入的数据
-            # (我们将 Alpha Vantage 键 映射到 我们的数据库列)
             data_to_store = {
                 "symbol": api_data.get("Symbol"),
-                "timestamp": self.get_current_time(), # [Time Machine] 使用统一时间
+                "timestamp": self.get_current_time(),
                 "market_cap": float(api_data.get("MarketCapitalization", 0)),
                 "pe_ratio": float(api_data.get("PERatio", 0) if api_data.get("PERatio") != "None" else 0),
                 "sector": api_data.get("Sector"),
@@ -544,8 +547,6 @@ class DataManager:
                 "beta": float(api_data.get("Beta", 0) if api_data.get("Beta") != "None" else 0)
             }
 
-            # 3. 存入 TabularDB
-            # (我们假设表名为 'fundamentals'，主键为 'symbol')
             success = await self.tabular_db.upsert_data(
                 table_name="fundamentals",
                 data=data_to_store,
@@ -566,33 +567,30 @@ class DataManager:
     async def refresh_data_sources(self):
         """
         OPTIMIZED: Iterates through the data catalog and triggers
-        updates for sources marked for refresh. Replaces placeholder.
+        updates for sources marked for refresh.
         """
         logger.info("Starting data source refresh...")
         
         for source_name, config in self.data_catalog.items():
             source_type = config.get("type")
-            
             try:
                 if source_type == "market_data_api":
-                    # [Task 3.1] Now natively async
                     await self._fetch_and_store_market_data(config)
-                    
                 elif source_type == "news_api":
-                    # (异步)
                     query = config.get("query")
                     if query:
                         logger.info(f"Refreshing news for query: {query}")
                         await self.fetch_news_data(query, force_refresh=True)
-                        
                 elif source_type == "fundamental_api":
-                    # (异步)
                     await self._fetch_and_store_fundamentals(config)
-                    
                 else:
                     logger.debug(f"Skipping refresh for source type: {source_type}")
-                    
             except Exception as e:
                 logger.error(f"Failed to refresh data source '{source_name}': {e}")
 
         logger.info("Data source refresh finished.")
+
+    async def close(self):
+        """[Task 5.1] Gracefully close the persistent HTTP client."""
+        await self.http_client.aclose()
+        logger.info("DataManager HTTP client closed.")
