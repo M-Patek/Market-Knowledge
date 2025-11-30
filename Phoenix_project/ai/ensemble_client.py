@@ -93,13 +93,19 @@ class EnsembleClient:
         return response.get("text") if isinstance(response, dict) else str(response)
 
     def _clean_json_string(self, text: str) -> str:
-        """Removes Markdown code blocks to extract pure JSON string."""
+        """
+        [Task 3.3] Robust JSON Extraction: Finds outer-most braces.
+        Ignores markdown code blocks or conversational text wrapper.
+        """
         text = text.strip()
-        # Use regex to find content inside ```json ... ``` or ``` ... ```
-        match = re.search(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
-        if match:
-            text = match.group(1)
-        return text.strip()
+        
+        start_idx = text.find('{')
+        end_idx = text.rfind('}')
+        
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            return text[start_idx : end_idx + 1]
+            
+        return text
 
     async def run_chain_structured(self, prompt: str, tools: Optional[List[Any]] = None, model_name: Optional[str] = None) -> Optional[Any]:
         """
