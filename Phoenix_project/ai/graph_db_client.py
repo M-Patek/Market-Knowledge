@@ -1,7 +1,8 @@
 import os
 import asyncio
 from neo4j import AsyncGraphDatabase
-from typing import List, Dict, Any, Optional, Tuple # [Task 3] 导入 Tuple
+from typing import List, Dict, Any, Optional, Tuple, AsyncGenerator
+from collections import defaultdict
 from uuid import UUID
 
 # 导入 Phoenix 项目的日志记录器
@@ -54,33 +55,38 @@ class GraphDBClient:
             return False
 
     @retry_with_exponential_backoff()
-    async def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    async def execute_query_stream(self, query: str, params: Optional[Dict[str, Any]] = None) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        对 Neo4j 数据库执行一个只读的 Cypher 查询。
-        
-        Args:
-            query (str): 要执行的 Cypher 查询语句。
-            params (Optional[Dict[str, Any]]): 查询参数。
-
-        Returns:
-            List[Dict[str, Any]]: 结果记录列表，每条记录是一个字典。
+        [Task 3.1] Streams results from Neo4j (Async Generator).
+        Prevents OOM on large datasets.
         """
         if not self.driver:
-            logger.error(f"{self.log_prefix} 查询失败：驱动程序未初始化。")
-            return []
+            logger.error(f"{self.log_prefix} Stream query failed: Driver not initialized.")
+            return
             
         params = params or {}
-        logger.debug(f"{self.log_prefix} 正在执行查询: {query} with params {params}")
+        # logger.debug(f"{self.log_prefix} Streaming query: {query} with params {params}")
         
         try:
             async with self.driver.session() as session:
                 result = await session.run(query, params)
-                # 将 Neo4j 记录转换为标准字典
-                data = [record.data() async for record in result]
-                logger.debug(f"{self.log_prefix} 查询返回 {len(data)} 条记录。")
-                return data
+                async for record in result:
+                    yield record.data()
         except Exception as e:
-            logger.error(f"{self.log_prefix} Cypher 查询执行失败: {e}", exc_info=True)
+            logger.error(f"{self.log_prefix} Stream query failed: {e}", exc_info=True)
+            raise
+
+    async def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Wrapper for backward compatibility. Collects stream into list.
+        WARNING: Use execute_query_stream for large datasets to avoid OOM.
+        """
+        data = []
+        try:
+            async for record in self.execute_query_stream(query, params):
+                data.append(record)
+            return data
+        except Exception:
             return []
 
     @retry_with_exponential_backoff()
@@ -145,15 +151,8 @@ class GraphDBClient:
     @retry_with_exponential_backoff()
     async def add_triples(self, triples: List[Tuple[str, str, Any]], batch_id: Optional[UUID] = None) -> bool:
         """
-        [Task 3] 批量添加三元组 (subject_id, predicate, object_literal_or_id) 到图。
-        这使用 UNWIND 和 APOC 来高效处理。
-        
-        警告: 此实现依赖 Neo4j APOC 插件 (CALL apoc.do.case)。
-               请确保您的 Neo4j 实例 (docker-compose.yml) 已安装 APOC。
-        
-        Args:
-            triples (List[Tuple[str, str, Any]]): (subject_id, predicate, object) 的列表。
-            batch_id (Optional[UUID]): [Task 3C] The atomic ingestion batch ID to stamp on new nodes.
+        [Task 3.1] Batch add triples using standard Cypher (No APOC).
+        Groups triples by type/label to optimize execution.
         """
         if not self.driver:
             logger.error(f"{self.log_prefix} 写入三元组失败：驱动程序未初始化。")
@@ -163,62 +162,65 @@ class GraphDBClient:
             logger.warning(f"{self.log_prefix} add_triples 被调用，但没有三元组。")
             return True
 
-        # 将三元组转换为字典列表以便参数化
-        params_list = [{"s": t[0], "p": t[1], "o": t[2]} for t in triples]
+        # 1. Pre-process and Bucket Triples
+        nodes_data = defaultdict(lambda: defaultdict(dict)) # Label -> ID -> Props
         
-        # 这个 Cypher 查询遍历每个三元组：
-        # 1. MERGE 主语节点 (s) (基于其 'id')
-        # 2. CALL apoc.do.case 检查谓词 (p)：
-        #    - 如果 p 是 'isAnalysisOf' (L1), 'targetsSymbol' (L2), 'basedOnAnalysis' (L2),
-        #      则 MERGE 对象节点 (o) 并创建关系 (s)-[r]->(o)。
-        #    - 否则 (默认): 将 'o' 视为 (s) 上的属性并设置它。
-        query = """
-        UNWIND $triples as t
+        l1_rels = []      # isAnalysisOf
+        l2_target = []    # targetsSymbol
+        l2_basis = []     # basedOnAnalysis
         
-        // 步骤 1: 确定主语标签。L1 是 Analysis, L2 是 FusionDecision
-        // (我们假设 t.s 包含前缀, e.g., "Analysis:uuid")
-        WITH t, split(t.s, ':')[0] AS s_label, split(t.s, ':')[1] AS s_id
-        MERGE (s {id: t.s})
-        // 在创建时设置标签
-        ON CREATE SET s.id = t.s, s.uid = s_id, s_label_dynamic = s_label, s.ingestion_batch_id = $batch_id
-        WITH s, s_label_dynamic, t
-        CALL apoc.create.addLabels(s, [s_label_dynamic]) YIELD node AS s_labeled
-        
-        // 步骤 2: 处理对象 (关系 或 属性)
-        CALL apoc.do.case([
-            // --- L1 关系 ---
-            t.p = 'isAnalysisOf', 
-            'MERGE (o:Symbol {id: t.o}) MERGE (s_labeled)-[:IS_ANALYSIS_OF {timestamp: timestamp()}]->(o)',
+        RESTRICTED_KEYS = {'id', 'uid', 'ingestion_batch_id'}
+
+        for s, p, o in triples:
+            # Determine Label from ID (e.g., "Analysis:123" -> "Analysis")
+            label = s.split(':')[0] if ':' in s else 'Unknown'
             
-            // --- L2 关系 ---
-            t.p = 'targetsSymbol', 
-            'MERGE (o:Symbol {id: t.o}) MERGE (s_labeled)-[:TARGETS_SYMBOL {timestamp: timestamp()}]->(o)',
-            
-            t.p = 'basedOnAnalysis', 
-            'MERGE (o:Analysis {id: t.o}) MERGE (s_labeled)-[:BASED_ON_ANALYSIS {timestamp: timestamp()}]->(o)'
-        ],
-        // ELSE (默认): 将 'o' 视为 (s) 上的属性
-        'SET s_labeled[t.p] = t.o',
-        {s_labeled: s_labeled, t: t}) YIELD value
-        
-        RETURN count(t) as triples_processed
-        """
+            # Bucket Relations
+            if p == 'isAnalysisOf':
+                l1_rels.append({'s': s, 'o': o})
+                if s not in nodes_data[label]: nodes_data[label][s] = {} # Ensure node creation
+            elif p == 'targetsSymbol':
+                l2_target.append({'s': s, 'o': o})
+                if s not in nodes_data[label]: nodes_data[label][s] = {}
+            elif p == 'basedOnAnalysis':
+                l2_basis.append({'s': s, 'o': o})
+                if s not in nodes_data[label]: nodes_data[label][s] = {}
+            else:
+                # Bucket Properties (Guard against restricted keys)
+                if p not in RESTRICTED_KEYS:
+                    nodes_data[label][s][p] = o
         
         try:
-            query_params = {
-                "triples": params_list,
-                "batch_id": str(batch_id) if batch_id else None
-            }
-            # [Fix] 此处应使用 execute_write 而不是 execute_query
-            success = await self.execute_write(query, params=query_params)
-            if success:
-                logger.info(f"{self.log_prefix} 成功添加/更新了 {len(params_list)} 个三元组 (Batch ID: {batch_id})。")
-                return True
-            else:
-                logger.error(f"{self.log_prefix} add_triples 事务失败。")
-                return False
+            # 2. Execute Node Creation & Property Setting (Per Label)
+            for label, nodes in nodes_data.items():
+                batch = [{'id': nid, 'props': props} for nid, props in nodes.items()]
+                # Dynamic Label Injection (Safe: label derived from internal logic)
+                q_nodes = (
+                    f"UNWIND $batch as item "
+                    f"MERGE (n:`{label}` {{id: item.id}}) "
+                    f"ON CREATE SET n.ingestion_batch_id = $batch_id, n.uid = split(item.id, ':')[1] "
+                    f"SET n += item.props"
+                )
+                await self.execute_write(q_nodes, {'batch': batch, 'batch_id': str(batch_id) if batch_id else None})
+
+            # 3. Execute Relations (Per Type)
+            if l1_rels:
+                q_l1 = "UNWIND $batch as r MERGE (s {id: r.s}) MERGE (o:Symbol {id: r.o}) MERGE (s)-[:IS_ANALYSIS_OF {timestamp: timestamp()}]->(o)"
+                await self.execute_write(q_l1, {'batch': l1_rels})
+            
+            if l2_target:
+                q_l2t = "UNWIND $batch as r MERGE (s {id: r.s}) MERGE (o:Symbol {id: r.o}) MERGE (s)-[:TARGETS_SYMBOL {timestamp: timestamp()}]->(o)"
+                await self.execute_write(q_l2t, {'batch': l2_target})
+                
+            if l2_basis:
+                q_l2b = "UNWIND $batch as r MERGE (s {id: r.s}) MERGE (o:Analysis {id: r.o}) MERGE (s)-[:BASED_ON_ANALYSIS {timestamp: timestamp()}]->(o)"
+                await self.execute_write(q_l2b, {'batch': l2_basis})
+
+            logger.info(f"{self.log_prefix} Successfully processed {len(triples)} triples (Batch: {batch_id}).")
+            return True
+
         except Exception as e:
-            logger.error(f"{self.log_prefix} add_triples 事务失败 (是否安装了 APOC?): {e}", exc_info=True)
+            logger.error(f"{self.log_prefix} add_triples failed: {e}", exc_info=True)
             return False
 
     async def count_by_batch_id(self, batch_id: UUID) -> int:
