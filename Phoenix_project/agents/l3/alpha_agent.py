@@ -94,10 +94,10 @@ class AlphaAgent(BaseDRLAgent):
         norm_balance = (balance / initial_balance) if initial_balance > 0 else 1.0
         
         log_return = 0.0
-        if price > 0 and prev_price > 0:
+        if price > 1e-8 and prev_price > 1e-8: # [Task 4.1] Math Shield
             log_return = np.log(price / prev_price)
             
-        log_volume = np.log(volume + 1.0)
+        log_volume = np.log(volume + 1.0) if volume >= 0 else 0.0
 
         # [Task 6.1] Macro Feature: Market Regime
         regime_val = 0.0
