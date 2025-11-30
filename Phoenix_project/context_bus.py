@@ -1,5 +1,5 @@
 # Phoenix_project/context_bus.py
-# [主人喵的修复] 实现了真正的异步 Pub/Sub 消息总线
+# [主人喵的修复] 实现了真正的异步 Pub/Sub 消息总线，具备断线重连和非阻塞分发功能
 
 import json
 import redis.asyncio as redis
@@ -34,7 +34,7 @@ class ContextBus:
         self._handlers: Dict[str, Callable] = {}
         self._lock = asyncio.Lock()
 
-    # --- 核心通信功能 (修复点: 全异步) ---
+    # --- 核心通信功能 (修复点: 全异步 & 健壮) ---
 
     async def publish(self, channel: str, message: Union[Dict, str]) -> bool:
         """
@@ -74,37 +74,40 @@ class ContextBus:
     async def _listen_loop(self):
         """
         后台任务：异步监听 Redis 消息。
+        [Task 0.3 Fix] 实现“复活循环” (Resurrection Loop) 和非阻塞分发。
         """
-        try:
-            async for message in self._pubsub.listen():
-                if not self._listening:
-                    break
-                
-                if message['type'] == 'message':
-                    channel = message['channel']
-                    if isinstance(channel, bytes):
-                        channel = channel.decode('utf-8')
-                        
-                    handler = self._handlers.get(channel)
-                    if handler:
-                        try:
-                            data = message['data']
-                            # 简化解码逻辑
-                            if isinstance(data, bytes): data = data.decode('utf-8')
-                            try: payload = json.loads(data)
-                            except: payload = data
+        while self._listening:
+            try:
+                async for message in self._pubsub.listen():
+                    if not self._listening:
+                        break
+                    
+                    if message['type'] == 'message':
+                        channel = message['channel']
+                        if isinstance(channel, bytes):
+                            channel = channel.decode('utf-8')
                             
-                            # 支持异步或同步回调
-                            if asyncio.iscoroutinefunction(handler):
-                                await handler(payload)
-                            else:
-                                handler(payload)
-                        except Exception as e:
-                            logger.error(f"Error processing message on {channel}: {e}")
-        except Exception as e:
-            logger.error(f"ContextBus listener loop crashed: {e}", exc_info=True)
-        finally:
-            self._listening = False
+                        handler = self._handlers.get(channel)
+                        if handler:
+                            try:
+                                data = message['data']
+                                # 简化解码逻辑
+                                if isinstance(data, bytes): data = data.decode('utf-8')
+                                try: payload = json.loads(data)
+                                except: payload = data
+                                
+                                # [Task 0.3 Fix] 非阻塞分发：使用 create_task 防止阻塞总线
+                                if asyncio.iscoroutinefunction(handler):
+                                    asyncio.create_task(handler(payload))
+                                else:
+                                    # 同步 handler 仍会阻塞，建议使用 async handler
+                                    handler(payload)
+                            except Exception as e:
+                                logger.error(f"Error processing message on {channel}: {e}")
+            except Exception as e:
+                # [Task 0.3 Fix] 捕获连接断开异常，休眠后重试，而不是直接退出
+                logger.error(f"ContextBus listener loop interrupted: {e}. Retrying in 1s...", exc_info=True)
+                await asyncio.sleep(1)
 
     # --- 状态持久化功能 (修复点: Async Redis) ---
 
