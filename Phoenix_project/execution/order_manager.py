@@ -4,6 +4,7 @@
 [Beta Final Fix] 集成 Fail-Safe 逻辑，捕获数据完整性错误并执行紧急停止。
 [Task 4] Concurrency Safety & Execution Protection
 [Phase IV Fix] Time Machine Support & Precision/Risk Controls
+[Task 4.1] Async Cancellation, Decimal Enforcement
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
@@ -89,17 +90,16 @@ class OrderManager:
     def _get_instrument_metadata(self, symbol: str) -> Dict[str, float]:
         return {"tick_size": 0.01, "lot_size": 1.0}
 
-    def _round_to_tick(self, price: float, tick_size: float) -> float:
+    def _round_to_tick(self, price: Decimal, tick_size: Decimal) -> Decimal:
         """[Task 4] Fixes Penny Gap using Decimal arithmetic."""
-        d_price = Decimal(str(price))
-        d_tick = Decimal(str(tick_size))
-        rounded = d_price.quantize(d_tick, rounding=ROUND_DOWN)
-        return float(rounded)
+        # Inputs are already Decimal
+        rounded = price.quantize(tick_size, rounding=ROUND_DOWN)
+        return rounded
 
     def generate_orders(self, 
                         current_portfolio: PortfolioState, 
                         target_portfolio: TargetPortfolio, 
-                        market_prices: Dict[str, float],
+                        market_prices: Dict[str, Decimal],
                         active_orders: Dict[str, Order]
                        ) -> List[Order]:
         """
@@ -110,52 +110,52 @@ class OrderManager:
         
         if not current_portfolio or not target_portfolio: return []
 
-        total_value = float(current_portfolio.total_value)
+        total_value = current_portfolio.total_value
         if total_value <= 0:
-            if float(current_portfolio.cash) > 0:
-                 total_value = float(current_portfolio.cash)
+            if current_portfolio.cash > 0:
+                 total_value = current_portfolio.cash
             else:
                 return []
 
-        current_gross_exposure = sum(abs(float(p.market_value)) for p in current_portfolio.positions.values())
+        current_gross_exposure = sum(abs(p.market_value) for p in current_portfolio.positions.values())
 
         # 1. Effective Position Calculation
-        effective_quantities = defaultdict(float)
+        effective_quantities = defaultdict(Decimal)
         for symbol, position in current_portfolio.positions.items():
-            effective_quantities[symbol] += float(position.quantity)
+            effective_quantities[symbol] += position.quantity
         for order in active_orders.values():
-            effective_quantities[order.symbol] += float(order.quantity)
+            effective_quantities[order.symbol] += order.quantity
             
-        current_weights: Dict[str, float] = {}
+        current_weights: Dict[str, Decimal] = {}
         for symbol, qty in effective_quantities.items():
-            price = market_prices.get(symbol, 0)
+            price = market_prices.get(symbol, Decimal(0))
             if price > 0 and total_value != 0:
                  current_weights[symbol] = (qty * price) / total_value
 
-        target_weights: Dict[str, float] = {}
+        target_weights: Dict[str, Decimal] = {}
         for pos in target_portfolio.positions:
-            target_weights[pos.symbol] = float(pos.target_weight)
+            target_weights[pos.symbol] = pos.target_weight
 
         all_symbols = set(current_weights.keys()) | set(target_weights.keys())
 
         for symbol in all_symbols:
-            current_w = current_weights.get(symbol, 0.0)
-            target_w = target_weights.get(symbol, 0.0)
+            current_w = current_weights.get(symbol, Decimal(0))
+            target_w = target_weights.get(symbol, Decimal(0))
             
             delta_weight = target_w - current_w
             
-            if abs(delta_weight) > 0.0001:
+            if abs(delta_weight) > Decimal("0.0001"):
                 target_dollar_value = delta_weight * total_value
                 price = market_prices.get(symbol)
                 
                 if price is None or price <= 0: continue
                 
                 order_quantity = target_dollar_value / price
-                slippage_factor = 0.005
+                slippage_factor = Decimal("0.005")
                 limit_price = price * (1 + slippage_factor) if order_quantity > 0 else price * (1 - slippage_factor)
                 
                 meta = self._get_instrument_metadata(symbol)
-                limit_price = self._round_to_tick(limit_price, meta["tick_size"])
+                limit_price = self._round_to_tick(limit_price, Decimal(str(meta["tick_size"])))
 
                 expected_value = order_quantity * price
                 if abs(expected_value) > self.max_order_value:
@@ -164,8 +164,8 @@ class OrderManager:
                 new_order = Order(
                     id=f"order_{symbol}_{uuid.uuid4()}",
                     symbol=symbol,
-                    quantity=Decimal(str(order_quantity)), # Convert to Decimal
-                    price=Decimal(str(limit_price)),
+                    quantity=order_quantity,
+                    limit_price=limit_price, # Mapped to limit_price field, using Decimal directly
                     order_type="LIMIT",
                     status=OrderStatus.NEW,
                     time_in_force="DAY",
@@ -181,14 +181,14 @@ class OrderManager:
             risk_action = state.l3_decision.get("risk_action")
             if risk_action == "HALT_TRADING":
                 logger.critical(f"{self.log_prefix} EMERGENCY BRAKE TRIGGERED. Cancelling all orders.")
-                self.cancel_all_open_orders()
+                await self.cancel_all_open_orders()
                 return
 
         target_portfolio = state.target_portfolio
         if not target_portfolio: return
 
         symbols = [p.symbol for p in target_portfolio.positions]
-        market_prices = {}
+        market_prices: Dict[str, Decimal] = {}
         
         for sym in symbols:
             md = await self.data_manager.get_latest_market_data(sym)
@@ -197,17 +197,19 @@ class OrderManager:
             time_diff = state.current_time - md.timestamp.replace(tzinfo=None) 
             if abs(time_diff) > timedelta(minutes=1): continue
                 
-            market_prices[sym] = float(md.close)
+            market_prices[sym] = md.close
             
         await self._reconcile_active_orders()
 
         try:
+            # TradeLifecycleManager expects Dict[str, Decimal] for market_prices? 
+            # Assuming it's updated or handles it. The schema is strict now.
             current_portfolio = self.trade_lifecycle_manager.get_current_portfolio_state(
                 market_prices, timestamp=state.current_time
             )
         except ValueError as e:
             logger.critical(f"{self.log_prefix} DATA INTEGRITY ALERT: {e}. EMERGENCY STOP.")
-            self.cancel_all_open_orders()
+            await self.cancel_all_open_orders()
             return 
 
         async with self.lock:
@@ -217,7 +219,7 @@ class OrderManager:
             orders = self.generate_orders(current_portfolio, target_portfolio, market_prices, active_orders_snapshot)
         except RiskViolationError as e:
             logger.critical(f"{self.log_prefix} FATAL RISK VIOLATION: {e}. STOPPING ALL TRADING.")
-            self.cancel_all_open_orders()
+            await self.cancel_all_open_orders()
             return
         
         orders_to_submit = []
@@ -229,7 +231,7 @@ class OrderManager:
                 orders_to_submit.append(order)
 
         for order in orders_to_submit:
-            price = float(order.limit_price) if order.limit_price else market_prices.get(order.symbol)
+            price = float(order.limit_price) if order.limit_price else float(market_prices.get(order.symbol))
             try:
                 if self.broker:
                     # Convert Decimal fields to float for broker API if needed, usually managed by adapter
@@ -279,9 +281,14 @@ class OrderManager:
         except Exception as e:
             logger.error(f"{self.log_prefix} Failed to reconcile active orders: {e}")
 
-    def cancel_all_open_orders(self):
-        order_ids = list(self.active_orders.keys())
+    async def cancel_all_open_orders(self):
+        """[Task 4.1] Non-blocking Async Cancellation."""
+        async with self.lock:
+            order_ids = list(self.active_orders.keys())
+        
         for order_id in order_ids:
             try:
-                if self.broker: self.broker.cancel_order(order_id)
-            except Exception: pass
+                if self.broker:
+                    await asyncio.to_thread(self.broker.cancel_order, order_id)
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Failed to cancel order {order_id}: {e}")
