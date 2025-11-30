@@ -6,6 +6,7 @@
 # [Task 6.1] Macro Regime Injection
 # [Task 6.2] Micro-structure Injection (Spread, Imbalance)
 # [Task 4.1] Risk Hard Override
+# [Task 5.3] Log Sampling for Idle Loops
 
 import logging
 import asyncio
@@ -24,6 +25,8 @@ from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
 from Phoenix_project.execution.order_manager import OrderManager
 from Phoenix_project.audit_manager import AuditManager
 from Phoenix_project.core.exceptions import CognitiveError, PipelineError
+# [Task 1.1 Fix] Import get_logger
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -71,6 +74,9 @@ class Orchestrator:
         self.execution_agent = execution_agent
         self.risk_initialized = False
         
+        # [Task 5.3] Log Sampling Counter
+        self.no_event_counter = 0
+        
         logger.info("Orchestrator initialized.")
 
     async def run_main_cycle(self):
@@ -80,6 +86,7 @@ class Orchestrator:
         这是由 Celery beat (LoopManager) 调度的主要入口点。
         """
         start_time = datetime.now()
+        # [Optimization] Reduced start log verbosity or moved to debug if needed, keeping info for now
         logger.info(f"Orchestrator main cycle START at {start_time}")
 
         pipeline_state = None
@@ -120,9 +127,14 @@ class Orchestrator:
             # [Phase 0 Fix] Use native async call
             new_events = await self.event_distributor.get_pending_events()
             if not new_events:
-                logger.info("No new events retrieved. Cycle complete.")
+                # [Task 5.3] Log Sampling: Only log "No events" once every 100 ticks
+                self.no_event_counter += 1
+                if self.no_event_counter % 100 == 0:
+                    logger.info("No new events retrieved. Cycle complete. (Log sampled 1/100)")
                 return
             
+            # Reset counter on activity
+            self.no_event_counter = 0
             logger.info(f"Retrieved {len(new_events)} new events from EventDistributor.")
             pipeline_state.set_raw_events(new_events)
 
