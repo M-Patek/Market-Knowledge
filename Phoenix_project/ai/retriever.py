@@ -118,11 +118,11 @@ class Retriever:
             : self.top_k_vector
         ]
 
-    def _rerank_documents(
+    async def _rerank_documents(
         self, query: str, documents: List[Evidence]
     ) -> List[Evidence]:
         """
-        Reranks a list of documents against a query using the CrossEncoder.
+        [Task 3.2] Async Reranking: Offloads blocking inference to thread.
         """
         if not documents:
             return []
@@ -135,7 +135,7 @@ class Retriever:
             if not pairs:
                 return []
 
-            scores = self.reranker.predict(pairs)
+            scores = await asyncio.to_thread(self.reranker.predict, pairs)
 
             reranked_docs: List[Evidence] = []
             for i, doc in enumerate(documents):
@@ -550,23 +550,24 @@ class Retriever:
             self.search_web(query) 
         ]
         
-        try:
-            all_results = await asyncio.gather(*tasks)
-        except Exception as e:
-            logger.error(
-                f"[RAG Retrieval Failure] Critical error during asyncio.gather in retrieve_and_rerank: {e}",
-                exc_info=True
-            )
-            all_results = [[], [], [], [], [], []] 
+        # [Task 3.2] Resilient Gathering: Prevent "All-or-Nothing" failure
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        vector_results: List[Evidence] = all_results[0]
-        graph_search_results: List[GraphQueryResult] = all_results[1]
-        gnn_results: List[Evidence] = all_results[2]
-        temporal_results: List[Evidence] = all_results[3]
-        tabular_results: List[Evidence] = all_results[4]
-        web_results: List[Evidence] = all_results[5]
+        def get_safe_result(index, name):
+            res = all_results[index]
+            if isinstance(res, Exception):
+                logger.warning(f"Retrieval source '{name}' failed: {res}")
+                return []
+            return res
 
-        successful_sources_count = sum(1 for result_list in all_results if result_list)
+        vector_results: List[Evidence] = get_safe_result(0, "VectorDB")
+        graph_search_results: List[GraphQueryResult] = get_safe_result(1, "GraphDB")
+        gnn_results: List[Evidence] = get_safe_result(2, "GNN")
+        temporal_results: List[Evidence] = get_safe_result(3, "TemporalDB")
+        tabular_results: List[Evidence] = get_safe_result(4, "TabularDB")
+        web_results: List[Evidence] = get_safe_result(5, "WebSearch")
+
+        successful_sources_count = sum(1 for res in [vector_results, graph_search_results, gnn_results, temporal_results, tabular_results, web_results] if res)
         
         if successful_sources_count < self.min_successful_sources:
             logger.critical(
@@ -610,7 +611,7 @@ class Retriever:
             f"{len(web_results)} web results."
         )
 
-        final_results = self._rerank_documents(query, combined_results)
+        final_results = await self._rerank_documents(query, combined_results)
 
         final_top_k = self.config.get("l1_retriever", {}).get("final_top_k", 5)
         final_results = final_results[:final_top_k]
