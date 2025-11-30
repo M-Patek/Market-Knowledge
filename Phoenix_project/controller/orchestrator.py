@@ -5,6 +5,7 @@
 # [Safety Patch] Implemented Fail-Closed logic for Ledger and Risk Agents.
 # [Task 6.1] Macro Regime Injection
 # [Task 6.2] Micro-structure Injection (Spread, Imbalance)
+# [Task 4.1] Risk Hard Override
 
 import logging
 import asyncio
@@ -306,7 +307,8 @@ class Orchestrator:
             risk_action = "HALT_TRADING" 
             if self.risk_agent:
                 obs = self.risk_agent.format_observation(state_data, pipeline_state.latest_fusion_result, pipeline_state.market_state)
-                raw_risk_action = await self.risk_agent.compute_action(obs)
+                # [Task 4.1] Pass fusion_result for Hard Override
+                raw_risk_action = await self.risk_agent.compute_action(obs, fusion_result=pipeline_state.latest_fusion_result)
                 
                 raw_val = raw_risk_action[0] if (hasattr(raw_risk_action, '__len__') and len(raw_risk_action) > 0) else raw_risk_action
                 # [Phase II Fix] 1.0 = HALT
