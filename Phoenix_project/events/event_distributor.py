@@ -4,8 +4,8 @@
 [主人喵的修复 2]
 这个类现在是一个基于 Redis List 的可靠事件队列。
 - StreamProcessor (生产者) 使用 lpush (publish) 将事件推入列表头部。
-- Orchestrator (消费者) 使用 rpoplpush (get_pending_events) 从尾部安全消费。
-[Phase I Fix] 实现了 RPOPLPUSH 可靠队列模式，消除了“破坏性读取”数据丢失风险。
+- Orchestrator (消费者) 使用 lmove (get_pending_events) 从尾部安全消费。
+[Phase I Fix] 实现了 LMOVE 可靠队列模式，消除了“破坏性读取”数据丢失风险。
 [Phase 0 Fix] Added Dependency Injection and Async/Sync compatibility.
 """
 import redis
@@ -55,25 +55,14 @@ class EventDistributor:
             logger.error(f"Failed to publish event to Redis: {e}", exc_info=True)
             return False
 
-    def publish_sync(self, event_data: Dict[str, Any], sync_redis_client: redis.StrictRedis) -> bool:
-        """
-        (Sync) Fallback for synchronous producers (e.g. StreamProcessor).
-        """
-        try:
-            event_json = json.dumps(event_data, default=str)
-            sync_redis_client.lpush(self.queue_name, event_json)
-            logger.debug(f"Published event (Sync) to '{self.queue_name}': {event_data.get('id', 'N/A')}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to publish event (Sync): {e}", exc_info=True)
-            return False
+    # [Task 1.1] Removed publish_sync to enforce async architecture.
 
     async def get_pending_events(self, max_events: int = 100) -> List[Dict[str, Any]]:
         """
-        (Async) Fetch pending events using RPOPLPUSH.
+        (Async) Fetch pending events using LMOVE.
         (消费者调用) 获取待处理事件。
-        [Phase I Fix] 使用 RPOPLPUSH 实现“可靠队列”模式。
-        事件被原子地移动到 :processing 队列，防止在处理崩溃时丢失。
+        [Phase I Fix] 使用 LMOVE 实现“可靠队列”模式。
+        事件被原子地移动到 :processing 队列 (LMOVE RIGHT->LEFT)，防止在处理崩溃时丢失。
         """
         if not self.redis_client:
             logger.error("Cannot get events, Redis client is not connected.")
@@ -83,8 +72,8 @@ class EventDistributor:
         try:
             # 循环 pop 每一个事件
             for _ in range(max_events):
-                # Async atomic move
-                raw_event = await self.redis_client.rpoplpush(self.queue_name, self.processing_queue_name)
+                # Async atomic move (Modern LMOVE: RIGHT -> LEFT)
+                raw_event = await self.redis_client.lmove(self.queue_name, self.processing_queue_name, "RIGHT", "LEFT")
                 
                 if not raw_event:
                     break # 队列空了
@@ -124,3 +113,24 @@ class EventDistributor:
             logger.debug(f"Acknowledged {len(events)} events (Removed from processing queue).")
         except Exception as e:
             logger.error(f"Failed to ack events: {e}", exc_info=True)
+
+    async def recover_stale_events(self) -> int:
+        """
+        (Recovery) Resurrect zombie events from processing queue.
+        Moves events from RIGHT (Tail) of processing back to LEFT (Head) of main queue.
+        This handles cases where the system crashed before acking events.
+        """
+        if not self.redis_client: return 0
+        count = 0
+        try:
+            while True:
+                # Move from Processing (RIGHT/Tail) back to Main Queue (LEFT/Head)
+                event = await self.redis_client.lmove(self.processing_queue_name, self.queue_name, "RIGHT", "LEFT")
+                if not event: break
+                count += 1
+            if count > 0:
+                logger.warning(f"Resurrected {count} zombie events from '{self.processing_queue_name}' to '{self.queue_name}'")
+            return count
+        except Exception as e:
+            logger.error(f"Failed to recover stale events: {e}", exc_info=True)
+            return 0
