@@ -18,6 +18,10 @@ class ExecutionAgent(BaseDRLAgent):
         """
         return np.array([0.0], dtype=np.float32)
 
+    async def compute_action(self, observation: np.ndarray) -> np.ndarray:
+        """[Task 4.1] Deprecated / Pass-Through."""
+        return self.get_safe_action()
+
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
         """
         [Task 6.2] Format observation to match TradingEnv (9-d).
