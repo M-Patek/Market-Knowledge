@@ -3,6 +3,7 @@
 DRL (深度强化学习) 训练执行脚本。
 
 现在包含 ET 感知的安全停止逻辑，与 gnn_engine.py 类似。
+[Phase 5] Added Backtest Mode and Dry Run.
 """
 
 import argparse
@@ -10,6 +11,8 @@ import os
 import datetime # [阶段 4]
 import pytz # [阶段 4]
 import time # [阶段 4]
+import asyncio
+from unittest.mock import MagicMock
 
 from Phoenix_project.training.drl.multi_agent_trainer import MultiAgentDRLTrainer
 from Phoenix_project.training.walk_forward_trainer import WalkForwardTrainer
@@ -18,6 +21,10 @@ from Phoenix_project.monitor.logging import get_logger
 # [阶段 4] 导入安全逻辑依赖
 from Phoenix_project.monitor.metrics import METRICS
 from Phoenix_project.models.registry import registry, MODEL_ARTIFACTS_DIR
+# [Phase 5] Import for Backtest Mode
+from Phoenix_project.training.backtest_engine import BacktestEngine
+from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.data_schema import MarketData
 
 logger = get_logger(__name__)
 
@@ -123,6 +130,54 @@ def run_fine_tuning(config: ConfigLoader): # [Fix II.2]
         # 向上抛出异常，以便 Celery 链 (chain) 知道它失败了
         raise
 
+def run_backtest(config: ConfigLoader, dry_run: bool = False):
+    """
+    [Phase 5] Execute System Backtest / Dry Run.
+    """
+    logger.info(f"Starting Backtest (Dry Run: {dry_run})...")
+    
+    if dry_run:
+        # Initialize BacktestEngine with Mocks for System Integrity Check
+        mock_dm = MagicMock()
+        mock_pipeline = PipelineState()
+        mock_cognitive = MagicMock()
+        mock_risk = MagicMock()
+        
+        engine = BacktestEngine(
+            config={},
+            data_manager=mock_dm,
+            pipeline_state=mock_pipeline,
+            cognitive_engine=mock_cognitive,
+            risk_manager=mock_risk
+        )
+        
+        # Mock Data Iterator
+        async def mock_iterator():
+            start_time = datetime.datetime.now(pytz.UTC)
+            for i in range(5): # 5 Steps
+                current_time = start_time + datetime.timedelta(minutes=i)
+                # Mock Market Data Batch
+                md = MarketData(
+                    symbol="BTC/USD", 
+                    timestamp=current_time, 
+                    open=100.0, high=105.0, low=95.0, close=102.0, volume=1000.0
+                )
+                batch = {"market_data": [md]}
+                yield current_time, batch
+                
+        # Run Loop
+        try:
+            asyncio.run(engine.run_backtest(mock_iterator()))
+            logger.info("Dry Run Backtest completed successfully.")
+        except Exception as e:
+            logger.critical(f"Dry Run Failed: {e}", exc_info=True)
+            raise
+            
+    else:
+        # Full Backtest logic (not implemented in this phase)
+        logger.warning("Full backtest mode not yet implemented. Use --dry-run.")
+
+
 def run_walk_forward(config: ConfigLoader): # [Fix II.2]
     """执行步进优化 (Walk-Forward Optimization)"""
     logger.info("Starting Walk-Forward Optimization (WFO)...")
@@ -135,9 +190,10 @@ def main():
     parser = argparse.ArgumentParser(description="Phoenix 训练执行器")
     parser.add_argument(
         "mode",
-        choices=["fine-tune", "walk-forward", "full-retrain"],
+        choices=["fine-tune", "walk-forward", "full-retrain", "backtest"],
         help="要执行的训练模式 (fine-tune, walk-forward, full-retrain)",
     )
+    parser.add_argument("--dry-run", action="store_true", help="Run a quick system check.")
     args = parser.parse_args()
 
     # 加载主配置
@@ -157,6 +213,9 @@ def main():
         logger.info("Full retraining (DRL) requested...")
         # (这可能是一个更长的过程, 暂时指向 fine-tune)
         run_fine_tuning(config)
+        
+    elif args.mode == "backtest":
+        run_backtest(config, dry_run=args.dry_run)
     
     else:
         logger.error(f"未知的训练模式: {args.mode}")
