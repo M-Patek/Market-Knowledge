@@ -214,3 +214,9 @@ ai_components:
   gnn:
     # (用于 GNNInferencer)
     model_path: "/app/models/gnn/v1_saved_model" # (容器内的占位符路径)
+
+8. 评估与安全 (Evaluation & Safety)
+
+evaluation:
+  fact_checker:
+    model_name: "gemini-1.5-flash-latest" # (Flash 适用于快速核查)
