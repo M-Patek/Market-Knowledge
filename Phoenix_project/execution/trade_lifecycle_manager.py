@@ -134,10 +134,11 @@ class TradeLifecycleManager:
         for symbol, pos in self.positions.items():
             current_price = current_market_data.get(symbol)
             
-            # [Phase II Fix] Zombie Valuation: Fail Fast instead of using stale data
+            # [Task 3.3] Valuation Resilience (Limp Mode)
+            # Fallback to Cost Basis if market data is missing, preventing system crash.
             if current_price is None or current_price <= 0:
-                # Critical valuation error - do not guess
-                raise ValueError(f"Valuation Error: Missing market data for {symbol}")
+                logger.warning(f"{self.log_prefix} Valuation Limp Mode: Missing market data for {symbol}. Using Cost Basis.")
+                current_price = pos.average_price
 
             # Calculate in Decimal for safety, though Position model might enforce float
             # Note: Explicit casting Decimal -> float for schema compatibility
