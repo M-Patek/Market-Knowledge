@@ -4,7 +4,7 @@ Defines the L2 output schema: FusionResult.
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 # [Phase III Fix] System Status Enum for Zero Trap Prevention
@@ -19,7 +19,8 @@ class FusionResult(BaseModel):
     This is the primary input for the L3 AlphaAgent.
     """
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique ID for the fusion result.")
-    timestamp: datetime = Field(default_factory=datetime.utcnow, description="Timestamp (UTC) of when the decision was fused.")
+    # [Phase I Fix] Use timezone-aware UTC
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Timestamp (UTC) of when the decision was fused.")
     
     target_symbol: str = Field(..., description="The asset symbol this decision pertains to (e.g., 'AAPL').")
     
@@ -30,8 +31,8 @@ class FusionResult(BaseModel):
     reasoning: str = Field(..., description="A summary of the reasoning, including how L1 evidence was synthesized and conflicts resolved.")
     uncertainty: float = Field(..., description="A quantified score of the overall uncertainty in the decision.", ge=0.0, le=1.0)
     
-    # [Phase III Fix] Added system_status to signal engine health
-    system_status: SystemStatus = Field(default=SystemStatus.OK, description="Operational status of the inference engine (OK, DEGRADED, HALT).")
+    # [Phase I/III Fix] Fail-Closed Default: Default to HALT to prevent executing on silent failures.
+    system_status: SystemStatus = Field(default=SystemStatus.HALT, description="Operational status of the inference engine (OK, DEGRADED, HALT).")
     
     supporting_evidence_ids: List[str] = Field(default_factory=list, description="List of IDs from the L1 EvidenceItems that support this decision.")
     conflicting_evidence_ids: List[str] = Field(default_factory=list, description="List of IDs from L1 EvidenceItems that conflict with this decision.")
@@ -39,3 +40,4 @@ class FusionResult(BaseModel):
 
     class Config:
         frozen = False
+        # Optional: Add use_enum_values = True if needed for simple serialization
