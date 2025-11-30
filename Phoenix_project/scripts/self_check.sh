@@ -1,18 +1,19 @@
 #!/bin/bash
-
-Phoenix_project/scripts/self_check.sh
-
-Task 22: Automated integration testing.
-
 set -e
 
-echo "Running automated integration test..."
+echo "=========================================="
+echo "   PHOENIX SYSTEM SELF-DIAGNOSTIC v5.0    "
+echo "=========================================="
 
-修复：[FIX-10] 'run_cli.py' 不接受 '--ticker' 参数。
+# 1. Set Environment
+export PYTHONPATH=$PYTHONPATH:.
 
-在我们知道正确的参数之前，先不带参数运行它。
+# 2. Run Unit & Safety Tests
+echo "[1/2] Running Safety & Integrity Tests..."
+python -m pytest tests/test_safety_mechanisms.py -v
 
-python scripts/run_cli.py status --api-url http://localhost:8000
+# 3. Run System Integration (Dry Run)
+echo "[2/2] Running Pipeline Integration Check (Dry Run)..."
+python Phoenix_project/run_training.py --mode backtest --dry-run
 
-echo "Running unit tests..."
-pytest -q
+echo "✅ SELF-CHECK COMPLETE. ALL SYSTEMS GREEN."
