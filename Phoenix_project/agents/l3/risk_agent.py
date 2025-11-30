@@ -21,6 +21,14 @@ class RiskAgent(BaseDRLAgent):
         """
         return np.array([1.0], dtype=np.float32)
     
+    async def compute_action(self, observation: np.ndarray, fusion_result: Optional[FusionResult] = None) -> np.ndarray:
+        """[Task 4.1] Hard Override: Bypass NN if L2 signals HALT."""
+        if fusion_result and str(getattr(fusion_result, "decision", "")).upper() in ["HALT", "HALT_TRADING"]:
+            logger.warning("RiskAgent: Hard stop triggered by L2 signal.")
+            return self.get_safe_action()
+            
+        return await super().compute_action(observation)
+    
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
         """
         [Task 6.1] Format observation to match TradingEnv (7-d).
