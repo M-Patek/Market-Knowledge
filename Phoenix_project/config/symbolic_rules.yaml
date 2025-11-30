@@ -31,3 +31,12 @@ rules:
       rule_triggered: "major_positive_analyst_upgrade"
       confidence: 1.0
 
+# [Task 6.2] Externalized Sentiment Mapping
+# Maps decision strings to numeric sentiment scores for use by FusionAgent and RiskAgent
+sentiment_mapping:
+  STRONG_BUY: 1.0
+  BUY: 0.5
+  HOLD: 0.0
+  NEUTRAL: 0.0
+  SELL: -0.5
+  STRONG_SELL: -1.0
