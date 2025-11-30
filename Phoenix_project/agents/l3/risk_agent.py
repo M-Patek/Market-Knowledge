@@ -2,7 +2,7 @@ from typing import Dict, Any, Optional
 import numpy as np
 from .base import BaseDRLAgent
 from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.core.schemas.fusion_result import FusionResult
+from Phoenix_project.core.schemas.fusion_result import FusionResult, SystemStatus
 
 logger = get_logger(__name__)
 
@@ -23,8 +23,17 @@ class RiskAgent(BaseDRLAgent):
     
     async def compute_action(self, observation: np.ndarray, fusion_result: Optional[FusionResult] = None) -> np.ndarray:
         """[Task 4.1] Hard Override: Bypass NN if L2 signals HALT."""
+        
+        # [Safety Phase III] Check System Health First
+        # If the fusion result indicates the system is not OK (e.g. HALT or DEGRADED),
+        # we immediately engage the circuit breaker.
+        if fusion_result and fusion_result.system_status != SystemStatus.OK:
+            logger.warning(f"RiskAgent: Circuit Breaker ENGAGED. System Status: {fusion_result.system_status}")
+            return self.get_safe_action()
+
+        # Secondary check for explicit HALT decision string
         if fusion_result and str(getattr(fusion_result, "decision", "")).upper() in ["HALT", "HALT_TRADING"]:
-            logger.warning("RiskAgent: Hard stop triggered by L2 signal.")
+            logger.warning("RiskAgent: Hard stop triggered by L2 signal string.")
             return self.get_safe_action()
             
         return await super().compute_action(observation)
@@ -52,14 +61,16 @@ class RiskAgent(BaseDRLAgent):
 
         # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
         sentiment = 0.0
-        confidence = 0.5
+        # [Safety Phase III] Zero Trust Default
+        # Default confidence is 0.0 (Unknown = Unsafe), removing optimistic bias of 0.5
+        confidence = 0.0
 
         if fusion_result:
             # [Fix] Map L2 decision string to numeric sentiment for RL observation
             decision_str = str(getattr(fusion_result, "decision", "HOLD")).upper()
             score_map = {"STRONG_BUY": 1.0, "BUY": 0.5, "SELL": -0.5, "STRONG_SELL": -1.0}
             sentiment = score_map.get(decision_str, 0.0)
-            confidence = float(getattr(fusion_result, "confidence", 0.5))
+            confidence = float(getattr(fusion_result, "confidence", 0.0))
 
         # [Task 3.3] Feature Engineering
         norm_balance = (balance / initial_balance) if initial_balance > 0 else 1.0
