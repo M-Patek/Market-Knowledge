@@ -2,6 +2,7 @@
 Agent Executor (智能体执行器)
 负责调度和运行 L1/L2 智能体。
 [Beta Final Fix] 集成 safe_run 调用，确保 L1 智能体的异常被捕获。
+[Task 1.3] Implemented Concurrency Control (Semaphore).
 """
 import logging
 import asyncio
@@ -12,7 +13,7 @@ from omegaconf import DictConfig
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.agents.l1.base import BaseL1Agent
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # [新] 定义用于上下文总线的常量
 AGENT_TASK_TOPIC = "AGENT_TASK"
@@ -37,7 +38,11 @@ class AgentExecutor:
         self.retry_wait_min = self.config.get("retry_wait_min_seconds", 1)
         self.retry_wait_max = self.config.get("retry_wait_max_seconds", 10)
 
-        logger.info(f"AgentExecutor initialized with agents: {list(self.agents.keys())}")
+        # [Task 1.3] Concurrency Control
+        self.max_concurrency = self.config.get("max_concurrency", 50)
+        self.semaphore = asyncio.Semaphore(self.max_concurrency)
+
+        logger.info(f"AgentExecutor initialized with agents: {list(self.agents.keys())}, Max Concurrency: {self.max_concurrency}")
         
         # [实现] 订阅任务主题
         try:
@@ -82,6 +87,7 @@ class AgentExecutor:
     async def execute_task(self, agent_name: str, task: dict):
         """
         [已实现] 异步执行单个任务，包含重试和结果发布。
+        [Task 1.3] Throttled by Semaphore.
         """
         task_id = task.get("task_id", "unknown_task")
         
@@ -100,44 +106,46 @@ class AgentExecutor:
         context = task.get("context", {})
         task_content = task.get("content", {})
 
-        try:
-            # [已实现] 重试逻辑
-            retry_decorator = retry(
-                stop=stop_after_attempt(self.retry_attempts),
-                wait=wait_exponential(min=self.retry_wait_min, max=self.retry_wait_max),
-                reraise=True
-            )
-            
-            # Create a partial or bound async function for tenacity to retry
-            async_agent_runner = retry_decorator(self._run_agent_with_retry)
-            result = await async_agent_runner(agent, task_content, context)
-            
-            logger.info(f"Task {task_id} on {agent_name} completed successfully.")
-            result_payload = {
-                "task_id": task_id,
-                "agent_name": agent_name,
-                "status": "SUCCESS",
-                "result": result 
-            }
-            
-        except RetryError as e:
-            logger.error(f"Task {task_id} on {agent_name} failed after {self.retry_attempts} attempts: {e}", exc_info=True)
-            result_payload = {
-                "task_id": task_id,
-                "agent_name": agent_name,
-                "status": "ERROR",
-                "error": f"Task failed after retries: {str(e.last_exception)}",
-                "exception_type": type(e.last_exception).__name__
-            }
-        except Exception as e:
-            logger.error(f"Task {task_id} on {agent_name} failed unexpectedly: {e}", exc_info=True)
-            result_payload = {
-                "task_id": task_id,
-                "agent_name": agent_name,
-                "status": "ERROR",
-                "error": str(e),
-                "exception_type": type(e).__name__
-            }
+        # [Task 1.3] Guard execution with Semaphore to prevent OOM
+        async with self.semaphore:
+            try:
+                # [已实现] 重试逻辑
+                retry_decorator = retry(
+                    stop=stop_after_attempt(self.retry_attempts),
+                    wait=wait_exponential(min=self.retry_wait_min, max=self.retry_wait_max),
+                    reraise=True
+                )
+                
+                # Create a partial or bound async function for tenacity to retry
+                async_agent_runner = retry_decorator(self._run_agent_with_retry)
+                result = await async_agent_runner(agent, task_content, context)
+                
+                logger.info(f"Task {task_id} on {agent_name} completed successfully.")
+                result_payload = {
+                    "task_id": task_id,
+                    "agent_name": agent_name,
+                    "status": "SUCCESS",
+                    "result": result 
+                }
+                
+            except RetryError as e:
+                logger.error(f"Task {task_id} on {agent_name} failed after {self.retry_attempts} attempts: {e}", exc_info=True)
+                result_payload = {
+                    "task_id": task_id,
+                    "agent_name": agent_name,
+                    "status": "ERROR",
+                    "error": f"Task failed after retries: {str(e.last_exception)}",
+                    "exception_type": type(e.last_exception).__name__
+                }
+            except Exception as e:
+                logger.error(f"Task {task_id} on {agent_name} failed unexpectedly: {e}", exc_info=True)
+                result_payload = {
+                    "task_id": task_id,
+                    "agent_name": agent_name,
+                    "status": "ERROR",
+                    "error": str(e),
+                    "exception_type": type(e).__name__
+                }
             
         self.context_bus.publish(AGENT_RESULT_TOPIC, result_payload)
         return result_payload
