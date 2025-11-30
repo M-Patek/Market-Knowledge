@@ -13,9 +13,10 @@ FIX (E1, E2, E4):
 [主人喵的修复]
 6. 添加 TargetPosition 和 TargetPortfolio，供 PortfolioConstructor 和 RiskManager 使用。
 [Phase I Fix] Decimal Refactoring for Financial Precision.
+[Task 2.1] Implemented Enums, Physics Constraints, and Precision Guards.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, Dict, Any, List, Union
 from decimal import Decimal
 from datetime import datetime
@@ -38,6 +39,23 @@ class MarketData(BaseModel):
     volume: Decimal = Field(..., description="成交量")
     ingestion_batch_id: Optional[UUID] = Field(None, description="[Task 3] Atomic batch ID for ingestion tracking.")
     
+    # [Task 2.1] Precision Guard: Force Float -> Str -> Decimal conversion
+    @field_validator('open', 'high', 'low', 'close', 'volume', mode='before')
+    @classmethod
+    def float_to_decimal(cls, v: Any) -> Decimal:
+        if isinstance(v, float):
+            return Decimal(str(v))
+        return v
+
+    # [Task 2.1] Enforce Physics
+    @model_validator(mode='after')
+    def check_physics(self) -> 'MarketData':
+        if self.high < self.low:
+            raise ValueError(f"High ({self.high}) cannot be less than Low ({self.low})")
+        if self.volume < 0:
+            raise ValueError(f"Volume ({self.volume}) cannot be negative")
+        return self
+
     class Config:
         frozen = True
 
@@ -72,6 +90,14 @@ class EconomicIndicator(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict, description="其他元数据 (e.g., 'country')")
     ingestion_batch_id: Optional[UUID] = Field(None, description="[Task 3] Atomic batch ID for ingestion tracking.")
 
+    @field_validator('value', 'expected', 'previous', mode='before')
+    @classmethod
+    def float_to_decimal(cls, v: Any) -> Optional[Decimal]:
+        if v is None: return None
+        if isinstance(v, float):
+            return Decimal(str(v))
+        return v
+
     class Config:
         frozen = True
 
@@ -88,15 +114,29 @@ class KGNode(BaseModel):
 # --- 交易执行 (Trading & Execution) ---
 # FIX (E2, E4): 从 execution/interfaces.py 移入并标准化
 
+class SignalType(str, Enum):
+    """[Task 2.1] Strict Enum for Signal Types"""
+    BUY = "BUY"
+    SELL = "SELL"
+    HOLD = "HOLD"
+
 class Signal(BaseModel):
     """
     交易信号。由认知层生成，由投资组合构造器消费。
     """
     symbol: str = Field(..., description="资产代码")
     timestamp: datetime = Field(..., description="信号生成时间 (UTC)")
-    signal_type: str = Field(..., description="信号类型 (e.g., 'BUY', 'SELL', 'HOLD')")
+    # [Task 2.1] Use Enum
+    signal_type: SignalType = Field(..., description="信号类型 (BUY, SELL, HOLD)")
     strength: Decimal = Field(..., description="信号强度 (e.g., 0.0 to 1.0)", ge=0.0, le=1.0)
     metadata: Dict[str, Any] = Field(default_factory=dict, description="信号来源、原因等元数据")
+
+    @field_validator('strength', mode='before')
+    @classmethod
+    def float_to_decimal(cls, v: Any) -> Decimal:
+        if isinstance(v, float):
+            return Decimal(str(v))
+        return v
 
 class OrderStatus(str, Enum):
     """
@@ -126,6 +166,14 @@ class Order(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow, description="订单创建时间 (UTC)")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="其他元数据")
 
+    @field_validator('quantity', 'limit_price', mode='before')
+    @classmethod
+    def float_to_decimal(cls, v: Any) -> Optional[Decimal]:
+        if v is None: return None
+        if isinstance(v, float):
+            return Decimal(str(v))
+        return v
+
 class Fill(BaseModel):
     """
     成交回报 (原 Execution)。
@@ -137,6 +185,13 @@ class Fill(BaseModel):
     quantity: Decimal = Field(..., description="成交数量 (正数为买入, 负数为卖出)")
     price: Decimal = Field(..., description="成交价格")
     commission: Decimal = Field(Decimal("0.0"), description="手续费")
+
+    @field_validator('quantity', 'price', 'commission', mode='before')
+    @classmethod
+    def float_to_decimal(cls, v: Any) -> Decimal:
+        if isinstance(v, float):
+            return Decimal(str(v))
+        return v
 
 # --- 投资组合状态 (Portfolio State) ---
 
@@ -150,6 +205,13 @@ class Position(BaseModel):
     market_value: Decimal = Field(..., description="当前市值")
     unrealized_pnl: Decimal = Field(..., description="未实现盈亏")
 
+    @field_validator('quantity', 'average_price', 'market_value', 'unrealized_pnl', mode='before')
+    @classmethod
+    def float_to_decimal(cls, v: Any) -> Decimal:
+        if isinstance(v, float):
+            return Decimal(str(v))
+        return v
+
 class PortfolioState(BaseModel):
     """
     整个投资组合在特定时间点的快照。
@@ -160,6 +222,13 @@ class PortfolioState(BaseModel):
     positions: Dict[str, Position] = Field(default_factory=dict, description="当前持仓")
     realized_pnl: Decimal = Field(Decimal("0.0"), description="已实现盈亏")
 
+    @field_validator('cash', 'total_value', 'realized_pnl', mode='before')
+    @classmethod
+    def float_to_decimal(cls, v: Any) -> Decimal:
+        if isinstance(v, float):
+            return Decimal(str(v))
+        return v
+
 # --- [主人喵的修复] 新增：目标投资组合模式 ---
 
 class TargetPosition(BaseModel):
@@ -169,6 +238,13 @@ class TargetPosition(BaseModel):
     symbol: str = Field(..., description="资产代码")
     target_weight: Decimal = Field(..., description="目标投资组合权重 (e.g., 0.1 for 10%, -0.05 for -5%)")
     reasoning: str = Field("N/A", description="做出此分配的理由")
+
+    @field_validator('target_weight', mode='before')
+    @classmethod
+    def float_to_decimal(cls, v: Any) -> Decimal:
+        if isinstance(v, float):
+            return Decimal(str(v))
+        return v
 
 class TargetPortfolio(BaseModel):
     """
