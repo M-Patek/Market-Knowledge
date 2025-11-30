@@ -9,6 +9,8 @@ from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.core.schemas.fusion_result import FusionResult
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 from Phoenix_project.core.exceptions import CognitiveError
+# [Task 1.1 Fix] Import get_logger to prevent NameError
+from Phoenix_project.monitor.logging import get_logger
 
 # 依赖组件接口
 from Phoenix_project.agents.l2.fusion_agent import FusionAgent
@@ -55,7 +57,7 @@ class ReasoningEnsemble:
         
         try:
             # 1. 准备依赖数据 (L1 Insights)
-            # [拆包逻辑] 从 PipelineState 中提取并清洗数据
+            # [Task 1.1 Fix] 拆包逻辑适配 List[EvidenceItem]
             raw_insights = state.l1_insights
             dependencies = self._unwrap_dependencies(raw_insights)
             
@@ -65,17 +67,9 @@ class ReasoningEnsemble:
 
             # 2. L2 Fusion (融合)
             logger.info(f"Running L2 Fusion on {len(dependencies)} items...")
-            fusion_result = None
             
-            # [Task 3.3] Standardized Request-Response Protocol (No more generator guesswork)
-            # Direct await allows for a cleaner contract with the Agent
-            raw_result = await self.fusion_agent.run(state=state, dependencies=dependencies)
-            
-            # Handle List return type (if Agent returns batch) vs Single Object
-            if isinstance(raw_result, list):
-                fusion_result = raw_result[0] if raw_result else None
-            else:
-                fusion_result = raw_result
+            # [Task 1.3 Fix] Standardized Sync: await direct return, no generator
+            fusion_result = await self.fusion_agent.run(state=state, dependencies=dependencies)
 
             if not fusion_result:
                 logger.error("L2 Fusion Agent yielded no results.")
@@ -102,45 +96,15 @@ class ReasoningEnsemble:
             # [最终兜底] 无论发生什么，都返回一个安全的对象
             return self._create_fallback_result(state, target_symbol, f"Critical Ensemble Error: {str(e)}")
 
-    def _unwrap_dependencies(self, raw_insights: Dict[str, Any]) -> List[EvidenceItem]:
+    def _unwrap_dependencies(self, raw_insights: List[EvidenceItem]) -> List[EvidenceItem]:
         """
-        [清洗逻辑] 从可能被过度包装的 L1 结果中提取 EvidenceItem。
-        处理: Dict[str, EvidenceItem] 或 Dict[str, {'result': ..., 'status': ...}]
+        [Task 1.1 Fix] 清洗逻辑优化：直接处理 List[EvidenceItem]
         """
-        valid_items = []
         if not raw_insights:
-            return valid_items
-
-        for key, value in raw_insights.items():
-            # 情况 A: 已经是 EvidenceItem 对象
-            if isinstance(value, EvidenceItem):
-                valid_items.append(value)
-                continue
-            
-            # 情况 B: Executor 包装的信封 {'status': 'SUCCESS', 'result': ...}
-            if isinstance(value, dict) and "result" in value:
-                inner_result = value["result"]
-                if isinstance(inner_result, EvidenceItem):
-                    valid_items.append(inner_result)
-                    continue
-                # 尝试从字典恢复
-                if isinstance(inner_result, dict):
-                    try:
-                        item = EvidenceItem.model_validate(inner_result)
-                        valid_items.append(item)
-                        continue
-                    except:
-                        pass
-            
-            # 情况 C: 裸字典
-            if isinstance(value, dict):
-                try:
-                    item = EvidenceItem.model_validate(value)
-                    valid_items.append(item)
-                except:
-                    pass
-                    
-        return valid_items
+            return []
+        
+        # Filter and ensure type safety
+        return [item for item in raw_insights if isinstance(item, EvidenceItem)]
 
     async def _apply_fact_check(self, fusion_result: FusionResult):
         """
@@ -162,7 +126,7 @@ class ReasoningEnsemble:
                 fusion_result.confidence = 0.0
                 fusion_result.reasoning += "\n[FACT-CHECK]: Reasoning Unverified/Refuted. Decision neutralized."
             else:
-                # [Optimization] Removed magic number boosting (+0.1) for purity
+                # [Task 1.2 Fix] Removed magic number logic (+0.1) - Purity
                 pass
                 
         except Exception as e:
