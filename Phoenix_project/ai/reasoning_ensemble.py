@@ -18,7 +18,7 @@ from Phoenix_project.evaluation.arbitrator import Arbitrator
 from Phoenix_project.evaluation.fact_checker import FactChecker
 from Phoenix_project.data_manager import DataManager
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class ReasoningEnsemble:
     """
@@ -67,11 +67,15 @@ class ReasoningEnsemble:
             logger.info(f"Running L2 Fusion on {len(dependencies)} items...")
             fusion_result = None
             
-            # 调用 FusionAgent (它现在是一个 AsyncGenerator，或者我们需要适配它的 run 方法)
-            # 假设 FusionAgent.run 返回 AsyncGenerator[FusionResult, None]
-            async for result in self.fusion_agent.run(state=state, dependencies=dependencies):
-                fusion_result = result
-                break # 只取第一个结果
+            # [Task 3.3] Standardized Request-Response Protocol (No more generator guesswork)
+            # Direct await allows for a cleaner contract with the Agent
+            raw_result = await self.fusion_agent.run(state=state, dependencies=dependencies)
+            
+            # Handle List return type (if Agent returns batch) vs Single Object
+            if isinstance(raw_result, list):
+                fusion_result = raw_result[0] if raw_result else None
+            else:
+                fusion_result = raw_result
 
             if not fusion_result:
                 logger.error("L2 Fusion Agent yielded no results.")
