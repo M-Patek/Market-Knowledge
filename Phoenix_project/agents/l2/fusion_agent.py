@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import List, Any, AsyncGenerator, Optional
+from typing import List, Any, Optional
 
 from Phoenix_project.agents.l2.base import L2Agent
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
@@ -19,18 +19,17 @@ class FusionAgent(L2Agent):
     审查所有 L1 和 L2 的证据，融合冲突信息，并得出最终的 L2 决策。
     """
 
-    async def run(self, state: PipelineState, dependencies: List[Any]) -> AsyncGenerator[FusionResult, None]:
+    async def run(self, state: PipelineState, dependencies: List[Any]) -> FusionResult:
         """
         异步运行智能体，以融合所有 L1/L2 证据。
-        此智能体运行一次（不使用 gather），产出一个 FusionResult。
-        [Refactored Phase 3.2] 适配 PipelineState，增加鲁棒性和兜底机制。
+        [Task 1.3 Fix] Changed from AsyncGenerator to Direct Return.
         
         参数:
             state (PipelineState): 当前管道状态 (提供时间与上下文)。
             dependencies (List[Any]): 上游 L1/L2 的输出列表 (EvidenceItem)。
 
         收益:
-            AsyncGenerator[FusionResult, None]: 异步生成 *单一* 的 FusionResult 对象。
+            FusionResult: 返回 *单一* 的 FusionResult 对象。
         """
         # 1. 确定目标 Symbol
         target_symbol = state.main_task_query.get("symbol", "UNKNOWN")
@@ -52,9 +51,8 @@ class FusionAgent(L2Agent):
                         logger.warning(f"[{self.agent_id}] Failed to recover evidence item: {e}")
 
         if not evidence_items:
-            logger.warning(f"[{self.agent_id}] No valid EvidenceItems found. Yielding fallback result.")
-            yield self._create_fallback_result(state, target_symbol, "No evidence provided.")
-            return
+            logger.warning(f"[{self.agent_id}] No valid EvidenceItems found. Returning fallback result.")
+            return self._create_fallback_result(state, target_symbol, "No evidence provided.")
 
         logger.info(f"[{self.agent_id}] Found {len(evidence_items)} total evidence items (L1+L2) to fuse.")
 
@@ -80,8 +78,7 @@ class FusionAgent(L2Agent):
 
             if not response_str:
                 logger.warning(f"[{self.agent_id}] LLM returned empty response.")
-                yield self._create_fallback_result(state, target_symbol, "LLM returned empty response.")
-                return
+                return self._create_fallback_result(state, target_symbol, "LLM returned empty response.")
 
             # 5. 解析和验证 FusionResult
             logger.debug(f"[{self.agent_id}] Received LLM fusion response (raw): {response_str[:200]}...")
@@ -105,8 +102,6 @@ class FusionAgent(L2Agent):
                         json_str = clean_str[start_index : i+1]
                         break
             
-            # Fallback: if stack parsing failed (e.g. incomplete json), try loading original cleaned string
-            # or rely on json.loads to catch it later.
             if json_str:
                 clean_str = json_str
 
@@ -128,14 +123,15 @@ class FusionAgent(L2Agent):
                     response_data["decision"] = "HOLD"
 
             # [Fix Phase II] Synthesize numeric sentiment from decision if missing
-            # 防止 L3 看到 "0.0" 的情感值即使决策是 "STRONG BUY"
             if "sentiment" not in response_data:
-                d = response_data.get("decision", "HOLD").upper()
-                if "STRONG_BUY" in d: response_data["sentiment"] = 1.0
-                elif "BUY" in d: response_data["sentiment"] = 0.5
-                elif "STRONG_SELL" in d: response_data["sentiment"] = -1.0
-                elif "SELL" in d: response_data["sentiment"] = -0.5
-                else: response_data["sentiment"] = 0.0
+                # [Task 6.2 Fix] Externalized sentiment mapping
+                decision_key = response_data.get("decision", "HOLD").upper().replace(" ", "_")
+                
+                # Load mapping from config or use safe defaults
+                default_mapping = {"STRONG_BUY": 1.0, "BUY": 0.5, "HOLD": 0.0, "NEUTRAL": 0.0, "SELL": -0.5, "STRONG_SELL": -1.0}
+                mapping = self.config.get("sentiment_mapping", default_mapping)
+                
+                response_data["sentiment"] = mapping.get(decision_key, 0.0)
 
             # 2. Ensure confidence is float
             if "confidence" in response_data:
@@ -166,19 +162,19 @@ class FusionAgent(L2Agent):
             
             logger.info(f"[{self.agent_id}] Successfully generated FusionResult. Decision: {fusion_result.decision}")
             
-            yield fusion_result
+            return fusion_result
 
         except json.JSONDecodeError as e:
             logger.error(f"[{self.agent_id}] Failed to decode LLM JSON response for fusion task. Error: {e}")
-            yield self._create_fallback_result(state, target_symbol, f"JSON Decode Error: {e}")
+            return self._create_fallback_result(state, target_symbol, f"JSON Decode Error: {e}")
             
         except ValidationError as e:
             logger.error(f"[{self.agent_id}] Failed to validate FusionResult schema. Error: {e}")
-            yield self._create_fallback_result(state, target_symbol, f"Schema Validation Error: {e}")
+            return self._create_fallback_result(state, target_symbol, f"Schema Validation Error: {e}")
             
         except Exception as e:
             logger.error(f"[{self.agent_id}] An unexpected error occurred during fusion task. Error: {e}")
-            yield self._create_fallback_result(state, target_symbol, f"Unexpected Error: {e}")
+            return self._create_fallback_result(state, target_symbol, f"Unexpected Error: {e}")
 
     def _create_fallback_result(self, state: PipelineState, symbol: str, reason: str) -> FusionResult:
         """
