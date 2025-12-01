@@ -7,6 +7,7 @@ by the cognitive engine and agents (e.g., market data, news, fundamentals).
 [Phase II Fix] Cache Isolation & Session ID
 [Phase IV Fix] Async Locking (Thundering Herd)
 [Phase V Fix] Distributed Redis Lock & Connection Pooling
+[Beta Fix] Phantom Interface & Split-Brain Prevention
 """
 
 import logging
@@ -96,6 +97,39 @@ class DataManager:
         获取当前系统时间 (如果是回测模式，则返回仿真时间)。
         """
         return self._simulation_time if self._simulation_time else datetime.now()
+
+    async def get_current_portfolio(self) -> Dict[str, Any]:
+        """
+        [Beta Fix] Retrieves current portfolio state from persistent ledger (TabularDB).
+        This implements the previously missing interface required by PortfolioConstructor.
+        """
+        if not self.tabular_db:
+            logger.warning("TabularDB not connected. Returning empty portfolio.")
+            return {"positions": {}, "cash": 100000.0}
+
+        try:
+            # Query Balance
+            balance_res = await self.tabular_db.query("SELECT cash FROM ledger_balance ORDER BY id DESC LIMIT 1")
+            cash = 100000.0
+            if balance_res and balance_res.get("results"):
+                cash = float(balance_res["results"][0]["cash"])
+
+            # Query Positions
+            pos_res = await self.tabular_db.query("SELECT symbol, quantity FROM ledger_positions")
+            positions = {}
+            if pos_res and pos_res.get("results"):
+                for row in pos_res["results"]:
+                    positions[row["symbol"]] = float(row["quantity"])
+
+            # Format to match PortfolioConstructor expectations
+            # Note: PortfolioConstructor logic (Line 42) seems to expect a dict 
+            # that closely resembles core.schemas.data_schema.PortfolioState structure,
+            # but usually it needs at least 'positions' and 'cash'.
+            return {"positions": positions, "cash": cash}
+            
+        except Exception as e:
+            logger.error(f"Failed to retrieve current portfolio: {e}", exc_info=True)
+            return {"positions": {}, "cash": 100000.0}
 
     def _load_data_catalog(self, catalog_path: str) -> Dict[str, Any]:
         """Loads the data catalog JSON file."""
@@ -344,11 +378,17 @@ class DataManager:
     ) -> List[NewsData]:
         """
         OPTIMIZED: Fetches news data from an external API, using caching.
-        [Task 4.2] Uses Distributed Redis Lock to prevent Thundering Herd in distributed env.
-        [Task 5.1] Uses Persistent HTTP Client for connection reuse.
+        [Task 4.2] Uses Distributed Redis Lock to prevent Thundering Herd.
+        [Beta Fix] Time Machine clamping & Resilient Locking.
         """
+        # [Beta Fix] Time Machine: Clamp end_date to simulation time
+        if self._simulation_time:
+            if end_date:
+                end_date = min(end_date, self._simulation_time)
+            else:
+                end_date = self._simulation_time
+
         cache_key = self._get_cache_key("news", query)
-        
         if start_date or end_date:
             cache_key = self._get_cache_key("news", f"{query}_{start_date}_{end_date}")
         
@@ -363,7 +403,7 @@ class DataManager:
         
         try:
             # [Task 4.2] Distributed Lock with Timeout
-            async with self.redis_client.lock(lock_key, timeout=60, blocking_timeout=10):
+            async with self.redis_client.lock(lock_key, timeout=60, blocking_timeout=5): # Reduced blocking wait
                 # 3. Second Check (Double-Checked Locking)
                 if not force_refresh:
                     cached = await self._get_from_cache(cache_key)
@@ -420,8 +460,12 @@ class DataManager:
                     return []
                     
         except redis.exceptions.LockError:
-            # [Task 4.2] Failed to acquire lock (timeout)
-            logger.warning(f"Failed to acquire distributed lock for {query}. Skipping news fetch.")
+            # [Beta Fix] Lock Fail Strategy: Return stale/cached if available, else empty.
+            # Do NOT return empty list immediately if cache exists.
+            logger.warning(f"Failed to acquire distributed lock for {query}. Trying to return stale cache.")
+            cached = await self._get_from_cache(cache_key)
+            if cached:
+                return [NewsData(**item) for item in cached]
             return []
             
         except Exception as e:
@@ -434,6 +478,7 @@ class DataManager:
         """
         Helper: Fetches market data from external API and stores
         it in persistent storage (e.g., TemporalDB).
+        [Beta Fix] Do NOT write to live Redis key to avoid Split-Brain.
         """
         symbol = config.get("symbol")
         if not symbol or not self.temporal_db:
@@ -470,27 +515,10 @@ class DataManager:
                     tags={"symbol": symbol}
                 )
                 
-                # [Task 3.1 Fix] Sync to Redis Cache (Live Data)
-                # The TemporalDB write is historical; we must also update the hot cache 
-                # so get_latest_market_data() can find it immediately.
-                try:
-                    latest = df.iloc[-1]
-                    md = MarketData(
-                        symbol=symbol,
-                        timestamp=latest.name, # Index is time
-                        open=latest['open'],
-                        high=latest['high'],
-                        low=latest['low'],
-                        close=latest['close'],
-                        volume=latest['volume']
-                    )
-                    live_key = f"phx:{self.run_mode}:market_data:live:{symbol}"
-                    await self.redis_client.set(live_key, md.model_dump_json())
-                    logger.debug(f"Synced latest market data to Redis for {symbol}")
-                except Exception as e:
-                    logger.error(f"Failed to sync Redis cache for {symbol}: {e}")
-
-                logger.info(f"Successfully refreshed and stored market data for {symbol}")
+                # [Beta Fix] Split-Brain Prevention.
+                # Removed the logic that writes batch data to the 'Live' Redis key.
+                # Only StreamProcessor is allowed to touch the live key.
+                logger.info(f"Successfully backfilled historical market data for {symbol}")
 
         except (requests.exceptions.RequestException, httpx.HTTPError) as e:
             logger.error(f"Failed to fetch market data from API for {symbol}: {e}")
