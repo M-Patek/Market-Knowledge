@@ -15,6 +15,7 @@ class OrderManager:
     订单管理器 (Order Manager)
     负责将 TargetPortfolio 转换为具体的 Order，并管理订单生命周期。
     [Task 5.2] Concurrent Execution & Zombie Position Fix
+    [Beta FIX] "Machine Gun" Loop Prevention & Time Travel Fix
     """
 
     def __init__(self, broker_adapter: Optional[IBrokerAdapter], data_manager: DataManager):
@@ -38,22 +39,44 @@ class OrderManager:
         target_holdings = {p.symbol for p in target_portfolio.positions}
         relevant_symbols = current_holdings.union(target_holdings)
 
+        # [Beta FIX] Parallel Market Data Fetch (Serial IO Slippage Fix)
         market_prices: Dict[str, Decimal] = {}
         
-        # 获取所有相关资产的最新价格
-        for sym in relevant_symbols:
-            md = await self.data_manager.get_latest_market_data(sym)
-            if not md:
+        # Prepare fetch tasks
+        fetch_tasks = []
+        symbol_list = list(relevant_symbols)
+        for sym in symbol_list:
+            fetch_tasks.append(self.data_manager.get_latest_market_data(sym))
+        
+        # Execute parallel fetch
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        
+        for sym, res in zip(symbol_list, results):
+            if isinstance(res, Exception) or not res:
                 logger.warning(f"{self.log_prefix} Market data missing for {sym}. Skipping.")
                 continue
-            market_prices[sym] = Decimal(str(md.close))
+            market_prices[sym] = Decimal(str(res.close))
 
         orders_to_submit: List[Order] = []
         current_positions = state.portfolio_state.positions if state.portfolio_state else {}
 
-        # --- 核心 Diff 逻辑 (此前被略写的部分) ---
+        # --- 核心 Diff 逻辑 ---
         for symbol in relevant_symbols:
             if symbol not in market_prices:
+                continue
+
+            # [Beta FIX] "Machine Gun" Prevention (In-Flight Check)
+            # Check if we already have an active order for this symbol.
+            # If so, SKIP reconciliation to prevent duplicate orders (double spending).
+            has_active_order = False
+            async with self.lock:
+                for active_order in self.active_orders.values():
+                    if active_order.symbol == symbol and active_order.status in [OrderStatus.PENDING_SUBMISSION, OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED]:
+                        has_active_order = True
+                        break
+            
+            if has_active_order:
+                logger.info(f"{self.log_prefix} Skipping {symbol} due to active in-flight order.")
                 continue
 
             price = market_prices[symbol]
@@ -82,6 +105,11 @@ class OrderManager:
             side = OrderSide.BUY if delta > 0 else OrderSide.SELL
             abs_qty = float(abs(delta))
             
+            # [Beta FIX] Time Travel Prevention
+            # Use the timestamp from the PortfolioState (synchronized simulation time)
+            # instead of datetime.now() (physical server time).
+            order_time = state.timestamp if state.timestamp else datetime.utcnow()
+
             # 创建订单对象
             # 注意：实际生产中可能需要考虑 limit_price (限价) 或 slippage (滑点)
             order = Order(
@@ -89,7 +117,7 @@ class OrderManager:
                 side=side,
                 order_type=OrderType.MARKET, # 默认为市价单以保证成交
                 quantity=abs_qty,
-                timestamp=datetime.now(),
+                timestamp=order_time,
                 status=OrderStatus.PENDING_SUBMISSION
             )
             
