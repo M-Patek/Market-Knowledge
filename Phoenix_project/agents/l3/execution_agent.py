@@ -8,34 +8,28 @@ from Phoenix_project.core.schemas.fusion_result import FusionResult
 class ExecutionAgent(BaseDRLAgent):
     """
     L3 Execution 智能体。
-    负责根据 L2 分析和市场状态，决定执行策略（如 TWAP, VWAP 等，或简单的执行强度）。
+    负责根据 L2 分析和市场状态，决定执行策略。
+    [Beta FIX] Aligned with 9-dim observation space.
     """
     
     def get_safe_action(self) -> np.ndarray:
         """
         [Safety] Returns neutral zero vector.
-        Fixed: Must return np.ndarray, not None.
         """
         return np.array([0.0], dtype=np.float32)
 
     async def compute_action(self, observation: np.ndarray) -> np.ndarray:
-        """[Task 4.1] Deprecated / Pass-Through."""
-        return self.get_safe_action()
+        """
+        [Task 4.1] Standard inference logic.
+        """
+        return await super().compute_action(observation)
 
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
         """
-        [Task 6.2] Format observation to match TradingEnv (9-d).
-        Includes Micro-structure features (Spread, Depth Imbalance).
-        Vector: [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence, MarketRegime, Spread, Imbalance]
-        
-        Args:
-            state_data (dict): {'balance', 'initial_balance', 'position_weight', 'price', 'prev_price', 'volume', 'spread', 'depth_imbalance'}
-            fusion_result (FusionResult): 来自 L2 认知引擎的分析结果。
-
-        Returns:
-            np.ndarray: (9,) float32 vector.
+        [Beta FIX] Confirmed 9-Dimensions.
+        Vector: [NormBalance, PositionWeight, LogReturn, LogVolume, Sentiment, Confidence, Regime, Spread, Imbalance]
         """
-        # 1. 从 state_data 中提取市场状态
+        # 1. State Data
         balance = state_data.get('balance', 0.0)
         initial_balance = state_data.get('initial_balance', balance)
         position_weight = state_data.get('position_weight', 0.0)
@@ -43,16 +37,15 @@ class ExecutionAgent(BaseDRLAgent):
         prev_price = state_data.get('prev_price', price)
         volume = state_data.get('volume', 0.0)
         
-        # [Task 6.2] Extract Micro-structure
+        # Microstructure
         spread = state_data.get('spread', 0.0)
         depth_imbalance = state_data.get('depth_imbalance', 0.0)
 
-        # 2. (关键) 从 L2 FusionResult 中提取 L2 特征
+        # 2. L2 Features
         sentiment = 0.0
         confidence = 0.5
         
         if fusion_result:
-            # 映射字符串决策到数值情感
             decision_map = {
                 "STRONG_BUY": 1.0, 
                 "BUY": 0.5, 
@@ -60,14 +53,11 @@ class ExecutionAgent(BaseDRLAgent):
                 "SELL": -0.5, 
                 "STRONG_SELL": -1.0
             }
-            # 获取 decision 字段，默认 HOLD
             decision_str = getattr(fusion_result, 'decision', 'HOLD')
             sentiment = decision_map.get(str(decision_str).upper(), 0.0)
-            
-            # 获取 confidence 字段
             confidence = getattr(fusion_result, 'confidence', 0.5)
 
-        # [Task 3.3] Feature Engineering
+        # 3. Calculations
         norm_balance = (balance / initial_balance) if initial_balance > 0 else 1.0
         
         log_return = 0.0
@@ -76,14 +66,13 @@ class ExecutionAgent(BaseDRLAgent):
             
         log_volume = np.log(volume + 1.0)
 
-        # [Task 6.1] Macro Feature
         regime_val = 0.0
         if market_state:
             regime = str(market_state.get('regime', 'NEUTRAL')).upper()
             if 'BULL' in regime: regime_val = 1.0
             elif 'BEAR' in regime: regime_val = -1.0
 
-        # 3. Construct 9-d State Vector
+        # 4. Construct 9-d State Vector
         obs = np.array([
             norm_balance,
             position_weight,
@@ -92,8 +81,8 @@ class ExecutionAgent(BaseDRLAgent):
             sentiment,
             confidence,
             regime_val,
-            spread,           # [Task 6.2]
-            depth_imbalance   # [Task 6.2]
+            spread,
+            depth_imbalance
         ], dtype=np.float32)
         
         return obs
