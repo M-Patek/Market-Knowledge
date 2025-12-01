@@ -18,24 +18,34 @@ class BaseDRLAgent(ABC):
     [任务 4.1] 更新:
     - __init__ 现在存储加载的 RLLib Algorithm。
     - 实现了 compute_action 方法 (Task 0.2 Async)。
+    
+    [Beta FIX] Removed Procrustean Bed (Fixed Dimension).
+    Now dynamically adapts to the model's observation space.
     """
     
-    def __init__(self, algorithm: Algorithm):
+    def __init__(self, algorithm: Algorithm, policy_id: str = "default_policy"):
         """
         [任务 4.1] 构造函数现在接收一个已加载的 RLLib 算法实例。
         """
         if not isinstance(algorithm, Algorithm):
             raise ValueError(f"Expected ray.rllib.algorithms.algorithm.Algorithm, got {type(algorithm)}")
         self.algorithm = algorithm
+        self.policy_id = policy_id # [Beta FIX] Bind to specific policy
         self.logger = get_logger(self.__class__.__name__)
-        self.logger.info(f"DRL Agent ({self.__class__.__name__}) initialized with algorithm.")
         
-        # [Task 3.1] Initialize Internal Memory (Hidden States)
-        # Required for LSTM/GRU to maintain context across time steps.
+        # [Beta FIX] Dynamic Dimension Detection
         try:
-            self.internal_state = self.algorithm.get_policy().get_initial_state()
+            policy = self.algorithm.get_policy(self.policy_id)
+            if policy:
+                self.expected_dim = policy.observation_space.shape[0]
+                self.logger.info(f"DRL Agent initialized. Policy: {self.policy_id}, Expected Obs Dim: {self.expected_dim}")
+                self.internal_state = policy.get_initial_state()
+            else:
+                raise ValueError(f"Policy '{self.policy_id}' not found in algorithm.")
         except Exception as e:
-            self.logger.warning(f"State initialization failed (defaulting to stateless): {e}")
+            self.logger.error(f"Failed to inspect policy or initialize state: {e}")
+            # Fallback to standard 9 dim if inspection fails, but log critical error
+            self.expected_dim = 9 
             self.internal_state = []
 
     @abstractmethod
@@ -44,7 +54,6 @@ class BaseDRLAgent(ABC):
         (抽象方法)
         子类 (Alpha, Risk, Exec) 必须实现此方法。
         它将 Phoenix 状态 转换为 匹配 TradingEnv 的 np.ndarray。
-        [Task 6.1] Added market_state for macro awareness.
         """
         pass
     
@@ -67,27 +76,25 @@ class BaseDRLAgent(ABC):
         """
         [任务 4.1 & 0.2] 完成“神经连接”。
         使用加载的 RLLib 算法计算确定性动作。
-        
-        [Fix 0.2] 使用 asyncio.to_thread 防止阻塞主事件循环。
-        (由 Orchestrator 调用)
         """
-        # [Phase III Fix] Input Dimension Validation & Self-Healing
-        EXPECTED_DIM = 7
-        if observation.shape != (EXPECTED_DIM,):
-            self.logger.warning(f"Observation shape mismatch: Expected ({EXPECTED_DIM},), got {observation.shape}. Auto-correcting.")
-            if observation.shape[0] < EXPECTED_DIM:
-                observation = np.pad(observation, (0, EXPECTED_DIM - observation.shape[0]), 'constant')
-            elif observation.shape[0] > EXPECTED_DIM:
-                observation = observation[:EXPECTED_DIM]
+        # [Beta FIX] Strict Dimension Validation (No Auto-Truncation)
+        if observation.shape[0] != self.expected_dim:
+            self.logger.critical(
+                f"Observation shape mismatch! Expected ({self.expected_dim},), got {observation.shape}. "
+                "This indicates a logic divergence between Agent code and Trained Model. "
+                "Refusing to infer on malformed data."
+            )
+            # Fail safe immediately
+            return self.get_safe_action()
 
         try:
             # explore=False 确保我们在生产 (Inference) 模式下
             # 获取确定性动作，而不是随机探索。
-            # [Task 3.1] Enable Stateful Inference (Pass & Update Hidden States)
             result = await asyncio.to_thread(
                 self.algorithm.compute_single_action,
                 observation,
                 state=self.internal_state,
+                policy_id=self.policy_id, # [Beta FIX] Use correct policy
                 explore=False
             )
             
@@ -102,17 +109,7 @@ class BaseDRLAgent(ABC):
         
         except Exception as e:
             self.logger.error(f"Error during compute_single_action: {e}", exc_info=True)
-            # [Safety Phase II] Use agent-specific safe fallback
             safe_action = self.get_safe_action()
-            
-            # [Task 1.1] Critical Type Safety Check
-            if not isinstance(safe_action, np.ndarray):
-                self.logger.critical(
-                    f"FATAL: get_safe_action() returned {type(safe_action)} instead of np.ndarray. "
-                    "Forcing zero-vector fallback to prevent crash."
-                )
-                return np.array([0.0], dtype=np.float32)
-                
             return safe_action
 
 
@@ -125,19 +122,12 @@ class DRLAgentLoader:
     
     @staticmethod
     def load_agent(
-        agent_class: Type[BaseDRLAgent], # (例如 AlphaAgent, RiskAgent)
-        checkpoint_path: str
+        agent_class: Type[BaseDRLAgent], 
+        checkpoint_path: str,
+        policy_id: str = "default_policy" # [Beta FIX] Support Policy ID
     ) -> Optional[BaseDRLAgent]:
         """
         [任务 4.1] 实现加载器。
-        (由 registry.py 在 [任务 1.1] 中调用)
-        
-        Args:
-            agent_class: 要实例化的智能体类 (例如 AlphaAgent)。
-            checkpoint_path: 指向 RLLib 检查点目录的路径 (来自 system.yaml)。
-
-        Returns:
-            一个已初始化的、准备好用于推理的 BaseDRLAgent 实例。
         """
         if not checkpoint_path:
             logger.error(f"Cannot load {agent_class.__name__}: checkpoint_path is missing or empty.")
@@ -151,7 +141,7 @@ class DRLAgentLoader:
             logger.info(f"RLLib Algorithm loaded successfully for {agent_class.__name__}.")
             
             # 2. 将加载的算法注入到我们的智能体包装器中
-            agent_instance = agent_class(algorithm=algo)
+            agent_instance = agent_class(algorithm=algo, policy_id=policy_id)
             
             logger.info(f"{agent_class.__name__} instance created and ready.")
             return agent_instance
