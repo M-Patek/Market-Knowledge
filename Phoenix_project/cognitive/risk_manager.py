@@ -5,6 +5,7 @@ Monitors portfolio state, market conditions, and operational metrics
 to enforce risk controls and trigger circuit breakers.
 [Task 5] Persistence and Warm-up
 [Task 6.3] Direction-Aware Risk Control
+[Beta FIX] Interface Mismatch & Flatline Bypass Fix
 """
 
 import logging
@@ -48,6 +49,7 @@ class RiskManager:
         self.max_position_concentration_pct = self.config.get("max_position_concentration_pct", 0.20)
         self.volatility_threshold = self.config.get("volatility_threshold", 0.05)
         self.volatility_window = self.config.get("volatility_window", 30)
+        # [Beta FIX] Configurable Frequency Factor
         self.frequency_factor = self.config.get("frequency_factor", 252)
 
         self.current_equity: float = initial_capital 
@@ -136,6 +138,41 @@ class RiskManager:
                 await self.redis_client.set("phoenix:risk:current_equity", self.current_equity)
         except Exception as e:
             logger.error(f"Failed to save current_equity: {e}")
+
+    async def validate_allocations(
+        self, target_weights: Dict[str, float], current_portfolio: Dict[str, Any], market_data: Any
+    ) -> RiskReport:
+        """
+        [Beta FIX] Implemented Missing Interface.
+        Validates a proposed set of portfolio weights against risk constraints.
+        """
+        if self.circuit_breaker_tripped:
+            return RiskReport(passed=False, adjustments_made="Circuit Breaker Tripped")
+
+        violations = []
+        adjustments = []
+        
+        # Simple simulation of total portfolio value
+        # In a real scenario, this would check leverage and margin requirements
+        # Here we just iterate and check concentration
+        
+        # Mock PortfolioState for check_concentration reuse
+        # This assumes 'current_portfolio' is a raw dict from DataManager, we might need to wrap it
+        pf_value = current_portfolio.get("cash", 0.0) # Conservative estimate
+        # Ideally, we calculate real value from positions
+        
+        # Check each target allocation
+        for sym, weight in target_weights.items():
+            if abs(weight) > self.max_position_concentration_pct:
+                violations.append(f"Concentration {weight:.2f} > {self.max_position_concentration_pct}")
+                adjustments.append(f"Capped {sym} at {self.max_position_concentration_pct}")
+                # We could auto-adjust here, but for now we just report
+                
+        if violations:
+            logger.warning(f"Allocation validation failed: {violations}")
+            return RiskReport(passed=False, adjustments_made="; ".join(adjustments))
+            
+        return RiskReport(passed=True, adjustments_made="None")
 
     def check_pre_trade(
         self, proposed_position: Position, portfolio: PortfolioState
@@ -241,7 +278,7 @@ class RiskManager:
 
     def check_volatility(self, market_data: MarketData) -> Optional[VolatilitySignal]:
         symbol = market_data.symbol
-        price = float(market_data.close) # MarketData now uses Decimal, cast to float for calc
+        price = float(market_data.close) 
 
         if symbol not in self.price_history:
             self.price_history[symbol] = deque(maxlen=self.volatility_window)
@@ -252,8 +289,11 @@ class RiskManager:
             return None
 
         try:
+            # [Beta FIX] Filter out invalid prices (Flatline Fix)
             prices = np.array(self.price_history[symbol])
-            if np.any(prices <= 0): return None
+            prices = prices[prices > 0] 
+            
+            if len(prices) < 2: return None
 
             log_returns = np.log(prices[1:] / prices[:-1])
             current_volatility = np.std(log_returns) * np.sqrt(self.frequency_factor)
@@ -268,7 +308,11 @@ class RiskManager:
     async def trip_circuit_breaker(self, reason: str):
         self.circuit_breaker_tripped = True
         if self.redis_client:
-            await self.redis_client.set("phoenix:risk:halted", "1")
+            # [Beta FIX] Await setting the key to ensure persistence before proceeding
+            try:
+                await self.redis_client.set("phoenix:risk:halted", "1")
+            except Exception as e:
+                logger.error(f"Failed to persist halt state to Redis: {e}")
         logger.critical(f"CIRCUIT BREAKER TRIPPED. Reason: {reason}")
 
     async def reset_circuit_breaker(self):
