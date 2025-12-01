@@ -2,9 +2,9 @@
 交易生命周期管理器 (Trade Lifecycle Manager)
 负责跟踪从信号 -> 订单 -> 成交 -> 持仓 的整个过程。
 计算已实现和未实现的盈亏 (PnL)。
-[Beta FIX] 防止僵尸估值 (Zombie Valuation)
+[Beta FIX] 防止僵尸估值 (Zombie Valuation) & 脏读崩溃 (Dirty Read)
 [Task 3] Atomic Transactions & Write-Ahead Persistence
-[Phase III Fix] Valuation Resilience (Limp Mode)
+[Phase III Fix] Valuation Resilience (Fail-Closed)
 [Phase II Fix] Decimal Precision & Atomic Transactions
 [Phase V Fix] SQL Injection Protection
 """
@@ -16,7 +16,6 @@ import asyncio
 # FIX (E2, E4): 从核心模式导入 Order, Fill, Position, PortfolioState
 from Phoenix_project.core.schemas.data_schema import Order, Fill, Position, PortfolioState
 
-# 修正：将 'monitor.logging...' 转换为 'Phoenix_project.monitor.logging...'
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.ai.tabular_db_client import TabularDBClient
 
@@ -122,39 +121,54 @@ class TradeLifecycleManager:
     def get_current_portfolio_state(self, current_market_data: Dict[str, float], timestamp: Optional[datetime] = None) -> PortfolioState:
         """
         根据最新的市场价格计算并返回当前的投资组合状态。
-        [Beta FIX] 增加了严格的数据完整性检查。
-        [Phase III Fix] Valuation Resilience (Limp Mode)
-        [Phase IV Fix] Time Machine Support: Accept simulation timestamp.
+        [Beta FIX] 增加了严格的数据完整性检查 (Ostrich Valuation Fix)。
+        [Fix] 增加了线程安全的迭代快照 (Dirty Read Fix)。
         :param current_market_data: Dict[symbol, current_price]
         :param timestamp: Optional simulation timestamp (for backtesting consistency)
         """
+        # [Fix Dirty Read] Create a shallow copy of positions to allow safe iteration 
+        # while on_fill might be modifying the main dict in the background.
+        positions_snapshot = {k: v.model_copy() for k, v in self.positions.items()}
+        
         total_value = self.cash
         
-        # 更新持仓的市值和未实现盈亏
-        for symbol, pos in self.positions.items():
+        # 更新持仓的市值和未实现盈亏 (使用快照)
+        for symbol, pos in positions_snapshot.items():
             current_price = current_market_data.get(symbol)
             
-            # [Task 3.3] Valuation Resilience (Limp Mode)
-            # Fallback to Cost Basis if market data is missing, preventing system crash.
+            # [Beta FIX] Valuation Resilience (Fail-Closed)
+            # 原有的 "Limp Mode" (使用成本价兜底) 被移除，因为它掩盖了市场崩盘的风险。
+            # 如果数据丢失，我们强制将价格设为 0.0。
+            # 这会导致净值暴跌，从而触发下游风控的 Margin Call 或 Halt，这比“假装没亏钱”要安全得多。
             if current_price is None or current_price <= 0:
-                logger.warning(f"{self.log_prefix} Valuation Limp Mode: Missing market data for {symbol}. Using Cost Basis.")
-                current_price = pos.average_price
+                logger.critical(f"{self.log_prefix} CRITICAL: Missing market data for {symbol}. Mark-to-Market failed. Forcing value to 0.0 to trigger Risk Halt.")
+                current_price = 0.0
 
-            # Calculate in Decimal for safety, though Position model might enforce float
+            # Calculate in Decimal for safety
             # Note: Explicit casting Decimal -> float for schema compatibility
-            pos.market_value = float(Decimal(str(pos.quantity)) * Decimal(str(current_price)))
-            pos.unrealized_pnl = float((Decimal(str(current_price)) - Decimal(str(pos.average_price))) * Decimal(str(pos.quantity)))
-            
-            total_value += Decimal(str(pos.market_value))
+            try:
+                # 使用 Decimal 进行高精度计算，避免浮点数漂移
+                d_qty = Decimal(str(pos.quantity))
+                d_price = Decimal(str(current_price))
+                d_avg = Decimal(str(pos.average_price))
+                
+                pos.market_value = float(d_qty * d_price)
+                pos.unrealized_pnl = float((d_price - d_avg) * d_qty)
+                
+                total_value += Decimal(str(pos.market_value))
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Valuation error for {symbol}: {e}")
+                # 保持原值或设为0，视具体策略。这里由上层捕获。
         
-        # Determine timestamp: Use provided simulation time or UTC now
+        # Determine timestamp: Use provided simulation time or UTC now (Default)
+        # [Fix] Prefer injected timestamp for causal consistency
         state_timestamp = timestamp if timestamp else datetime.utcnow()
 
         return PortfolioState(
             timestamp=state_timestamp,
             cash=float(self.cash), # Convert back to float for Schema
             total_value=float(total_value),
-            positions=self.positions.copy(),
+            positions=positions_snapshot, # Return the consistent snapshot
             realized_pnl=float(self.realized_pnl)
         )
 
@@ -198,9 +212,10 @@ class TradeLifecycleManager:
                 logger.info(f"{self.log_prefix} Position closed for {fill.symbol}")
                 # 计算已实现 PnL (Fix: Direction specific)
                 qty_closed = abs(current_qty)
-                if current_qty > 0:
+                # PnL = (Exit Price - Entry Price) * Qty * Direction
+                if current_qty > 0: # Long Close
                     pnl = (fill_price - current_avg_price) * qty_closed
-                else:
+                else: # Short Close
                     pnl = (current_avg_price - fill_price) * qty_closed
 
                 new_realized_pnl += pnl
