@@ -7,6 +7,7 @@
 [Phase III Fix] Valuation Resilience (Fail-Closed)
 [Phase II Fix] Decimal Precision & Atomic Transactions
 [Phase V Fix] SQL Injection Protection
+[Code Opt Expert Fix] Task 11 & 12: Concurrency Crash Fix & Valuation Fallback
 """
 from typing import Dict, Optional
 from datetime import datetime
@@ -128,7 +129,9 @@ class TradeLifecycleManager:
         """
         # [Fix Dirty Read] Create a shallow copy of positions to allow safe iteration 
         # while on_fill might be modifying the main dict in the background.
-        positions_snapshot = {k: v.model_copy() for k, v in self.positions.items()}
+        # [Task 11] Atomic Snapshot: Copy dict keys/refs first to prevent iteration errors
+        raw_positions = self.positions.copy()
+        positions_snapshot = {k: v.model_copy() for k, v in raw_positions.items()}
         
         total_value = self.cash
         
@@ -137,12 +140,10 @@ class TradeLifecycleManager:
             current_price = current_market_data.get(symbol)
             
             # [Beta FIX] Valuation Resilience (Fail-Closed)
-            # 原有的 "Limp Mode" (使用成本价兜底) 被移除，因为它掩盖了市场崩盘的风险。
-            # 如果数据丢失，我们强制将价格设为 0.0。
-            # 这会导致净值暴跌，从而触发下游风控的 Margin Call 或 Halt，这比“假装没亏钱”要安全得多。
+            # [Task 12] Valuation Fallback: Use Cost Basis for "Limp Mode" to prevent artificial bankruptcy
             if current_price is None or current_price <= 0:
-                logger.critical(f"{self.log_prefix} CRITICAL: Missing market data for {symbol}. Mark-to-Market failed. Forcing value to 0.0 to trigger Risk Halt.")
-                current_price = 0.0
+                logger.warning(f"{self.log_prefix} WARNING: Missing market data for {symbol}. Using Cost Basis ({pos.average_price}) for valuation (Stale Mode).")
+                current_price = pos.average_price
 
             # Calculate in Decimal for safety
             # Note: Explicit casting Decimal -> float for schema compatibility
