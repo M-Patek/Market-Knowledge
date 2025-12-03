@@ -16,6 +16,7 @@ class OrderManager:
     负责将 TargetPortfolio 转换为具体的 Order，并管理订单生命周期。
     [Task 5.2] Concurrent Execution & Zombie Position Fix
     [Beta FIX] "Machine Gun" Loop Prevention & Time Travel Fix
+    [Code Opt Expert Fix] Task 10: Enforce Atomicity (Race Condition Fix)
     """
 
     def __init__(self, broker_adapter: Optional[IBrokerAdapter], data_manager: DataManager):
@@ -65,69 +66,68 @@ class OrderManager:
             if symbol not in market_prices:
                 continue
 
-            # [Beta FIX] "Machine Gun" Prevention (In-Flight Check)
-            # Check if we already have an active order for this symbol.
-            # If so, SKIP reconciliation to prevent duplicate orders (double spending).
-            has_active_order = False
+            # [Task 10] Enforce Atomicity: Lock the entire check-calculate-register block
             async with self.lock:
+                # [Beta FIX] "Machine Gun" Prevention (In-Flight Check)
+                # Check if we already have an active order for this symbol.
+                has_active_order = False
                 for active_order in self.active_orders.values():
                     if active_order.symbol == symbol and active_order.status in [OrderStatus.PENDING_SUBMISSION, OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED]:
                         has_active_order = True
                         break
-            
-            if has_active_order:
-                logger.info(f"{self.log_prefix} Skipping {symbol} due to active in-flight order.")
-                continue
+                
+                if has_active_order:
+                    logger.info(f"{self.log_prefix} Skipping {symbol} due to active in-flight order.")
+                    continue
 
-            price = market_prices[symbol]
-            if price <= 0: continue
+                price = market_prices[symbol]
+                if price <= 0: continue
 
-            # 获取当前持仓数量
-            current_qty = Decimal("0.0")
-            if symbol in current_positions:
-                current_qty = Decimal(str(current_positions[symbol].quantity))
+                # 获取当前持仓数量
+                current_qty = Decimal("0.0")
+                if symbol in current_positions:
+                    current_qty = Decimal(str(current_positions[symbol].quantity))
 
-            # 获取目标持仓数量
-            target_qty = Decimal("0.0")
-            # 查找目标组合中的匹配项
-            target_pos = next((p for p in target_portfolio.positions if p.symbol == symbol), None)
-            if target_pos:
-                target_qty = Decimal(str(target_pos.quantity))
+                # 获取目标持仓数量
+                target_qty = Decimal("0.0")
+                # 查找目标组合中的匹配项
+                target_pos = next((p for p in target_portfolio.positions if p.symbol == symbol), None)
+                if target_pos:
+                    target_qty = Decimal(str(target_pos.quantity))
 
-            # 计算差异
-            delta = target_qty - current_qty
-            
-            # 设置最小交易阈值 (例如 0.0001) 防止极小订单
-            if abs(delta) < Decimal("0.0001"):
-                continue
+                # 计算差异
+                delta = target_qty - current_qty
+                
+                # 设置最小交易阈值 (例如 0.0001) 防止极小订单
+                if abs(delta) < Decimal("0.0001"):
+                    continue
 
-            # 生成订单
-            side = OrderSide.BUY if delta > 0 else OrderSide.SELL
-            abs_qty = float(abs(delta))
-            
-            # [Beta FIX] Time Travel Prevention
-            # Use the timestamp from the PortfolioState (synchronized simulation time)
-            # instead of datetime.now() (physical server time).
-            order_time = state.timestamp if state.timestamp else datetime.utcnow()
+                # 生成订单
+                side = OrderSide.BUY if delta > 0 else OrderSide.SELL
+                abs_qty = float(abs(delta))
+                
+                # [Beta FIX] Time Travel Prevention
+                # Use the timestamp from the PortfolioState (synchronized simulation time)
+                # instead of datetime.now() (physical server time).
+                order_time = state.timestamp if state.timestamp else datetime.utcnow()
 
-            # 创建订单对象
-            # 注意：实际生产中可能需要考虑 limit_price (限价) 或 slippage (滑点)
-            order = Order(
-                symbol=symbol,
-                side=side,
-                order_type=OrderType.MARKET, # 默认为市价单以保证成交
-                quantity=abs_qty,
-                timestamp=order_time,
-                status=OrderStatus.PENDING_SUBMISSION
-            )
-            
-            # 如果是限价单逻辑 (可选):
-            # order.limit_price = float(price * Decimal("1.01")) if side == OrderSide.BUY else float(price * Decimal("0.99"))
+                # 创建订单对象
+                # 注意：实际生产中可能需要考虑 limit_price (限价) 或 slippage (滑点)
+                order = Order(
+                    symbol=symbol,
+                    side=side,
+                    order_type=OrderType.MARKET, # 默认为市价单以保证成交
+                    quantity=abs_qty,
+                    timestamp=order_time,
+                    status=OrderStatus.PENDING_SUBMISSION
+                )
+                
+                # 如果是限价单逻辑 (可选):
+                # order.limit_price = float(price * Decimal("1.01")) if side == OrderSide.BUY else float(price * Decimal("0.99"))
 
-            orders_to_submit.append(order)
-            
-            # 将订单加入活跃列表跟踪
-            async with self.lock:
+                orders_to_submit.append(order)
+                
+                # 将订单加入活跃列表跟踪 (Atomic Registration)
                 self.active_orders[order.id] = order
 
         logger.info(f"{self.log_prefix} Generated {len(orders_to_submit)} rebalancing orders.")
