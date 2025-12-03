@@ -6,6 +6,7 @@ to enforce risk controls and trigger circuit breakers.
 [Task 5] Persistence and Warm-up
 [Task 6.3] Direction-Aware Risk Control
 [Beta FIX] Interface Mismatch & Flatline Bypass Fix
+[Code Opt Expert Fix] Task 03 & 04: Cold Start Protection & Distributed Pub/Sub
 """
 
 import logging
@@ -103,6 +104,10 @@ class RiskManager:
                 logger.error(f"Failed to warm up risk data for {sym}: {e}")
 
         await asyncio.gather(*[_fetch_and_fill(s) for s in symbols])
+        
+        # [Task 04] Start Distributed Circuit Breaker Listener
+        asyncio.create_task(self._monitor_circuit_breaker())
+        
         logger.info(f"RiskManager warm-up complete.")
 
     async def _load_peak_equity(self) -> float:
@@ -153,13 +158,7 @@ class RiskManager:
         adjustments = []
         
         # Simple simulation of total portfolio value
-        # In a real scenario, this would check leverage and margin requirements
-        # Here we just iterate and check concentration
-        
-        # Mock PortfolioState for check_concentration reuse
-        # This assumes 'current_portfolio' is a raw dict from DataManager, we might need to wrap it
         pf_value = current_portfolio.get("cash", 0.0) # Conservative estimate
-        # Ideally, we calculate real value from positions
         
         # Check each target allocation
         for sym, weight in target_weights.items():
@@ -285,8 +284,16 @@ class RiskManager:
         
         self.price_history[symbol].append(price)
 
+        # [Task 03] Cold Start Protection
+        # If insufficient data, assume extreme volatility (BLOCKING).
         if len(self.price_history[symbol]) < self.volatility_window:
-            return None
+            return VolatilitySignal(
+                description="Insufficient data for volatility check (Cold Start Protection).",
+                symbol=symbol,
+                current_volatility=999.0,
+                volatility_threshold=self.volatility_threshold,
+                triggers_circuit_breaker=False
+            )
 
         try:
             # [Beta FIX] Filter out invalid prices (Flatline Fix)
@@ -311,12 +318,41 @@ class RiskManager:
             # [Beta FIX] Await setting the key to ensure persistence before proceeding
             try:
                 await self.redis_client.set("phoenix:risk:halted", "1")
+                # [Task 04] Publish TRIP event
+                await self.redis_client.publish("phoenix:risk:halted", "TRIP")
             except Exception as e:
-                logger.error(f"Failed to persist halt state to Redis: {e}")
+                logger.error(f"Failed to persist/publish halt state: {e}")
         logger.critical(f"CIRCUIT BREAKER TRIPPED. Reason: {reason}")
 
     async def reset_circuit_breaker(self):
         self.circuit_breaker_tripped = False
         if self.redis_client:
             await self.redis_client.delete("phoenix:risk:halted")
+            # [Task 04] Publish RESET event
+            await self.redis_client.publish("phoenix:risk:halted", "RESET")
         logger.info("RiskManager circuit breaker has been reset.")
+
+    async def _monitor_circuit_breaker(self):
+        """
+        [Task 04] Real-time Circuit Breaker Sync via Redis Pub/Sub.
+        """
+        if not self.redis_client: return
+        
+        try:
+            pubsub = self.redis_client.pubsub()
+            await pubsub.subscribe("phoenix:risk:halted")
+            logger.info("Listening for distributed circuit breaker events on 'phoenix:risk:halted'...")
+
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    data = message["data"].decode("utf-8")
+                    if data in ("1", "TRIP"):
+                        if not self.circuit_breaker_tripped:
+                            self.circuit_breaker_tripped = True
+                            logger.critical("DISTRIBUTED CIRCUIT BREAKER TRIPPED via Pub/Sub!")
+                    elif data in ("0", "RESET"):
+                        if self.circuit_breaker_tripped:
+                            self.circuit_breaker_tripped = False
+                            logger.info("Circuit breaker RESET via Pub/Sub.")
+        except Exception as e:
+            logger.error(f"Circuit breaker monitor failed: {e}")
