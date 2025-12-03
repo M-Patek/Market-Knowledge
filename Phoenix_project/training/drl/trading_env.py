@@ -2,6 +2,7 @@
 # [凤凰 V7 迭代] - 统一效用与务实权衡
 # [Beta 修复] 维度扩容 (7->9) 与 资产锚定
 # [Phase III Fix] Echo Chamber Removal & Feature/Position Unification
+# [Code Opt Expert Fix] Task 13, 14, 15: Asset Fingerprint, Death Penalty, Risk Blindness
 
 import numpy as np
 import gymnasium as gym
@@ -11,6 +12,7 @@ from typing import Dict, Any, List
 # --- V7 奖励函数惩罚系数 (可调参数) ---
 K_DRAWDOWN = 10.0
 K_UNCERTAINTY = 5.0 
+K_BANKRUPTCY = -1000.0 # [Task 14] Death Penalty Constant
 
 class PhoenixMultiAgentEnvV7(gym.Env):
     """
@@ -32,6 +34,15 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         # 如果 config 中未提供，则尝试从 iterator 或 defaults 获取，但必须在 init 阶段固定
         self.asset_list: List[str] = config.get("asset_list", ["BTC", "ETH", "SOL", "AVAX", "MATIC"]) 
         self.num_assets = len(self.asset_list)
+        
+        # [Task 13] Asset Fingerprint Validation: Prevent Model/Env Mismatch
+        expected_assets = config.get("model_asset_list")
+        if expected_assets is not None:
+            # Strict comparison of assets and their order
+            if expected_assets != self.asset_list:
+                raise ValueError(f"Asset configuration mismatch! Model expects {expected_assets} but Env configured with {self.asset_list}.")
+        
+        print(f"PhoenixEnvV7 Asset Fingerprint: {self.asset_list}")
         
         self.agents = ["alpha", "risk", "exec"]
         
@@ -117,12 +128,16 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         R_risk = self._calculate_risk_reward()
         Total_Reward_V7 = R_alpha_cost + R_risk
 
+        # [Task 14] Death Penalty: Explicitly punish bankruptcy to prevent "slow bleed" behavior
+        terminated = self.total_value <= (self.initial_balance * 0.5)
+        if terminated:
+            Total_Reward_V7 = K_BANKRUPTCY
+
         rewards = {agent: Total_Reward_V7 for agent in self.agents}
 
         obs = self._get_obs_dict()
         info = self._get_info_dict(R_alpha_cost, R_risk, Total_Reward_V7)
         
-        terminated = self.total_value <= (self.initial_balance * 0.5)
         truncated = self.current_step >= 1000
         
         terminateds = {agent: terminated for agent in self.agents}
@@ -210,9 +225,13 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         total_uncertainty_penalty = 0.0
         for asset_id, alloc in self.current_allocation.items():
             l2_info = self.l2_knowledge.get(asset_id)
-            if not l2_info: continue # [Beta Note] This skips penalty if L2 is silent. Maybe enforce default?
             
-            l2_uncertainty = 1.0 - l2_info.get('l2_confidence', 0.5)
+            # [Task 15] Fix Risk Blindness: Enforce Max Uncertainty if L2 is silent
+            if not l2_info:
+                l2_uncertainty = 1.0 # Max uncertainty when blind
+            else:
+                l2_uncertainty = 1.0 - l2_info.get('l2_confidence', 0.5)
+            
             pos_size = abs(alloc)
             penalty = (pos_size * l2_uncertainty) ** 2
             total_uncertainty_penalty += penalty
