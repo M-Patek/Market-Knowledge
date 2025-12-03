@@ -2,7 +2,9 @@
 事件风险过滤器
 在事件进入认知引擎之前，对其进行初步过滤。
 (例如：过滤掉不相关的符号、低可信度来源的新闻)
+[Code Opt Expert Fix] Task 01 & 02: Fail-Safe & Standardized Logging
 """
+import logging
 from typing import List, Dict, Any
 from Phoenix_project.config.loader import ConfigLoader
 
@@ -17,16 +19,18 @@ class EventRiskFilter:
     def __init__(self, config_loader: ConfigLoader):
         self.config = config_loader.get_event_filter_config()
         self.log_prefix = "EventRiskFilter:"
+        # [Task 02] Standardized Logging
+        self.logger = logging.getLogger(__name__)
         
         self.min_news_confidence = self.config.get("min_news_confidence", 0.0)
         self.allowed_sources = set(self.config.get("allowed_sources", []))
         self.blocked_symbols = set(self.config.get("blocked_symbols", []))
         
-        print(f"{self.log_prefix} Initialized.")
+        self.logger.info(f"{self.log_prefix} Initialized.")
         if self.allowed_sources:
-            print(f"{self.log_prefix} Allowed sources: {self.allowed_sources}")
+            self.logger.info(f"{self.log_prefix} Allowed sources: {self.allowed_sources}")
         if self.blocked_symbols:
-            print(f"{self.log_prefix} Blocked symbols: {self.blocked_symbols}")
+            self.logger.info(f"{self.log_prefix} Blocked symbols: {self.blocked_symbols}")
 
     def filter_batch(self, data_batch: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         """
@@ -76,7 +80,7 @@ class EventRiskFilter:
         过滤市场数据的规则。
         """
         if data.symbol in self.blocked_symbols:
-            print(f"{self.log_prefix} Blocking market data for {data.symbol}")
+            self.logger.warning(f"{self.log_prefix} Blocking market data for {data.symbol}")
             return False
         
         # 示例：过滤掉异常的0成交量数据
@@ -89,13 +93,18 @@ class EventRiskFilter:
         """
         过滤新闻事件的规则。
         """
+        # [Task 01] Fail-Safe: If allowed_sources is empty, block everything to prevent data poisoning.
+        if not self.allowed_sources:
+            self.logger.critical(f"{self.log_prefix} SECURITY: No allowed sources configured! Rejecting all news to prevent data poisoning.")
+            return False
+
         # 1. 按来源过滤
         if self.allowed_sources and data.source not in self.allowed_sources:
             return False
             
         # 2. 按符号过滤
         if any(symbol in self.blocked_symbols for symbol in data.symbols):
-            print(f"{self.log_prefix} Blocking news {data.id} due to blocked symbol")
+            self.logger.warning(f"{self.log_prefix} Blocking news {data.id} due to blocked symbol")
             return False
             
         # 3. (假设) 按可信度过滤
@@ -114,7 +123,7 @@ class EventRiskFilter:
             
         # Log potential attack patterns
         if "<system>" in text or "<user>" in text:
-             print(f"{self.log_prefix} WARNING: Potential Prompt Injection tags detected.")
+             self.logger.warning(f"{self.log_prefix} WARNING: Potential Prompt Injection tags detected.")
              
         # Escape critical characters
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
