@@ -10,6 +10,7 @@ class AlphaAgent(BaseDRLAgent):
     L3 Alpha 智能体。
     负责根据 L2 分析和市场状态，决定理想的 *目标仓位* (例如 目标权重)。
     [Beta FIX] Unified 9-dim observation space.
+    [Code Opt Expert Fix] Task 16 & 21: Dynamic Obs Shaping & Bankruptcy Normalization
     """
 
     def get_safe_action(self) -> np.ndarray:
@@ -84,7 +85,8 @@ class AlphaAgent(BaseDRLAgent):
             confidence = getattr(fusion_result, 'confidence', 0.5)
 
         # 3. Calculations
-        norm_balance = (balance / initial_balance) if initial_balance > 0 else 1.0
+        # [Task 21] Fix Bankruptcy Normalization: Default to 0.0 (Bankrupt) not 1.0 (Healthy) if init_bal is invalid
+        norm_balance = (balance / initial_balance) if initial_balance > 0 else 0.0
         
         log_return = 0.0
         if price > 1e-8 and prev_price > 1e-8:
@@ -111,4 +113,18 @@ class AlphaAgent(BaseDRLAgent):
             depth_imbalance   # [New]
         ], dtype=np.float32)
         
+        # [Task 16] Dynamic Observation Shaping: Adapt to Model Expectations
+        if self.algorithm and hasattr(self.algorithm, 'observation_space'):
+            expected_shape = self.algorithm.observation_space.shape
+            if expected_shape and len(expected_shape) > 0:
+                target_dim = expected_shape[0]
+                current_dim = obs.shape[0]
+                
+                if current_dim < target_dim:
+                    # Pad with zeros
+                    obs = np.pad(obs, (0, target_dim - current_dim), 'constant')
+                elif current_dim > target_dim:
+                    # Truncate
+                    obs = obs[:target_dim]
+                    
         return obs
