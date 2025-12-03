@@ -1,5 +1,7 @@
 """
 Phoenix Project (Market Knowledge) - 主入口点
+[Code Opt Expert Fix] Task 18: Pre-Trade Risk Manager Warm-up
+[Fix IV.1] Registry & API Key Fixes
 """
 
 import asyncio
@@ -412,6 +414,12 @@ class PhoenixProject:
             
             # [Task 4.1] 初始化持久化账本 (Async Init)
             await trade_lifecycle_manager.initialize()
+
+            # [Task 18] Explicit Risk Manager Initialization (Pre-Trade Warm-up)
+            risk_manager = self.services["risk_manager"]
+            symbols = [self.cfg.trading.get('default_symbol', 'BTC/USD')]
+            await risk_manager.initialize(symbols)
+            logger.info("Risk Manager initialized and warmed up.")
 
             # 启动主循环 (统一入口)
             loop_manager.start_loop()
