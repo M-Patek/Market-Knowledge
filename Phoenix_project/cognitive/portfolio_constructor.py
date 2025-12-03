@@ -3,6 +3,7 @@
 # [主人喵的修复 11.12] 实现了 TBD (从 DataManager 加载初始投资组合)。
 # [Code Opt Expert Fix] Task 3: Clean Architecture / Remove ContextBus Communication
 # [Phase III Fix] Risk Gating & Signal Mapping
+# [Code Opt Expert Fix] Task 07: Fix Stale Portfolio State
 
 import logging
 from omegaconf import DictConfig
@@ -108,11 +109,19 @@ class PortfolioConstructor:
         # 3. [Safety Fix] Validate Allocations (Async & Type Safe)
         target_weights = alpha_signals
         
+        # [Task 07] Fix Stale Portfolio State: Use real-time state from pipeline
+        if not pipeline_state.portfolio_state:
+            logger.warning("No real-time portfolio state found. Cannot validate risk.")
+            return None
+            
+        # Convert Pydantic model to dict for RiskManager
+        real_time_portfolio = pipeline_state.portfolio_state.model_dump()
+
         try:
             logger.debug(f"Validating target weights with RiskManager: {target_weights}")
             risk_report = await self.risk_manager.validate_allocations(
                 target_weights,
-                self.current_portfolio,
+                real_time_portfolio, # [Task 07] Use real-time data
                 market_data
             )
             
