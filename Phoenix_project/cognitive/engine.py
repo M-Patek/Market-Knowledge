@@ -1,6 +1,7 @@
 # Phoenix_project/cognitive/engine.py
 # [主人喵的修复] 重建了缺失的 L1 调用接口，增加了针对 Dict Bomb 的类型防御
 # [Phase II Fix] L1 自动发现逻辑增强 & 逻辑纯化
+# [Code Opt Expert Fix] Task 06: Atomic State Updates (Prevent Race Conditions)
 
 import logging
 import uuid
@@ -128,6 +129,7 @@ class CognitiveEngine:
     async def process_cognitive_cycle(self, pipeline_state: PipelineState) -> Dict[str, Any]:
         """
         执行核心认知循环 (L2 融合 -> 事实检查 -> 决策防御)。
+        [Task 06] Refactored for Atomic State Updates.
         """
         logger.info("Starting cognitive cycle...")
         
@@ -149,7 +151,9 @@ class CognitiveEngine:
             logger.error(f"Cognitive cycle failed at Reasoning stage: {e}", exc_info=True)
             raise CognitiveError(f"ReasoningEnsemble failed: {e}") from e
             
-        pipeline_state.update_value("last_fusion_result", fusion_result)
+        # [Task 06] Removed intermediate update to prevent race condition
+        # pipeline_state.update_value("last_fusion_result", fusion_result)
+        
         # [Fix] Ensure the guard sees the result
         pipeline_state.latest_fusion_result = fusion_result.model_dump()
         
@@ -160,7 +164,9 @@ class CognitiveEngine:
                 # 传入列表
                 claims = [fusion_result.reasoning]
                 fact_check_report = await self.fact_checker.check_facts(claims)
-                pipeline_state.update_value("last_fact_check", fact_check_report)
+                
+                # [Task 06] Removed intermediate update
+                # pipeline_state.update_value("last_fact_check", fact_check_report)
                 
                 # 根据事实检查调整置信度
                 support_status = fact_check_report.get("overall_support")
@@ -185,13 +191,20 @@ class CognitiveEngine:
                 fusion_result.confidence = 0.0
                 fusion_result.reasoning = f"Guardrail Block: {error_msg}"
             
-            pipeline_state.update_value("last_guarded_decision", fusion_result)
+            # [Task 06] Removed intermediate update
+            # pipeline_state.update_value("last_guarded_decision", fusion_result)
             
         except Exception as e:
             logger.error(f"Uncertainty guardrail failed: {e}", exc_info=True)
             # Fail safe
             fusion_result.decision = "ERROR_HOLD"
             fusion_result.confidence = 0.0
+
+        # [Task 06] Atomic Commit: Update global state only after all checks pass
+        pipeline_state.update_value("last_fusion_result", fusion_result)
+        if fact_check_report:
+            pipeline_state.update_value("last_fact_check", fact_check_report)
+        pipeline_state.update_value("last_guarded_decision", fusion_result)
 
         logger.info(f"Cognitive cycle complete. Final decision: {fusion_result.decision}")
         
