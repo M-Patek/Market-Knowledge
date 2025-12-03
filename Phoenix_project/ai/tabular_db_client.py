@@ -5,6 +5,7 @@ This module provides a client for interacting with tabular (SQL) databases,
 including a text-to-SQL agent capability.
 [Phase II Fix] Atomic Transactions & Connection Management
 [Phase IV Fix] Async SQLAlchemy Engine & Native Transactions
+[Code Opt Expert Fix] Task 05: SQL Injection Hardening
 """
 
 import logging
@@ -13,7 +14,8 @@ from contextlib import asynccontextmanager
 from typing import Any, List, Dict, Optional, Callable
 
 import sqlalchemy  # type: ignore
-from sqlalchemy import inspect, text  # type: ignore
+from sqlalchemy import inspect, text, table, column  # type: ignore
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine # type: ignore
 from sqlalchemy.exc import SQLAlchemyError  # type: ignore
 
@@ -130,6 +132,16 @@ class TabularDBClient:
                 raise ValueError("LLM failed to generate SQL query.")
 
             sql_query = sql_query_generated.strip().replace("```sql", "").replace("```", "").strip(";")
+            
+            # [Task 05] SQL Injection Hardening: Enforce Read-Only Access
+            normalized_query = sql_query.upper().strip()
+            if not normalized_query.startswith("SELECT"):
+                 raise ValueError("Security Violation: Only SELECT queries are allowed.")
+            
+            forbidden_keywords = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "GRANT", "REVOKE", "EXEC"]
+            if any(keyword in normalized_query for keyword in forbidden_keywords):
+                 raise ValueError(f"Security Violation: Query contains forbidden keywords.")
+
             logger.info(f"Generated SQL: {sql_query}")
 
             rows = []
@@ -197,9 +209,10 @@ class TabularDBClient:
     @retry_with_exponential_backoff(exceptions_to_retry=(SQLAlchemyError,))
     async def upsert_data(self, table_name: str, data: Dict[str, Any], unique_key: str, connection=None) -> bool:
         """
-        [Task 2] 插入或更新 (Upsert) 一行数据到指定的表格。
+        [Task 2] Insert or Update (Upsert) a row.
         [Phase II Fix] Added optional connection for atomic transactions.
         [Phase IV Fix] Native Async Execution (No more to_thread).
+        [Task 05] Refactored to use SQLAlchemy Expression Language (Safe Identifiers).
         """
         if not self.engine:
             logger.error(f"Upsert failed: DB engine not initialized.")
@@ -213,31 +226,29 @@ class TabularDBClient:
             logger.error(f"Upsert logic is only implemented for PostgreSQL, not {self.engine.dialect.name}.")
             return False
         
-        columns = data.keys()
-        column_names = ", ".join([f'"{c}"' for c in columns])
-        placeholders = ", ".join([f":{c}" for c in columns])
-        update_set_parts = [f'"{c}" = EXCLUDED."{c}"' for c in columns if c != unique_key]
-        
-        if not update_set_parts:
-            update_set = "DO NOTHING"
-        else:
-            update_set = f"DO UPDATE SET {', '.join(update_set_parts)}"
-            
-        sql = text(f"""
-            INSERT INTO "{table_name}" ({column_names})
-            VALUES ({placeholders})
-            ON CONFLICT ("{unique_key}")
-            {update_set};
-        """)
-        
         try:
+            # [Task 05] Refactored to use SQLAlchemy Expression Language (Safe Identifiers)
+            # Create a lightweight table object for the statement
+            tbl = table(table_name, *[column(c) for c in data.keys()])
+            
+            # Build the insert statement
+            stmt = pg_insert(tbl).values(**data)
+            
+            # Build the ON CONFLICT update clause
+            update_dict = {c: stmt.excluded[c] for c in data.keys() if c != unique_key}
+            
+            if update_dict:
+                stmt = stmt.on_conflict_do_update(index_elements=[unique_key], set_=update_dict)
+            else:
+                stmt = stmt.on_conflict_do_nothing(index_elements=[unique_key])
+
             if connection:
                 # [Phase IV Fix] Use existing transaction context (Atomic)
-                await connection.execute(sql, data)
+                await connection.execute(stmt)
             else:
                 # [Phase IV Fix] New atomic transaction (Auto-Commit)
                 async with self.engine.begin() as conn:
-                    await conn.execute(sql, data)
+                    await conn.execute(stmt)
             
             logger.info(f"Successfully upserted data into '{table_name}' for key {data.get(unique_key)}")
             return True
