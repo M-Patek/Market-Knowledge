@@ -17,7 +17,25 @@ class FusionAgent(L2Agent):
     """
     L2 智能体：融合 (Fusion)
     审查所有 L1 和 L2 的证据，融合冲突信息，并得出最终的 L2 决策。
+    [Code Opt Expert Fix] Task 08 & 09: DoS Prevention & Prompt Injection Sanitization
     """
+
+    def _sanitize_symbol(self, symbol: str) -> str:
+        """
+        [Task 09] Sanitize symbol input to prevent Prompt Injection.
+        Strictly allows alphanumeric, commas, dashes, and spaces.
+        """
+        if not symbol: return "UNKNOWN"
+        # Remove any character that is NOT alphanumeric, space, comma, or dash
+        return re.sub(r'[^a-zA-Z0-9\s,\-]', '', str(symbol)).strip()
+
+    def _sanitize_general_input(self, text: str) -> str:
+        """
+        [Task 09] Sanitize general text inputs.
+        Escapes XML-like tags to prevent system prompt overriding.
+        """
+        if not text: return ""
+        return str(text).replace("<", "&lt;").replace(">", "&gt;")
 
     async def run(self, state: PipelineState, dependencies: List[Any]) -> FusionResult:
         """
@@ -31,9 +49,12 @@ class FusionAgent(L2Agent):
         收益:
             FusionResult: 返回 *单一* 的 FusionResult 对象。
         """
-        # 1. 确定目标 Symbol
-        target_symbol = state.main_task_query.get("symbol", "UNKNOWN")
-        task_desc = state.main_task_query.get("description", "Fusion Task")
+        # 1. 确定目标 Symbol (Task 09 Sanitization)
+        raw_symbol = state.main_task_query.get("symbol", "UNKNOWN")
+        target_symbol = self._sanitize_symbol(raw_symbol)
+        
+        raw_desc = state.main_task_query.get("description", "Fusion Task")
+        task_desc = self._sanitize_general_input(raw_desc)
         
         logger.info(f"[{self.agent_id}] Running FusionAgent for symbol: {target_symbol}")
 
@@ -65,7 +86,8 @@ class FusionAgent(L2Agent):
             
             context_map = {
                 "symbols_list_str": target_symbol,
-                "evidence_json_list": evidence_json_list
+                "evidence_json_list": evidence_json_list,
+                "task_desc": task_desc # Pass sanitized description
             }
 
             # 4. 异步调用 LLM
@@ -86,24 +108,16 @@ class FusionAgent(L2Agent):
             # [Robustness] Clean Markdown code blocks and extract JSON
             clean_str = response_str.strip()
             
-            # [Task 5.3] Fix: Replace naive regex with stack-based extractor to handle nested objects
-            json_str = None
-            brace_count = 0
-            start_index = -1
+            # [Task 08] Optimized JSON Extraction (DoS Prevention)
+            # Efficiently locate the outermost JSON boundaries
+            start_idx = clean_str.find('{')
+            end_idx = clean_str.rfind('}')
             
-            for i, char in enumerate(clean_str):
-                if char == '{':
-                    if start_index == -1:
-                        start_index = i
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0 and start_index != -1:
-                        json_str = clean_str[start_index : i+1]
-                        break
-            
-            if json_str:
-                clean_str = json_str
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                clean_str = clean_str[start_idx : end_idx + 1]
+            else:
+                # Fallback to simple strip if braces not found or malformed
+                pass
 
             response_data = json.loads(clean_str)
             
