@@ -1,5 +1,6 @@
 # Phoenix_project/context_bus.py
 # [主人喵的修复] 实现了真正的异步 Pub/Sub 消息总线，具备断线重连和非阻塞分发功能
+# [Code Opt Expert Fix] Task 20: Fire-and-Forget Fix (Zombie Task Prevention)
 
 import json
 import redis.asyncio as redis
@@ -33,8 +34,23 @@ class ContextBus:
         self._pubsub = self.redis.pubsub()
         self._handlers: Dict[str, Callable] = {}
         self._lock = asyncio.Lock()
+        # [Task 20] Background Task Registry
+        self._background_tasks = set()
 
     # --- 核心通信功能 (修复点: 全异步 & 健壮) ---
+
+    def _handle_task_exception(self, task: asyncio.Task):
+        """
+        [Task 20] Callback to handle background task exceptions and cleanup.
+        """
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"ContextBus background task failed: {e}", exc_info=True)
+        finally:
+            self._background_tasks.discard(task)
 
     async def publish(self, channel: str, message: Union[Dict, str]) -> bool:
         """
@@ -69,6 +85,9 @@ class ContextBus:
     async def _start_listener(self):
         self._listening = True
         self._listen_task = asyncio.create_task(self._listen_loop())
+        # Register the listener task itself
+        self._background_tasks.add(self._listen_task)
+        self._listen_task.add_done_callback(self._handle_task_exception)
         logger.info("ContextBus background listener task started.")
 
     async def _listen_loop(self):
@@ -98,7 +117,10 @@ class ContextBus:
                                 
                                 # [Task 0.3 Fix] 非阻塞分发：使用 create_task 防止阻塞总线
                                 if asyncio.iscoroutinefunction(handler):
-                                    asyncio.create_task(handler(payload))
+                                    # [Task 20] Fix Fire-and-Forget: Track tasks to prevent GC and log errors
+                                    task = asyncio.create_task(handler(payload))
+                                    self._background_tasks.add(task)
+                                    task.add_done_callback(self._handle_task_exception)
                                 else:
                                     # 同步 handler 仍会阻塞，建议使用 async handler
                                     handler(payload)
