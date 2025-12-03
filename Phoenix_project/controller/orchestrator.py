@@ -7,6 +7,7 @@
 # [Task 6.2] Micro-structure Injection (Spread, Imbalance)
 # [Task 4.1] Risk Hard Override
 # [Task 5.3] Log Sampling for Idle Loops
+# [Code Opt Expert Fix] Task 17: Poison Pill Protection (Reliable ACK)
 
 import logging
 import asyncio
@@ -88,6 +89,9 @@ class Orchestrator:
         start_time = datetime.now()
         # [Optimization] Reduced start log verbosity or moved to debug if needed, keeping info for now
         logger.info(f"Orchestrator main cycle START at {start_time}")
+        
+        # [Task 17] Scope Initialization: Ensure accessible in finally block
+        new_events = []
 
         pipeline_state = None
         try:
@@ -144,8 +148,7 @@ class Orchestrator:
             
             if not filtered_events:
                 logger.info("No events remaining after filtering. Cycle complete.")
-                # Even if filtered, we should ack the originals to clear them
-                await self.event_distributor.ack_events(new_events)
+                # [Task 17] Redundant Ack Removed: Handled in finally block
                 return
             
             logger.info(f"{len(filtered_events)} events remaining after filtering.")
@@ -190,9 +193,7 @@ class Orchestrator:
             # 7. 运行执行 (订单管理器)
             await self._run_execution(pipeline_state)
             
-            # [Phase 0 Fix] CRITICAL: Acknowledge events to clear them from processing queue
-            if new_events:
-                await self.event_distributor.ack_events(new_events)
+            # [Task 17] Redundant Ack Removed: Handled in finally block
 
         except CognitiveError as e:
             logger.error(f"CognitiveEngine failed with a known error: {e}", exc_info=True)
@@ -210,6 +211,14 @@ class Orchestrator:
                await self.audit_manager.audit_error(e, "OrchestratorFatal", pipeline_state)
 
         finally:
+            # [Task 17] Poison Pill Protection: Ensure events are ACKed even on failure
+            if new_events:
+                try:
+                    await self.event_distributor.ack_events(new_events)
+                    logger.info("Events acknowledged in finally block.")
+                except Exception as e:
+                    logger.error(f"Failed to ack events: {e}")
+
             # 8. 审计
             if pipeline_state:
                 self.audit_manager.log_cycle(pipeline_state)
