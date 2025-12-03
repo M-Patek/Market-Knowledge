@@ -16,14 +16,24 @@ class PhoenixFactory:
     """
     [主人喵 Factory] 依赖注入工厂。
     确保 Brain (PhoenixProject) 和 Body (Worker) 共享相同的组件构造逻辑。
+    [Code Opt Expert Fix] Task 19: Redis Authentication
     """
 
     @staticmethod
     def create_redis_client() -> redis.Redis:
         host = os.environ.get("REDIS_HOST", "localhost")
         port = int(os.environ.get("REDIS_PORT", 6379))
+        
+        # [Task 19] Implement Redis Authentication
+        password = os.environ.get("REDIS_PASSWORD", None)
+        
+        if password:
+            logger.info(f"Connecting to Redis at {host}:{port} with authentication.")
+        else:
+            logger.warning(f"Connecting to Redis at {host}:{port} WITHOUT authentication (Insecure).")
+            
         # [Task 1.3] 返回异步 Redis 客户端
-        return redis.Redis(host=host, port=port, db=0, decode_responses=False)
+        return redis.Redis(host=host, port=port, password=password, db=0, decode_responses=False)
 
     @staticmethod
     def create_context_bus(redis_client: redis.Redis, config: Dict[str, Any]) -> ContextBus:
