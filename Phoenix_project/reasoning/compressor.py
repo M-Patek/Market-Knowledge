@@ -25,14 +25,27 @@ def compress_cot(cot_text: str) -> str:
     if num_sentences <= 4:
         return cot_text
     
-    # 提取前 2 句和后 1 句
+    # [Task 3.3 Fix] Semantic Compression (Pivot Retention)
     try:
-        summary_parts = [
-            sentences[0],
-            sentences[1],
-            "...",
-            sentences[-1]
-        ]
+        # Always keep first and last
+        indices_to_keep = {0, num_sentences - 1}
+        
+        # Scan middle for logic pivots
+        pivot_keywords = ["but", "however", "although", "risk", "warning", "critical", "halt"]
+        for i in range(1, num_sentences - 1):
+            if any(k in sentences[i].lower() for k in pivot_keywords):
+                indices_to_keep.add(i)
+        
+        sorted_indices = sorted(list(indices_to_keep))
+        summary_parts = []
+        last_idx = -1
+        
+        for idx in sorted_indices:
+            if last_idx != -1 and idx > last_idx + 1:
+                summary_parts.append("...")
+            summary_parts.append(sentences[idx])
+            last_idx = idx
+            
         summary = " ".join(summary_parts)
         
         original_len = len(cot_text)
