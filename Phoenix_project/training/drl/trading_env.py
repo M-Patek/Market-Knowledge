@@ -30,9 +30,14 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         self.orchestrator = config["orchestrator"]
         self.context_bus = config["context_bus"]
         
-        # [Beta Fix] 固定资产列表 (Asset Anchor)
-        # 如果 config 中未提供，则尝试从 iterator 或 defaults 获取，但必须在 init 阶段固定
-        self.asset_list: List[str] = config.get("asset_list", ["BTC", "ETH", "SOL", "AVAX", "MATIC"]) 
+        # [Task 0.3 Fix] Force Configuration or Fail
+        if "asset_list" in config:
+            self.asset_list = config["asset_list"]
+        elif "default_symbols" in config:
+            self.asset_list = config["default_symbols"]
+        else:
+            raise ValueError("Missing critical configuration: 'asset_list' or 'default_symbols' must be provided in config.")
+        
         self.num_assets = len(self.asset_list)
         
         # [Task 13] Asset Fingerprint Validation: Prevent Model/Env Mismatch
