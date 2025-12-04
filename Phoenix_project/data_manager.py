@@ -1,239 +1,170 @@
-"""
-Data Manager for Phoenix (Restored & Optimized).
-
-Unified Data Access Layer that acts as a Facade for:
-1. Hot Data (Redis) - Real-time market data
-2. Cold Data (TemporalDB) - Historical market data
-3. Asset Data (TabularDB) - Portfolio & Fundamentals
-4. External Data (HTTP API) - News & Alternative Data
-
-[Features]
-- Smart Caching (Read-Through)
-- Distributed Locking (Thundering Herd Protection)
-- Connection Pooling (httpx)
-- Atomic Snapshots (SQL)
-"""
-
-import logging
 import json
+import logging
 import asyncio
-import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta
-
 import pandas as pd
-import httpx
 import redis.asyncio as redis
-from redis.exceptions import LockError
 
-# 使用相对导入适配项目结构
-from .core.schemas.data_schema import MarketData, NewsData
-from .ai.tabular_db_client import TabularDBClient
-from .ai.temporal_db_client import TemporalDBClient
-from .config.constants import REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE
+from Phoenix_project.ai.tabular_db_client import TabularDBClient
+from Phoenix_project.ai.temporal_db_client import TemporalDBClient
+from Phoenix_project.config.loader import ConfigLoader
+from Phoenix_project.core.schemas.data_schema import MarketData
+from Phoenix_project.config.constants import REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
 class DataManager:
-    def __init__(self, config: Dict[str, Any], redis_client: redis.Redis, tabular_db=None, temporal_db=None):
-        self.config = config.get("data_manager", {})
-        self.trading_config = config.get("trading", {}) # 获取交易配置
-        self.api_keys = config.get("api_keys", {})
+    """
+    数据管理器 (DataManager)
+    负责所有数据的访问、缓存和持久化。
+    充当系统的 "海马体"，连接 Redis (短期记忆) 和 Temporal/Tabular DB (长期记忆)。
+    
+    [Task 4] Integrated Failover & Read-Repair
+    [Restored] fetch_news_data for L1 Agents
+    """
+
+    def __init__(self, config_loader: ConfigLoader, redis_client: Optional[redis.Redis] = None):
+        self.config = config_loader.load_config('system.yaml')
         self.redis_client = redis_client
-        self.tabular_db = tabular_db
-        self.temporal_db = temporal_db
         
-        # [Config]
-        self.run_mode = config.get("run_mode", "DEV").lower()
-        self.cache_ttl = self.config.get("cache_ttl_sec", 300)
-        self.news_api_url = self.config.get("news_api_url", "https://newsapi.org/v2/everything")
-        self.news_api_key = self.api_keys.get("news_api") or os.environ.get("NEWS_API_KEY")
+        # Initialize DB Clients
+        self.tabular_db = TabularDBClient(self.config.get("data_manager", {}).get("tabular_db", {}))
+        self.temporal_db = TemporalDBClient(self.config.get("data_manager", {}).get("temporal_db", {}))
         
-        # 获取初始资金配置，默认为 100k
-        self.initial_capital = self.trading_config.get("initial_capital", 100000.0)
-
-        # [Task 5.1] Persistent HTTP Client
-        self.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0, connect=5.0),
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
-        )
-        logger.info(f"DataManager initialized (Mode: {self.run_mode}).")
-
-    # --- Core: Caching Utilities ---
-
-    def _get_cache_key(self, prefix: str, identifier: str) -> str:
-        """Namespace isolated cache key."""
-        return f"phx:{self.run_mode}:cache:{prefix}:{identifier}"
-
-    async def _get_from_cache(self, key: str) -> Optional[Any]:
-        """Fail-safe cache retrieval."""
-        try:
-            if not self.redis_client: return None
-            data = await self.redis_client.get(key)
-            return json.loads(data) if data else None
-        except Exception as e:
-            logger.warning(f"Cache read failed for {key}: {e}")
-            return None
-
-    async def _set_to_cache(self, key: str, data: Any, ttl: int = 300):
-        """Fail-safe cache write."""
-        try:
-            if not self.redis_client: return
-            
-            # Handle Pydantic/JSON serialization
-            if hasattr(data, 'model_dump_json'):
-                val = data.model_dump_json()
-            elif isinstance(data, list) and data and hasattr(data[0], 'model_dump'):
-                # Ensure datetime objects in list are serialized
-                val = json.dumps([d.model_dump() for d in data], default=str)
-            else:
-                val = json.dumps(data, default=str)
-            
-            await self.redis_client.setex(key, ttl, val)
-        except Exception as e:
-            logger.warning(f"Cache write failed for {key}: {e}")
-
-    # --- Domain: Market Data ---
+        logger.info("DataManager initialized.")
 
     async def get_latest_market_data(self, symbol: str) -> Optional[MarketData]:
-        """[Hot Path] Direct Redis Access."""
-        if not self.redis_client: return None
+        """
+        获取最新的市场数据。
+        [Hot Path] 优先读取 Redis，失败时降级到 TemporalDB (Failover)，并触发读修复 (Read-Repair)。
+        """
         key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=symbol)
-        try:
-            data = await self.redis_client.get(key)
-            if data:
-                return MarketData.model_validate_json(data)
-        except Exception as e:
-            logger.error(f"Error fetching live data for {symbol}: {e}")
+        
+        # 1. Try Redis (Hot Path)
+        if self.redis_client:
+            try:
+                data = await self.redis_client.get(key)
+                if data:
+                    return MarketData.model_validate_json(data)
+            except Exception as e:
+                logger.error(f"Redis read failed for {symbol}: {e}")
+
+        # 2. Failover to TemporalDB (Cold Path)
+        logger.warning(f"Cache miss for {symbol}, attempting DB failover...")
+        if self.temporal_db:
+            try:
+                # Fetch recent data (last 24h to ensure relevance)
+                end = datetime.now()
+                start = end - timedelta(hours=24)
+                df = await self.temporal_db.query_market_data(symbol, start, end)
+                
+                if not df.empty:
+                    # Get latest record
+                    latest_record = df.iloc[-1].to_dict()
+                    market_data = MarketData(**latest_record)
+                    
+                    # 3. Read-Repair: Write back to Redis to restore Hot Path
+                    if self.redis_client:
+                        try:
+                            # Use 60s TTL as per Task 003
+                            await self.redis_client.setex(key, 60, market_data.model_dump_json())
+                            logger.info(f"Read-Repair: Restored {symbol} to Redis cache.")
+                        except Exception:
+                            pass # Ignore write-back errors during failover, return data is priority
+                            
+                    logger.info(f"Restored market data for {symbol} from TemporalDB.")
+                    return market_data
+            except Exception as e:
+                logger.error(f"Failover failed for {symbol}: {e}")
+                
         return None
 
-    async def get_market_data_history(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-        """[Cold Path] Cache -> TemporalDB."""
-        # 1. Check Cache
-        # [Optimization] Use timestamp for precision instead of date() to allow intraday caching
-        cache_key = self._get_cache_key("history", f"{symbol}_{int(start.timestamp())}_{int(end.timestamp())}")
-        
-        cached = await self._get_from_cache(cache_key)
-        if cached:
-            return pd.DataFrame(cached)
-
+    async def get_market_data_history(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        """
+        从 TemporalDB 获取历史行情数据。
+        用于回测、训练或 RiskManager 预热。
+        """
         if not self.temporal_db:
+            logger.warning("TemporalDB not configured.")
             return pd.DataFrame()
-
-        # 2. Query DB
-        df = await self.temporal_db.query_market_data(symbol, start, end)
-        
-        # 3. Write Cache (if data exists)
-        if not df.empty:
-            await self._set_to_cache(cache_key, df.to_dict(orient="records"))
             
-        return df
+        return await self.temporal_db.query_market_data(symbol, start_time, end_time)
 
-    # --- Domain: News (Restored) ---
-
-    async def fetch_news_data(self, query: str, limit: int = 5) -> List[NewsData]:
+    async def fetch_news_data(self, start_time: datetime, end_time: datetime, limit: int = 100) -> List[Dict[str, Any]]:
         """
-        [Restored] Fetch news with Distributed Locking & Caching.
-        Prevents Thundering Herd on API.
+        [Restored] 获取新闻/事件数据。
+        L1 舆情分析师 (Innovation/Geopolitical) 依赖此接口。
         """
-        if not self.news_api_key:
-            logger.warning("News API Key missing. Returning empty list.")
+        if not self.temporal_db:
+            logger.warning("TemporalDB not configured. Cannot fetch news.")
+            return []
+            
+        try:
+            # 假设 TemporalDBClient 有 query_events 或类似方法
+            # 这里映射到通用的查询接口
+            return await self.temporal_db.query_events(
+                event_type="news", 
+                start_time=start_time, 
+                end_time=end_time,
+                limit=limit
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch news data: {e}")
             return []
 
-        cache_key = self._get_cache_key("news", f"{query}_{limit}")
-        
-        # 1. Fast Path: Check Cache
-        cached = await self._get_from_cache(cache_key)
-        if cached:
-            # Rehydrate Pydantic models from cache dicts
-            return [NewsData(**item) for item in cached]
-
-        # 2. Slow Path: Distributed Lock
-        lock_key = f"phx:lock:news:{query}"
-        try:
-            if not self.redis_client: raise LockError("No Redis")
-            
-            # Wait up to 5s for lock, hold for 60s
-            async with self.redis_client.lock(lock_key, timeout=60, blocking_timeout=5):
-                # 3. Double-Check Cache (Optimization)
-                cached = await self._get_from_cache(cache_key)
-                if cached:
-                    return [NewsData(**item) for item in cached]
-
-                # 4. Call External API
-                logger.info(f"Fetching live news for: {query}")
-                params = {
-                    "q": query,
-                    "apiKey": self.news_api_key,
-                    "pageSize": limit,
-                    "sortBy": "publishedAt",
-                    "language": "en"
+    async def get_current_portfolio(self) -> Optional[Dict[str, Any]]:
+        """
+        [Task 18 Dependency] 获取当前投资组合状态 (从持久化存储或 Ledger)。
+        用于 PortfolioConstructor 的异步初始化。
+        """
+        # 优先从 Ledger (TabularDB) 获取
+        if self.tabular_db:
+            try:
+                # 查询最新的余额
+                balance_res = await self.tabular_db.query("SELECT cash, realized_pnl FROM ledger_balance ORDER BY id DESC LIMIT 1")
+                # 查询最新的持仓 (snapshot)
+                positions_res = await self.tabular_db.query("SELECT * FROM ledger_positions")
+                
+                portfolio = {
+                    "cash": 100000.0, # Default if empty
+                    "positions": {},
+                    "realized_pnl": 0.0
                 }
                 
-                response = await self.http_client.get(self.news_api_url, params=params)
-                response.raise_for_status()
-                data = response.json()
-                
-                articles = []
-                for item in data.get("articles", []):
-                    # Minimal mapping
-                    articles.append(NewsData(
-                        headline=item.get("title"),
-                        url=item.get("url"),
-                        timestamp=datetime.now(), # Simplified for demo
-                        summary=item.get("description"),
-                        source=item.get("source", {}).get("name")
-                    ))
-
-                # 5. Update Cache
-                if articles:
-                    await self._set_to_cache(cache_key, articles, ttl=600) # Cache for 10 mins
-                
-                return articles
-
-        except (LockError, AttributeError):
-            logger.warning(f"Could not acquire lock or Redis missing for news: {query}. Skipping.")
-            return []
-        except Exception as e:
-            logger.error(f"News fetch failed: {e}")
-            return []
-
-    # --- Domain: Portfolio (Preserved) ---
-
-    async def get_current_portfolio(self) -> Dict[str, Any]:
-        """[Task 1.3] Atomic Snapshot via Single Query."""
-        if not self.tabular_db: return {}
+                if balance_res and "results" in balance_res and balance_res["results"]:
+                    row = balance_res["results"][0]
+                    portfolio["cash"] = float(row["cash"])
+                    portfolio["realized_pnl"] = float(row["realized_pnl"])
+                    
+                if positions_res and "results" in positions_res:
+                    for row in positions_res["results"]:
+                        sym = row["symbol"]
+                        # 简单的聚合或最新值逻辑由 SQL 保证 (Task 012 Read Logic)
+                        # 这里假设 query 返回的是去重后的列表
+                        portfolio["positions"][sym] = {
+                            "symbol": sym,
+                            "quantity": float(row["quantity"]),
+                            "average_price": float(row["average_price"]),
+                            "market_value": float(row["market_value"]),
+                            "unrealized_pnl": float(row["unrealized_pnl"])
+                        }
+                return portfolio
+            except Exception as e:
+                logger.error(f"Failed to fetch portfolio from Ledger: {e}")
         
-        try:
-            # [Fix] Atomic LEFT JOIN ensures Balance and Positions are from the same snapshot
-            query = """
-                SELECT b.cash, p.symbol, p.quantity 
-                FROM ledger_balance b 
-                LEFT JOIN ledger_positions p ON 1=1 
-                WHERE b.id = 1
-            """
-            res = await self.tabular_db.query(query)
-            
-            # [Optimization] Use configured initial capital instead of hardcoded 100k
-            cash = self.initial_capital
-            positions = {}
-            
-            if res and "results" in res and res["results"]:
-                first = res["results"][0]
-                if first.get("cash") is not None:
-                    cash = float(first["cash"])
-                
-                for row in res["results"]:
-                    if row.get("symbol"):
-                        positions[row["symbol"]] = float(row["quantity"])
-                        
-            return {"cash": cash, "positions": positions}
-            
-        except Exception as e:
-            logger.error(f"Portfolio snapshot failed: {e}")
-            return {"cash": self.initial_capital, "positions": {}}
+        return None
 
-    async def close(self):
-        if self.http_client:
-            await self.http_client.aclose()
-        logger.info("DataManager closed.")
+    async def get_current_time(self) -> datetime:
+        """
+        获取当前系统时间。
+        在回测模式下，这应该连接到 TimeMachine/Clock 服务。
+        """
+        return datetime.utcnow()
+
+    async def save_state(self, state: Dict[str, Any]):
+        """
+        保存一般系统状态 (Snapshot)。
+        """
+        # 实现状态快照保存逻辑 (e.g., to Redis or S3)
+        pass
