@@ -160,7 +160,8 @@ class StreamProcessor:
                 
                 # 3. 存储完整数据 (OHLCV)
                 # This is the EXCLUSIVE write to this key now (DataManager batch write removed).
-                self.redis_client.set(redis_key, market_data.model_dump_json())
+                # [Task 1.1 Fix] Use setex with 10s TTL to prevent zombie prices
+                self.redis_client.setex(redis_key, 10, market_data.model_dump_json())
                 logger.debug(f"Updated market data for {market_data.symbol} at {redis_key}")
             
             else:
@@ -195,4 +196,7 @@ class StreamProcessor:
         finally:
             if self.consumer:
                 self.consumer.close()
+            # [Task 4.1 Fix] Explicitly close Redis connection
+            if self.redis_client:
+                self.redis_client.close()
             logger.info("Kafka consumer closed.")
