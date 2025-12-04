@@ -138,12 +138,15 @@ class FusionAgent(L2Agent):
 
             # [Fix Phase II] Synthesize numeric sentiment from decision if missing
             if "sentiment" not in response_data:
-                # [Task 6.2 Fix] Externalized sentiment mapping
                 decision_key = response_data.get("decision", "HOLD").upper().replace(" ", "_")
                 
-                # Load mapping from config or use safe defaults
-                default_mapping = {"STRONG_BUY": 1.0, "BUY": 0.5, "HOLD": 0.0, "NEUTRAL": 0.0, "SELL": -0.5, "STRONG_SELL": -1.0}
-                mapping = self.config.get("sentiment_mapping", default_mapping)
+                # [Task 5.2 Fix] Explicit Logic for Transparency
+                fallback_mapping = {"STRONG_BUY": 1.0, "BUY": 0.5, "HOLD": 0.0, "NEUTRAL": 0.0, "SELL": -0.5, "STRONG_SELL": -1.0}
+                mapping = self.config.get("sentiment_mapping")
+                
+                if not mapping:
+                     logger.warning(f"[{self.agent_id}] Sentiment mapping missing in config, using hardcoded fallback.")
+                     mapping = fallback_mapping
                 
                 response_data["sentiment"] = mapping.get(decision_key, 0.0)
 
