@@ -13,6 +13,7 @@ from typing import Dict, Optional
 from datetime import datetime
 from decimal import Decimal
 import asyncio
+from sqlalchemy.exc import IntegrityError
 
 # FIX (E2, E4): 从核心模式导入 Order, Fill, Position, PortfolioState
 from Phoenix_project.core.schemas.data_schema import Order, Fill, Position, PortfolioState
@@ -139,11 +140,9 @@ class TradeLifecycleManager:
         for symbol, pos in positions_snapshot.items():
             current_price = current_market_data.get(symbol)
             
-            # [Beta FIX] Valuation Resilience (Fail-Closed)
-            # [Task 12] Valuation Fallback: Use Cost Basis for "Limp Mode" to prevent artificial bankruptcy
+            # [Task 2.3 Fix] Remove Ostrich Valuation (Fail-Closed)
             if current_price is None or current_price <= 0:
-                logger.warning(f"{self.log_prefix} WARNING: Missing market data for {symbol}. Using Cost Basis ({pos.average_price}) for valuation (Stale Mode).")
-                current_price = pos.average_price
+                raise ValueError(f"CRITICAL: Missing market data for {symbol}. Cannot value portfolio.")
 
             # Calculate in Decimal for safety
             # Note: Explicit casting Decimal -> float for schema compatibility
@@ -272,6 +271,9 @@ class TradeLifecycleManager:
                     async with self.tabular_db.transaction() as conn:
                         await self._persist_transaction(new_cash, new_realized_pnl, new_pos, fill.symbol, conn)
                         await self._record_fill(fill, conn)
+                except IntegrityError:
+                    logger.warning(f"{self.log_prefix} Duplicate fill {fill.id} detected during DB commit. Rolling back.")
+                    return # Graceful exit, memory state remains untouched
                 except Exception as e:
                     # CRITICAL: DB write failed. Do NOT update memory. Halt system.
                     logger.critical(f"{self.log_prefix} LEDGER WRITE FAILED. HALTING to prevent split-brain. Error: {e}")
@@ -323,7 +325,7 @@ class TradeLifecycleManager:
 
     async def _record_fill(self, fill: Fill, conn=None):
         """记录 Fill 事件以防止重放。"""
-        await self.tabular_db.upsert_data(
+        await self.tabular_db.insert_data(
             "ledger_fills",
             {"fill_id": fill.id, "order_id": fill.order_id, "symbol": fill.symbol, 
              "quantity": fill.quantity, "price": fill.price, "timestamp": fill.timestamp},
