@@ -43,10 +43,9 @@ class BaseDRLAgent(ABC):
             else:
                 raise ValueError(f"Policy '{self.policy_id}' not found in algorithm.")
         except Exception as e:
-            self.logger.error(f"Failed to inspect policy or initialize state: {e}")
-            # Fallback to standard 9 dim if inspection fails, but log critical error
-            self.expected_dim = 9 
-            self.internal_state = []
+            self.logger.critical(f"Failed to inspect policy or initialize state: {e}. Cannot start Agent.")
+            # [Task 3.2 Fix] Block startup on failure
+            raise RuntimeError(f"Critical Policy Failure: {e}")
 
     @abstractmethod
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
