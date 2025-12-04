@@ -220,3 +220,17 @@ ai_components:
 evaluation:
   fact_checker:
     model_name: "gemini-1.5-flash-latest" # (Flash 适用于快速核查)
+
+9. L3 智能体配置 (L3 Agent Configuration)
+
+agents:
+  l3:
+    alpha:
+      checkpoint_path: "/app/models/checkpoints/alpha_v1"
+      policy_id: "alpha_policy_default"
+    risk:
+      checkpoint_path: "/app/models/checkpoints/risk_v1"
+      policy_id: "risk_policy_conservative"
+    execution:
+      checkpoint_path: "/app/models/checkpoints/execution_v1"
+      policy_id: "execution_policy_standard"
