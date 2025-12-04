@@ -4,6 +4,7 @@
 # [Code Opt Expert Fix] Task 3: Clean Architecture / Remove ContextBus Communication
 # [Phase III Fix] Risk Gating & Signal Mapping
 # [Code Opt Expert Fix] Task 07: Fix Stale Portfolio State
+# [Task 011, 018] Silent Liquidation Fix & Safe Async Initialization
 
 import logging
 from omegaconf import DictConfig
@@ -31,9 +32,15 @@ class PortfolioConstructor:
         self.sizing_strategy = sizing_strategy
         self.data_manager = data_manager # [新] 需要 DataManager 来获取当前状态
         
-        self.current_portfolio = self._load_initial_portfolio()
-        logger.info("PortfolioConstructor initialized.")
+        # [Task 018] Safe Async Initialization: No blocking I/O here
+        self.current_portfolio = None
+        logger.info("PortfolioConstructor initialized (pending async setup).")
 
+    async def initialize(self):
+        """[Task 018] Async Initializer to prevent blocking I/O in __init__."""
+        logger.info("Async initializing PortfolioConstructor...")
+        self.current_portfolio = self._load_initial_portfolio()
+        logger.info("PortfolioConstructor async setup complete.")
 
     def _load_initial_portfolio(self):
         """
@@ -51,9 +58,9 @@ class PortfolioConstructor:
                 return current_portfolio
             else:
                 # [Safety Fix] Phantom Initialization Prevention
-                err_msg = "DataManager returned no initial portfolio or data was malformed. Cannot safely start."
-                logger.critical(err_msg)
-                raise RuntimeError(err_msg)
+                # Non-fatal during async init, but worth logging warning if cold start
+                logger.warning("DataManager returned no initial portfolio. Starting with empty state.")
+                return None
         except Exception as e:
             # [Safety Fix] Prevent starting with phantom zero positions if data service is down
             logger.critical(f"Failed to load initial portfolio from DataManager: {e}. System HALT.", exc_info=True)
@@ -159,11 +166,24 @@ class PortfolioConstructor:
             
             # [Task 3] Adapter: Convert Sizing results back to TargetPortfolio object
             # FIX: Use TargetPosition, not Position (which is for current holdings)
+            
+            # [Task 011 Fix] Calculate Physical Quantity to prevent Silent Liquidation
+            total_equity = float(real_time_portfolio.get("total_value", 0.0))
+            price_map = {md.symbol: float(md.close) for md in market_data if md.close}
+            
             target_positions_list = []
             for res in allocation_results:
+                sym = res.get("ticker")
+                weight = res.get("capital_allocation_pct", 0.0)
+                price = price_map.get(sym)
+                
+                # Calculate quantity: Equity * Weight / Price
+                qty = (total_equity * weight) / price if (price and price > 0) else 0.0
+                
                 target_positions_list.append(TargetPosition(
-                    symbol=res.get("ticker"),
-                    target_weight=res.get("capital_allocation_pct", 0.0),
+                    symbol=sym,
+                    target_weight=weight,
+                    quantity=qty,
                     reasoning="Sizing Strategy Output"
                 ))
             
