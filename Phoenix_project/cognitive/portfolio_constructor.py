@@ -125,12 +125,16 @@ class PortfolioConstructor:
                 market_data
             )
             
-            if not risk_report.passed:
-                logger.warning(f"Risk validation failed: {risk_report.adjustments_made}. HALTING construction.")
+            # [Task 3.1 Fix] Honor RiskReport feedback
+            if risk_report.adjusted_weights:
+                logger.info(f"Risk intervention: Applying adjusted weights. Reason: {risk_report.adjustments_made}")
+                adjusted_weights = risk_report.adjusted_weights
+            elif not risk_report.passed:
+                logger.warning(f"Risk validation failed and no safe fallback provided. HALTING.")
                 return None
-
-            # Pass-through if validated
-            adjusted_weights = target_weights
+            else:
+                # No adjustments, passed check
+                adjusted_weights = target_weights
             
         except Exception as e:
             logger.error(f"RiskManager validation error: {e}. Aborting construction.", exc_info=True)
