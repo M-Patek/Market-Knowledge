@@ -3,7 +3,7 @@
 
 [主人喵的修复 2]
 此类现在被设计为独立运行 (参见 run_stream_processor.py)。
-它不再被 Orchestrator 拥有，而是通过 EventDistributor (Redis)
+它不再被 Orchestrator 拥有，而是通过 SyncEventDistributor (Redis)
 与 Orchestrator 通信。
 
 [阶段 2 更新]
@@ -23,7 +23,7 @@ from kafka import KafkaConsumer
 from pydantic import ValidationError
 from Phoenix_project.config.loader import ConfigLoader
 from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.events.event_distributor import EventDistributor
+from Phoenix_project.events.event_distributor import SyncEventDistributor
 from Phoenix_project.core.schemas.data_schema import MarketData
 from Phoenix_project.config.constants import REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE
 
@@ -34,14 +34,14 @@ class StreamProcessor:
     def __init__(
         self, 
         config_loader: ConfigLoader,
-        event_distributor: EventDistributor
+        event_distributor: SyncEventDistributor
     ):
         """
         初始化 Kafka 消费者。
         
         参数:
             config_loader (ConfigLoader): 用于加载配置。
-            event_distributor (EventDistributor): 用于将处理后的消息推送到 Redis。
+            event_distributor (SyncEventDistributor): 用于将处理后的消息推送到 Redis。
         """
         self.config_loader = config_loader
         # [修复] 确保 get_system_config 被调用
@@ -60,9 +60,7 @@ class StreamProcessor:
         self.group_id = self.kafka_config.get('group_id', 'phoenix_consumer_group')
         
         # [Beta FIX] Resource Fix: Do not create private StrictRedis.
-        # Use the redis_client from the injected event_distributor if available,
-        # or rely on the fact that we will fix the connection pooling globally.
-        # For now, we will reuse the client from event_distributor to avoid connection leaks.
+        # Use the redis_client from the injected event_distributor if available.
         if hasattr(self.event_distributor, 'redis_client'):
              self.redis_client = self.event_distributor.redis_client
              logger.info("StreamProcessor reusing Redis client from EventDistributor.")
@@ -95,7 +93,6 @@ class StreamProcessor:
                 group_id=self.group_id,
                 # [Beta FIX] Fragile Deserialization: Removed lambda.
                 # We decode manually in the loop to handle errors gracefully.
-                # value_deserializer=lambda x: json.loads(x.decode('utf-8')) 
             )
             logger.info("Kafka Consumer connected successfully.")
         except Exception as e:
@@ -122,24 +119,9 @@ class StreamProcessor:
             # --- 路由逻辑 ---
             
             if topic == "phoenix_news_events":
-                # [Beta FIX] Deadlock Fix: Use publish_sync (which we must ensure exists in EventDistributor)
-                # or better yet, assume we are in a synchronous loop context here.
-                # Since StreamProcessor is a separate process loop, synchronous blocking push to Redis is acceptable
-                # provided timeouts are short. The previous 'await' issue was because it was mixed async/sync code.
-                
-                # Check if EventDistributor has a sync publish method or if we need to run async
-                # For simplicity in this Kafka loop, we assume EventDistributor is thread-safe/sync compatible here.
-                # If EventDistributor only has 'async def publish', we would need `asyncio.run()`, which is slow.
-                # Ideally EventDistributor should expose `publish_sync`.
-                
-                if hasattr(self.event_distributor, 'publish_sync'):
-                    success = self.event_distributor.publish_sync(data, self.redis_client)
-                else:
-                    # Fallback for async-only distributor (not ideal for high throughput)
-                    # This is the "Blocking I/O" warning from Alpha, but unavoidable without full async rewrite.
-                    # We log a warning.
-                    logger.warning("EventDistributor lacks publish_sync. Skipping event to avoid loop blocking.")
-                    success = False
+                # [Task 001 Integration] Use SyncEventDistributor
+                # The Sync distributor provides a blocking 'publish' method, perfectly safe here.
+                success = self.event_distributor.publish(data)
 
                 if success:
                     logger.debug(f"Published event {data.get('id', 'N/A')} to distributor.")
@@ -159,9 +141,9 @@ class StreamProcessor:
                 redis_key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=market_data.symbol)
                 
                 # 3. 存储完整数据 (OHLCV)
-                # This is the EXCLUSIVE write to this key now (DataManager batch write removed).
-                # [Task 1.1 Fix] Use setex with 10s TTL to prevent zombie prices
-                self.redis_client.setex(redis_key, 10, market_data.model_dump_json())
+                # [Task 003 Fix] Use setex with 60s TTL to prevent "Short-term Memory Loss"
+                # allowing Orchestrator time for heavy inference.
+                self.redis_client.setex(redis_key, 60, market_data.model_dump_json())
                 logger.debug(f"Updated market data for {market_data.symbol} at {redis_key}")
             
             else:
@@ -175,7 +157,6 @@ class StreamProcessor:
     def start_consumer(self):
         """
         (阻塞) 启动消费者循环。
-        这应该在一个专用的服务中运行。
         """
         if not self.consumer:
             logger.error("Consumer is not connected. Call connect() first.")
@@ -184,9 +165,6 @@ class StreamProcessor:
         logger.info("Starting Kafka consumer loop (blocking)...")
         try:
             for message in self.consumer:
-                # [Beta FIX] message.value is now bytes because we removed value_deserializer
-                # logger.debug(f"Received message from Kafka: {message.topic}:{message.partition}:{message.offset}")
-                
                 self.process_stream(message.topic, message.value)
         
         except KeyboardInterrupt:
