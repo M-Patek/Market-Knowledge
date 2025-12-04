@@ -10,6 +10,7 @@ including a text-to-SQL agent capability.
 
 import logging
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from typing import Any, List, Dict, Optional, Callable
 
@@ -48,7 +49,17 @@ class TabularDBClient:
         if self.db_uri.startswith("postgresql://"):
              self.db_uri = self.db_uri.replace("postgresql://", "postgresql+asyncpg://")
              
-        self.engine: AsyncEngine = self._create_db_engine()
+        self.engine: AsyncEngine = self._create_db_engine(self.db_uri)
+        
+        # [Task 4.4] Read-Only Engine Support
+        self.db_uri_ro = os.environ.get("TABULAR_DB_URI_RO")
+        if self.db_uri_ro and self.db_uri_ro.startswith("postgresql://"):
+             self.db_uri_ro = self.db_uri_ro.replace("postgresql://", "postgresql+asyncpg://")
+        
+        self.engine_ro = None
+        if self.db_uri_ro:
+             self.engine_ro = self._create_db_engine(self.db_uri_ro)
+        
         self.schema: str = "" 
         
         self.prompt_manager = prompt_manager
@@ -58,13 +69,13 @@ class TabularDBClient:
         if self.llm_client:
             self.sql_agent = self._initialize_sql_agent()
 
-    def _create_db_engine(self) -> AsyncEngine:
+    def _create_db_engine(self, uri: str) -> AsyncEngine:
         try:
-            engine = create_async_engine(self.db_uri)
-            logger.info(f"Async DB engine created for {self.db_uri.split('@')[-1]}")
+            engine = create_async_engine(uri)
+            logger.info(f"Async DB engine created for {uri.split('@')[-1]}")
             return engine
         except SQLAlchemyError as e:
-            logger.error(f"Failed to connect to SQL database at {self.db_uri}: {e}")
+            logger.error(f"Failed to connect to SQL database at {uri}: {e}")
             raise
 
     async def _get_db_schema_async(self) -> str:
@@ -145,7 +156,13 @@ class TabularDBClient:
             logger.info(f"Generated SQL: {sql_query}")
 
             rows = []
-            async with self.engine.connect() as conn:
+            
+            # [Task 4.4] Use Read-Only Engine
+            execution_engine = self.engine_ro if self.engine_ro else self.engine
+            if not self.engine_ro:
+                 logger.warning("SECURITY WARNING: Using Read-Write engine for Text-to-SQL. Configure TABULAR_DB_URI_RO for isolation.")
+
+            async with execution_engine.connect() as conn:
                 result = await conn.execute(text(sql_query))
                 rows = [dict(row) for row in result.mappings().all()]
             
@@ -256,6 +273,28 @@ class TabularDBClient:
             logger.error(f"Failed to upsert data into {table_name}: {e}", exc_info=True)
             raise e
 
+    async def insert_data(self, table_name: str, data: Dict[str, Any], connection=None) -> bool:
+        """
+        [Task 2.1] Strict Insert (No Upsert). Raises IntegrityError on conflict.
+        """
+        if not self.engine:
+             raise ValueError("DB engine not initialized.")
+        
+        try:
+            tbl = table(table_name, *[column(c) for c in data.keys()])
+            stmt = pg_insert(tbl).values(**data)
+            # No on_conflict clause here!
+            
+            if connection:
+                await connection.execute(stmt)
+            else:
+                async with self.engine.begin() as conn:
+                    await conn.execute(stmt)
+            return True
+        except SQLAlchemyError as e:
+            # Let the caller handle the specific error (e.g., IntegrityError)
+            raise e
+
     @asynccontextmanager
     async def transaction(self):
         """
@@ -264,11 +303,10 @@ class TabularDBClient:
         async with self.engine.begin() as conn:
             yield conn
 
-    def close(self):
+    async def close(self):
         """Closes the database engine connection pool."""
         if self.engine:
-            # engine.dispose is synchronous-compatible in newer async engines or needs await
-            # For now we assume standard dispose pattern
-            pass
-            # asyncio.create_task(self.engine.dispose()) # Ideally
-            logger.info("Tabular DB client connections closed.")
+            await self.engine.dispose()
+        if self.engine_ro:
+            await self.engine_ro.dispose()
+        logger.info("Tabular DB client connections closed.")
