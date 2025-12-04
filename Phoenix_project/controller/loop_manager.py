@@ -17,6 +17,7 @@ class LoopManager:
     管理主事件循环（实时交易或回测）。
     控制循环的开始、停止、暂停和恢复。
     [Task 1.2] Refactored to Pure Async (No Threading).
+    [Task 017, 020] Exception Backoff & Time Drift Calibration
     """
 
     def __init__(
@@ -98,13 +99,35 @@ class LoopManager:
     async def _live_loop(self):
         """
         [Task 4.3] Live execution loop for the Phoenix system. Implements Fail-Fast.
+        [Task 017, 020] Enhanced Robustness (Backoff & Drift Correct)
         """
         log.info("Starting Phoenix live execution loop...")
+        
+        # [Task 020] Time Drift Calibration Init
+        start_time = time.time()
+        count = 0
+        
+        # [Task 017] Backoff Init
+        failure_count = 0
         
         while self.is_running:
             try:
                 await self.orchestrator.run_main_cycle() # Using standardized method name
-                await asyncio.sleep(self.cycle_interval)
+                
+                # [Task 017] Reset failure count on success
+                failure_count = 0
+
+                # [Task 020] Drift-Corrected Sleep
+                # Calculates exact target time for next tick to prevent cumulative drift
+                count += 1
+                target_time = start_time + (count * self.cycle_interval)
+                sleep_duration = target_time - time.time()
+                
+                if sleep_duration > 0:
+                    await asyncio.sleep(sleep_duration)
+                else:
+                    # System is overloaded and running behind schedule
+                    log.warning(f"Loop lagging behind by {abs(sleep_duration):.4f}s")
 
             # [Task 4.3] Only catch non-fatal exceptions to enable fail-fast.
             except asyncio.CancelledError:
@@ -113,8 +136,14 @@ class LoopManager:
             except Exception as e:
                 # Catch general runtime errors (non-fatal)
                 log.error(f"Critical runtime error in live loop, continuing: {e}", exc_info=True)
-                # Avoid rapid continuous failures if error happens instantly
-                await asyncio.sleep(self.cycle_interval / 2)
+                
+                # [Task 017] Exponential Backoff
+                # Prevents CPU thrashing and log flooding during transient outages
+                failure_count += 1
+                backoff_time = min(2 ** failure_count, 60) # Cap at 60s
+                log.warning(f"Backing off for {backoff_time}s due to error.")
+                await asyncio.sleep(backoff_time)
+                
             except BaseException as e:
                 # Catch fatal errors (SystemExit, KeyboardInterrupt, etc.)
                 log.critical(f"FATAL BaseException in live loop. Exiting now: {e}", exc_info=True)
@@ -135,20 +164,8 @@ class LoopManager:
                 if not self.is_running:
                     break
                 
-                # Pass batch to orchestrator logic via run_main_cycle or specific backtest method
-                # Since Orchestrator.run_main_cycle pulls from event queue, we might need to inject data.
-                # In BacktestEngine context, loop management differs.
-                # Assuming LoopManager for backtest orchestrates step-by-step injection:
-                
-                # Update pipeline state with time/data from iterator (handled inside Orchestrator or here)
-                # For now, we assume orchestrator handles data consumption if properly mocked/configured,
-                # or we interact with BacktestEngine.
-                
-                # For strict Orchestrator compatibility, we might inject an event or update state.
-                # Based on previous context, we call orchestrator.
-                
-                # Note: LoopManager.run_backtest usually delegates to a specific engine or calls cycle.
-                # If using Orchestrator directly:
+                # In backtest mode, we typically drive the orchestrator directly or via backtest engine.
+                # Here we assume standard cycle execution.
                 await self.orchestrator.run_main_cycle()
                 
         except Exception as e:
