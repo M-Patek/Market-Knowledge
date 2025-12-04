@@ -67,6 +67,7 @@ class FactChecker:
             "If no evidence is found after searching, you MUST report the claim as 'Unverified' or 'No Evidence Found'. "
             "Do NOT fabricate sources or evidence to satisfy the request. "
             "Do not rely on internal knowledge."
+            " You are allowed to report that no evidence was found. Do not feel pressured to find supporting facts if they do not exist."
             "\n---\n"
         )
         
