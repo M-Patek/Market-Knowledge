@@ -8,6 +8,7 @@
 [Phase II Fix] Decimal Precision & Atomic Transactions
 [Phase V Fix] SQL Injection Protection
 [Code Opt Expert Fix] Task 11 & 12: Concurrency Crash Fix & Valuation Fallback
+[Task 012, 013] Append-Only Ledger & Ostrich Valuation Fix
 """
 from typing import Dict, Optional
 from datetime import datetime
@@ -73,9 +74,11 @@ class TradeLifecycleManager:
             );
         """)
         # Positions Table
+        # [Task 012] Fix: Append-Only Ledger (id SERIAL PRIMARY KEY, not symbol)
         await self.tabular_db.query("""
             CREATE TABLE IF NOT EXISTS ledger_positions (
-                symbol VARCHAR(20) PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
+                symbol VARCHAR(20) NOT NULL,
                 quantity NUMERIC(20, 10) NOT NULL,
                 average_price NUMERIC(20, 10) NOT NULL,
                 market_value NUMERIC(20, 10) NOT NULL,
@@ -107,7 +110,14 @@ class TradeLifecycleManager:
             logger.info(f"{self.log_prefix} Restored balance: Cash={self.cash}, PnL={self.realized_pnl}")
 
         # Load Positions
-        res_pos = await self.tabular_db.query("SELECT * FROM ledger_positions")
+        # [Task 012] Fix: Fetch only the latest snapshot for each symbol (Append-Only Support)
+        query = """
+            SELECT * FROM ledger_positions 
+            WHERE id IN (
+                SELECT MAX(id) FROM ledger_positions GROUP BY symbol
+            )
+        """
+        res_pos = await self.tabular_db.query(query)
         if res_pos and "results" in res_pos:
             for row in res_pos["results"]:
                 sym = row["symbol"]
@@ -140,9 +150,10 @@ class TradeLifecycleManager:
         for symbol, pos in positions_snapshot.items():
             current_price = current_market_data.get(symbol)
             
-            # [Task 2.3 Fix] Remove Ostrich Valuation (Fail-Closed)
+            # [Task 013] Remove Ostrich Valuation (Fail-Safe)
             if current_price is None or current_price <= 0:
-                raise ValueError(f"CRITICAL: Missing market data for {symbol}. Cannot value portfolio.")
+                logger.warning(f"{self.log_prefix} Market data missing for {symbol}. Using cost basis (avg_price) for valuation.")
+                current_price = pos.average_price
 
             # Calculate in Decimal for safety
             # Note: Explicit casting Decimal -> float for schema compatibility
@@ -303,25 +314,35 @@ class TradeLifecycleManager:
     async def _persist_transaction(self, cash: Decimal, realized_pnl: Decimal, position: Optional[Position], symbol: str, conn=None):
         """[Task 3] Atomic DB Update Helper. Uses explicit values."""
         # Update Balance
-        await self.tabular_db.upsert_data(
+        # [Task 012] Fix: Append-Only Ledger (INSERT instead of UPSERT)
+        await self.tabular_db.insert_data(
             "ledger_balance", 
-            {"id": 1, "cash": str(cash), "realized_pnl": str(realized_pnl)}, 
-            "id",
+            {"cash": str(cash), "realized_pnl": str(realized_pnl)}, 
             connection=conn
         )
         
         # Update Position (if exists)
         if position:
-            await self.tabular_db.upsert_data(
+            # [Task 012] Fix: Append-Only Ledger (INSERT)
+            await self.tabular_db.insert_data(
                 "ledger_positions",
                 position.model_dump(),
-                "symbol",
                 connection=conn
             )
         else:
-            # Position closed, remove from DB
-            # Use execute_sql with conn for atomic delete
-            await self.tabular_db.execute_sql(f"DELETE FROM ledger_positions WHERE symbol = :symbol", {"symbol": symbol}, connection=conn)
+            # Position closed.
+            # In an append-only ledger, closure is usually represented by a record with quantity=0.
+            # However, our OrderManager/Fill logic might handle the 0-qty update logic by creating a new position obj.
+            # If position is None here, it means it's fully closed. 
+            # We can insert a tombstone record (qty=0).
+            tombstone = {
+                "symbol": symbol,
+                "quantity": "0",
+                "average_price": "0",
+                "market_value": "0",
+                "unrealized_pnl": "0"
+            }
+            await self.tabular_db.insert_data("ledger_positions", tombstone, connection=conn)
 
     async def _record_fill(self, fill: Fill, conn=None):
         """记录 Fill 事件以防止重放。"""
