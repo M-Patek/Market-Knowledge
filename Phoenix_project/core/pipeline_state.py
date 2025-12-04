@@ -97,4 +97,5 @@ class PipelineState(BaseModel):
             self.latest_decisions = fusion_result.agent_decisions
         
         # 序列化 FusionResult 以便存储
-        self.latest_fusion_result = fusion_result.model_dump() if hasattr(fusion_result, 'model
+        # [Task 0.1 Fix] Complete truncation & Handle Pydantic V1/V2 compatibility
+        self.latest_fusion_result = fusion_result.model_dump() if hasattr(fusion_result, 'model_dump') else fusion_result.dict()
