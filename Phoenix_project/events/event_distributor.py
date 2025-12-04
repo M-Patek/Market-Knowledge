@@ -13,6 +13,8 @@ class AsyncEventDistributor:
     Async Event Distributor
     Exclusively for the Orchestrator loop (using aioredis).
     Handles the 'processing' queue using a ZSET (Sorted Set) for reliable ACKs and timeout management.
+    [Task 001] Decoupled from Sync I/O.
+    [Task 002] ZSET Architecture for Reliable ACK.
     """
 
     def __init__(self, redis_client: aioredis.Redis):
@@ -23,6 +25,9 @@ class AsyncEventDistributor:
         self._json_separators = (',', ':') 
 
     async def publish(self, event: Dict[str, Any]) -> bool:
+        """
+        [Async] 将事件推送到 Redis 队列 (LPUSH)。
+        """
         try:
             # [Beta FIX] Consistent Serialization
             message = json.dumps(event, separators=self._json_separators, sort_keys=True)
@@ -34,6 +39,10 @@ class AsyncEventDistributor:
             return False
 
     async def get_pending_events(self, batch_size: int = 10) -> List[Dict[str, Any]]:
+        """
+        [Async] 从队列中获取待处理事件。
+        [Task 002] 使用 Lua 脚本原子性地执行 RPOP + ZADD (Timestamp Score)。
+        """
         events = []
         # Lua script to atomically RPOP from queue and ZADD to processing with timestamp
         # KEYS[1]=queue, KEYS[2]=processing, ARGV[1]=timestamp
@@ -70,6 +79,9 @@ class AsyncEventDistributor:
         return events
 
     async def ack_event(self, event: Dict[str, Any]):
+        """
+        [Async] 确认事件已处理，将其从 processing ZSET 中移除。
+        """
         try:
             # [Beta FIX] Consistent Serialization for matching
             # Must match exactly what was put into the queue
@@ -86,8 +98,10 @@ class AsyncEventDistributor:
             logger.error(f"Error ACKing event: {e}")
 
     async def recover_stale_events(self, timeout_seconds: int = 300):
-        # [Task 4.2 Fix] Implementation of Stale Event Recovery
-        # Uses ZRANGEBYSCORE to identify and move stale events
+        """
+        [Async] 恢复超时未处理的事件。
+        [Task 002] 使用 ZRANGEBYSCORE 识别陈旧事件并重新入队。
+        """
         recovered_count = 0
         try:
             limit = time.time() - timeout_seconds
@@ -111,6 +125,7 @@ class SyncEventDistributor:
     """
     Sync Event Distributor
     Exclusively for the StreamProcessor/Ingestion (using standard redis).
+    [Task 001] Strict Sync Interface.
     """
     def __init__(self, redis_client: redis.Redis):
         self.redis_client = redis_client
