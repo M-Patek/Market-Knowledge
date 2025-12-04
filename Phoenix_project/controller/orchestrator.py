@@ -8,18 +8,21 @@
 # [Task 4.1] Risk Hard Override
 # [Task 5.3] Log Sampling for Idle Loops
 # [Code Opt Expert Fix] Task 17: Poison Pill Protection (Reliable ACK)
+# [Task 005, 006, 010] Real-time Risk Integration, Temporal Safety, Magic String Removal
 
 import logging
 import asyncio
+from enum import Enum
 from datetime import datetime
 from omegaconf import DictConfig
 from typing import List, Dict, Optional, Any
 
 from Phoenix_project.core.pipeline_state import PipelineState
+from Phoenix_project.core.schemas.data_schema import MarketData
 from Phoenix_project.context_bus import ContextBus
 from Phoenix_project.data_manager import DataManager
 from Phoenix_project.cognitive.engine import CognitiveEngine
-from Phoenix_project.events.event_distributor import EventDistributor
+from Phoenix_project.events.event_distributor import AsyncEventDistributor
 from Phoenix_project.events.risk_filter import EventRiskFilter
 from Phoenix_project.ai.market_state_predictor import MarketStatePredictor
 from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
@@ -30,6 +33,10 @@ from Phoenix_project.core.exceptions import CognitiveError, PipelineError
 from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
+
+class RiskAction(str, Enum):
+    HALT = "HALT_TRADING"
+    CONTINUE = "CONTINUE"
 
 class Orchestrator:
     """
@@ -44,7 +51,7 @@ class Orchestrator:
         context_bus: ContextBus,
         data_manager: Optional[DataManager],
         cognitive_engine: CognitiveEngine,
-        event_distributor: EventDistributor,
+        event_distributor: AsyncEventDistributor,
         event_filter: EventRiskFilter,
         market_state_predictor: MarketStatePredictor,
         portfolio_constructor: PortfolioConstructor,
@@ -112,7 +119,7 @@ class Orchestrator:
             
             # [Time Machine] 关键：使用 DataManager 的时间同步 State
             if self.data_manager:
-                pipeline_state.update_time(self.data_manager.get_current_time())
+                pipeline_state.update_time(await self.data_manager.get_current_time())
                 pipeline_state.step_index += 1
 
             # [Task 1 Fix] State Sync: Active sync from Ledger (Brain-Body Connection)
@@ -141,6 +148,17 @@ class Orchestrator:
             self.no_event_counter = 0
             logger.info(f"Retrieved {len(new_events)} new events from EventDistributor.")
             pipeline_state.set_raw_events(new_events)
+
+            # [Task 005] Ghost Risk Manager Fix: Update Risk State immediately
+            if self.risk_manager:
+                for event in new_events:
+                    # Check if event looks like market data
+                    if event.get("symbol") and "close" in event:
+                        try:
+                            md = MarketData(**event)
+                            await self.risk_manager.on_market_data(md)
+                        except Exception as e:
+                            logger.warning(f"RiskManager update failed for event: {e}")
 
             # [TBD-1 修复] 过滤事件
             logger.info(f"Filtering {len(new_events)} events...")
@@ -173,7 +191,7 @@ class Orchestrator:
             await self._run_l3_decision(pipeline_state)
             
             # [Safety] Risk Blockade
-            if pipeline_state.l3_decision and pipeline_state.l3_decision.get("risk_action") == "HALT_TRADING":
+            if pipeline_state.l3_decision and pipeline_state.l3_decision.get("risk_action") == RiskAction.HALT.value:
                 logger.critical("HALT_TRADING triggered by L3 Risk Agent. Aborting cycle.")
                 return
             
@@ -288,9 +306,19 @@ class Orchestrator:
             task_query = pipeline_state.get_main_task_query()
             symbol = task_query.get("symbol") or self.config.get('trading.default_symbol', "BTC/USD")
             
+            # [Task 006] Temporal Leakage Fix: Use current batch data only
             market_data = None
-            if self.data_manager:
-                market_data = await self.data_manager.get_latest_market_data(symbol)
+            for event in pipeline_state.raw_events:
+                if event.get("symbol") == symbol and "close" in event:
+                    try:
+                        market_data = MarketData(**event)
+                        break # Use the first matching event
+                    except:
+                        continue
+            
+            if not market_data:
+                logger.warning(f"L3 Decision Skipped: No market data for {symbol} in current batch (Temporal Safety).")
+                return
             
             price = float(market_data.close) if market_data else 0.0
             
@@ -325,7 +353,7 @@ class Orchestrator:
 
             # 3. Risk Agent Decision (Async)
             # [Fail-Closed Patch] The Ghost Risk Agent Fix
-            risk_action = "HALT_TRADING" 
+            risk_action = RiskAction.HALT.value
             if self.risk_agent:
                 obs = self.risk_agent.format_observation(state_data, pipeline_state.latest_fusion_result, pipeline_state.market_state)
                 # [Task 4.1] Pass fusion_result for Hard Override
@@ -333,7 +361,7 @@ class Orchestrator:
                 
                 raw_val = raw_risk_action[0] if (hasattr(raw_risk_action, '__len__') and len(raw_risk_action) > 0) else raw_risk_action
                 # [Phase II Fix] 1.0 = HALT
-                risk_action = "HALT_TRADING" if float(raw_val) > 0.5 else "CONTINUE"
+                risk_action = RiskAction.HALT.value if float(raw_val) > 0.5 else RiskAction.CONTINUE.value
                 logger.info(f"Risk Agent Action (Translated): {risk_action}")
 
             # 4. Execution Agent Decision (Async)
