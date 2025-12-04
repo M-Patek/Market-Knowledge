@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
 from decimal import Decimal
 from datetime import datetime
 
@@ -17,6 +17,7 @@ class OrderManager:
     [Task 5.2] Concurrent Execution & Zombie Position Fix
     [Beta FIX] "Machine Gun" Loop Prevention & Time Travel Fix
     [Code Opt Expert Fix] Task 10: Enforce Atomicity (Race Condition Fix)
+    [Task 014, 015] Price Anchoring & Race Condition Fix
     """
 
     def __init__(self, broker_adapter: Optional[IBrokerAdapter], data_manager: DataManager):
@@ -26,44 +27,42 @@ class OrderManager:
         self.log_prefix = "OrderManager:"
         self.lock = asyncio.Lock()
 
-    async def reconcile_portfolio(self, state: PortfolioState):
+    async def reconcile_portfolio(self, pipeline_state: Any):
         """
         根据当前状态和目标投资组合生成并提交订单。
         [Full Implementation] 包含完整的 Diff 计算逻辑和并发提交。
         """
-        target_portfolio = state.target_portfolio
+        # [Task 014] Fix Type Mismatch & Price Anchoring
+        # Orchestrator passes PipelineState, not PortfolioState directly.
+        target_portfolio = pipeline_state.target_portfolio
         if not target_portfolio: return
+        
+        # Extract PortfolioState (Current Holdings)
+        current_pf_state = pipeline_state.portfolio_state
 
         # [Task 3.2] Fix: Fetch prices for both Target AND Current positions
         # Prevents "Zombie Position" crashes where we hold an asset not in target
-        current_holdings = set(state.portfolio_state.positions.keys()) if state.portfolio_state else set()
+        current_holdings = set(current_pf_state.positions.keys()) if current_pf_state else set()
         target_holdings = {p.symbol for p in target_portfolio.positions}
         relevant_symbols = current_holdings.union(target_holdings)
 
-        # [Beta FIX] Parallel Market Data Fetch (Serial IO Slippage Fix)
+        # [Task 014] Fix Price Anchoring: Do NOT re-fetch data. Use batch from PipelineState.
+        # This ensures "What You See Is What You Trade" (Execution uses same price as Decision)
         market_prices: Dict[str, Decimal] = {}
-        
-        # Prepare fetch tasks
-        fetch_tasks = []
-        symbol_list = list(relevant_symbols)
-        for sym in symbol_list:
-            fetch_tasks.append(self.data_manager.get_latest_market_data(sym))
-        
-        # Execute parallel fetch
-        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-        
-        for sym, res in zip(symbol_list, results):
-            if isinstance(res, Exception) or not res:
-                logger.warning(f"{self.log_prefix} Market data missing for {sym}. Skipping.")
-                continue
-            market_prices[sym] = Decimal(str(res.close))
+        if pipeline_state.market_data_batch:
+            for md in pipeline_state.market_data_batch:
+                if md.close:
+                    market_prices[md.symbol] = Decimal(str(md.close))
+        else:
+             logger.warning(f"{self.log_prefix} No market_data_batch in PipelineState! Execution might fail for missing prices.")
 
         orders_to_submit: List[Order] = []
-        current_positions = state.portfolio_state.positions if state.portfolio_state else {}
+        current_positions = current_pf_state.positions if current_pf_state else {}
 
         # --- 核心 Diff 逻辑 ---
         for symbol in relevant_symbols:
             if symbol not in market_prices:
+                # [Task 014] Skip if price not in batch (Fail-Safe)
                 continue
 
             # [Task 10] Enforce Atomicity: Lock the entire check-calculate-register block
@@ -107,9 +106,9 @@ class OrderManager:
                 abs_qty = float(abs(delta))
                 
                 # [Beta FIX] Time Travel Prevention
-                # Use the timestamp from the PortfolioState (synchronized simulation time)
+                # Use the timestamp from the PipelineState (synchronized simulation time)
                 # instead of datetime.now() (physical server time).
-                order_time = state.timestamp if state.timestamp else datetime.utcnow()
+                order_time = pipeline_state.current_time if pipeline_state.current_time else datetime.utcnow()
 
                 # 创建订单对象
                 # 注意：实际生产中可能需要考虑 limit_price (限价) 或 slippage (滑点)
@@ -171,6 +170,10 @@ class OrderManager:
                     await asyncio.to_thread(self.broker.cancel_order, order.id)
                 async with self.lock:
                     order.status = OrderStatus.CANCELLED
-                    if order.id in self.active_orders: del self.active_orders[order.id]
+                    # [Task 015] EAFP Pattern to prevent race condition crashes
+                    try:
+                        del self.active_orders[order.id]
+                    except KeyError:
+                        pass
             except Exception as e:
                 logger.error(f"{self.log_prefix} Failed to cancel order {order.id}: {e}")
