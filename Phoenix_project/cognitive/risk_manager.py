@@ -66,12 +66,17 @@ class RiskManager:
     async def _load_circuit_breaker_state(self) -> bool:
         """[Task 5] Loads circuit breaker state from Redis."""
         try:
-            if not self.redis_client: return False
+            # [Task 4.5 Fix] Fail-Closed: If Redis is missing, assume tripped.
+            if not self.redis_client: 
+                logger.warning("RiskManager: No Redis client. Defaulting to TRIPPED (Safe Mode).")
+                return True
+                
             state = await self.redis_client.get("phoenix:risk:halted")
             return bool(int(state)) if state else False
         except Exception as e:
-            logger.error(f"Failed to load circuit breaker state: {e}")
-            return False
+            # [Task 4.5 Fix] Fail-Closed: If connection fails, assume tripped.
+            logger.error(f"Failed to load circuit breaker state: {e}. Defaulting to TRIPPED.")
+            return True
 
     async def initialize(self, symbols: List[str]):
         """
