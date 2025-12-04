@@ -7,6 +7,7 @@ to enforce risk controls and trigger circuit breakers.
 [Task 6.3] Direction-Aware Risk Control
 [Beta FIX] Interface Mismatch & Flatline Bypass Fix
 [Code Opt Expert Fix] Task 03 & 04: Cold Start Protection & Distributed Pub/Sub
+[Task 007, 008, 009] Fail-Closed Logic, Volatility Scaling, Poisoning Defense
 """
 
 import logging
@@ -50,8 +51,19 @@ class RiskManager:
         self.max_position_concentration_pct = self.config.get("max_position_concentration_pct", 0.20)
         self.volatility_threshold = self.config.get("volatility_threshold", 0.05)
         self.volatility_window = self.config.get("volatility_window", 30)
-        # [Beta FIX] Configurable Frequency Factor
-        self.frequency_factor = self.config.get("frequency_factor", 252)
+        
+        # [Task 008] Volatility Scale Calibration
+        if "frequency_factor" in self.config:
+            self.frequency_factor = self.config["frequency_factor"]
+        else:
+            # Check for data_frequency in global trading config (default to daily)
+            trading_config = config.get("trading", {})
+            data_freq = trading_config.get("data_frequency", "daily")
+            
+            if data_freq == "minute":
+                self.frequency_factor = 252 * 390 # 98280 for intraday
+            else:
+                self.frequency_factor = 252
 
         self.current_equity: float = initial_capital 
         
@@ -94,7 +106,7 @@ class RiskManager:
             return
 
         logger.info(f"Warming up RiskManager for {len(symbols)} symbols...")
-        end_time = self.data_manager.get_current_time()
+        end_time = await self.data_manager.get_current_time()
         start_time = end_time - timedelta(days=int(self.volatility_window * 2) + 5)
 
         async def _fetch_and_fill(sym):
@@ -120,7 +132,12 @@ class RiskManager:
             if not self.redis_client: return self.initial_capital
             peak_equity_raw = await self.redis_client.get("phoenix:risk:peak_equity")
             if peak_equity_raw:
-                return max(float(peak_equity_raw), self.initial_capital)
+                val = float(peak_equity_raw)
+                # [Task 009] Sanity Check: Limit to 50x initial capital to prevent DoS via poisoning
+                if val > self.initial_capital * 50:
+                    logger.warning(f"Suspicious peak equity value detected in Redis ({val}). Resetting to initial capital.")
+                    return self.initial_capital
+                return max(val, self.initial_capital)
             return self.initial_capital
         except Exception as e:
             logger.error(f"Failed to load peak_equity: {e}")
@@ -289,15 +306,15 @@ class RiskManager:
         
         self.price_history[symbol].append(price)
 
-        # [Task 03] Cold Start Protection
-        # If insufficient data, assume extreme volatility (BLOCKING).
+        # [Task 007] Cold Start Protection (Fail-Closed)
+        # If insufficient data, assume extreme volatility and BLOCK trading.
         if len(self.price_history[symbol]) < self.volatility_window:
             return VolatilitySignal(
-                description="Insufficient data for volatility check (Cold Start Protection).",
+                description="Circuit Breaker Tripped due to Cold Start (Insufficient Data).",
                 symbol=symbol,
                 current_volatility=999.0,
                 volatility_threshold=self.volatility_threshold,
-                triggers_circuit_breaker=False
+                triggers_circuit_breaker=True
             )
 
         try:
