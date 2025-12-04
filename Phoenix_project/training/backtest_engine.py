@@ -3,11 +3,12 @@ Backtest Engine
 - 模拟执行交易策略
 - 使用历史数据
 - 评估策略表现
+[Task 016, 019] Risk Integration & Short Selling Constraint
 """
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.data_manager import DataManager
 from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.data_schema import PortfolioState, Position
+from Phoenix_project.core.schemas.data_schema import PortfolioState, Position, MarketData
 from Phoenix_project.cognitive.engine import CognitiveEngine
 from Phoenix_project.core.exceptions import RiskViolationError, CircuitBreakerError
 from typing import Dict, Any, List, Optional
@@ -75,11 +76,31 @@ class BacktestEngine:
             # [Task 4.2] Step A: Execute Pending Orders from T-1 at Current Open (T)
             await self._execute_pending_orders(market_data_slice)
 
+            # [Task 016] Backtest Risk Integration: Update RiskManager state
+            # Ensure RiskManager sees the data AFTER execution (T) but BEFORE next decision (T -> T+1)
+            if self.risk_manager:
+                # Handle various data structures (List or Object)
+                data_list = market_data_slice
+                if hasattr(market_data_slice, 'market_data'):
+                    data_list = market_data_slice.market_data
+                elif isinstance(market_data_slice, dict) and 'market_data' in market_data_slice:
+                    data_list = market_data_slice['market_data']
+                
+                # Iterate and update
+                if isinstance(data_list, list):
+                    for item in data_list:
+                        # Convert dict to MarketData if needed, or use object
+                        try:
+                            md = item if isinstance(item, MarketData) else MarketData(**item)
+                            await self.risk_manager.on_market_data(md)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to update risk manager in backtest: {e}")
+
             # [Task 4.2] Step B: Generate Signals for T (to be executed at T+1)
             target_portfolio = None
             if self.portfolio_constructor:
                 # Generate Target for *Next* Step
-                target_portfolio = self.portfolio_constructor.construct_portfolio(self.pipeline_state)
+                target_portfolio = await self.portfolio_constructor.construct_portfolio(self.pipeline_state)
                 if target_portfolio:
                     self._stage_orders_for_next_bar(target_portfolio, market_data_slice)
             
@@ -145,14 +166,6 @@ class BacktestEngine:
             # [Task 4.2 Fix] Pre-Trade Risk Check
             if self.risk_manager:
                 try:
-                    # Create a temporary Position object representing the proposed trade
-                    # Note: RiskManager usually expects 'proposed_position' as the FINAL position, 
-                    # but check_pre_trade might interpret it differently based on implementation.
-                    # Assuming check_concentration takes the *change* or the *result*.
-                    # Looking at risk_manager.py: check_concentration takes proposed_position.
-                    # It adds trade_qty to existing_qty. So we pass the DELTA here?
-                    # "trade_qty = proposed_position.quantity" -> Yes, we pass the delta as a 'position' object.
-                    
                     proposed_trade = Position(
                         symbol=symbol,
                         quantity=qty_delta, # Delta
@@ -178,6 +191,13 @@ class BacktestEngine:
             if qty_delta > 0: # Buying
                 if current_pf.cash < total_debit:
                     self.logger.warning(f"MARGIN CALL: Insufficient funds for {symbol}. Req: {total_debit:.2f}, Avail: {current_pf.cash:.2f}. Order REJECTED.")
+                    continue
+            else: # Selling
+                # [Task 019] Short Selling Constraint
+                # Ensure we don't sell more than we own (Long-Only Backtest default)
+                current_pos_qty = current_pf.positions[symbol].quantity
+                if current_pos_qty < abs(qty_delta):
+                    self.logger.warning(f"Short Sell Rejected: Insufficient holdings for {symbol}. Have: {current_pos_qty}, Sell: {abs(qty_delta)}.")
                     continue
             
             current_pf.positions[symbol].quantity += qty_delta
