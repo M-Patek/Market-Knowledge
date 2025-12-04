@@ -126,6 +126,18 @@ class EventDistributor:
         """
         [Async] (可选后台任务) 检查 processing 队列中的陈旧事件并重新排队。
         """
-        # Implementation omitted for brevity, but would involve checking timestamps
-        # or simply moving everything from processing back to queue on startup.
-        pass
+        # [Task 4.2 Fix] Implementation of Stale Event Recovery
+        # Ideally, we would check timestamps, but for now, we recover everything on startup/recovery call.
+        # This moves events from the processing queue (tail) back to the main queue (head) so they are retried.
+        recovered_count = 0
+        try:
+            while True:
+                # [Task 4.2 Fix] Atomically move from processing tail back to queue head
+                event = await self.redis_client.rpoplpush(self.processing_key, self.queue_key)
+                if event is None:
+                    break
+                recovered_count += 1
+            if recovered_count > 0:
+                logger.warning(f"Recovered {recovered_count} stale events from processing queue.")
+        except Exception as e:
+            logger.error(f"Error recovering stale events: {e}")
