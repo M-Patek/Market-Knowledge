@@ -8,7 +8,7 @@ from Phoenix_project.core.schemas.data_schema import Order, OrderStatus, Portfol
 from Phoenix_project.execution.interfaces import IBrokerAdapter
 from Phoenix_project.data_manager import DataManager
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class OrderManager:
     """
@@ -110,13 +110,18 @@ class OrderManager:
                 # instead of datetime.now() (physical server time).
                 order_time = pipeline_state.current_time if pipeline_state.current_time else datetime.utcnow()
 
+                # [Task 1.3 Fix] Slippage Protection
+                # Mandate Limit Orders with 5% tolerance to prevent flash crash execution
+                slippage = Decimal("0.05")
+                limit_price_val = price * (1 + slippage) if side == OrderSide.BUY else price * (1 - slippage)
+
                 # 创建订单对象
-                # 注意：实际生产中可能需要考虑 limit_price (限价) 或 slippage (滑点)
                 order = Order(
                     symbol=symbol,
                     side=side,
-                    order_type=OrderType.MARKET, # 默认为市价单以保证成交
+                    order_type=OrderType.LIMIT,
                     quantity=abs_qty,
+                    limit_price=float(limit_price_val),
                     timestamp=order_time,
                     status=OrderStatus.PENDING_SUBMISSION
                 )
