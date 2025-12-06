@@ -150,10 +150,12 @@ class TradeLifecycleManager:
         for symbol, pos in positions_snapshot.items():
             current_price = current_market_data.get(symbol)
             
-            # [Task 013] Remove Ostrich Valuation (Fail-Safe)
+            # [Task 1.1 Fix] Fail-Closed Valuation: Raise error on missing data
+            # Removed Ostrich Valuation (fallback to average_price) which hides losses
             if current_price is None or current_price <= 0:
-                logger.warning(f"{self.log_prefix} Market data missing for {symbol}. Using cost basis (avg_price) for valuation.")
-                current_price = pos.average_price
+                error_msg = f"Valuation failed: Market data missing/invalid for {symbol}."
+                logger.critical(f"{self.log_prefix} {error_msg}")
+                raise ValueError(error_msg)
 
             # Calculate in Decimal for safety
             # Note: Explicit casting Decimal -> float for schema compatibility
