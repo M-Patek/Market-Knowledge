@@ -193,7 +193,9 @@ class Orchestrator:
             # [Safety] Risk Blockade
             if pipeline_state.l3_decision and pipeline_state.l3_decision.get("risk_action") == RiskAction.HALT.value:
                 logger.critical("HALT_TRADING triggered by L3 Risk Agent. Aborting cycle.")
-                return
+                # [Task 1.2 Fix] Do NOT return immediately. Let PortfolioConstructor handle Emergency Liquidation.
+                # proceed to _run_portfolio_construction which now handles HALT logic.
+                pass
             
             if not pipeline_state.l3_decision:
                 logger.warning("L3 DRL Agents did not produce a decision. Cycle ending.")
@@ -316,8 +318,14 @@ class Orchestrator:
                     except:
                         continue
             
+            # [Task 4.2 Fix] News Blindness Fallback: Fetch from cache if batch lacks price
+            if not market_data and self.data_manager:
+                market_data = await self.data_manager.get_latest_market_data(symbol)
+                if market_data:
+                    logger.info(f"Using cached market data for {symbol} to enable Event-Driven decision.")
+
             if not market_data:
-                logger.warning(f"L3 Decision Skipped: No market data for {symbol} in current batch (Temporal Safety).")
+                logger.warning(f"L3 Decision Skipped: No market data for {symbol} in batch or cache.")
                 return
             
             price = float(market_data.close) if market_data else 0.0
@@ -385,10 +393,15 @@ class Orchestrator:
             
             if alpha_action is not None:
                 try:
-                    val = float(alpha_action) if not hasattr(alpha_action, '__len__') else float(alpha_action[0])
-                    pipeline_state.set_l3_alpha_signal({symbol: val})
-                except (ValueError, TypeError, IndexError):
-                    logger.warning(f"Could not convert alpha_action {alpha_action} to signal.")
+                    # [Task 4.1 Fix] Polymorphic Signal Handling (Dict vs Scalar)
+                    if isinstance(alpha_action, dict):
+                        clean_signals = {k: float(v) for k, v in alpha_action.items()}
+                        pipeline_state.set_l3_alpha_signal(clean_signals)
+                    else:
+                        val = float(alpha_action) if not hasattr(alpha_action, '__len__') else float(alpha_action[0])
+                        pipeline_state.set_l3_alpha_signal({symbol: val})
+                except (ValueError, TypeError, IndexError) as e:
+                    logger.warning(f"Could not convert alpha_action {alpha_action} to signal: {e}")
 
             if market_data:
                 pipeline_state.set_market_data_batch([market_data])
