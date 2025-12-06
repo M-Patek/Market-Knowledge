@@ -103,31 +103,30 @@ class LoopManager:
         """
         log.info("Starting Phoenix live execution loop...")
         
-        # [Task 020] Time Drift Calibration Init
-        start_time = time.time()
-        count = 0
-        
-        # [Task 017] Backoff Init
+        # [Task 0.2 Fix] Relative Pacing & Fuse Init
+        last_end_time = time.time()
         failure_count = 0
+        max_consecutive_failures = 5
         
         while self.is_running:
+            # [Task 0.2 Fix] Pacing & Anti-Flood Logic
+            target_wake_time = last_end_time + self.cycle_interval
+            current_time = time.time()
+            sleep_duration = target_wake_time - current_time
+
+            if sleep_duration < -5 * self.cycle_interval:
+                log.warning(f"Severe lag detected ({abs(sleep_duration):.2f}s). Skipping frames to prevent flood.")
+                last_end_time = current_time
+            else:
+                if sleep_duration > 0:
+                    await asyncio.sleep(sleep_duration)
+                last_end_time = target_wake_time
+
             try:
                 await self.orchestrator.run_main_cycle() # Using standardized method name
                 
                 # [Task 017] Reset failure count on success
                 failure_count = 0
-
-                # [Task 020] Drift-Corrected Sleep
-                # Calculates exact target time for next tick to prevent cumulative drift
-                count += 1
-                target_time = start_time + (count * self.cycle_interval)
-                sleep_duration = target_time - time.time()
-                
-                if sleep_duration > 0:
-                    await asyncio.sleep(sleep_duration)
-                else:
-                    # System is overloaded and running behind schedule
-                    log.warning(f"Loop lagging behind by {abs(sleep_duration):.4f}s")
 
             # [Task 4.3] Only catch non-fatal exceptions to enable fail-fast.
             except asyncio.CancelledError:
@@ -140,6 +139,12 @@ class LoopManager:
                 # [Task 017] Exponential Backoff
                 # Prevents CPU thrashing and log flooding during transient outages
                 failure_count += 1
+                
+                # [Task 0.2 Fix] Fuse: Fail Fast
+                if failure_count > max_consecutive_failures:
+                    log.critical(f"Fuse Blow: {failure_count} consecutive failures. Terminating process.")
+                    raise SystemExit("Too many consecutive failures")
+
                 backoff_time = min(2 ** failure_count, 60) # Cap at 60s
                 log.warning(f"Backing off for {backoff_time}s due to error.")
                 await asyncio.sleep(backoff_time)
