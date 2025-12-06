@@ -2,7 +2,7 @@ import json
 import logging
 import asyncio
 from typing import Optional, Dict, List, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import redis.asyncio as redis
 
@@ -55,7 +55,8 @@ class DataManager:
         if self.temporal_db:
             try:
                 # Fetch recent data (last 24h to ensure relevance)
-                end = datetime.now()
+                # [Task 0.3 Fix] Use aware UTC time for failover query
+                end = datetime.now(timezone.utc)
                 start = end - timedelta(hours=24)
                 df = await self.temporal_db.query_market_data(symbol, start, end)
                 
@@ -160,7 +161,8 @@ class DataManager:
         获取当前系统时间。
         在回测模式下，这应该连接到 TimeMachine/Clock 服务。
         """
-        return datetime.utcnow()
+        # [Task 0.3 Fix] Return timezone-aware UTC datetime to prevent TypeError in PipelineState
+        return datetime.now(timezone.utc)
 
     async def save_state(self, state: Dict[str, Any]):
         """
