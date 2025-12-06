@@ -11,7 +11,7 @@ to enforce risk controls and trigger circuit breakers.
 """
 
 import logging
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Set
 from collections import deque
 from datetime import datetime, timedelta
 import asyncio
@@ -47,6 +47,9 @@ class RiskManager:
         self.data_manager = data_manager
         self.initial_capital = initial_capital
         
+        # [Task 2.3 Fix] Symbol-Level Halt Tracker
+        self.halted_symbols: Set[str] = set()
+        
         self.max_drawdown_pct = self.config.get("max_drawdown_pct", 0.15)
         self.max_position_concentration_pct = self.config.get("max_position_concentration_pct", 0.20)
         self.volatility_threshold = self.config.get("volatility_threshold", 0.05)
@@ -59,9 +62,13 @@ class RiskManager:
             # Check for data_frequency in global trading config (default to daily)
             trading_config = config.get("trading", {})
             data_freq = trading_config.get("data_frequency", "daily")
+            asset_class = self.config.get("asset_class", "stock").lower()
             
-            if data_freq == "minute":
-                self.frequency_factor = 252 * 390 # 98280 for intraday
+            # [Task 2.3 Fix] Crypto Calendar Support
+            if asset_class == "crypto":
+                self.frequency_factor = 525600 if data_freq == "minute" else 365
+            elif data_freq == "minute":
+                self.frequency_factor = 252 * 390 # 98280 for intraday (Stock)
             else:
                 self.frequency_factor = 252
 
@@ -133,10 +140,7 @@ class RiskManager:
             peak_equity_raw = await self.redis_client.get("phoenix:risk:peak_equity")
             if peak_equity_raw:
                 val = float(peak_equity_raw)
-                # [Task 009] Sanity Check: Limit to 50x initial capital to prevent DoS via poisoning
-                if val > self.initial_capital * 50:
-                    logger.warning(f"Suspicious peak equity value detected in Redis ({val}). Resetting to initial capital.")
-                    return self.initial_capital
+                # [Task 2.3 Fix] Success Penalty Removed. Allow growth > 50x.
                 return max(val, self.initial_capital)
             return self.initial_capital
         except Exception as e:
@@ -203,6 +207,10 @@ class RiskManager:
         """
         if self.circuit_breaker_tripped:
             raise CircuitBreakerError("Risk circuit breaker is active. No new trades allowed.")
+
+        # [Task 2.3 Fix] Check Symbol-Level Halt
+        if proposed_position.symbol in self.halted_symbols:
+            raise RiskViolationError(f"Trading halted for {proposed_position.symbol} due to volatility", [])
 
         signals = []
         conc_signal = self.check_concentration(proposed_position, portfolio)
@@ -329,7 +337,10 @@ class RiskManager:
 
             if current_volatility > self.volatility_threshold:
                 desc = f"High volatility detected for {symbol}: {current_volatility:.4f}"
-                return VolatilitySignal(description=desc, symbol=symbol, current_volatility=current_volatility, volatility_threshold=self.volatility_threshold, triggers_circuit_breaker=self.config.get("volatility_triggers_breaker", False))
+                # [Task 2.3 Fix] Symbol-Level Halt (Do not trip global breaker)
+                self.halted_symbols.add(symbol)
+                logger.warning(f"Symbol {symbol} HALTED due to volatility.")
+                return VolatilitySignal(description=desc, symbol=symbol, current_volatility=current_volatility, volatility_threshold=self.volatility_threshold, triggers_circuit_breaker=False)
         except Exception:
             pass
         return None
