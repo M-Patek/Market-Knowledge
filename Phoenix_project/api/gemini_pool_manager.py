@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import httpx
+import threading
 from typing import Dict, Any, List, Optional, Union
 from contextlib import asynccontextmanager
 from collections import defaultdict 
@@ -184,6 +185,30 @@ class GeminiPoolManager:
         # 5. 保留 QPM 限制的配置
         qpm_limits_config = config.get('gemini_qpm_limits', {})
         self.qpm_limits = {**DEFAULT_QPM_LIMITS, **qpm_limits_config}
+        
+        # [Task 5.2 Fix] Thread Safety Lock for key rotation
+        self._lock = threading.Lock()
+
+    def _rotate(self, model_id: str):
+        """[Task 5.2] Rotates the key index for the given model."""
+        current_index = self.model_counters[model_id]
+        self.model_counters[model_id] = (current_index + 1) % len(self.shared_key_pool)
+
+    def get_key(self, model_id: str) -> str:
+        """[Task 5.2] Fetch current key and rotate (Round Robin) with Thread Safety."""
+        with self._lock:
+            current_index = self.model_counters[model_id]
+            key = self.shared_key_pool[current_index]
+            self._rotate(model_id)
+            return key
+
+    def handle_error(self, e: Exception) -> bool:
+        """[Task 5.2] Detect Rate Limit errors to trigger retry."""
+        msg = str(e).lower()
+        if "429" in msg or "resourceexhausted" in msg or "quota" in msg:
+             logger.warning(f"Gemini API Rate Limit/Quota detected: {e}. Advising key rotation/retry.")
+             return True
+        return False
 
     @asynccontextmanager
     async def get_client(self, model_id: str) -> GeminiClient:
@@ -192,12 +217,8 @@ class GeminiPoolManager:
         并返回该密钥对应的、带速率限制的客户端。
         """
         
-        # 步骤 1: 根据 model_id 独立循环，选择一个密钥
-        current_index = self.model_counters[model_id]
-        key_to_use = self.shared_key_pool[current_index]
-        
-        # 步骤 2: 更新该 model_id 的计数器（循环）
-        self.model_counters[model_id] = (current_index + 1) % len(self.shared_key_pool)
+        # [Task 5.2] Use standardized thread-safe get_key for rotation
+        key_to_use = self.get_key(model_id)
 
         # 步骤 3: 检查此【密钥 + 模型ID】组合是否已有缓存的客户端
         cache_key = (key_to_use, model_id)
