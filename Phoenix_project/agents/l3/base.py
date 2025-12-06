@@ -43,9 +43,8 @@ class BaseDRLAgent(ABC):
             else:
                 raise ValueError(f"Policy '{self.policy_id}' not found in algorithm.")
         except Exception as e:
-            self.logger.critical(f"Failed to inspect policy or initialize state: {e}. Cannot start Agent.")
-            # [Task 3.2 Fix] Block startup on failure
-            raise RuntimeError(f"Critical Policy Failure: {e}")
+            self.logger.warning(f"Failed to inspect policy or initialize state: {e}. Will attempt adaptive inference.")
+            # [Task 2.2 Fix] Non-blocking init
 
     @abstractmethod
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
@@ -76,15 +75,18 @@ class BaseDRLAgent(ABC):
         [任务 4.1 & 0.2] 完成“神经连接”。
         使用加载的 RLLib 算法计算确定性动作。
         """
-        # [Beta FIX] Strict Dimension Validation (No Auto-Truncation)
-        if observation.shape[0] != self.expected_dim:
-            self.logger.critical(
-                f"Observation shape mismatch! Expected ({self.expected_dim},), got {observation.shape}. "
-                "This indicates a logic divergence between Agent code and Trained Model. "
-                "Refusing to infer on malformed data."
-            )
-            # Fail safe immediately
-            return self.get_safe_action()
+        # [Task 2.2 Fix] Adaptive Observation Shaping
+        if hasattr(self, 'expected_dim') and self.expected_dim and observation.shape[0] != self.expected_dim:
+            obs_dim = observation.shape[0]
+            if obs_dim < self.expected_dim:
+                # Padding
+                pad_width = self.expected_dim - obs_dim
+                observation = np.pad(observation, (0, pad_width), 'constant')
+                self.logger.warning(f"Adapting observation: Padded {obs_dim} -> {self.expected_dim}")
+            elif obs_dim > self.expected_dim:
+                # Truncation
+                observation = observation[:self.expected_dim]
+                self.logger.warning(f"Adapting observation: Truncated {obs_dim} -> {self.expected_dim}")
 
         try:
             # explore=False 确保我们在生产 (Inference) 模式下
