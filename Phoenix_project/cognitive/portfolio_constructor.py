@@ -1,5 +1,5 @@
 # Phoenix_project/cognitive/portfolio_constructor.py
-# [主人喵的修复 11.11] 实现了 FIXME (TBD 风险管理逻辑)。
+# [主人喵的修复 11.11] 实现了 L2->L3 的数据流 TODO。
 # [主人喵的修复 11.12] 实现了 TBD (从 DataManager 加载初始投资组合)。
 # [Code Opt Expert Fix] Task 3: Clean Architecture / Remove ContextBus Communication
 # [Phase III Fix] Risk Gating & Signal Mapping
@@ -15,7 +15,7 @@ from Phoenix_project.core.schemas.risk_schema import RiskReport
 from Phoenix_project.core.schemas.data_schema import TargetPortfolio, TargetPosition
 from Phoenix_project.context_bus import ContextBus
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class PortfolioConstructor:
     """
@@ -78,8 +78,22 @@ class PortfolioConstructor:
         if pipeline_state.l3_decision:
             risk_action = pipeline_state.l3_decision.get("risk_action", "CONTINUE")
             if risk_action == "HALT_TRADING":
-                logger.warning("Portfolio Construction ABORTED by L3 Risk Agent (HALT_TRADING).")
-                return None
+                logger.critical("Portfolio Construction Triggering EMERGENCY LIQUIDATION due to L3 Risk Agent (HALT_TRADING).")
+                
+                # [Task 1.2 Fix] Emergency Liquidation: Close all positions
+                liquidation_targets = []
+                if pipeline_state.portfolio_state and pipeline_state.portfolio_state.positions:
+                    for sym, pos in pipeline_state.portfolio_state.positions.items():
+                        # Create closing target (Quantity 0.0)
+                        if abs(float(pos.quantity)) > 0:
+                            liquidation_targets.append(TargetPosition(
+                                symbol=sym,
+                                target_weight=0.0,
+                                quantity=0.0,
+                                reasoning="Emergency Liquidation - Risk Halt"
+                            ))
+                
+                return TargetPortfolio(positions=liquidation_targets, metadata={"source": "EmergencyLiquidation"})
         
         # 1. 获取 L3 Alpha 信号 (目标权重)
         alpha_signals = pipeline_state.l3_alpha_signal
