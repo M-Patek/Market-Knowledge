@@ -72,18 +72,23 @@ class FactChecker:
         )
         
         if "system" in self.prompt:
-            self.prompt["system"] = self.prompt["system"] + search_instruction
+            # [Task 3.2 Fix] Type Safety: Handle list vs string prompts
+            if isinstance(self.prompt["system"], list):
+                self.prompt["system"].append(search_instruction)
+            else:
+                self.prompt["system"] = self.prompt["system"] + search_instruction
         else:
             self.prompt["system"] = search_instruction.strip()
             
         logger.info(f"FactChecker initialized with 'l2_critic' prompt and model '{self.model_name}'.")
 
-    async def check_facts(self, claims: List[str]) -> List[FactCheckResult]:
+    async def check_facts(self, claims: List[str], symbol: str = "Unknown") -> List[FactCheckResult]:
         """
         核查一系列声明。
 
         Args:
             claims: 需要核查的字符串声明列表。
+            symbol: 关联的标的代码，用于上下文消歧。
 
         Returns:
             一个 FactCheckResult 列表。
@@ -100,7 +105,7 @@ class FactChecker:
             # 我们将 'claims' 映射到 'evidence_items' 字段（或 'l2_critic' 提示期望的字段）
             prompt_context = {
                 "evidence_items": claims_str, # 假设 'l2_critic' 提示期望一个名为 'evidence_items' 的字段
-                "symbol": "N/A" # 'l2_critic' 提示可能需要一个 symbol
+                "symbol": symbol # [Task 3.2 Fix] Injected context
             }
             
             prompt = self.prompt_renderer.render(
