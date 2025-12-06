@@ -37,6 +37,8 @@ class PipelineState(BaseModel):
     latest_decisions: List[AgentDecision] = Field(default_factory=list)
     latest_fusion_result: Optional[Dict[str, Any]] = None
     latest_final_decision: Optional[Dict[str, Any]] = None
+    # [Task 0.1 Fix] Added storage for fact check results
+    latest_fact_check: Optional[Dict[str, Any]] = None
     
     # [Phase I Fix] Strict Typing for Serialization Safety
     target_portfolio: Optional[TargetPortfolio] = None 
@@ -59,7 +61,28 @@ class PipelineState(BaseModel):
 
     def update_time(self, new_time: datetime):
         """更新系统仿真时间。"""
-        self.current_time = new_time
+        # [Task 0.1 Fix] Enforce UTC (Offset-Aware)
+        if new_time.tzinfo is None:
+            self.current_time = new_time.replace(tzinfo=timezone.utc)
+        else:
+            self.current_time = new_time.astimezone(timezone.utc)
+
+    def update_value(self, key: str, value: Any):
+        """
+        [Task 0.1 Fix] Safe Accessor with Legacy Mapping & Validation
+        """
+        # Map legacy keys from CognitiveEngine to Schema fields
+        key_map = {
+            "last_fusion_result": "latest_fusion_result",
+            "last_fact_check": "latest_fact_check",
+            "last_guarded_decision": "latest_final_decision"
+        }
+        target_key = key_map.get(key, key)
+        
+        if target_key not in self.model_fields:
+            raise ValueError(f"Invalid state key: '{key}' (mapped to '{target_key}'). Not in model fields.")
+            
+        setattr(self, target_key, value)
 
     def update_portfolio_state(self, new_state: PortfolioState):
         """更新持仓状态。"""
