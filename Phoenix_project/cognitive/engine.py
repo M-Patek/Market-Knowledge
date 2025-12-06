@@ -123,8 +123,49 @@ class CognitiveEngine:
             
     # [Placeholder] run_l2_supervision 需要实现，但这里主要修复 L1 和 融合逻辑
     async def run_l2_supervision(self, l1_insights: List[EvidenceItem], raw_events: List[Any]) -> List[SupervisionResult]:
-         # 简单实现以支持 orchestrator 调用
-         return []
+        """
+        [Task 3.3 Fix] Active L2 Supervision
+        Executes the 'l2_critic' agent to review L1 insights.
+        """
+        if not l1_insights:
+            return []
+            
+        try:
+            # Dispatch task to l2_critic
+            task_payload = {
+                "agent_name": "l2_critic",
+                "task": {
+                    "task_id": f"l2_critic_{uuid.uuid4().hex[:8]}",
+                    "content": {
+                        "l1_insights": [item.model_dump() for item in l1_insights],
+                        "raw_events": raw_events
+                    },
+                    "context": {}
+                }
+            }
+            
+            logger.info("Dispatching L2 Supervision task (Critic)...")
+            executor_results = await self.agent_executor.run_parallel([task_payload])
+            
+            # Parse results (Assuming standard list return or single item)
+            supervision_results = []
+            for res in executor_results:
+                if isinstance(res, dict) and res.get("status") == "SUCCESS":
+                    val = res.get("result")
+                    if isinstance(val, list):
+                        for v in val:
+                            try: supervision_results.append(SupervisionResult(**v))
+                            except: pass
+                    elif isinstance(val, dict):
+                        try: supervision_results.append(SupervisionResult(**val))
+                        except: pass
+            
+            logger.info(f"L2 Supervision complete. Generated {len(supervision_results)} critiques.")
+            return supervision_results
+            
+        except Exception as e:
+            logger.error(f"L2 Supervision failed: {e}")
+            return []
 
     async def process_cognitive_cycle(self, pipeline_state: PipelineState) -> Dict[str, Any]:
         """
@@ -157,27 +198,8 @@ class CognitiveEngine:
         # [Fix] Ensure the guard sees the result
         pipeline_state.latest_fusion_result = fusion_result.model_dump()
         
-        # 2. Fact-check (如果置信度足够)
-        fact_check_report = None
-        if fusion_result.confidence >= self.fact_check_threshold:
-            try:
-                # 传入列表
-                claims = [fusion_result.reasoning]
-                fact_check_report = await self.fact_checker.check_facts(claims)
-                
-                # [Task 06] Removed intermediate update
-                # pipeline_state.update_value("last_fact_check", fact_check_report)
-                
-                # 根据事实检查调整置信度
-                support_status = fact_check_report.get("overall_support")
-                if support_status == "Refuted":
-                    logger.warning("Reasoning refuted by fact-checker. Neutralizing decision.")
-                    fusion_result.decision = "NEUTRAL"
-                    fusion_result.confidence = 0.0
-                # [Task 1.2 Fix] Removed "Supported" magic boost logic
-                    
-            except Exception as e:
-                logger.error(f"Fact-checker failed: {e}")
+        # [Task 3.3 Fix] Removed redundant Fact-Check block. 
+        # Verification is now handled internally by ReasoningEnsemble.
         
         # 3. Apply Uncertainty Guardrail
         try:
@@ -202,13 +224,11 @@ class CognitiveEngine:
 
         # [Task 06] Atomic Commit: Update global state only after all checks pass
         pipeline_state.update_value("last_fusion_result", fusion_result)
-        if fact_check_report:
-            pipeline_state.update_value("last_fact_check", fact_check_report)
         pipeline_state.update_value("last_guarded_decision", fusion_result)
 
         logger.info(f"Cognitive cycle complete. Final decision: {fusion_result.decision}")
         
         return {
             "final_decision": fusion_result,
-            "fact_check_report": fact_check_report
+            "fact_check_report": None
         }
