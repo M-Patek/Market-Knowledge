@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import signal
+import threading
 from typing import Dict, Any, Optional
 import hydra
 import redis.asyncio as redis
@@ -406,8 +407,10 @@ class PhoenixProject:
             )
 
             # Start API Server explicitly [Fixed Dormant API]
-            # APIServer.run returns a thread, it's non-blocking
-            api_thread = self.api_server.run() 
+            # [Task 5.1 Fix] Offload API Server to Daemon Thread to prevent blocking
+            api_thread = threading.Thread(target=self.api_server.run, daemon=True)
+            api_thread.start()
+            logger.info("API Server started in background thread.")
 
             # --- 4. 启动后台任务 (Loops) ---
             logger.info("Starting background processing loops...")
@@ -422,7 +425,7 @@ class PhoenixProject:
             logger.info("Risk Manager initialized and warmed up.")
 
             # 启动主循环 (统一入口)
-            loop_manager.start_loop()
+            await loop_manager.start_loop()
             
             # [Phase IV Fix] Graceful Shutdown Handling
             loop = asyncio.get_running_loop()
