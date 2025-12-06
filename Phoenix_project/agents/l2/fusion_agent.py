@@ -27,7 +27,8 @@ class FusionAgent(L2Agent):
         """
         if not symbol: return "UNKNOWN"
         # Remove any character that is NOT alphanumeric, space, comma, or dash
-        return re.sub(r'[^a-zA-Z0-9\s,\-]', '', str(symbol)).strip()
+        # [Task 3.1 Fix] Allow forward slash and dot for Crypto/Stock tickers (BTC/USD, BRK.B)
+        return re.sub(r'[^a-zA-Z0-9\s,\-/\.]', '', str(symbol)).strip()
 
     def _sanitize_general_input(self, text: str) -> str:
         """
@@ -108,16 +109,20 @@ class FusionAgent(L2Agent):
             # [Robustness] Clean Markdown code blocks and extract JSON
             clean_str = response_str.strip()
             
-            # [Task 08] Optimized JSON Extraction (DoS Prevention)
-            # Efficiently locate the outermost JSON boundaries
-            start_idx = clean_str.find('{')
-            end_idx = clean_str.rfind('}')
-            
-            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                clean_str = clean_str[start_idx : end_idx + 1]
+            # [Task 3.1 Fix] Prioritize Markdown Code Blocks
+            json_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", clean_str)
+            if json_match:
+                clean_str = json_match.group(1)
             else:
-                # Fallback to simple strip if braces not found or malformed
-                pass
+                # [Task 08] Fallback: Efficiently locate the outermost JSON boundaries
+                start_idx = clean_str.find('{')
+                end_idx = clean_str.rfind('}')
+                
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    clean_str = clean_str[start_idx : end_idx + 1]
+                else:
+                    # Fallback to simple strip if braces not found or malformed
+                    pass
 
             response_data = json.loads(clean_str)
             
