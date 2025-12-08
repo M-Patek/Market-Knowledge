@@ -54,10 +54,11 @@ class DataManager:
         logger.warning(f"Cache miss for {symbol}, attempting DB failover...")
         if self.temporal_db:
             try:
-                # Fetch recent data (last 24h to ensure relevance)
+                # Fetch recent data (last 72h to ensure relevance and cover weekends)
                 # [Task 0.3 Fix] Use aware UTC time for failover query
                 end = datetime.now(timezone.utc)
-                start = end - timedelta(hours=24)
+                # [Fix] Weekend Amnesia: Extend lookback to 72 hours
+                start = end - timedelta(hours=72)
                 df = await self.temporal_db.query_market_data(symbol, start, end)
                 
                 if not df.empty:
@@ -66,13 +67,19 @@ class DataManager:
                     market_data = MarketData(**latest_record)
                     
                     # 3. Read-Repair: Write back to Redis to restore Hot Path
-                    if self.redis_client:
+                    # [Fix] Zombie Data Poisoning Check: Do not poison cache with stale DB data
+                    # Check if data is older than 5 minutes
+                    is_stale = (end - market_data.timestamp) > timedelta(minutes=5)
+                    
+                    if self.redis_client and not is_stale:
                         try:
                             # Use 60s TTL as per Task 003
                             await self.redis_client.setex(key, 60, market_data.model_dump_json())
                             logger.info(f"Read-Repair: Restored {symbol} to Redis cache.")
                         except Exception:
                             pass # Ignore write-back errors during failover, return data is priority
+                    elif is_stale:
+                        logger.warning(f"Stale data fetched for {symbol} (Age > 5m). Skipping Read-Repair.")
                             
                     logger.info(f"Restored market data for {symbol} from TemporalDB.")
                     return market_data
