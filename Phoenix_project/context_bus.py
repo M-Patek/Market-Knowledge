@@ -6,6 +6,7 @@ import json
 import redis.asyncio as redis
 import asyncio
 from typing import Optional, Dict, Any, Callable, Union
+from pydantic import BaseModel
 
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.monitor.logging import get_logger
@@ -36,6 +37,8 @@ class ContextBus:
         self._lock = asyncio.Lock()
         # [Task 20] Background Task Registry
         self._background_tasks = set()
+        # [Fix] Backpressure: Limit concurrent handler tasks
+        self._task_semaphore = asyncio.Semaphore(1000)
 
     # --- 核心通信功能 (修复点: 全异步 & 健壮) ---
 
@@ -51,13 +54,18 @@ class ContextBus:
             logger.error(f"ContextBus background task failed: {e}", exc_info=True)
         finally:
             self._background_tasks.discard(task)
+            # [Fix] Backpressure: Release slot
+            self._task_semaphore.release()
 
-    async def publish(self, channel: str, message: Union[Dict, str]) -> bool:
+    async def publish(self, channel: str, message: Union[Dict, str, BaseModel]) -> bool:
         """
         向指定频道发布消息。支持自动 JSON 序列化。
         """
         try:
-            if isinstance(message, dict):
+            # [Phase II Fix] Smart Serialization
+            if isinstance(message, BaseModel):
+                payload = message.model_dump_json()
+            elif isinstance(message, dict):
                 payload = json.dumps(message, default=str)
             else:
                 payload = str(message)
@@ -117,6 +125,9 @@ class ContextBus:
                                 
                                 # [Task 0.3 Fix] 非阻塞分发：使用 create_task 防止阻塞总线
                                 if asyncio.iscoroutinefunction(handler):
+                                    # [Fix] Backpressure: Wait for available slot
+                                    await self._task_semaphore.acquire()
+                                    
                                     # [Task 20] Fix Fire-and-Forget: Track tasks to prevent GC and log errors
                                     task = asyncio.create_task(handler(payload))
                                     self._background_tasks.add(task)
