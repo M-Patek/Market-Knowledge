@@ -35,7 +35,10 @@ class PipelineState(BaseModel):
 
     # --- 认知状态 (仅保留上一帧结果) ---
     latest_decisions: List[AgentDecision] = Field(default_factory=list)
-    latest_fusion_result: Optional[Dict[str, Any]] = None
+    
+    # [Phase II Fix] Strict Typing for Fusion Result
+    latest_fusion_result: Optional[FusionResult] = None
+    
     latest_final_decision: Optional[Dict[str, Any]] = None
     # [Task 0.1 Fix] Added storage for fact check results
     latest_fact_check: Optional[Dict[str, Any]] = None
@@ -119,6 +122,5 @@ class PipelineState(BaseModel):
         if fusion_result.agent_decisions:
             self.latest_decisions = fusion_result.agent_decisions
         
-        # 序列化 FusionResult 以便存储
-        # [Task 0.1 Fix] Complete truncation & Handle Pydantic V1/V2 compatibility
-        self.latest_fusion_result = fusion_result.model_dump() if hasattr(fusion_result, 'model_dump') else fusion_result.dict()
+        # [Phase II Fix] Store as object directly, do not dump here.
+        self.latest_fusion_result = fusion_result
