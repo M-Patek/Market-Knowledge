@@ -10,7 +10,7 @@
 [Code Opt Expert Fix] Task 11 & 12: Concurrency Crash Fix & Valuation Fallback
 [Task 012, 013] Append-Only Ledger & Ostrich Valuation Fix
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from datetime import datetime
 from decimal import Decimal
 import asyncio
@@ -355,3 +355,82 @@ class TradeLifecycleManager:
             "fill_id",
             connection=conn
         )
+
+    async def reconcile_with_broker(self, broker_adapter: Any) -> Dict[str, Any]:
+        """
+        [Phase III] Mandatory Ledger Reconciliation.
+        Syncs internal state with Broker's authoritative state (Source of Truth).
+        """
+        corrections = []
+        async with self._lock:
+            try:
+                # 1. Fetch Truth
+                broker_info = broker_adapter.get_account_info()
+                if broker_info.get("status") != "success":
+                    logger.warning(f"{self.log_prefix} Reconciliation skipped. Broker error: {broker_info.get('message')}")
+                    return {"status": "error", "message": broker_info.get("message")}
+
+                # 2. Cash Sync
+                account_data = broker_info.get("account", {})
+                broker_cash = Decimal(str(account_data.get("cash", 0.0)))
+                
+                if abs(self.cash - broker_cash) > Decimal("0.01"):
+                    logger.warning(f"{self.log_prefix} Cash Drift: Local {self.cash} vs Broker {broker_cash}. Overwriting.")
+                    self.cash = broker_cash
+                    corrections.append("Fixed Cash Drift")
+                    
+                    if self.tabular_db:
+                        await self.tabular_db.insert_data(
+                            "ledger_balance", 
+                            {"cash": str(self.cash), "realized_pnl": str(self.realized_pnl)}
+                        )
+
+                # 3. Position Sync
+                broker_positions = broker_info.get("positions", [])
+                broker_map = {p["symbol"]: p for p in broker_positions}
+                
+                # 3a. Phantom Positions (Local exists, Broker missing)
+                local_symbols = list(self.positions.keys())
+                for sym in local_symbols:
+                    if sym not in broker_map:
+                        if abs(self.positions[sym].quantity) > 1e-6:
+                            logger.warning(f"{self.log_prefix} Phantom Position {sym} detected. Removing.")
+                            self.positions.pop(sym)
+                            corrections.append(f"Removed Phantom {sym}")
+                            
+                            if self.tabular_db:
+                                tombstone = {"symbol": sym, "quantity": "0", "average_price": "0", 
+                                             "market_value": "0", "unrealized_pnl": "0"}
+                                await self.tabular_db.insert_data("ledger_positions", tombstone)
+
+                # 3b. Mismatches & Untracked (Broker exists, Local mismatch)
+                for sym, b_data in broker_map.items():
+                    b_qty = Decimal(str(b_data.get("qty", 0)))
+                    local_pos = self.positions.get(sym)
+                    
+                    is_mismatch = False
+                    if not local_pos:
+                        is_mismatch = True
+                    elif abs(Decimal(str(local_pos.quantity)) - b_qty) > Decimal("0.0001"):
+                        is_mismatch = True
+                        
+                    if is_mismatch:
+                        logger.warning(f"{self.log_prefix} Syncing position {sym} to Qty {b_qty}.")
+                        new_pos = Position(
+                            symbol=sym,
+                            quantity=float(b_qty),
+                            average_price=float(b_data.get("avg_entry_price", 0.0)),
+                            market_value=float(b_data.get("market_value", 0.0)),
+                            unrealized_pnl=float(b_data.get("unrealized_pl", 0.0))
+                        )
+                        self.positions[sym] = new_pos
+                        corrections.append(f"Synced {sym}")
+                        
+                        if self.tabular_db:
+                            await self.tabular_db.insert_data("ledger_positions", new_pos.model_dump())
+
+                return {"status": "success", "corrections": corrections}
+                
+            except Exception as e:
+                logger.error(f"{self.log_prefix} Reconciliation Error: {e}", exc_info=True)
+                return {"status": "error", "message": str(e)}
