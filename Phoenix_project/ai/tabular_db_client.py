@@ -59,6 +59,9 @@ class TabularDBClient:
         self.engine_ro = None
         if self.db_uri_ro:
              self.engine_ro = self._create_db_engine(self.db_uri_ro)
+        else:
+             # [Security] Force Read-Only isolation. Do not allow fallback.
+             logger.warning("Read-Only DB URI not configured. SQL Agent capabilities will be limited.")
         
         self.schema: str = "" 
         
@@ -158,11 +161,10 @@ class TabularDBClient:
             rows = []
             
             # [Task 4.4] Use Read-Only Engine
-            execution_engine = self.engine_ro if self.engine_ro else self.engine
             if not self.engine_ro:
-                 logger.warning("SECURITY WARNING: Using Read-Write engine for Text-to-SQL. Configure TABULAR_DB_URI_RO for isolation.")
+                 raise RuntimeError("Operation refused: Read-Only DB not configured.")
 
-            async with execution_engine.connect() as conn:
+            async with self.engine_ro.connect() as conn:
                 result = await conn.execute(text(sql_query))
                 rows = [dict(row) for row in result.mappings().all()]
             
