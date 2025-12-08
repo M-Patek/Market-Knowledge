@@ -183,13 +183,31 @@ class TemporalDBClient:
             return []
 
     @retry_with_exponential_backoff()
+    async def query_market_data(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime
+    ) -> pd.DataFrame:
+        """
+        Wrapper around query_range specifically for market data failover.
+        """
+        return await self.query_range(
+            measurement="market_data", 
+            symbol=symbol, 
+            start=start_time, 
+            end=end_time
+        )
+
+    @retry_with_exponential_backoff()
     async def query_range(
         self,
         measurement: str,
         symbol: str,
         start: datetime,
         end: datetime,
-        columns: Optional[List[str]] = None
+        columns: Optional[List[str]] = None,
+        limit: int = 50000 # [Fix] OOM Safety Cap
     ) -> pd.DataFrame:
         """
         Retrieves historical data for a specific measurement and symbol within a time range.
@@ -230,6 +248,11 @@ class TemporalDBClient:
                     
                 for hit in hits:
                     all_source_data.append(hit['_source'])
+                
+                # [Fix] OOM Safety Cap: Prevent unbounded growth
+                if len(all_source_data) >= limit:
+                    logger.warning(f"Query limit reached ({limit}). Returning partial results to prevent OOM.")
+                    break
                 
                 last_sort_values = hits[-1]['sort']
                 if len(hits) < batch_size:
@@ -293,8 +316,10 @@ class TemporalDBClient:
                 actions.append({"_index": self.index_name, "_source": doc})
             
             # [Task 2.2] Optimize: Remove refresh=True per bulk, do it once manually
+            # [Fix] Refresh Storm: Removed explicit refresh call to prevent CPU spikes. 
+            # Rely on ES background refresh (1s default).
             await async_bulk(self.es, actions)
-            await self.es.indices.refresh(index=self.index_name)
+            # await self.es.indices.refresh(index=self.index_name) 
             return True
         except Exception as e:
             logger.error(f"Error writing dataframe to TemporalDB: {e}", exc_info=True)
