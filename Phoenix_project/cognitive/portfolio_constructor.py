@@ -15,7 +15,7 @@ from Phoenix_project.core.schemas.risk_schema import RiskReport
 from Phoenix_project.core.schemas.data_schema import TargetPortfolio, TargetPosition
 from Phoenix_project.context_bus import ContextBus
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class PortfolioConstructor:
     """
@@ -151,8 +151,9 @@ class PortfolioConstructor:
                 logger.info(f"Risk intervention: Applying adjusted weights. Reason: {risk_report.adjustments_made}")
                 adjusted_weights = risk_report.adjusted_weights
             elif not risk_report.passed:
-                logger.warning(f"Risk validation failed and no safe fallback provided. HALTING.")
-                return None
+                logger.warning(f"Risk validation failed. Generating CLAMPED portfolio.")
+                # [Task 4.2 Fix] Fallback to clamped weights instead of halting
+                adjusted_weights = self.risk_manager.get_clamped_weights(target_weights, real_time_portfolio)
             else:
                 # No adjustments, passed check
                 adjusted_weights = target_weights
@@ -209,3 +210,28 @@ class PortfolioConstructor:
             return None
 
         return target_portfolio
+
+    async def emergency_shutdown(self) -> TargetPortfolio:
+        """
+        [Task 17] Emergency Shutdown Protocol.
+        Generates a liquidation portfolio (Cash Only) to flatten the book.
+        """
+        logger.critical("Initiating EMERGENCY SHUTDOWN protocols.")
+        liquidation_targets = []
+        try:
+            # Attempt to load current state to target specific positions
+            if self.data_manager:
+                # [Fix] Await async call to fetch current holdings
+                current_pf = await self.data_manager.get_current_portfolio()
+                if current_pf and "positions" in current_pf:
+                    for sym, data in current_pf["positions"].items():
+                        if abs(float(data.get("quantity", 0))) > 0:
+                            liquidation_targets.append(TargetPosition(
+                                symbol=sym, target_weight=0.0, quantity=0.0, 
+                                reasoning="Emergency Shutdown"
+                            ))
+        except Exception as e:
+            logger.error(f"Failed to fetch portfolio for shutdown: {e}")
+        
+        # Return valid (even if empty) portfolio to allow downstream handling
+        return TargetPortfolio(positions=liquidation_targets, metadata={"source": "EmergencyShutdown"})
