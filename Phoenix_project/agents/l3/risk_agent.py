@@ -15,14 +15,23 @@ class RiskAgent(BaseDRLAgent):
     
     def get_safe_action(self) -> np.ndarray:
         """
-        [Safety Phase II] Returns HALT signal (1.0).
+        [Safety Phase II] Returns HALT signal.
         Fixed: Must return np.ndarray, not None.
+        Fixed: Returns 0.0 (Neutral/Halt), not 1.0 (Long).
         If the agent fails/crashes, we default to HALT (Fail-Closed).
         """
-        return np.array([1.0], dtype=np.float32)
+        return np.array([0.0], dtype=np.float32)
     
     async def compute_action(self, observation: np.ndarray, fusion_result: Optional[FusionResult] = None) -> np.ndarray:
         """[Task 4.1] Hard Override: Bypass NN if L2 signals HALT."""
+        
+        # [Phase II Fix] Local Adapter for legacy dict support
+        if isinstance(fusion_result, dict):
+            try:
+                fusion_result = FusionResult(**fusion_result)
+            except Exception as e:
+                logger.warning(f"RiskAgent: Failed to convert fusion_result dict: {e}")
+                # Continue without object access if conversion fails, effectively treating as None or using fallback
         
         # [Safety Phase III] Check System Health First
         # If the fusion result indicates the system is not OK (e.g. HALT or DEGRADED),
