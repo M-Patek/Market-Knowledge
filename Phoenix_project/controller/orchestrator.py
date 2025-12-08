@@ -229,6 +229,10 @@ class Orchestrator:
             logger.critical(f"Orchestrator main cycle failed: {e}", exc_info=True)
             if pipeline_state:
                await self.audit_manager.audit_error(e, "OrchestratorFatal", pipeline_state)
+            
+            # [Task 17] Emergency Shutdown & Re-raise (Prevent Exception Swallowing)
+            await self.portfolio_constructor.emergency_shutdown()
+            raise
 
         finally:
             # [Task 17] Poison Pill Protection: Ensure events are ACKed even on failure
