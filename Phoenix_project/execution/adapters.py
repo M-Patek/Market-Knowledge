@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from abc import ABC, abstractmethod
 import os
+import asyncio
 
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.execution.interfaces import IBrokerAdapter
@@ -10,11 +11,15 @@ from Phoenix_project.core.schemas.data_schema import Order, OrderStatus
 
 # [任务 B.2] 导入 Alpaca 客户端
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.requests import (
+    MarketOrderRequest, LimitOrderRequest,
+    StopOrderRequest, StopLimitOrderRequest, TrailingStopOrderRequest
+)
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.stream import TradingStream
 
 logger = get_logger(__name__)
 
@@ -54,6 +59,14 @@ class AlpacaAdapter(IBrokerAdapter):
                 secret_key=self.api_secret,
                 raw_data=False # False = 自动转换为 Pydantic/Pandas
             )
+            
+            # [任务 B.3] Initialize Trading Stream
+            self.trading_stream = TradingStream(
+                api_key=self.api_key,
+                secret_key=self.api_secret,
+                paper=self.paper
+            )
+            self._stream_task = None
             
             account = self.trading_client.get_account()
             logger.info(f"Alpaca connection successful. Account: {account.account_number}")
@@ -137,14 +150,22 @@ class AlpacaAdapter(IBrokerAdapter):
 
     # --- IExecutionBroker 实现 ---
 
-    def connect(self) -> None:
-        pass
+    async def connect(self) -> None:
+        """Starts the WebSocket stream in a background thread."""
+        if self._stream_task:
+            return
+        
+        loop = asyncio.get_running_loop()
+        # run() is blocking, so we execute it in the default executor
+        self._stream_task = loop.run_in_executor(None, self.trading_stream.run)
+        logger.info("Alpaca Trading Stream connected (background).")
 
     def disconnect(self) -> None:
         pass
 
     def subscribe_fills(self, callback) -> None:
-        pass
+        self.trading_stream.subscribe_trade_updates(callback)
+        logger.info("Subscribed to trade updates.")
 
     def subscribe_order_status(self, callback) -> None:
         pass
@@ -153,13 +174,26 @@ class AlpacaAdapter(IBrokerAdapter):
         return []
 
     def get_portfolio_value(self) -> float:
-        return 0.0
+        try:
+            return float(self.trading_client.get_account().portfolio_value)
+        except Exception as e:
+            logger.error(f"Error fetching portfolio value: {e}")
+            return 0.0
 
     def get_cash_balance(self) -> float:
-        return 0.0
+        try:
+            return float(self.trading_client.get_account().cash)
+        except Exception as e:
+            logger.error(f"Error fetching cash balance: {e}")
+            return 0.0
 
     def get_position(self, symbol: str) -> float:
-        return 0.0
+        try:
+            pos = self.trading_client.get_open_position(symbol)
+            return float(pos.qty)
+        except Exception:
+            # 404 or other error means no position likely
+            return 0.0
 
     def place_order(self, order: Order, price: Optional[float] = None) -> str:
         """
@@ -180,11 +214,14 @@ class AlpacaAdapter(IBrokerAdapter):
     def submit_order(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Submits an order to Alpaca.
+        Supports: market, limit, stop, stop_limit, trailing_stop
         """
         symbol = order_data.get('symbol')
         qty = order_data.get('quantity')
         order_type = order_data.get('order_type', 'market')
         limit_price = order_data.get('limit_price')
+        stop_price = order_data.get('stop_price')
+        trail_percent = order_data.get('trail_percent')
         
         if not symbol or not qty:
             msg = "Order submission failed: Symbol and Quantity are required."
@@ -213,6 +250,43 @@ class AlpacaAdapter(IBrokerAdapter):
                     side=side,
                     time_in_force=TimeInForce.DAY,
                     limit_price=limit_price
+                )
+            elif order_type == 'stop':
+                if not stop_price:
+                    msg = "Stop order requires 'stop_price'."
+                    logger.error(msg)
+                    return {"status": "error", "message": msg}
+                request = StopOrderRequest(
+                    symbol=symbol,
+                    qty=abs_qty,
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                    stop_price=stop_price
+                )
+            elif order_type == 'stop_limit':
+                if not stop_price or not limit_price:
+                    msg = "Stop-Limit order requires 'stop_price' and 'limit_price'."
+                    logger.error(msg)
+                    return {"status": "error", "message": msg}
+                request = StopLimitOrderRequest(
+                    symbol=symbol,
+                    qty=abs_qty,
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                    stop_price=stop_price,
+                    limit_price=limit_price
+                )
+            elif order_type == 'trailing_stop':
+                if not trail_percent:
+                    msg = "Trailing stop requires 'trail_percent'."
+                    logger.error(msg)
+                    return {"status": "error", "message": msg}
+                request = TrailingStopOrderRequest(
+                    symbol=symbol,
+                    qty=abs_qty,
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                    trail_percent=trail_percent
                 )
             else:
                 msg = f"Unsupported order type: {order_type}"
