@@ -199,6 +199,19 @@ class RiskManager:
             
         return RiskReport(passed=True, adjustments_made="None")
 
+    def get_clamped_weights(self, target_weights: Dict[str, float], current_portfolio: Dict[str, Any]) -> Dict[str, float]:
+        """
+        [Task 4.2] Returns weights clamped to risk limits (Fallback Mechanism).
+        """
+        clamped = {}
+        for sym, w in target_weights.items():
+            if abs(w) > self.max_position_concentration_pct:
+                sign = 1.0 if w > 0 else -1.0
+                clamped[sym] = sign * self.max_position_concentration_pct
+            else:
+                clamped[sym] = w
+        return clamped
+
     def check_pre_trade(
         self, proposed_position: Position, portfolio: PortfolioState
     ) -> List[RiskSignal]:
@@ -206,7 +219,20 @@ class RiskManager:
         Checks risk before a new trade is executed.
         """
         if self.circuit_breaker_tripped:
-            raise CircuitBreakerError("Risk circuit breaker is active. No new trades allowed.")
+            # [Task 7.1 Fix] Escape Route: Allow risk-reducing trades (liquidations) even if tripped.
+            # Otherwise, we lock the system in a "Frozen Death" state where it can't exit positions.
+            symbol = proposed_position.symbol
+            existing_pos = portfolio.positions.get(symbol)
+            existing_qty = float(existing_pos.quantity) if existing_pos else 0.0
+            trade_qty = float(proposed_position.quantity)
+
+            # Logic: Trade must be opposite sign AND not exceed existing size (no flipping)
+            is_reducing = (existing_qty != 0) and (existing_qty * trade_qty < 0) and (abs(trade_qty) <= abs(existing_qty) + 1e-9)
+            
+            if is_reducing:
+                logger.warning(f"Circuit Breaker Override: Allowing risk-reducing trade for {symbol} (Qty: {trade_qty}).")
+            else:
+                raise CircuitBreakerError("Risk circuit breaker is active. No new/increasing trades allowed.")
 
         # [Task 2.3 Fix] Check Symbol-Level Halt
         if proposed_position.symbol in self.halted_symbols:
