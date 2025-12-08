@@ -140,14 +140,18 @@ class LoopManager:
                 # Prevents CPU thrashing and log flooding during transient outages
                 failure_count += 1
                 
-                # [Task 0.2 Fix] Fuse: Fail Fast
+                # [Task 0.2 Fix] Fuse: Safe Mode
                 if failure_count > max_consecutive_failures:
-                    log.critical(f"Fuse Blow: {failure_count} consecutive failures. Terminating process.")
-                    raise SystemExit("Too many consecutive failures")
+                    log.critical(f"Fuse Blow: {failure_count} consecutive failures. Safe Mode active (holding).")
 
                 backoff_time = min(2 ** failure_count, 60) # Cap at 60s
                 log.warning(f"Backing off for {backoff_time}s due to error.")
-                await asyncio.sleep(backoff_time)
+                
+                # [Fix] Interruptible sleep during backoff
+                for _ in range(backoff_time):
+                    if not self.is_running:
+                        break
+                    await asyncio.sleep(1)
                 
             except BaseException as e:
                 # Catch fatal errors (SystemExit, KeyboardInterrupt, etc.)
