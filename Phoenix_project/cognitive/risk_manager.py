@@ -1,13 +1,8 @@
 """
-Risk Manager for the Phoenix cognitive engine.
-
-Monitors portfolio state, market conditions, and operational metrics
-to enforce risk controls and trigger circuit breakers.
-[Task 5] Persistence and Warm-up
-[Task 6.3] Direction-Aware Risk Control
-[Beta FIX] Interface Mismatch & Flatline Bypass Fix
-[Code Opt Expert Fix] Task 03 & 04: Cold Start Protection & Distributed Pub/Sub
-[Task 007, 008, 009] Fail-Closed Logic, Volatility Scaling, Poisoning Defense
+Phoenix_project/cognitive/risk_manager.py
+[Phase 3 Task 5] Fix RiskManager Silent Failure.
+Replace silent 'return None' in anomaly paths with 'raise RiskDataError' 
+to enforce Fail-Closed logic.
 """
 
 import logging
@@ -24,9 +19,13 @@ from ..core.schemas.risk_schema import (
 )
 from ..core.exceptions import RiskViolationError, CircuitBreakerError
 
+# Define specific error for data failures
+class RiskDataError(Exception):
+    pass
+
 logger = logging.getLogger(__name__)
 
-# Forward declaration or import
+# Forward declaration
 from ..data_manager import DataManager
 
 
@@ -47,7 +46,6 @@ class RiskManager:
         self.data_manager = data_manager
         self.initial_capital = initial_capital
         
-        # [Task 2.3 Fix] Symbol-Level Halt Tracker
         self.halted_symbols: Set[str] = set()
         
         self.max_drawdown_pct = self.config.get("max_drawdown_pct", 0.15)
@@ -55,20 +53,17 @@ class RiskManager:
         self.volatility_threshold = self.config.get("volatility_threshold", 0.05)
         self.volatility_window = self.config.get("volatility_window", 30)
         
-        # [Task 008] Volatility Scale Calibration
         if "frequency_factor" in self.config:
             self.frequency_factor = self.config["frequency_factor"]
         else:
-            # Check for data_frequency in global trading config (default to daily)
             trading_config = config.get("trading", {})
             data_freq = trading_config.get("data_frequency", "daily")
             asset_class = self.config.get("asset_class", "stock").lower()
             
-            # [Task 2.3 Fix] Crypto Calendar Support
             if asset_class == "crypto":
                 self.frequency_factor = 525600 if data_freq == "minute" else 365
             elif data_freq == "minute":
-                self.frequency_factor = 252 * 390 # 98280 for intraday (Stock)
+                self.frequency_factor = 252 * 390 
             else:
                 self.frequency_factor = 252
 
@@ -83,24 +78,17 @@ class RiskManager:
         logger.info("RiskManager initialized.")
 
     async def _load_circuit_breaker_state(self) -> bool:
-        """[Task 5] Loads circuit breaker state from Redis."""
         try:
-            # [Task 4.5 Fix] Fail-Closed: If Redis is missing, assume tripped.
             if not self.redis_client: 
                 logger.warning("RiskManager: No Redis client. Defaulting to TRIPPED (Safe Mode).")
                 return True
-                
             state = await self.redis_client.get("phoenix:risk:halted")
             return bool(int(state)) if state else False
         except Exception as e:
-            # [Task 4.5 Fix] Fail-Closed: If connection fails, assume tripped.
             logger.error(f"Failed to load circuit breaker state: {e}. Defaulting to TRIPPED.")
             return True
 
     async def initialize(self, symbols: List[str]):
-        """
-        [Task 5] Cold-start Warm-up: Backfill price history & Load Persistence.
-        """
         self.circuit_breaker_tripped = await self._load_circuit_breaker_state()
         self.peak_equity = await self._load_peak_equity()
         self.current_equity = await self._load_current_equity()
@@ -128,10 +116,7 @@ class RiskManager:
                 logger.error(f"Failed to warm up risk data for {sym}: {e}")
 
         await asyncio.gather(*[_fetch_and_fill(s) for s in symbols])
-        
-        # [Task 04] Start Distributed Circuit Breaker Listener
         asyncio.create_task(self._monitor_circuit_breaker())
-        
         logger.info(f"RiskManager warm-up complete.")
 
     async def _load_peak_equity(self) -> float:
@@ -140,7 +125,6 @@ class RiskManager:
             peak_equity_raw = await self.redis_client.get("phoenix:risk:peak_equity")
             if peak_equity_raw:
                 val = float(peak_equity_raw)
-                # [Task 2.3 Fix] Success Penalty Removed. Allow growth > 50x.
                 return max(val, self.initial_capital)
             return self.initial_capital
         except Exception as e:
@@ -173,25 +157,17 @@ class RiskManager:
     async def validate_allocations(
         self, target_weights: Dict[str, float], current_portfolio: Dict[str, Any], market_data: Any
     ) -> RiskReport:
-        """
-        [Beta FIX] Implemented Missing Interface.
-        Validates a proposed set of portfolio weights against risk constraints.
-        """
         if self.circuit_breaker_tripped:
             return RiskReport(passed=False, adjustments_made="Circuit Breaker Tripped")
 
         violations = []
         adjustments = []
+        pf_value = current_portfolio.get("cash", 0.0)
         
-        # Simple simulation of total portfolio value
-        pf_value = current_portfolio.get("cash", 0.0) # Conservative estimate
-        
-        # Check each target allocation
         for sym, weight in target_weights.items():
             if abs(weight) > self.max_position_concentration_pct:
                 violations.append(f"Concentration {weight:.2f} > {self.max_position_concentration_pct}")
                 adjustments.append(f"Capped {sym} at {self.max_position_concentration_pct}")
-                # We could auto-adjust here, but for now we just report
                 
         if violations:
             logger.warning(f"Allocation validation failed: {violations}")
@@ -200,9 +176,6 @@ class RiskManager:
         return RiskReport(passed=True, adjustments_made="None")
 
     def get_clamped_weights(self, target_weights: Dict[str, float], current_portfolio: Dict[str, Any]) -> Dict[str, float]:
-        """
-        [Task 4.2] Returns weights clamped to risk limits (Fallback Mechanism).
-        """
         clamped = {}
         for sym, w in target_weights.items():
             if abs(w) > self.max_position_concentration_pct:
@@ -215,18 +188,12 @@ class RiskManager:
     def check_pre_trade(
         self, proposed_position: Position, portfolio: PortfolioState
     ) -> List[RiskSignal]:
-        """
-        Checks risk before a new trade is executed.
-        """
         if self.circuit_breaker_tripped:
-            # [Task 7.1 Fix] Escape Route: Allow risk-reducing trades (liquidations) even if tripped.
-            # Otherwise, we lock the system in a "Frozen Death" state where it can't exit positions.
             symbol = proposed_position.symbol
             existing_pos = portfolio.positions.get(symbol)
             existing_qty = float(existing_pos.quantity) if existing_pos else 0.0
             trade_qty = float(proposed_position.quantity)
 
-            # Logic: Trade must be opposite sign AND not exceed existing size (no flipping)
             is_reducing = (existing_qty != 0) and (existing_qty * trade_qty < 0) and (abs(trade_qty) <= abs(existing_qty) + 1e-9)
             
             if is_reducing:
@@ -234,7 +201,6 @@ class RiskManager:
             else:
                 raise CircuitBreakerError("Risk circuit breaker is active. No new/increasing trades allowed.")
 
-        # [Task 2.3 Fix] Check Symbol-Level Halt
         if proposed_position.symbol in self.halted_symbols:
             raise RiskViolationError(f"Trading halted for {proposed_position.symbol} due to volatility", [])
 
@@ -268,11 +234,17 @@ class RiskManager:
     async def on_market_data(self, market_data: MarketData) -> Optional[RiskSignal]:
         if self.circuit_breaker_tripped: return None
         
-        vol_signal = self.check_volatility(market_data)
-        if vol_signal:
-            if vol_signal.triggers_circuit_breaker:
-                await self.trip_circuit_breaker(vol_signal.description)
-            return vol_signal
+        try:
+            vol_signal = self.check_volatility(market_data)
+            if vol_signal:
+                if vol_signal.triggers_circuit_breaker:
+                    await self.trip_circuit_breaker(vol_signal.description)
+                return vol_signal
+        except RiskDataError as e:
+            # [Task 5] Catch data errors and Trip Breaker (Fail-Closed)
+            logger.critical(f"Critical Risk Data Failure: {e}. Tripping Circuit Breaker.")
+            await self.trip_circuit_breaker(f"Data Failure: {e}")
+            
         return None
 
     async def update_portfolio_value(self, new_equity: float):
@@ -293,10 +265,6 @@ class RiskManager:
     def check_concentration(
         self, proposed_position: Position, portfolio: PortfolioState
     ) -> Optional[ConcentrationSignal]:
-        """
-        Checks if a new position would violate concentration limits.
-        [Task 6.3] Direction-Aware: Allows risk-reducing trades even if overweight.
-        """
         symbol = proposed_position.symbol
         
         existing_pos = portfolio.positions.get(symbol)
@@ -305,14 +273,11 @@ class RiskManager:
         
         final_qty = existing_qty + trade_qty
         
-        # 2. Check for Risk Reduction (Unwinding)
-        # If absolute exposure decreases AND we are not flipping direction, we ALLOW.
         same_sign = (existing_qty * final_qty) >= 0
         if existing_qty != 0 and abs(final_qty) < abs(existing_qty) - 1e-9 and same_sign:
             logger.info(f"Risk reduction detected for {symbol}. Allowing trade.")
             return None
 
-        # 3. Calculate Final Value (Estimated)
         price = 0.0
         if existing_pos and float(existing_pos.market_value) > 0 and abs(existing_qty) > 0:
             price = float(existing_pos.market_value) / abs(existing_qty)
@@ -333,6 +298,11 @@ class RiskManager:
 
     def check_volatility(self, market_data: MarketData) -> Optional[VolatilitySignal]:
         symbol = market_data.symbol
+        
+        # [Task 5 Fix] Validate Market Data Input
+        if market_data.close is None or market_data.close <= 0:
+             raise RiskDataError(f"Invalid market data for {symbol}: close={market_data.close}")
+
         price = float(market_data.close) 
 
         if symbol not in self.price_history:
@@ -340,8 +310,6 @@ class RiskManager:
         
         self.price_history[symbol].append(price)
 
-        # [Task 007] Cold Start Protection (Fail-Closed)
-        # If insufficient data, assume extreme volatility and BLOCK trading.
         if len(self.price_history[symbol]) < self.volatility_window:
             return VolatilitySignal(
                 description="Circuit Breaker Tripped due to Cold Start (Insufficient Data).",
@@ -352,32 +320,40 @@ class RiskManager:
             )
 
         try:
-            # [Beta FIX] Filter out invalid prices (Flatline Fix)
             prices = np.array(self.price_history[symbol])
             prices = prices[prices > 0] 
             
-            if len(prices) < 2: return None
+            # [Task 5 Fix] Fail-Closed on Calculation Error
+            if len(prices) < 2: 
+                raise RiskDataError(f"Insufficient valid prices for {symbol} volatility calc.")
 
             log_returns = np.log(prices[1:] / prices[:-1])
+            
+            # Check for NaN/Inf
+            if not np.all(np.isfinite(log_returns)):
+                 raise RiskDataError(f"Volatility calc resulted in NaN/Inf for {symbol}")
+
             current_volatility = np.std(log_returns) * np.sqrt(self.frequency_factor)
 
             if current_volatility > self.volatility_threshold:
                 desc = f"High volatility detected for {symbol}: {current_volatility:.4f}"
-                # [Task 2.3 Fix] Symbol-Level Halt (Do not trip global breaker)
                 self.halted_symbols.add(symbol)
                 logger.warning(f"Symbol {symbol} HALTED due to volatility.")
                 return VolatilitySignal(description=desc, symbol=symbol, current_volatility=current_volatility, volatility_threshold=self.volatility_threshold, triggers_circuit_breaker=False)
-        except Exception:
-            pass
+                
+        except RiskDataError:
+            raise # Re-raise known errors
+        except Exception as e:
+            # Catch unexpected numpy errors
+            raise RiskDataError(f"Volatility calculation crashed: {e}")
+            
         return None
 
     async def trip_circuit_breaker(self, reason: str):
         self.circuit_breaker_tripped = True
         if self.redis_client:
-            # [Beta FIX] Await setting the key to ensure persistence before proceeding
             try:
                 await self.redis_client.set("phoenix:risk:halted", "1")
-                # [Task 04] Publish TRIP event
                 await self.redis_client.publish("phoenix:risk:halted", "TRIP")
             except Exception as e:
                 logger.error(f"Failed to persist/publish halt state: {e}")
@@ -387,16 +363,11 @@ class RiskManager:
         self.circuit_breaker_tripped = False
         if self.redis_client:
             await self.redis_client.delete("phoenix:risk:halted")
-            # [Task 04] Publish RESET event
             await self.redis_client.publish("phoenix:risk:halted", "RESET")
         logger.info("RiskManager circuit breaker has been reset.")
 
     async def _monitor_circuit_breaker(self):
-        """
-        [Task 04] Real-time Circuit Breaker Sync via Redis Pub/Sub.
-        """
         if not self.redis_client: return
-        
         try:
             pubsub = self.redis_client.pubsub()
             await pubsub.subscribe("phoenix:risk:halted")
