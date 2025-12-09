@@ -1,10 +1,14 @@
-# Phoenix_project/cognitive/engine.py
-# [主人喵的修复] 重建了缺失的 L1 调用接口，增加了针对 Dict Bomb 的类型防御
-# [Phase II Fix] L1 自动发现逻辑增强 & 逻辑纯化
-# [Code Opt Expert Fix] Task 06: Atomic State Updates (Prevent Race Conditions)
+"""
+Phoenix_project/cognitive/engine.py
+[主人喵的修复] 重建了缺失的 L1 调用接口，增加了针对 Dict Bomb 的类型防御
+[Phase II Fix] L1 自动发现逻辑增强 & 逻辑纯化
+[Code Opt Expert Fix] Task 06: Atomic State Updates (Prevent Race Conditions)
+[Phase 1 Task 3] Deep Copy Isolation for ReasoningEnsemble
+"""
 
 import logging
 import uuid
+import copy  # [Task 3] Import copy for deepcopy
 from typing import List, Dict, Any, Optional
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
@@ -170,13 +174,16 @@ class CognitiveEngine:
     async def process_cognitive_cycle(self, pipeline_state: PipelineState) -> Dict[str, Any]:
         """
         执行核心认知循环 (L2 融合 -> 事实检查 -> 决策防御)。
-        [Task 06] Refactored for Atomic State Updates.
+        [Task 06] Refactored for Atomic State Updates using Deep Copy Isolation.
         """
         logger.info("Starting cognitive cycle...")
         
-        # 1. Run Reasoning Ensemble (L2 Fusion)
+        # [Task 3 Fix] Create a Deep Copy Snapshot to isolate reasoning process
+        state_snapshot = copy.deepcopy(pipeline_state)
+        
+        # 1. Run Reasoning Ensemble (L2 Fusion) on Snapshot
         try:
-            fusion_result = await self.reasoning_ensemble.reason(pipeline_state)
+            fusion_result = await self.reasoning_ensemble.reason(state_snapshot)
             
             # [致命防御] 检查是否为 Dict Bomb
             if isinstance(fusion_result, dict):
@@ -192,19 +199,13 @@ class CognitiveEngine:
             logger.error(f"Cognitive cycle failed at Reasoning stage: {e}", exc_info=True)
             raise CognitiveError(f"ReasoningEnsemble failed: {e}") from e
             
-        # [Task 06] Removed intermediate update to prevent race condition
-        # pipeline_state.update_value("last_fusion_result", fusion_result)
+        # Update snapshot so guard can see it
+        state_snapshot.latest_fusion_result = fusion_result.model_dump()
         
-        # [Fix] Ensure the guard sees the result
-        pipeline_state.latest_fusion_result = fusion_result.model_dump()
-        
-        # [Task 3.3 Fix] Removed redundant Fact-Check block. 
-        # Verification is now handled internally by ReasoningEnsemble.
-        
-        # 3. Apply Uncertainty Guardrail
+        # 3. Apply Uncertainty Guardrail on Snapshot
         try:
             # [Fix] Use correct API: validate_uncertainty(state) -> Optional[str]
-            error_msg = self.uncertainty_guard.validate_uncertainty(pipeline_state)
+            error_msg = self.uncertainty_guard.validate_uncertainty(state_snapshot)
             
             if error_msg:
                 logger.warning(f"Uncertainty Guardrail triggered: {error_msg}")
@@ -213,9 +214,6 @@ class CognitiveEngine:
                 fusion_result.confidence = 0.0
                 fusion_result.reasoning = f"Guardrail Block: {error_msg}"
             
-            # [Task 06] Removed intermediate update
-            # pipeline_state.update_value("last_guarded_decision", fusion_result)
-            
         except Exception as e:
             logger.error(f"Uncertainty guardrail failed: {e}", exc_info=True)
             # Fail safe
@@ -223,6 +221,8 @@ class CognitiveEngine:
             fusion_result.confidence = 0.0
 
         # [Task 06] Atomic Commit: Update global state only after all checks pass
+        # Now we apply the result from the isolated process to the real pipeline_state
+        pipeline_state.latest_fusion_result = fusion_result.model_dump()
         pipeline_state.update_value("last_fusion_result", fusion_result)
         pipeline_state.update_value("last_guarded_decision", fusion_result)
 
