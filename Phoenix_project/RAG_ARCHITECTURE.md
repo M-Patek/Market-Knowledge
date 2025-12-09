@@ -20,7 +20,9 @@ TabularDBClient (Postgres): 检索相关的财务报表 (结构化数据)。
 
 TemporalDBClient (Elasticsearch): 检索相关的时序事件 (例如 "Foxconn 工厂停工")。
 
-SearchClient (Tavily): 检索实时网络信息。
+SearchClient (Tavily / Gemini): 检索实时网络信息。
+
+GNN Inferencer (via Celery): 检索基于图神经网络的深层隐性关系。
 
 重排 (Rerank): Retriever 使用 CrossEncoder 模型对所有来源的证据 (Evidence) 进行融合和重排。
 
@@ -56,7 +58,7 @@ RAG: Retriever -> TemporalDBClient -> Augment.
 
 外部 (External): Web Search.
 
-RAG: Retriever -> SearchClient (Tavily) -> Augment.
+RAG: Retriever -> SearchClient (Tavily/Gemini) -> Augment.
 
 2. (RAG) 内存 / 数据库 (Memory / Databases)
 
@@ -66,7 +68,7 @@ memory/vector_store.py (VectorStore)
 
 用途: 存储 L1 证据 (Evidence) 和 RAG 文档 (Documents) 的嵌入。
 
-配置: config/system.yaml -> memory.vector_store.
+配置: config/system.yaml -> memory.vector_store (Host: phoenix_qdrant).
 
 ai/graph_db_client.py (GraphDBClient)
 
@@ -124,9 +126,9 @@ Text-to-Cypher: Retriever (L1/L2) 使用 EnsembleClient (LLM) 和 PromptRenderer
 
 GNN (Graph Neural Network):
 
-Graph-RAG: GNN (Graph Neural Network) training is an intended part of this architecture (see training/gnn/gnn_engine.py).
+Graph-RAG: GNN Inference is integrated into the retrieval process.
 
-[GNN Integration]: GNN (Graph Neural Network) training is shown in training/gnn/gnn_engine.py. The GNN inference model is loaded via the ai/gnn_inferencer.py module and has been integrated into the _query_graph_with_gnn method of ai/retriever.py to perform advanced graph inference and relationship discovery during real-time retrieval.
+[GNN Offloading]: GNN inference is computationally intensive and is now offloaded to a dedicated Celery queue (`gnn_queue`) in `ai/retriever.py`. This ensures the main RAG pipeline is not blocked by heavy matrix operations.
 
 4. (RAG) 检索器 (Retriever)
 
@@ -142,11 +144,15 @@ search_vector_db() (Vector)
 
 search_knowledge_graph() (Graph Text-to-Cypher)
 
-_query_graph_with_gnn() (Graph GNN-enhanced)
+_query_graph_with_gnn() (Graph GNN-enhanced via Celery)
 
-(未来: search_temporal_db, search_tabular_db, search_web)
+search_temporal_db()
 
-鲁棒性 (Robustness): 每个检索方法 (包括 GNN) 都有自己的 try...except 块，返回 [] 以防止 asyncio.gather 失败。
+search_tabular_db()
+
+search_web() (Web Search via Tavily or Gemini)
+
+鲁棒性 (Robustness - Resilient Gathering): 实现了 "Resilient Gathering" 模式。即使某个数据源 (如 GNN 或 Web Search) 失败或超时，检索器也会捕获异常并继续处理其他来源的结果，防止整个 RAG 流程中断。
 
 融合 (Fusion): 将所有来源的 Evidence 列表合并。
 
@@ -162,7 +168,9 @@ api/gateway.py (APIGateway):
 
 ai/embedding_client.py (EmbeddingClient):
 
-用途: 专门处理文本嵌入 (例如 text-embedding-3-large)。
+用途: 专门处理文本嵌入。
+
+模型: **models/text-embedding-004** (Google)。已修复硬编码维度，支持动态维度检测。
 
 配置: config/system.yaml -> api_gateway.embedding_model.
 
@@ -192,7 +200,9 @@ L2 智能体 (L2 Agents)
 
 RAG 用途: 元消费者 (Meta Consumers)。L2 智能体 (例如 FusionAgent) 从 VectorStore (L1 证据) 和 CoTDatabase (L1 思维链) 中检索上下文，以生成更高层次的综合洞察 (FusionResult)。
 
-流程: LoopManager (L2) -> CognitiveEngine -> L2Agent.execute() -> self.retriever.retrieve_l1_evidence() -> (Augment) -> self.llm.generate() -> Save to CoTDatabase.
+[新] 认知引擎 (Cognitive Engine): 引入了 `CognitiveEngine` (engine.py) 来协调 L2 流程，包括 L2 融合 (ReasoningEnsemble) 和不确定性防御 (UncertaintyGuard)。
+
+流程: LoopManager (L2) -> CognitiveEngine.process_cognitive_cycle() -> ReasoningEnsemble -> UncertaintyGuard -> Save to CoTDatabase.
 
 L3 智能体 (L3 Agents)
 
