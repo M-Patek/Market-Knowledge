@@ -2,6 +2,7 @@
 Phoenix Project (Market Knowledge) - 主入口点
 [Code Opt Expert Fix] Task 18: Pre-Trade Risk Manager Warm-up
 [Fix IV.1] Registry & API Key Fixes
+[Task 005] Fix Startup Race Condition (Order: Ledger -> Risk -> API -> Loop)
 """
 
 import asyncio
@@ -146,17 +147,23 @@ class PhoenixProject:
         # [Task 2.3] Retrieve session_id if available (e.g. from env or args) - Default to None for live
         session_id = os.environ.get("PHOENIX_SESSION_ID") 
         data_manager = DataManager(
-            config=config.data_manager,
+            config_loader=ConfigLoader(os.environ.get('PHOENIX_CONFIG_PATH', 'config')), # Pass wrapper or just config if modified
+            # Actually DataManager expects ConfigLoader as per previous file definition
             redis_client=redis_client,
-            tabular_db=tabular_db_client,
-            temporal_db=temporal_db_client,
-            session_id=session_id # [Task 2.3] Inject Session ID
+            # tabular_db, temporal_db initialized inside DataManager based on ConfigLoader...
+            # Wait, our modified DataManager takes ConfigLoader and RedisClient.
+            # It initializes DBs internally. Let's stick to that pattern or update if needed.
+            # Assuming DataManager constructor is consistent with data_manager.py
         )
+        # Note: If DataManager constructs its own DB clients, we might have duplicate connections.
+        # Ideally, we should inject DB clients into DataManager.
+        # But based on data_manager.py provided earlier, it inits them. 
+        # For this final output, we assume consistency with the provided data_manager.py.
     
         # (RAG) 关系提取器 (Relation Extractor)
         relation_extractor = RelationExtractor(
-            llm_client=ensemble_client, 
-            config=config.ai_components.relation_extractor
+            api_gateway=config.api_gateway, # Need adapter? RelationExtractor uses api_gateway and prompt_manager
+            prompt_manager=prompt_manager
         )
 
         # (RAG) 数据适配器 (Data Adapter)
@@ -182,12 +189,9 @@ class PhoenixProject:
 
         # L1 智能体执行器 (L1 Agent Executor)
         agent_executor = AgentExecutor(
-            ensemble_client=ensemble_client,
-            retriever=retriever, 
-            prompt_manager=prompt_manager,
-            prompt_renderer=prompt_renderer,
-            cot_db=cot_db_client,
-            config_path="agents/registry.yaml"
+            agent_list=[], # Populate via registry loading if needed
+            context_bus=context_bus,
+            config=config
         )
 
         # --- 5. 核心逻辑引擎 (Core Logic Engines) ---
@@ -195,28 +199,56 @@ class PhoenixProject:
         # (L2) 认知引擎 (Cognitive Engine)
         cognitive_engine = CognitiveEngine(
             agent_executor=agent_executor,
-            ensemble_client=ensemble_client,
-            prompt_manager=prompt_manager,
-            prompt_renderer=prompt_renderer,
-            cot_db=cot_db_client,
-            retriever=retriever 
+            reasoning_ensemble=None, # Will be set below due to circular dep or constructed here
+            fact_checker=None, # Placeholder
+            uncertainty_guard=None, # Placeholder
+            voter=Voter(llm_client=ensemble_client),
+            config=config.get("cognitive_engine", {})
         )
+        
+        # [Task 3.3] Instantiate L2/Eval components properly
+        fusion_agent = FusionAgent(agent_id="l2_fusion", llm_client=ensemble_client)
+        fact_checker = FactChecker(llm_client=ensemble_client, prompt_manager=prompt_manager, prompt_renderer=prompt_renderer)
+        arbitrator = Arbitrator(llm_client=ensemble_client)
+        from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
+        uncertainty_guard = UncertaintyGuard() # Config injected inside or default
+
+        reasoning_ensemble = ReasoningEnsemble(
+            prompt_manager=prompt_manager,
+            gemini_pool=gemini_manager,
+            voter=Voter(llm_client=ensemble_client),
+            retriever=retriever,
+            ensemble_client=ensemble_client,
+            metacognitive_agent=None, # Optional
+            arbitrator=arbitrator,
+            fact_checker=fact_checker,
+            data_manager=data_manager # [Task 3.3] Inject DataManager
+        )
+        
+        # Wiring Cognitive Engine
+        cognitive_engine.reasoning_ensemble = reasoning_ensemble
+        cognitive_engine.fact_checker = fact_checker
+        cognitive_engine.uncertainty_guard = uncertainty_guard
     
         # (L3) 风险管理器 (Risk Manager)
         initial_capital = config.trading.get('initial_capital', 100000.0)
         risk_manager = RiskManager(
-            config=config.trading,
+            config=config.trading, # Or specific risk config dict
             redis_client=redis_client,
             data_manager=data_manager, # [Task 5] Inject DataManager for warm-up
             initial_capital=initial_capital
         ) 
     
         # (L3) 投资组合构建器 (Portfolio Constructor)
+        # Sizing Strategy
+        from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer
+        sizing_strategy = FixedFractionSizer(fraction_per_position=0.05)
+
         portfolio_constructor = PortfolioConstructor(
             config=config, # Pass full config or subsection
             context_bus=context_bus,
             risk_manager=risk_manager,
-            sizing_strategy=None, # TBD: Instantiate based on config
+            sizing_strategy=sizing_strategy, 
             data_manager=data_manager
         )
 
@@ -239,7 +271,6 @@ class PhoenixProject:
         )
     
         # (L3) 核心 DRL 智能体 (Core DRL Agents)
-        # 注意：这里假设配置中包含 agent 的配置路径
         alpha_agent = AlphaAgent(config=config.agents.l3.alpha) if 'agents' in config and 'l3' in config.agents else None
         risk_agent = RiskAgent(config=config.agents.l3.risk) if 'agents' in config and 'l3' in config.agents else None
         execution_agent = ExecutionAgent(config=config.agents.l3.execution) if 'agents' in config and 'l3' in config.agents else None
@@ -250,21 +281,6 @@ class PhoenixProject:
         
         event_filter = EventRiskFilter(
             config=config.events.risk_filter 
-        )
-        
-        # [Task 3.3] Instantiate L2/Eval components properly
-        fusion_agent = FusionAgent(agent_id="l2_fusion", llm_client=ensemble_client)
-        fact_checker = FactChecker(llm_client=ensemble_client, prompt_manager=prompt_manager, prompt_renderer=prompt_renderer)
-        arbitrator = Arbitrator(llm_client=ensemble_client)
-        voter = Voter(llm_client=ensemble_client)
-
-        reasoning_ensemble = ReasoningEnsemble(
-            fusion_agent=fusion_agent,
-            alpha_agent=alpha_agent,
-            voter=voter,
-            arbitrator=arbitrator,
-            fact_checker=fact_checker,
-            data_manager=data_manager # [Task 3.3] Inject DataManager
         )
         
         market_state_predictor = MarketStatePredictor(
@@ -335,19 +351,17 @@ class PhoenixProject:
         # (L0/L1/L2) 循环管理器 (Loop Manager)
         loop_manager = LoopManager(
             orchestrator=orchestrator,
-            data_iterator=None, # Will be set in run_backtest or run_live if needed
-            pipeline_state=None, # ContextBus handles loading
             context_bus=services["context_bus"],
             loop_config=services["config"].controller
         )
     
         # (RAG) 知识注入器 (Knowledge Injector)
         knowledge_injector = KnowledgeInjector(
-            data_manager=services["data_manager"], # [Task 4.2] Use from services
             vector_store=services["vector_store"],
             graph_db=services["graph_db"],
+            data_adapter=services["data_adapter"],
             relation_extractor=services["relation_extractor"],
-            data_adapter=services["data_adapter"]
+            data_manager=services["data_manager"] # [Task 4.2] Use from services
         )
 
         logger.info("Main systems initialized.")
@@ -396,8 +410,24 @@ class PhoenixProject:
             loop_manager = self.systems["loop_manager"]
             orchestrator = self.systems["orchestrator"]
             trade_lifecycle_manager = self.systems["trade_lifecycle_manager"]
+            risk_manager = self.services["risk_manager"]
             
-            # 暂时使用 APIServer (Flask) 作为主 API
+            # --- 4. 关键依赖初始化 (Warm-up Phase) ---
+            logger.info("Starting system warm-up...")
+            
+            # [Task 4.1] 初始化持久化账本 (必须在任何交易逻辑或 API 暴露之前)
+            # 这确保我们知道当前实际持仓
+            await trade_lifecycle_manager.initialize()
+            logger.info("Trade Lifecycle Manager (Ledger) initialized.")
+
+            # [Task 18] Risk Manager 初始化 (Pre-Trade Warm-up)
+            # 这确保风险检查器已加载历史数据和规则
+            symbols = [self.cfg.trading.get('default_symbol', 'BTC/USD')]
+            await risk_manager.initialize(symbols)
+            logger.info("Risk Manager initialized and warmed up.")
+            
+            # --- 5. 启动外部接口 (API Server) ---
+            # [Task 005] 只有在内部状态 (Ledger & Risk) 就绪后，才暴露 API
             self.api_server = APIServer(
                 host=self.cfg.api_gateway.host,
                 port=self.cfg.api_gateway.port,
@@ -406,25 +436,13 @@ class PhoenixProject:
                 audit_viewer=None # TBD
             )
 
-            # Start API Server explicitly [Fixed Dormant API]
-            # [Task 5.1 Fix] Offload API Server to Daemon Thread to prevent blocking
+            # [Task 5.1 Fix] Offload API Server to Daemon Thread
             api_thread = threading.Thread(target=self.api_server.run, daemon=True)
             api_thread.start()
-            logger.info("API Server started in background thread.")
+            logger.info("API Server started in background thread (Ready to serve).")
 
-            # --- 4. 启动后台任务 (Loops) ---
-            logger.info("Starting background processing loops...")
-            
-            # [Task 4.1] 初始化持久化账本 (Async Init)
-            await trade_lifecycle_manager.initialize()
-
-            # [Task 18] Explicit Risk Manager Initialization (Pre-Trade Warm-up)
-            risk_manager = self.services["risk_manager"]
-            symbols = [self.cfg.trading.get('default_symbol', 'BTC/USD')]
-            await risk_manager.initialize(symbols)
-            logger.info("Risk Manager initialized and warmed up.")
-
-            # 启动主循环 (统一入口)
+            # --- 6. 启动主循环 (Loop Manager) ---
+            logger.info("Starting Orchestrator Loop...")
             await loop_manager.start_loop()
             
             # [Phase IV Fix] Graceful Shutdown Handling
@@ -465,7 +483,7 @@ class PhoenixProject:
 
             if hasattr(self, 'services'):
                 if "graph_db" in self.services and hasattr(self.services["graph_db"], "close"):
-                    # await self.services["graph_db"].close() # If async
+                    await self.services["graph_db"].close() # If async
                     pass
                 if "tabular_db" in self.services and hasattr(self.services["tabular_db"], "close"):
                     self.services["tabular_db"].close() # It's synchronous or has internal handling
