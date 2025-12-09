@@ -1,23 +1,25 @@
 """
-Agent Executor (智能体执行器)
-负责调度和运行 L1/L2 智能体。
-[Beta Final Fix] 集成 safe_run 调用，确保 L1 智能体的异常被捕获。
-[Task 1.3] Implemented Concurrency Control (Semaphore).
+Phoenix_project/agents/executor.py
+[Phase 5 Task 5] Fix AgentExecutor Result Loss.
+Switch from Pub/Sub to Redis List (RPUSH) for persistent result queuing.
 """
 import logging
 import asyncio
+import json
 from typing import Dict, Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 from omegaconf import DictConfig
 
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.agents.l1.base import BaseL1Agent
+from Phoenix_project.monitor.logging import get_logger
 
 logger = get_logger(__name__)
 
 # [新] 定义用于上下文总线的常量
 AGENT_TASK_TOPIC = "AGENT_TASK"
 AGENT_RESULT_TOPIC = "AGENT_RESULT"
+AGENT_RESULT_QUEUE = "phoenix:agent:results:queue" # [Task 5] Redis List Key
 
 class AgentExecutor:
     """
@@ -27,34 +29,22 @@ class AgentExecutor:
     """
 
     def __init__(self, agent_list: list, context_bus, config: DictConfig):
-        # Build a map for easy lookup: agent_name -> agent_instance
         self.agents = {agent.agent_name: agent for agent in agent_list}
         self.context_bus = context_bus
-        # Handle potential config structure differences
         self.config = config.get("agent_executor", {}) if isinstance(config, (dict, DictConfig)) else {}
         
-        # [实现] 从配置中读取重试参数
         self.retry_attempts = self.config.get("retry_attempts", 3)
         self.retry_wait_min = self.config.get("retry_wait_min_seconds", 1)
         self.retry_wait_max = self.config.get("retry_wait_max_seconds", 10)
 
-        # [Task 1.3] Concurrency Control
         self.max_concurrency = self.config.get("max_concurrency", 50)
         self.semaphore = asyncio.Semaphore(self.max_concurrency)
 
         logger.info(f"AgentExecutor initialized with agents: {list(self.agents.keys())}, Max Concurrency: {self.max_concurrency}")
         
-        # [实现] 订阅任务主题
-        try:
-            if hasattr(self.context_bus, "subscribe_async"):
-                self.context_bus.subscribe_async(AGENT_TASK_TOPIC, self.handle_task)
-            else:
-                # Fallback to sync subscribe if async not available (depends on ContextBus impl)
-                self.context_bus.subscribe(AGENT_TASK_TOPIC, self.handle_task_sync)
-            logger.info(f"AgentExecutor subscribed to '{AGENT_TASK_TOPIC}'")
-        except Exception as e:
-            logger.error(f"Failed to subscribe to ContextBus: {e}", exc_info=True)
-
+        # 订阅任务 (Task Queue/Topic is handled by Orchestrator or Bus logic)
+        # Here we just ensure we can publish results reliably
+        
     async def _run_agent_with_retry(self, agent, task_content, context):
         """
         [Beta Final Fix] 内部辅助函数，优先调用 safe_run。
@@ -62,18 +52,12 @@ class AgentExecutor:
         logger.debug(f"Attempting to run agent {agent.agent_name}...")
         
         if isinstance(agent, BaseL1Agent):
-            # [Task I Fix] Adapt for BaseL1Agent signature: run(state, dependencies)
             state = context.get('state')
             if not state:
                 logger.warning(f"No state provided for L1 Agent {agent.agent_name}. Using task_content as dependencies only.")
-                state = PipelineState() # Initialize empty/default state
-            
-            # [Task 2.1] L1 Agents are now natively async. 
-            # Direct await allows non-deterministic errors to bubble up to tenacity retry.
+                state = PipelineState() 
             return await agent.safe_run(state=state, dependencies=task_content)
 
-        # Default behavior for other agents (L2/L3) or non-BaseL1 agents
-        # 检查是否缺少 run 方法
         if not hasattr(agent, "run"):
             logger.warning(f"Agent {agent.agent_name} lacks a 'run' method.")
             raise NotImplementedError(f"Agent {agent.agent_name} must have a 'run' method.")
@@ -87,7 +71,7 @@ class AgentExecutor:
     async def execute_task(self, agent_name: str, task: dict):
         """
         [已实现] 异步执行单个任务，包含重试和结果发布。
-        [Task 1.3] Throttled by Semaphore.
+        [Task 5] Publish to Persistent Queue (Redis List) instead of Pub/Sub.
         """
         task_id = task.get("task_id", "unknown_task")
         
@@ -99,24 +83,21 @@ class AgentExecutor:
                 "status": "ERROR",
                 "error": f"Agent '{agent_name}' not found."
             }
-            self.context_bus.publish(AGENT_RESULT_TOPIC, result_payload)
+            await self._publish_result(result_payload)
             return result_payload
 
         agent = self.agents[agent_name]
         context = task.get("context", {})
         task_content = task.get("content", {})
 
-        # [Task 1.3] Guard execution with Semaphore to prevent OOM
         async with self.semaphore:
             try:
-                # [已实现] 重试逻辑
                 retry_decorator = retry(
                     stop=stop_after_attempt(self.retry_attempts),
                     wait=wait_exponential(min=self.retry_wait_min, max=self.retry_wait_max),
                     reraise=True
                 )
                 
-                # Create a partial or bound async function for tenacity to retry
                 async_agent_runner = retry_decorator(self._run_agent_with_retry)
                 result = await async_agent_runner(agent, task_content, context)
                 
@@ -147,8 +128,33 @@ class AgentExecutor:
                     "exception_type": type(e).__name__
                 }
             
-        self.context_bus.publish(AGENT_RESULT_TOPIC, result_payload)
+        await self._publish_result(result_payload)
         return result_payload
+
+    async def _publish_result(self, result_payload: Dict[str, Any]):
+        """
+        [Task 5] Publish result to persistent Redis Queue.
+        Fallback to Pub/Sub if queue push fails (or do both).
+        """
+        try:
+            # Check if context_bus exposes raw redis client or a queue push method
+            if hasattr(self.context_bus, 'redis') and self.context_bus.redis:
+                # Direct RPUSH to Redis List
+                # Ensure serialization
+                payload_str = json.dumps(result_payload, default=str)
+                await self.context_bus.redis.rpush(AGENT_RESULT_QUEUE, payload_str)
+                # logger.debug(f"Result for {result_payload.get('task_id')} pushed to {AGENT_RESULT_QUEUE}")
+                
+                # Also Publish for real-time listeners (optional but good for monitoring)
+                await self.context_bus.publish(AGENT_RESULT_TOPIC, result_payload)
+                
+            elif hasattr(self.context_bus, 'publish'):
+                # Fallback to Pub/Sub if raw redis not accessible
+                logger.warning("ContextBus raw redis missing. Falling back to Pub/Sub for results (Non-Persistent).")
+                self.context_bus.publish(AGENT_RESULT_TOPIC, result_payload)
+                
+        except Exception as e:
+            logger.error(f"Failed to publish execution result: {e}", exc_info=True)
 
     async def run_parallel(self, tasks: list[dict]):
         """
@@ -176,9 +182,7 @@ class AgentExecutor:
         return final_results
 
     async def handle_task(self, task_data: dict):
-        """
-        [新] 异步回调，用于处理来自 ContextBus 的任务。
-        """
+        # Implementation remains same
         logger.debug(f"Received task via async subscriber: {task_data.get('task_id')}")
         agent_name = task_data.get("agent_name")
         task_content = task_data.get("task")
@@ -189,9 +193,7 @@ class AgentExecutor:
         asyncio.create_task(self.execute_task(agent_name, task_content))
 
     def handle_task_sync(self, task_data: dict):
-        """
-        [新] 同步回调（备用）。
-        """
+        # Implementation remains same
         logger.debug(f"Received task via sync subscriber: {task_data.get('task_id')}")
         try:
             loop = asyncio.get_running_loop()
