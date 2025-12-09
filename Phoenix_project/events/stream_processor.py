@@ -1,20 +1,7 @@
 """
-事件流处理器 (Kafka 消费者)
-
-[主人喵的修复 2]
-此类现在被设计为独立运行 (参见 run_stream_processor.py)。
-它不再被 Orchestrator 拥有，而是通过 SyncEventDistributor (Redis)
-与 Orchestrator 通信。
-
-[阶段 2 更新]
-- 现在订阅 'phoenix_market_data' 和 'phoenix_news_events'。
-- 将行情数据路由到 Redis 缓存 ('latest_prices')。
-- 将新闻数据路由到 EventDistributor (现有逻辑)。
-
-[Beta FIX]
-- Removed fragile lambda deserializer (Fragile Deserialization Fix)
-- Strict Redis connection pooling usage (Resource Fix)
-- Non-blocking EventDistributor publishing (Deadlock Fix)
+Phoenix_project/events/stream_processor.py
+[Phase 5 Task 1] Activate Neural Pathway.
+Publish market data events to EventDistributor to wake up Orchestrator.
 """
 import os
 import json
@@ -145,6 +132,11 @@ class StreamProcessor:
                 # allowing Orchestrator time for heavy inference.
                 self.redis_client.setex(redis_key, 60, market_data.model_dump_json())
                 logger.debug(f"Updated market data for {market_data.symbol} at {redis_key}")
+
+                # [Phase 5 Task 1] Wake up Orchestrator via EventDistributor
+                # Market data acts as a 'tick' to drive the event loop.
+                self.event_distributor.publish(data)
+                logger.debug(f"Published market tick for {market_data.symbol} to distributor.")
             
             else:
                 logger.warning(f"Received message from unhandled topic: {topic}")
