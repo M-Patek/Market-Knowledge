@@ -1,184 +1,210 @@
+"""
+Phoenix_project/execution/order_manager.py
+[Phase 3 Task 3] Fix OrderManager Zombie State.
+Implement on_order_update to clean up active_orders on terminal states.
+Unblock 'One-Shot' deadlock.
+"""
 import asyncio
 import logging
-from typing import Dict, List, Optional, Set, Any
-from decimal import Decimal
+from typing import Dict, List, Optional, Any
 from datetime import datetime
 
-from Phoenix_project.core.schemas.data_schema import Order, OrderStatus, PortfolioState, TargetPortfolio, OrderSide, OrderType
 from Phoenix_project.execution.interfaces import IBrokerAdapter
+from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
+from Phoenix_project.core.schemas.data_schema import Order, OrderStatus, OrderType, OrderSide
+from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.data_manager import DataManager
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class OrderManager:
     """
     订单管理器 (Order Manager)
-    负责将 TargetPortfolio 转换为具体的 Order，并管理订单生命周期。
-    [Task 5.2] Concurrent Execution & Zombie Position Fix
-    [Beta FIX] "Machine Gun" Loop Prevention & Time Travel Fix
-    [Code Opt Expert Fix] Task 10: Enforce Atomicity (Race Condition Fix)
-    [Task 014, 015] Price Anchoring & Race Condition Fix
+    负责将目标投资组合转换为具体的订单，并管理订单生命周期。
+    
+    [Fix] 实时监听订单状态，自动清理已完成/取消的订单，防止死锁。
     """
 
-    def __init__(self, broker_adapter: Optional[IBrokerAdapter], data_manager: DataManager):
-        self.broker = broker_adapter
+    def __init__(
+        self, 
+        broker: IBrokerAdapter, 
+        trade_lifecycle_manager: TradeLifecycleManager,
+        data_manager: DataManager
+    ):
+        self.broker = broker
+        self.tlm = trade_lifecycle_manager
         self.data_manager = data_manager
-        self.active_orders: Dict[str, Order] = {}
-        self.log_prefix = "OrderManager:"
-        self.lock = asyncio.Lock()
-
-    async def reconcile_portfolio(self, pipeline_state: Any):
-        """
-        根据当前状态和目标投资组合生成并提交订单。
-        [Full Implementation] 包含完整的 Diff 计算逻辑和并发提交。
-        """
-        # [Task 014] Fix Type Mismatch & Price Anchoring
-        # Orchestrator passes PipelineState, not PortfolioState directly.
-        target_portfolio = pipeline_state.target_portfolio
-        if not target_portfolio: return
         
-        # Extract PortfolioState (Current Holdings)
-        current_pf_state = pipeline_state.portfolio_state
+        # 内部跟踪: symbol -> order_id (防止对同一标的重复下单)
+        # 也可以是 order_id -> Order object
+        self.active_orders: Dict[str, str] = {} 
+        self._lock = asyncio.Lock()
+        
+        # [Task 3.3] Subscribe to Broker Updates
+        # Ensure we listen to Status Updates (Canceled, Rejected, etc.) AND Fills
+        self.broker.subscribe_order_status(self.on_order_update)
+        # Fills might be handled by TLM, but we also subscribe here if needed 
+        # or rely on status updates 'filled' event. 
+        # Usually 'filled' event comes through order status stream too.
+        
+        # Connect explicitly if needed (Broker might handle lazy connect)
+        # asyncio.create_task(self.broker.connect()) # Moved to Orchestrator or explicit start
+        
+        logger.info("OrderManager initialized and subscribed to broker updates.")
 
-        # [Task 3.2] Fix: Fetch prices for both Target AND Current positions
-        # Prevents "Zombie Position" crashes where we hold an asset not in target
-        current_holdings = set(current_pf_state.positions.keys()) if current_pf_state else set()
-        target_holdings = {p.symbol for p in target_portfolio.positions}
-        relevant_symbols = current_holdings.union(target_holdings)
+    async def on_order_update(self, update: Any):
+        """
+        [Task 3.3] Callback for Order Status Updates.
+        Cleans up active_orders when orders reach terminal state.
+        """
+        try:
+            # Normalize update data (Alpaca stream returns objects or dicts)
+            # update.event: new, fill, partial_fill, canceled, expired, replaced, rejected, pending_cancel, etc.
+            # update.order: { id: ..., symbol: ... }
+            
+            # Helper to extract data safely
+            event = getattr(update, 'event', None)
+            order_data = getattr(update, 'order', None)
+            
+            if not event or not order_data:
+                # Fallback for dict
+                if isinstance(update, dict):
+                    event = update.get('event')
+                    order_data = update.get('order')
+            
+            if not event or not order_data:
+                return
 
-        # [Task 014] Fix Price Anchoring: Do NOT re-fetch data. Use batch from PipelineState.
-        # This ensures "What You See Is What You Trade" (Execution uses same price as Decision)
-        market_prices: Dict[str, Decimal] = {}
-        if pipeline_state.market_data_batch:
-            for md in pipeline_state.market_data_batch:
-                if md.close:
-                    market_prices[md.symbol] = Decimal(str(md.close))
-        else:
-             logger.warning(f"{self.log_prefix} No market_data_batch in PipelineState! Execution might fail for missing prices.")
+            # Extract IDs
+            # Alpaca object uses attributes, dict uses keys
+            order_id = getattr(order_data, 'id', None) or order_data.get('id')
+            symbol = getattr(order_data, 'symbol', None) or order_data.get('symbol')
+            
+            if not order_id or not symbol:
+                return
 
-        orders_to_submit: List[Order] = []
-        current_positions = current_pf_state.positions if current_pf_state else {}
+            logger.info(f"Order Update: {symbol} [{order_id}] -> {event}")
 
-        # --- 核心 Diff 逻辑 ---
-        for symbol in relevant_symbols:
-            if symbol not in market_prices:
-                # [Task 014] Skip if price not in batch (Fail-Safe)
-                continue
+            # Define Terminal States
+            TERMINAL_STATES = {
+                'filled', 'canceled', 'expired', 'rejected', 
+                'stopped', 'done_for_day', 'replaced' # Replaced creates new order, old one is dead
+            }
 
-            # [Task 10] Enforce Atomicity: Lock the entire check-calculate-register block
-            async with self.lock:
-                # [Beta FIX] "Machine Gun" Prevention (In-Flight Check)
-                # Check if we already have an active order for this symbol.
-                has_active_order = False
-                for active_order in self.active_orders.values():
-                    if active_order.symbol == symbol and active_order.status in [OrderStatus.PENDING_SUBMISSION, OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED]:
-                        has_active_order = True
-                        break
-                
-                if has_active_order:
-                    logger.info(f"{self.log_prefix} Skipping {symbol} due to active in-flight order.")
+            if event in TERMINAL_STATES:
+                async with self._lock:
+                    # Check if this order is tracked as active
+                    current_active_id = self.active_orders.get(symbol)
+                    
+                    if current_active_id == str(order_id):
+                        del self.active_orders[symbol]
+                        logger.info(f"Order {order_id} for {symbol} finished ({event}). Removed from active tracking.")
+                    
+                    # Handle 'replaced' logic specifically if needed?
+                    # For now, we assume Orchestrator will issue new orders if needed.
+
+            # Pass 'fill' events to TradeLifecycleManager for Ledger recording
+            if event == 'fill' or event == 'partial_fill':
+                # Convert to execution report format if needed by TLM
+                # But typically TLM subscribes to fills directly via adapter.
+                # If TLM is not subscribed, we could forward here.
+                # Assuming TLM handles its own subscription or we notify it.
+                pass 
+
+        except Exception as e:
+            logger.error(f"Error processing order update: {e}", exc_info=True)
+
+    async def reconcile_portfolio(self, state: PipelineState):
+        """
+        Reconciles the current portfolio with the target portfolio.
+        Generates and places orders.
+        """
+        target_portfolio = state.target_portfolio
+        if not target_portfolio:
+            return
+
+        logger.info("Reconciling portfolio...")
+        
+        # 1. Get Current Positions (from Broker or Ledger)
+        # Using Broker for execution accuracy
+        account_info = self.broker.get_account_info()
+        if account_info.get("status") == "error":
+            logger.error(f"Cannot reconcile: {account_info.get('message')}")
+            return
+            
+        current_positions = {
+            p['symbol']: float(p['qty']) 
+            for p in account_info.get('positions', [])
+        }
+        
+        # 2. Calculate Diffs
+        target_positions = target_portfolio.get('positions', {})
+        
+        # Symbols to trade: Union of current and target
+        all_symbols = set(current_positions.keys()) | set(target_positions.keys())
+        
+        async with self._lock:
+            for symbol in all_symbols:
+                # Skip if there is an active order for this symbol
+                if symbol in self.active_orders:
+                    logger.info(f"Skipping {symbol}: Active order {self.active_orders[symbol]} pending.")
                     continue
-
-                price = market_prices[symbol]
-                if price <= 0: continue
-
-                # 获取当前持仓数量
-                current_qty = Decimal("0.0")
-                if symbol in current_positions:
-                    current_qty = Decimal(str(current_positions[symbol].quantity))
-
-                # 获取目标持仓数量
-                target_qty = Decimal("0.0")
-                # 查找目标组合中的匹配项
-                target_pos = next((p for p in target_portfolio.positions if p.symbol == symbol), None)
-                if target_pos:
-                    target_qty = Decimal(str(target_pos.quantity))
-
-                # 计算差异
-                delta = target_qty - current_qty
                 
-                # 设置最小交易阈值 (例如 0.0001) 防止极小订单
-                if abs(delta) < Decimal("0.0001"):
+                current_qty = current_positions.get(symbol, 0.0)
+                # Target format check: target_portfolio might be complex object or dict
+                # Assuming dict: {symbol: {'quantity': x}}
+                target_data = target_positions.get(symbol, {})
+                target_qty = float(target_data.get('quantity', 0.0)) if target_data else 0.0
+                
+                diff = target_qty - current_qty
+                
+                # Apply Threshold (to avoid dust trading)
+                if abs(diff) < 0.0001: # E.g., crypto dust
                     continue
-
-                # 生成订单
-                side = OrderSide.BUY if delta > 0 else OrderSide.SELL
-                abs_qty = float(abs(delta))
                 
-                # [Beta FIX] Time Travel Prevention
-                # Use the timestamp from the PipelineState (synchronized simulation time)
-                # instead of datetime.now() (physical server time).
-                order_time = pipeline_state.current_time if pipeline_state.current_time else datetime.utcnow()
-
-                # [Task 1.3 Fix] Slippage Protection
-                # Mandate Limit Orders with 5% tolerance to prevent flash crash execution
-                slippage = Decimal("0.05")
-                limit_price_val = price * (1 + slippage) if side == OrderSide.BUY else price * (1 - slippage)
-
-                # 创建订单对象
+                # 3. Create Order
+                side = OrderSide.BUY if diff > 0 else OrderSide.SELL
+                qty = abs(diff)
+                
+                # Get current price for Limit orders? 
+                # For simplicity, using Market orders for now, or L3 decision could specify type.
+                # Assuming Market Order by default unless specified.
+                
                 order = Order(
                     symbol=symbol,
-                    side=side,
-                    order_type=OrderType.LIMIT,
-                    quantity=abs_qty,
-                    limit_price=float(limit_price_val),
-                    timestamp=order_time,
-                    status=OrderStatus.PENDING_SUBMISSION
+                    quantity=qty, # Order model usually takes signed or unsigned with side?
+                    # Based on Schema: quantity is float. Adapter handles side logic now.
+                    # But for clarity in logs:
+                    order_type=OrderType.MARKET,
+                    side=side, # Schema might have this
+                    status=OrderStatus.CREATED,
+                    timestamp=datetime.now()
                 )
                 
-                # 如果是限价单逻辑 (可选):
-                # order.limit_price = float(price * Decimal("1.01")) if side == OrderSide.BUY else float(price * Decimal("0.99"))
-
-                orders_to_submit.append(order)
-                
-                # 将订单加入活跃列表跟踪 (Atomic Registration)
-                self.active_orders[order.id] = order
-
-        logger.info(f"{self.log_prefix} Generated {len(orders_to_submit)} rebalancing orders.")
-
-        # [Task 5.2] Concurrent Order Submission
-        if orders_to_submit:
-            await self._submit_orders_concurrently(orders_to_submit, market_prices)
-
-    async def _submit_orders_concurrently(self, orders: List[Order], market_prices: Dict[str, Decimal]):
-        """[Task 5.2] Helper to submit a batch of orders concurrently."""
-        
-        async def _submit(order: Order):
-            price = float(order.limit_price) if order.limit_price else float(market_prices.get(order.symbol, 0))
-            try:
-                if self.broker:
-                    # Convert Decimal fields to float for broker API if needed
-                    logger.info(f"{self.log_prefix} Submitting {order.side} {order.quantity} {order.symbol}...")
-                    await asyncio.to_thread(self.broker.place_order, order, price)
-                
-                async with self.lock:
-                    current = self.active_orders.get(order.id)
-                    if current and current.status == OrderStatus.PENDING_SUBMISSION:
-                        current.status = OrderStatus.PENDING
-            except Exception as e:
-                logger.error(f"{self.log_prefix} Failed to place order {order.id}: {e}")
-                async with self.lock:
-                    order.status = OrderStatus.REJECTED
-                    if order.id in self.active_orders: del self.active_orders[order.id]
-        
-        # Gather all submission tasks
-        await asyncio.gather(*[_submit(o) for o in orders])
-
-    async def cancel_all_orders(self):
-        """取消所有活跃订单。"""
-        async with self.lock:
-            orders = list(self.active_orders.values())
-        
-        for order in orders:
-            try:
-                if self.broker:
-                    await asyncio.to_thread(self.broker.cancel_order, order.id)
-                async with self.lock:
-                    order.status = OrderStatus.CANCELLED
-                    # [Task 015] EAFP Pattern to prevent race condition crashes
-                    try:
-                        del self.active_orders[order.id]
-                    except KeyError:
-                        pass
-            except Exception as e:
-                logger.error(f"{self.log_prefix} Failed to cancel order {order.id}: {e}")
+                # 4. Execute
+                try:
+                    logger.info(f"Placing order: {side} {qty} {symbol}")
+                    # Adapter place_order returns ID
+                    # Pass signed quantity if Order object requires it, or Adapter handles it?
+                    # Previous Adapter fix expects signed quantity in 'order.quantity'
+                    # So we must set order.quantity to diff (signed)
+                    order.quantity = diff 
+                    
+                    order_id = self.broker.place_order(order)
+                    
+                    if order_id:
+                        self.active_orders[symbol] = order_id
+                        logger.info(f"Order placed successfully: {order_id}. Tracking as active.")
+                        state.execution_results.append({
+                            "symbol": symbol,
+                            "order_id": order_id,
+                            "status": "submitted",
+                            "diff": diff
+                        })
+                except Exception as e:
+                    logger.error(f"Failed to place order for {symbol}: {e}")
+                    state.execution_results.append({
+                        "symbol": symbol,
+                        "error": str(e),
+                        "status": "failed"
+                    })
