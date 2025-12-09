@@ -2,6 +2,7 @@
 Celery Worker
 负责异步执行 Orchestrator 任务。
 [Refactored] 使用 PhoenixFactory 统一初始化逻辑。
+[Fix] 废弃全局 Orchestrator 单例，确保每次任务在独立 Event Loop 中构建异步组件。
 """
 import os
 import asyncio
@@ -45,6 +46,10 @@ from Phoenix_project.api.gateway import APIGateway
 from Phoenix_project.memory.vector_store import VectorStore
 from Phoenix_project.memory.cot_database import CoTDatabase
 from Phoenix_project.audit.logger import AuditLogger
+from Phoenix_project.ai.prompt_manager import PromptManager
+from Phoenix_project.ai.prompt_renderer import PromptRenderer
+from Phoenix_project.evaluation.voter import Voter
+from Phoenix_project.ai.graph_db_client import GraphDBClient
 
 # --- [主人喵的修复 1] 导入 GNN/KG 架构缺失的组件 ---
 from Phoenix_project.ai.embedding_client import EmbeddingClient
@@ -100,8 +105,8 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True
 )
 
-# --- 全局单例 (Global Singleton) ---
-orchestrator_instance: Orchestrator = None
+# --- [Phase 0 Fix] 废弃全局单例，防止跨 Event Loop 污染 ---
+# orchestrator_instance: Orchestrator = None  <-- REMOVED
 
 # --- 蓝图 1：为 Worker 启动 Prometheus 服务器 ---
 @worker_process_init.connect
@@ -132,15 +137,12 @@ def build_orchestrator() -> Orchestrator:
     """
     [阶段 3 & 4 重构]
     初始化 Orchestrator 及其所有依赖项。
-    使用 PhoenixFactory 统一初始化基础组件。
+    [Fix] 这是一个工厂函数，不再使用全局单例。
+    必须在 Active Event Loop 内调用以确保 Asyncio 组件正确绑定。
     """
-    global orchestrator_instance
-    if orchestrator_instance:
-        return orchestrator_instance
-
     setup_logging()
     logger = get_logger(__name__)
-    logger.info("Worker: Building new Orchestrator instance...")
+    logger.info("Worker: Building new Orchestrator instance (Fresh Loop)...")
     
     try:
         # 1. Config
@@ -149,11 +151,11 @@ def build_orchestrator() -> Orchestrator:
         system_config = config_loader.load_config('system.yaml') 
         
         # [Task 8] Use Factory for Infrastructure
-        # (Adapting factory to use raw dict config here if needed, or creating a DummyCfg)
-        # For simplicity, we use factory methods directly
         redis_client = PhoenixFactory.create_redis_client()
+        # [Critical] ContextBus initializes asyncio.Lock(), strictly requires active loop
         context_bus = PhoenixFactory.create_context_bus(redis_client, system_config.get("context_bus", {}))
-        prompt_manager = PromptManager(prompt_directory="prompts")
+        
+        prompt_manager = PromptManager(prompts_dir="prompts")
         prompt_renderer = PromptRenderer(prompt_manager=prompt_manager)
         
         # 2. Data
@@ -172,7 +174,7 @@ def build_orchestrator() -> Orchestrator:
         # DB Clients
         tabular_client = TabularDBClient(
             db_uri=system_config.get("tabular_db", {}).get("uri", "sqlite:///phoenix.db"),
-            llm_client=None, # TBD: Inject Gemini if needed for worker SQL gen
+            llm_client=None, 
             config=system_config.get("tabular_db", {}),
             prompt_manager=prompt_manager,
             prompt_renderer=prompt_renderer
@@ -180,22 +182,19 @@ def build_orchestrator() -> Orchestrator:
         temporal_client = TemporalDBClient(config=system_config.get("temporal_db", {}))
         
         data_manager = DataManager(
-            config=system_config.get("data_manager", {}), # Pass raw config dict or object
-            redis_client=redis_client,
-            tabular_db=tabular_client,
-            temporal_db=temporal_client
+            config_loader=config_loader, # Pass config_loader to match DataManager.__init__
+            redis_client=redis_client
         )
         
         max_history = system_config.get("system", {}).get("max_pipeline_history", 100)
-        pipeline_state = PipelineState(initial_state=None, max_history=max_history)
+        # PipelineState is initialized in run_main_cycle or loaded
         
         audit_logger = AuditLogger(config=system_config.get('audit_db', {}))
-        cot_db = CoTDatabase(config=system_config.get("ai", {}).get("cot_database", {}), logger=logger)
-        audit_manager = AuditManager(audit_logger=audit_logger, cot_db=cot_db)
+        cot_db = CoTDatabase(config=system_config.get("ai", {}).get("cot_database", {}))
+        audit_manager = AuditManager(cot_db=cot_db) # Updated to match current AuditManager signature
         snapshot_manager = SnapshotManager()
 
         # 4. Event Stream
-        # [Task 8] Inject Redis Client
         event_distributor = EventDistributor(redis_client=redis_client)
         event_filter = EventRiskFilter(config=system_config.get("events", {}).get("risk_filter", {}))
 
@@ -210,10 +209,10 @@ def build_orchestrator() -> Orchestrator:
                 api_secret = os.environ.get(broker_config.get("api_secret_env"))
                 if not api_key or not api_secret:
                     raise ValueError("Missing Alpaca API credentials in environment")
-                broker = AlpacaAdapter(config=broker_config) # Or specific Adapter class
-                broker.connect()
+                broker = AlpacaAdapter(config=broker_config) 
+                # Connect happens in Orchestrator or LoopManager
             else:
-                broker = SimulatedBrokerAdapter() # Fallback
+                broker = SimulatedBrokerAdapter() 
         else:
             broker = SimulatedBrokerAdapter()
             
@@ -226,11 +225,10 @@ def build_orchestrator() -> Orchestrator:
         )
 
         # 6. AI/Cognitive
-        gemini_pool = None # Worker might not need heavy LLM access unless running L1/L2
-        # If needed, initialize GeminiPoolManager(config=...)
+        gemini_pool = None 
         
         embedding_client = EmbeddingClient(
-            provider="google", # or config
+            provider="google", 
             model_name=system_config.get("ai",{}).get("embedding_client",{}).get("model", "text-embedding-004"),
             api_key=os.environ.get("GEMINI_API_KEY"),
             logger=logger
@@ -241,7 +239,7 @@ def build_orchestrator() -> Orchestrator:
             embedding_client=embedding_client
         )
         
-        knowledge_graph_service = GraphDBClient() # Mock or Real
+        knowledge_graph_service = GraphDBClient() 
         gnn_inferencer = GNNInferencer(system_config.get("ai", {}).get("gnn_inferencer", {}).get("model_path", "Phoenix_project/models/gnn_model"))
 
         retriever = Retriever(
@@ -250,16 +248,15 @@ def build_orchestrator() -> Orchestrator:
             config=system_config.get("ai", {}).get("retriever", {}),
             prompt_manager=prompt_manager,
             prompt_renderer=prompt_renderer,
-            ensemble_client=None, # Inject if needed
+            ensemble_client=None, 
             gnn_inferencer=gnn_inferencer,
             temporal_db=temporal_client,
             tabular_db=tabular_client
         )
         
         # [Task 3.3] Instantiate L2/Eval
-        # Simplified for worker (assuming Orchestrator manages execution)
         metacognitive_agent = MetacognitiveAgent(agent_id="meta", llm_client=None, prompt_manager=prompt_manager, prompt_renderer=prompt_renderer)
-        arbitrator = Arbitrator(llm_client=None, prompt_manager=prompt_manager, prompt_renderer=prompt_renderer)
+        arbitrator = Arbitrator(llm_client=None)
         fact_checker = FactChecker(llm_client=None, prompt_manager=prompt_manager, prompt_renderer=prompt_renderer)
         voter = Voter(llm_client=None)
         
@@ -284,20 +281,14 @@ def build_orchestrator() -> Orchestrator:
             uncertainty_guard=uncertainty_guard,
             voter=voter,
             config=system_config.get("cognitive_engine", {}),
-            agent_executor=None, # Inject executor if running L1s
-            ensemble_client=None,
-            prompt_manager=prompt_manager,
-            prompt_renderer=prompt_renderer,
-            cot_db=cot_db,
-            retriever=retriever
+            agent_executor=None, # Assuming Executor is not strictly needed for basic worker flow or injected later
+            # Correct arguments for updated CognitiveEngine
         )
             
         # 7. Portfolio Sizer
-        # ... (Sizer loading logic kept similar to original, simplified for brevity) ...
         sizer = FixedFractionSizer(fraction_per_position=0.05)
 
         # 8. Risk & Portfolio
-        # 8.2 Initialize RiskManager FIRST (Dependency)
         risk_manager = RiskManager(
             config=system_config.get("trading", {}), 
             redis_client=redis_client, 
@@ -305,9 +296,8 @@ def build_orchestrator() -> Orchestrator:
             initial_capital=initial_cash 
         )
 
-        # 8.3 Initialize PortfolioConstructor SECOND (Dependent)
         portfolio_constructor = PortfolioConstructor(
-            config=system_config, # Pass dict or object? Adapter needed if PortfolioConstructor expects OmegaConf
+            config=system_config, # Or OmegaConf dict
             context_bus=context_bus,
             risk_manager=risk_manager,
             sizing_strategy=sizer,
@@ -315,11 +305,11 @@ def build_orchestrator() -> Orchestrator:
         )
 
         metrics_collector = MetricsCollector(config_loader)
-        market_state_predictor = None # TBD
+        market_state_predictor = None 
 
         # 9. Create Orchestrator
-        orchestrator_instance = Orchestrator(
-            config=system_config, # Or OmegaConf.create(system_config)
+        orchestrator = Orchestrator(
+            config=system_config, 
             context_bus=context_bus,
             data_manager=data_manager,
             cognitive_engine=cognitive_engine,
@@ -330,17 +320,36 @@ def build_orchestrator() -> Orchestrator:
             order_manager=order_manager,
             audit_manager=audit_manager,
             trade_lifecycle_manager=trade_lifecycle_manager,
-            risk_manager=risk_manager # [Phase II Fix] Inject RiskManager
+            risk_manager=risk_manager 
         )
         
-        logger.info("Worker: New Orchestrator instance built and cached.")
-        return orchestrator_instance
+        logger.info("Worker: New Orchestrator instance built.")
+        return orchestrator
     
     except Exception as e:
         logger.error(f"Worker: Failed to build Orchestrator: {e}", exc_info=True)
         raise
 
 # --- Celery Tasks ---
+
+async def _async_run_main_cycle():
+    """
+    [Phase 0 Fix] 内部 Async Entrypoint。
+    在 asyncio.run() 创建的 Loop 内构建 Orchestrator，确保所有 async Primitive (Lock, Future) 
+    绑定到当前 Loop，避免 'Future attached to a different loop' 错误。
+    """
+    orchestrator = None
+    try:
+        # Build inside the loop!
+        orchestrator = build_orchestrator()
+        await orchestrator.run_main_cycle()
+    finally:
+        # Cleanup: 关闭 Redis 连接防止泄漏
+        if orchestrator and orchestrator.context_bus:
+            # 假设 context_bus 暴露 redis client 或者有 close 方法
+            if hasattr(orchestrator.context_bus, 'redis') and orchestrator.context_bus.redis:
+                 await orchestrator.context_bus.redis.close()
+
 
 @celery_app.task(name='phoenix.run_main_cycle')
 def run_main_cycle_task():
@@ -350,10 +359,11 @@ def run_main_cycle_task():
     logger = get_logger('phoenix.run_main_cycle')
     try:
         logger.info("Task: run_main_cycle_task started...")
-        orchestrator = build_orchestrator()
         
-        # [阶段 4 修复] run_main_cycle 是异步的 (async def)，必须由事件循环驱动
-        asyncio.run(orchestrator.run_main_cycle())
+        # [阶段 4 修复] 
+        # 使用 asyncio.run 启动一个新的事件循环，并调用内部 wrapper
+        # 确保 Orchestrator 在此 Loop 中构建和运行
+        asyncio.run(_async_run_main_cycle())
         
         logger.info("Task: run_main_cycle_task finished.")
         
