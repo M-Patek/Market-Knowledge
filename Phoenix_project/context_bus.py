@@ -1,7 +1,12 @@
-# Phoenix_project/context_bus.py
-# [主人喵的修复] 实现了真正的异步 Pub/Sub 消息总线，具备断线重连和非阻塞分发功能
-# [Code Opt Expert Fix] Task 20: Fire-and-Forget Fix (Zombie Task Prevention)
-
+"""
+Phoenix_project/context_bus.py
+[Refactored Phase 3.0]
+上下文总线 (Context Bus) & 状态持久化适配器。
+1. 负责 PipelineState 的 Redis 持久化。
+2. [Fix] 负责基于 Redis Pub/Sub 的组件间异步通信 (Native AsyncIO)。
+3. [Phase I Fix] 实现环境隔离 (run_mode)。
+4. [Task 2] 实现分布式锁 (Distributed Lock) 防止状态覆盖。
+"""
 import json
 import redis.asyncio as redis
 import asyncio
@@ -11,15 +16,14 @@ from pydantic import BaseModel
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.monitor.logging import get_logger
 
+# [Task 2] Import LockException
+from redis.exceptions import LockError
+
 logger = get_logger(__name__)
 
 class ContextBus:
     """
-    [Refactored Phase 3.0]
     上下文总线 (Context Bus) & 状态持久化适配器。
-    1. 负责 PipelineState 的 Redis 持久化。
-    2. [Fix] 负责基于 Redis Pub/Sub 的组件间异步通信 (Native AsyncIO)。
-    3. [Phase I Fix] 实现环境隔离 (run_mode)。
     """
 
     def __init__(self, redis_client: redis.Redis, config: Optional[Dict[str, Any]] = None):
@@ -54,7 +58,6 @@ class ContextBus:
             logger.error(f"ContextBus background task failed: {e}", exc_info=True)
         finally:
             self._background_tasks.discard(task)
-            # [Fix] Backpressure: Release slot
             self._task_semaphore.release()
 
     async def publish(self, channel: str, message: Union[Dict, str, BaseModel]) -> bool:
@@ -118,42 +121,80 @@ class ContextBus:
                         if handler:
                             try:
                                 data = message['data']
-                                # 简化解码逻辑
                                 if isinstance(data, bytes): data = data.decode('utf-8')
                                 try: payload = json.loads(data)
                                 except: payload = data
                                 
-                                # [Task 0.3 Fix] 非阻塞分发：使用 create_task 防止阻塞总线
+                                # [Task 0.3 Fix] 非阻塞分发
                                 if asyncio.iscoroutinefunction(handler):
                                     # [Fix] Backpressure: Wait for available slot
                                     await self._task_semaphore.acquire()
                                     
-                                    # [Task 20] Fix Fire-and-Forget: Track tasks to prevent GC and log errors
+                                    # [Task 20] Fix Fire-and-Forget
                                     task = asyncio.create_task(handler(payload))
                                     self._background_tasks.add(task)
                                     task.add_done_callback(self._handle_task_exception)
                                 else:
-                                    # 同步 handler 仍会阻塞，建议使用 async handler
                                     handler(payload)
                             except Exception as e:
                                 logger.error(f"Error processing message on {channel}: {e}")
             except Exception as e:
-                # [Task 0.3 Fix] 捕获连接断开异常，休眠后重试，而不是直接退出
                 logger.error(f"ContextBus listener loop interrupted: {e}. Retrying in 1s...", exc_info=True)
                 await asyncio.sleep(1)
 
-    # --- 状态持久化功能 (修复点: Async Redis) ---
+    # --- 状态持久化功能 (修复点: Distributed Lock + CAS) ---
 
     async def save_state(self, state: PipelineState) -> bool:
+        """
+        保存状态。使用 Redis Lock 和 Version CAS 机制防止并发覆盖。
+        [Task 2] Implemented Blind Overwrite Protection.
+        """
+        key = f"phx:{self.run_mode}:state:{state.run_id}"
+        lock_key = f"lock:{key}"
+        
         try:
-            # [Phase I Fix] Apply Run Mode Namespacing
-            key = f"phx:{self.run_mode}:state:{state.run_id}"
-            json_data = state.model_dump_json()
-            await self.redis.setex(key, self.ttl, json_data)
-            await self.redis.set(f"phx:{self.run_mode}:state:latest_run_id", state.run_id)
-            return True
+            # [Task 2] Acquire Distributed Lock
+            async with self.redis.lock(lock_key, timeout=5.0, blocking_timeout=2.0):
+                # 1. CAS Check: 读取当前版本
+                current_data = await self.redis.get(key)
+                
+                if current_data:
+                    try:
+                        current_dict = json.loads(current_data)
+                        current_version = current_dict.get("version", 0)
+                        
+                        # [CRITICAL] 冲突检测
+                        if current_version > state.version:
+                            logger.error(
+                                f"CAS CONFLICT: Cannot save state. "
+                                f"DB Version ({current_version}) > Incoming Version ({state.version}). "
+                                f"RunID: {state.run_id}"
+                            )
+                            return False
+                            
+                        # 若版本一致，则允许更新，并增加版本号
+                        state.version = current_version + 1
+                        
+                    except json.JSONDecodeError:
+                        logger.warning(f"Corrupted state in Redis for {key}. Overwriting.")
+                        state.version = 1
+                else:
+                    state.version = 1
+
+                # 2. Save with new version
+                json_data = state.model_dump_json()
+                await self.redis.setex(key, self.ttl, json_data)
+                
+                await self.redis.set(f"phx:{self.run_mode}:state:latest_run_id", state.run_id)
+                
+                logger.debug(f"State saved successfully. Ver: {state.version}")
+                return True
+                
+        except LockError:
+            logger.warning(f"Failed to acquire lock for state save: {state.run_id}")
+            return False
         except Exception as e:
-            logger.error(f"Failed to save state: {e}", exc_info=True)
+            logger.error(f"Failed to save state (CAS error): {e}", exc_info=True)
             return False
 
     async def load_state(self, run_id: str) -> Optional[PipelineState]:
