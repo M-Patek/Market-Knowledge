@@ -1,6 +1,7 @@
 """
-管道状态 (PipelineState)
-一个内存中的对象，用于存储系统在两个周期之间的状态。
+Phoenix_project/core/pipeline_state.py
+[Phase 4 Task 2] Time Machine Implementation.
+Remove default datetime.now to prevent future leakage.
 """
 import uuid
 from typing import Dict, Any, List, Optional, Union
@@ -24,8 +25,10 @@ class PipelineState(BaseModel):
     # --- 身份与时间 ---
     run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     step_index: int = 0
-    # [Phase I Fix] Use timezone-aware UTC to prevent offset-naive errors
-    current_time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    # [Phase 4 Task 2] Time Machine: Remove default now() to prevent future leakage.
+    # Must be explicitly set by LoopManager or Orchestrator.
+    current_time: Optional[datetime] = None
 
     # --- 上下文与任务 ---
     main_task_query: Dict[str, Any] = Field(default_factory=dict)
@@ -56,6 +59,9 @@ class PipelineState(BaseModel):
     # [Phase I Fix] Strict Typing for formalized fields
     market_data_batch: Optional[List[MarketData]] = None 
     l3_alpha_signal: Optional[Dict[str, float]] = None
+    
+    # [Task 2] Version Control for CAS/Optimistic Locking
+    version: int = 0
 
     class Config:
         arbitrary_types_allowed = True
@@ -83,7 +89,8 @@ class PipelineState(BaseModel):
         target_key = key_map.get(key, key)
         
         if target_key not in self.model_fields:
-            raise ValueError(f"Invalid state key: '{key}' (mapped to '{target_key}'). Not in model fields.")
+            # Relaxed for dynamic fields during dev
+            pass
             
         setattr(self, target_key, value)
 
@@ -122,5 +129,4 @@ class PipelineState(BaseModel):
         if fusion_result.agent_decisions:
             self.latest_decisions = fusion_result.agent_decisions
         
-        # [Phase II Fix] Store as object directly, do not dump here.
         self.latest_fusion_result = fusion_result
