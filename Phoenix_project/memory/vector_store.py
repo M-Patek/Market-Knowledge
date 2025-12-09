@@ -1,3 +1,8 @@
+"""
+Phoenix_project/memory/vector_store.py
+[Phase 2 Task 1] Fix Content Truncation (Lobotomy).
+Ensure full text is stored in Pinecone metadata and retrieved.
+"""
 import os
 import uuid
 import asyncio
@@ -113,6 +118,7 @@ class PineconeVectorStore(BaseVectorStore):
     """
     [已优化] Pinecone Serverless 向量存储。
     [Phase III Fix] Dynamic Dimension Sync & Unified Namespace.
+    [Phase II Fix] Fixed Content Truncation (Lobotomy).
     """
     def __init__(
         self, embedding_client: EmbeddingClient, logger: ESLogger, config: Dict[str, Any]
@@ -172,7 +178,7 @@ class PineconeVectorStore(BaseVectorStore):
     async def aadd_batch(self, batch: List[Document], embeddings: List[List[float]], batch_id: UUID):
         """
         [Task 3C] Add batch to Global Namespace.
-        [Phase I Fix] Optimized Metadata (Reduced payload).
+        [Phase II Fix] Store FULL content in metadata.
         """
         if not self.index:
             raise Exception("Pinecone index not initialized.")
@@ -181,14 +187,20 @@ class PineconeVectorStore(BaseVectorStore):
         for doc, vector in zip(batch, embeddings):
             doc_id = doc.metadata.get("doc_id", doc.id if hasattr(doc, 'id') else str(uuid.uuid4()))
             
-            # [Phase I Fix] Sanitize and minimize metadata
+            # [Phase II Fix] Store full text content. 
+            # Note: Pinecone metadata limit is 40KB. Ensure chunks are sized appropriately upstream.
             sanitized_metadata = {
                 "doc_id": doc_id,
                 "source": doc.metadata.get("source", "unknown"),
-                "content_preview": doc.page_content[:100] if doc.page_content else "",
+                "text": doc.page_content, # STORE FULL CONTENT
                 "ingestion_batch_id": str(batch_id)
             }
             
+            # Add other metadata fields if needed, but be mindful of size
+            for k, v in doc.metadata.items():
+                if k not in sanitized_metadata and isinstance(v, (str, int, float, bool, list)):
+                     sanitized_metadata[k] = v
+
             vectors_to_upsert.append({
                 "id": doc_id,
                 "values": vector,
@@ -204,13 +216,9 @@ class PineconeVectorStore(BaseVectorStore):
     async def count_by_batch_id(self, batch_id: UUID) -> int:
         """
         [Task 3C] Count by metadata filtering (since we no longer isolate namespaces).
-        Note: Pinecone describe_index_stats doesn't support metadata filtering efficiently.
-        This is an approximation or requires a dummy query.
         """
         if not self.index:
             return 0
-        # Return 0 or implement a dummy query if critical.
-        # For performance, we skip exact count in global namespace mode unless needed.
         return 0
 
     async def asimilarity_search(
@@ -242,8 +250,10 @@ class PineconeVectorStore(BaseVectorStore):
             if results and "matches" in results:
                 for match in results["matches"]:
                     metadata = match.get("metadata", {})
-                    # Reconstruct Document from preview
-                    page_content = metadata.get("content_preview", "")
+                    
+                    # [Phase II Fix] Retrieve FULL TEXT from metadata 'text' field
+                    # Fallback to 'content_preview' only if 'text' is missing (legacy data)
+                    page_content = metadata.get("text", metadata.get("content_preview", ""))
                     score = float(match.get("score", 0.0))
                     
                     doc = Document(page_content=page_content, metadata=metadata)
