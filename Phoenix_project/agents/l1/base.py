@@ -1,93 +1,146 @@
-# Phoenix_project/agents/l1/base.py
-# [主人喵的修复] 修复了 safe_run 返回字典的问题，强制返回 EvidenceItem 对象
-# 确保错误能被上层系统感知，而不是被类型过滤器静默吞噬。
+"""
+Phoenix_project/agents/l1/base.py
+[Refactor] Unified L1 Agent Interface Contract.
+[Fix] Renamed BaseL1Agent to L1Agent to match subclass usage.
+[Fix] safe_run now normalizes List, Generator, and Single Item into List[EvidenceItem].
+"""
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union, AsyncGenerator
 import logging
 import traceback
-import asyncio
+import inspect
 from pydantic import ValidationError
+
 from Phoenix_project.core.pipeline_state import PipelineState
-# [修复] 引入标准数据契约
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceType
 
 logger = logging.getLogger(__name__)
 
-class BaseL1Agent(ABC):
+class L1Agent(ABC):
     """
     Abstract Base Class for all L1 agents.
     L1 agents are specialized LLM-driven experts that generate EvidenceItems.
     """
     
-    def __init__(self, agent_id: str, llm_client: Any):
+    def __init__(self, agent_id: str, llm_client: Any, data_manager: Any = None, **kwargs):
         """
         Initializes the L1 agent.
         
         Args:
-            agent_id (str): The unique identifier for the agent (from registry.yaml).
-            llm_client (Any): An instance of an LLM client (e.g., GeminiPoolManager).
+            agent_id (str): The unique identifier for the agent.
+            llm_client (Any): An instance of an LLM client.
+            data_manager (Any): Data Manager instance.
+            **kwargs: Additional args like 'role', 'prompt_template_name', 'prompt_manager', etc.
         """
         self.agent_id = agent_id
         self.llm_client = llm_client
+        self.data_manager = data_manager
+        self.role = kwargs.get('role', 'Agent')
+        self.prompt_template_name = kwargs.get('prompt_template_name')
+        
+        # [Optional] Inject prompt handling dependencies if provided
+        self.prompt_manager = kwargs.get('prompt_manager')
+        self.prompt_renderer = kwargs.get('prompt_renderer')
 
     @abstractmethod
-    async def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> EvidenceItem:
+    async def run(
+        self, state: PipelineState, dependencies: Dict[str, Any]
+    ) -> Union[EvidenceItem, List[EvidenceItem], AsyncGenerator[EvidenceItem, None]]:
         """
         The main execution method for the agent.
-        Must return an EvidenceItem.
+        Can return a single Item, a List of Items, or an AsyncGenerator.
         """
         pass
 
-    async def safe_run(self, state: PipelineState, dependencies: Dict[str, Any]) -> EvidenceItem:
+    async def render_prompt(self, variables: Dict[str, Any]) -> str:
         """
-        [Beta FIX] A defensive wrapper around the abstract run method.
-        Handles exceptions and returns a valid ERROR EvidenceItem if the agent crashes.
+        Helper to render prompt using injected prompt_renderer or prompt_manager.
         """
-        try:
-            logger.info(f"Agent {self.agent_id} starting execution.")
-            
-            # 基础输入检查
-            if not dependencies and state is None:
-                 logger.warning(f"Agent {self.agent_id} received empty state and dependencies.")
+        if self.prompt_renderer and self.prompt_template_name:
+            return await self.prompt_renderer.render(self.prompt_template_name, variables)
+        elif self.prompt_manager and self.prompt_template_name:
+            # Fallback if only manager is present
+            template = self.prompt_manager.get_prompt(self.prompt_template_name)
+            return template.format(**variables) # Simple format
+        else:
+            # Fallback for when no prompt system is injected (testing)
+            logger.warning(f"[{self.agent_id}] No PromptRenderer found. Using raw variable dump.")
+            return str(variables)
 
-            result = await self.run(state, dependencies)
+    async def safe_run(self, state: PipelineState, dependencies: Dict[str, Any]) -> List[EvidenceItem]:
+        """
+        [Unified Interface] A defensive wrapper that executes the agent and 
+        normalizes the output into a List[EvidenceItem].
+        """
+        results: List[EvidenceItem] = []
+        try:
+            logger.info(f"Agent {self.agent_id} ({self.role}) starting execution.")
             
-            # [双重检查] 确保子类实现返回了正确的类型
-            if not isinstance(result, EvidenceItem):
-                # 尝试兼容字典返回，但最好强制对象
-                if isinstance(result, dict):
-                    try:
-                        result = EvidenceItem.model_validate(result)
-                    except:
-                        raise ValueError(f"Agent {self.agent_id} returned invalid dict")
-                else:
-                    raise ValueError(f"Agent {self.agent_id} returned {type(result)} instead of EvidenceItem")
+            # Execute run
+            raw_result = await self.run(state, dependencies)
+            
+            # [Normalization Strategy]
+            if inspect.isasyncgen(raw_result):
+                # Case 1: Async Generator (Streaming)
+                async for item in raw_result:
+                    if self._validate_item(item):
+                        results.append(item)
+                        
+            elif isinstance(raw_result, list):
+                # Case 2: Batch List
+                for item in raw_result:
+                    if self._validate_item(item):
+                        results.append(item)
+                        
+            elif isinstance(raw_result, EvidenceItem):
+                # Case 3: Single Item
+                results.append(raw_result)
                 
-            return result
+            elif raw_result is None:
+                logger.info(f"Agent {self.agent_id} returned None.")
+                
+            else:
+                logger.warning(f"Agent {self.agent_id} returned unknown type: {type(raw_result)}")
+
+            return results
 
         except (ValueError, KeyError, TypeError, AttributeError, ValidationError) as e:
-            # [Task 2.1] Catch deterministic Business Logic Errors only.
-            # System/Network errors (RuntimeError, ConnectionError) will bubble up for Retry.
             error_msg = str(e)
             stack_trace = traceback.format_exc()
             logger.error(f"Agent {self.agent_id} CRASHED: {error_msg}\n{stack_trace}")
             
-            # [修复] 返回合法的 EvidenceItem 对象，而不是字典
-            # 这样 CognitiveEngine 就能接收到错误信息，而不会因为类型检查而丢弃它
-            return EvidenceItem(
+            # Return valid ERROR EvidenceItem in a list
+            error_item = EvidenceItem(
                 agent_id=self.agent_id,
-                content=f"CRITICAL FAILURE: Agent crashed during execution. Error: {error_msg}",
-                evidence_type=EvidenceType.GENERIC, # 或者可以定义一个 SYSTEM_ERROR 类型
-                confidence=0.0, # 零置信度
+                headline=f"Agent Crash: {self.role}",
+                content=f"CRITICAL FAILURE: Agent crashed. Error: {error_msg}",
+                evidence_type=EvidenceType.GENERIC, 
+                confidence=0.0,
                 data_horizon="Immediate",
-                symbols=[], # 无法确定涉及哪些代码，留空
+                symbols=[],
                 metadata={
                     "status": "CRASHED",
                     "error_type": type(e).__name__,
                     "stack_trace": stack_trace
                 }
             )
+            return [error_item]
+        
+        except Exception as e:
+            # Re-raise unexpected system errors (let Retry mechanism handle)
+            logger.error(f"Agent {self.agent_id} System Error: {e}", exc_info=True)
+            raise
+
+    def _validate_item(self, item: Any) -> bool:
+        """Helper to validate if an item is a valid EvidenceItem."""
+        if isinstance(item, EvidenceItem):
+            return True
+        logger.warning(f"[{self.agent_id}] Ignored invalid output item type: {type(item)}")
+        return False
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}(id='{self.agent_id}')>"
+
+# Alias for backward compatibility if needed, though most imports updated
+BaseL1Agent = L1Agent
