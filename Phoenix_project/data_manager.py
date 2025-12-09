@@ -1,3 +1,10 @@
+"""
+Phoenix_project/data_manager.py
+[Phase 2 Task 4] Fix Zombie Data Resurrection.
+Implement Strict Stale Data Check in Failover path.
+Fail-Closed: Return None if DB data is older than 5 minutes.
+[Phase 4 Task 2] Time Machine Support.
+"""
 import json
 import logging
 import asyncio
@@ -21,7 +28,7 @@ class DataManager:
     充当系统的 "海马体"，连接 Redis (短期记忆) 和 Temporal/Tabular DB (长期记忆)。
     
     [Task 4] Integrated Failover & Read-Repair
-    [Restored] fetch_news_data for L1 Agents
+    [Task 4.2] Time Machine Support
     """
 
     def __init__(self, config_loader: ConfigLoader, redis_client: Optional[redis.Redis] = None):
@@ -32,13 +39,39 @@ class DataManager:
         self.tabular_db = TabularDBClient(self.config.get("data_manager", {}).get("tabular_db", {}))
         self.temporal_db = TemporalDBClient(self.config.get("data_manager", {}).get("temporal_db", {}))
         
+        # [Config] Allow configuring stale threshold
+        self.stale_threshold_minutes = self.config.get("data_manager", {}).get("stale_threshold_minutes", 5)
+        
+        # [Phase 4 Task 2] Time Machine State
+        self._simulation_time: Optional[datetime] = None
+        
         logger.info("DataManager initialized.")
+
+    def set_simulation_time(self, sim_time: datetime):
+        """
+        [Phase 4 Task 2] Activate Time Machine.
+        Sets the internal clock to a historical timestamp.
+        """
+        if sim_time.tzinfo is None:
+            sim_time = sim_time.replace(tzinfo=timezone.utc)
+        self._simulation_time = sim_time
+        # logger.debug(f"DataManager Time Machine set to: {self._simulation_time}")
+
+    def clear_simulation_time(self):
+        """Deactivate Time Machine (Return to Live)."""
+        self._simulation_time = None
 
     async def get_latest_market_data(self, symbol: str) -> Optional[MarketData]:
         """
         获取最新的市场数据。
-        [Hot Path] 优先读取 Redis，失败时降级到 TemporalDB (Failover)，并触发读修复 (Read-Repair)。
+        [Hot Path] 优先读取 Redis。
+        [Cold Path] 失败时降级到 TemporalDB (Failover)，并触发读修复 (Read-Repair)。
+        [Fix] 严禁返回过期数据 (Zombie Data)。
         """
+        # [Time Machine] In backtest, query DB for specific time point.
+        if self._simulation_time:
+            return await self._get_market_data_at_time(symbol, self._simulation_time)
+
         key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=symbol)
         
         # 1. Try Redis (Hot Path)
@@ -54,44 +87,56 @@ class DataManager:
         logger.warning(f"Cache miss for {symbol}, attempting DB failover...")
         if self.temporal_db:
             try:
-                # Fetch recent data (last 72h to ensure relevance and cover weekends)
-                # [Task 0.3 Fix] Use aware UTC time for failover query
+                # Use aware UTC time for failover query
                 end = datetime.now(timezone.utc)
-                # [Fix] Weekend Amnesia: Extend lookback to 72 hours
                 start = end - timedelta(hours=72)
                 df = await self.temporal_db.query_market_data(symbol, start, end)
                 
                 if not df.empty:
-                    # Get latest record
                     latest_record = df.iloc[-1].to_dict()
                     market_data = MarketData(**latest_record)
                     
-                    # 3. Read-Repair: Write back to Redis to restore Hot Path
-                    # [Fix] Zombie Data Poisoning Check: Do not poison cache with stale DB data
-                    # Check if data is older than 5 minutes
-                    is_stale = (end - market_data.timestamp) > timedelta(minutes=5)
+                    # [Fix Phase 2 Task 4] Strict Stale Check (Fail-Closed)
+                    data_age = end - market_data.timestamp
+                    is_stale = data_age > timedelta(minutes=self.stale_threshold_minutes)
                     
-                    if self.redis_client and not is_stale:
+                    if is_stale:
+                        logger.error(f"CRITICAL: Stale data fetched for {symbol}. FAIL-SAFE TRIGGERED.")
+                        return None
+                    
+                    # 3. Read-Repair
+                    if self.redis_client:
                         try:
-                            # Use 60s TTL as per Task 003
                             await self.redis_client.setex(key, 60, market_data.model_dump_json())
                             logger.info(f"Read-Repair: Restored {symbol} to Redis cache.")
                         except Exception:
-                            pass # Ignore write-back errors during failover, return data is priority
-                    elif is_stale:
-                        logger.warning(f"Stale data fetched for {symbol} (Age > 5m). Skipping Read-Repair.")
+                            pass 
                             
-                    logger.info(f"Restored market data for {symbol} from TemporalDB.")
+                    logger.info(f"Restored valid market data for {symbol} from TemporalDB.")
                     return market_data
+                    
             except Exception as e:
                 logger.error(f"Failover failed for {symbol}: {e}")
                 
         return None
 
+    async def _get_market_data_at_time(self, symbol: str, timestamp: datetime) -> Optional[MarketData]:
+        """Helper to fetch data exactly at or before simulation time."""
+        if not self.temporal_db: return None
+        try:
+            # Query range slightly before sim time
+            start = timestamp - timedelta(hours=24)
+            df = await self.temporal_db.query_market_data(symbol, start, timestamp)
+            if not df.empty:
+                latest_record = df.iloc[-1].to_dict()
+                return MarketData(**latest_record)
+        except Exception:
+            pass
+        return None
+
     async def get_market_data_history(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         """
         从 TemporalDB 获取历史行情数据。
-        用于回测、训练或 RiskManager 预热。
         """
         if not self.temporal_db:
             logger.warning("TemporalDB not configured.")
@@ -102,15 +147,12 @@ class DataManager:
     async def fetch_news_data(self, start_time: datetime, end_time: datetime, limit: int = 100) -> List[Dict[str, Any]]:
         """
         [Restored] 获取新闻/事件数据。
-        L1 舆情分析师 (Innovation/Geopolitical) 依赖此接口。
         """
         if not self.temporal_db:
             logger.warning("TemporalDB not configured. Cannot fetch news.")
             return []
             
         try:
-            # 假设 TemporalDBClient 有 query_events 或类似方法
-            # 这里映射到通用的查询接口
             return await self.temporal_db.query_events(
                 event_type="news", 
                 start_time=start_time, 
@@ -124,18 +166,14 @@ class DataManager:
     async def get_current_portfolio(self) -> Optional[Dict[str, Any]]:
         """
         [Task 18 Dependency] 获取当前投资组合状态 (从持久化存储或 Ledger)。
-        用于 PortfolioConstructor 的异步初始化。
         """
-        # 优先从 Ledger (TabularDB) 获取
         if self.tabular_db:
             try:
-                # 查询最新的余额
                 balance_res = await self.tabular_db.query("SELECT cash, realized_pnl FROM ledger_balance ORDER BY id DESC LIMIT 1")
-                # 查询最新的持仓 (snapshot)
                 positions_res = await self.tabular_db.query("SELECT * FROM ledger_positions")
                 
                 portfolio = {
-                    "cash": 100000.0, # Default if empty
+                    "cash": 100000.0,
                     "positions": {},
                     "realized_pnl": 0.0
                 }
@@ -148,8 +186,6 @@ class DataManager:
                 if positions_res and "results" in positions_res:
                     for row in positions_res["results"]:
                         sym = row["symbol"]
-                        # 简单的聚合或最新值逻辑由 SQL 保证 (Task 012 Read Logic)
-                        # 这里假设 query 返回的是去重后的列表
                         portfolio["positions"][sym] = {
                             "symbol": sym,
                             "quantity": float(row["quantity"]),
@@ -165,15 +201,15 @@ class DataManager:
 
     async def get_current_time(self) -> datetime:
         """
-        获取当前系统时间。
-        在回测模式下，这应该连接到 TimeMachine/Clock 服务。
+        获取当前系统时间 (UTC)。
+        [Phase 4 Task 2] Time Machine: Returns simulation time if active.
         """
-        # [Task 0.3 Fix] Return timezone-aware UTC datetime to prevent TypeError in PipelineState
+        if self._simulation_time:
+            return self._simulation_time
         return datetime.now(timezone.utc)
 
     async def save_state(self, state: Dict[str, Any]):
         """
         保存一般系统状态 (Snapshot)。
         """
-        # 实现状态快照保存逻辑 (e.g., to Redis or S3)
         pass
