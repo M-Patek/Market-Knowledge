@@ -8,7 +8,7 @@ Docker 容器 (docker ps):
 
 确保所有核心服务都在运行 (phoenix_api, phoenix_worker, phoenix_stream_consumer, phoenix_data_producer)。
 
-检查基础设施 (phoenix_redis, phoenix_postgres, phoenix_elastic, phoenix_neo4j, phoenix_kafka) 是否都在运行。
+检查基础设施 (phoenix_redis, phoenix_postgres, phoenix_elastic, phoenix_neo4j, phoenix_kafka, phoenix_qdrant) 是否都在运行。
 
 API 服务 (phoenix_api):
 
@@ -28,6 +28,12 @@ Kafka & Zookeeper:
 
 预期: 看到已创建的主题（例如 market_data_stream, news_events_stream）。
 
+Vector DB (phoenix_qdrant):
+
+操作: docker logs phoenix_qdrant
+
+预期: 看到 "Qdrant is ready" 或监听端口 6333 的日志。
+
 数据生产者 (phoenix_data_producer):
 
 操作: docker logs phoenix_data_producer
@@ -46,7 +52,7 @@ Kafka & Zookeeper:
 
 检查 API 日志: docker logs phoenix_api
 
-问题: ConnectionError (连接到 Redis, Postgres, Neo4j...)
+问题: ConnectionError (连接到 Redis, Postgres, Neo4j, Qdrant...)
 
 解决: 检查 docker ps 确保目标数据库容器正在运行。检查 .env 文件中的 ..._URI 变量是否使用了正确的 Docker 服务名称（例如 phoenix_postgres 而不是 localhost）。
 
@@ -92,7 +98,11 @@ Orchestrator 正在运行，但 EventDistributor (Redis 队列) 是空的。
 
 日志: CognitiveEngine failed with a known error: ...
 
-含义: 这是 CognitiveEngine (cognitive/engine.py) 内部的业务逻辑失败（例如，ReasoningEnsemble 失败或 FactChecker 崩溃）。
+含义: 这是 CognitiveEngine (cognitive/engine.py) 内部的业务逻辑失败。
+
+[新] 错误类型: "Dict Bomb Detected!" 或 "Invalid return type (dict) from ReasoningEnsemble"
+
+含义: ReasoningEnsemble 返回了原始字典而不是 Pydantic 对象。这通常是 LLM 输出格式错误导致的。系统已拦截此错误以防止崩溃，但该周期的推理无效。
 
 [新] 诊断: 这是由 orchestrator.py 中的 except CognitiveError 捕获的。错误消息将明确指出是哪个 AI 子系统（如 ReasoningEnsemble）失败了。请深入检查该子系统的日志。
 
