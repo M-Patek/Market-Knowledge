@@ -54,6 +54,10 @@ class DependencyContainer:
         self.cot_database: Optional[CoTDatabase] = None
         self.graph_db_client: Optional[GraphDBClient] = None
         
+        # DB Clients (Hosted in Container to share pools)
+        self.tabular_db: Any = None
+        self.temporal_db: Any = None
+        
         # 子系统 (在 build_system 中初始化)
         self.retriever: Optional[Retriever] = None
         self.data_adapter: Optional[DataAdapter] = None
@@ -201,9 +205,23 @@ class Registry:
         self.container.vector_store = VectorStore(self.config.memory.vector_store, self.container.embedding_client)
         self.container.cot_database = CoTDatabase(self.config.memory.cot_database)
         self.container.graph_db_client = GraphDBClient(self.config.memory.graph_database)
+        
+        # 3b. 初始化 Shared DB Clients (Fix: Prevent Double Pool)
+        from Phoenix_project.ai.tabular_db_client import TabularDBClient
+        from Phoenix_project.ai.temporal_db_client import TemporalDBClient
+        
+        # config.data usually contains the db configs
+        self.container.tabular_db = TabularDBClient(self.config.data.get("tabular_db", {}))
+        self.container.temporal_db = TemporalDBClient(self.config.data.get("temporal_db", {}))
 
         # 4. 核心数据管理
-        self.container.data_manager = DataManager(self.config.data, redis_client=redis_client)
+        # Inject the pre-initialized DB clients
+        self.container.data_manager = DataManager(
+            config=self.config.data, 
+            redis_client=redis_client,
+            tabular_db=self.container.tabular_db,
+            temporal_db=self.container.temporal_db
+        )
 
         # 5. 核心审计
         self.container.audit_manager = AuditManager(self.config.audit, self.container.cot_database)
@@ -234,23 +252,28 @@ class Registry:
         # --- L1 智能体 (数据处理/分析) ---
         l1_agents = {}
         for key in AgentFactory.L1_MAP.keys():
-             l1_agents[key] = AgentFactory.create_agent(AgentFactory.L1_MAP, key, c)
+            try:
+                l1_agents[key] = AgentFactory.create_agent(AgentFactory.L1_MAP, key, c)
+            except Exception as e:
+                logger.error(f"Failed to initialize L1 Agent '{key}': {e}", exc_info=True)
+                # Fail soft? Or hard? Depending on criticality. L1 usually critical, but let's allow partial startup.
         
         # --- L2 智能体 (认知/融合) ---
         l2_agents = {}
         for key in AgentFactory.L2_MAP.keys():
-            l2_agents[key] = AgentFactory.create_agent(AgentFactory.L2_MAP, key, c)
+            try:
+                l2_agents[key] = AgentFactory.create_agent(AgentFactory.L2_MAP, key, c)
+            except Exception as e:
+                logger.error(f"Failed to initialize L2 Agent '{key}': {e}", exc_info=True)
 
         # --- L3 智能体 (决策/DRL) ---
-        l3_agents = {
-            "alpha": AgentFactory.create_l3_agent("alpha", config, c),
-            "risk": AgentFactory.create_l3_agent("risk", config, c),
-            "execution": AgentFactory.create_l3_agent("execution", config, c),
-        }
-
-        # Check Load Status
-        if not l3_agents["alpha"] or not l3_agents["risk"] or not l3_agents["execution"]:
-            logger.error("One or more L3 DRL Agents failed to load from checkpoint.")
+        l3_agents = {}
+        for key in ["alpha", "risk", "execution"]:
+            try:
+                l3_agents[key] = AgentFactory.create_l3_agent(key, config, c)
+            except Exception as e:
+                 logger.error(f"Failed to initialize L3 Agent '{key}': {e}", exc_info=True)
+                 l3_agents[key] = None
 
         # --- 执行层 ---
         order_manager = OrderManager(
