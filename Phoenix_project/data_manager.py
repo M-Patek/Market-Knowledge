@@ -1,10 +1,3 @@
-"""
-Phoenix_project/data_manager.py
-[Phase 2 Task 4] Fix Zombie Data Resurrection.
-Implement Strict Stale Data Check in Failover path.
-Fail-Closed: Return None if DB data is older than 5 minutes.
-[Phase 4 Task 2] Time Machine Support.
-"""
 import json
 import logging
 import asyncio
@@ -13,8 +6,9 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import redis.asyncio as redis
 
-from Phoenix_project.ai.tabular_db_client import TabularDBClient
-from Phoenix_project.ai.temporal_db_client import TemporalDBClient
+# Remove direct instantiation imports to support dependency injection
+# from Phoenix_project.ai.tabular_db_client import TabularDBClient
+# from Phoenix_project.ai.temporal_db_client import TemporalDBClient
 from Phoenix_project.config.loader import ConfigLoader
 from Phoenix_project.core.schemas.data_schema import MarketData
 from Phoenix_project.config.constants import REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE
@@ -31,13 +25,29 @@ class DataManager:
     [Task 4.2] Time Machine Support
     """
 
-    def __init__(self, config_loader: ConfigLoader, redis_client: Optional[redis.Redis] = None):
-        self.config = config_loader.load_config('system.yaml')
+    def __init__(self, config: Any, redis_client: Optional[redis.Redis] = None, tabular_db: Any = None, temporal_db: Any = None):
+        # [Refactor] Support both ConfigLoader (legacy) and direct DictConfig (Registry injected)
+        if hasattr(config, 'load_config'):
+            self.config = config.load_config('system.yaml')
+        else:
+            self.config = config
+
         self.redis_client = redis_client
         
-        # Initialize DB Clients
-        self.tabular_db = TabularDBClient(self.config.get("data_manager", {}).get("tabular_db", {}))
-        self.temporal_db = TemporalDBClient(self.config.get("data_manager", {}).get("temporal_db", {}))
+        # [Fix Task 1] Dependency Injection to prevent Double Connection Pool
+        # Use injected clients or fallback to lazy instantiation (only if not provided)
+        if tabular_db:
+            self.tabular_db = tabular_db
+        else:
+            # Fallback for tests/legacy
+            from Phoenix_project.ai.tabular_db_client import TabularDBClient
+            self.tabular_db = TabularDBClient(self.config.get("data_manager", {}).get("tabular_db", {}))
+
+        if temporal_db:
+            self.temporal_db = temporal_db
+        else:
+            from Phoenix_project.ai.temporal_db_client import TemporalDBClient
+            self.temporal_db = TemporalDBClient(self.config.get("data_manager", {}).get("temporal_db", {}))
         
         # [Config] Allow configuring stale threshold
         self.stale_threshold_minutes = self.config.get("data_manager", {}).get("stale_threshold_minutes", 5)
@@ -144,6 +154,35 @@ class DataManager:
             
         return await self.temporal_db.query_market_data(symbol, start_time, end_time)
 
+    async def get_fundamental_data(self, symbol: str, as_of_date: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """
+        获取基本面数据 (Financials, Ratios)。
+        [Time Machine] Supports as_of_date filtering to prevent future data leakage.
+        """
+        if not self.tabular_db:
+            logger.warning("TabularDB not configured.")
+            return None
+            
+        try:
+            # [Time Machine] Apply date filter if provided
+            date_clause = ""
+            if as_of_date:
+                # Ensure simple date comparison
+                date_str = as_of_date.strftime("%Y-%m-%d")
+                date_clause = f" AND date <= '{date_str}'"
+
+            # 简单的 SQL 查询，假设存在 fundamentals 表
+            query = f"SELECT * FROM fundamentals WHERE symbol = '{symbol}'{date_clause} ORDER BY date DESC LIMIT 1"
+            result = await self.tabular_db.query(query)
+            
+            if result and "results" in result and result["results"]:
+                return result["results"][0]
+                
+        except Exception as e:
+            logger.error(f"Failed to fetch fundamental data for {symbol}: {e}")
+            
+        return None
+
     async def fetch_news_data(self, start_time: datetime, end_time: datetime, limit: int = 100) -> List[Dict[str, Any]]:
         """
         [Restored] 获取新闻/事件数据。
@@ -213,3 +252,12 @@ class DataManager:
         保存一般系统状态 (Snapshot)。
         """
         pass
+
+    async def close(self):
+        # [Fix Task 3] Resource Cleanup
+        if self.tabular_db and hasattr(self.tabular_db, 'close'):
+            await self.tabular_db.close()
+        if self.temporal_db and hasattr(self.temporal_db, 'close'):
+            await self.temporal_db.close()
+        # Note: Redis client is usually managed externally (Registry), but close if owned?
+        # Typically we leave Redis close to the creator.
