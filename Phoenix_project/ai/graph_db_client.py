@@ -1,9 +1,3 @@
-"""
-Phoenix_project/ai/graph_db_client.py
-[Phase 2 Task 3] Fix Graph Dimensionality Reduction & Cypher Injection.
-1. Treat all non-property predicates as Edges (stop flattening graph).
-2. Use Parameterized Queries & Backtick Escaping for safety.
-"""
 import os
 import asyncio
 from neo4j import AsyncGraphDatabase
@@ -33,12 +27,15 @@ class GraphDBClient:
         'id', 'uid', 'ingestion_batch_id', 'chunk_index'
     }
 
-    def __init__(self):
+    def __init__(self, config: Dict[str, Any] = None):
+        if config is None:
+            config = {}
+        
+        self.uri = config.get("uri_env") or os.environ.get("NEO4J_URI", "bolt://neo4j:7687")
+        self.user = config.get("user_env") or os.environ.get("NEO4J_USER", "neo4j")
+        self.password = config.get("pass_env") or os.environ.get("NEO4J_PASSWORD", "password")
+        
         try:
-            self.uri = os.environ.get("NEO4J_URI", "bolt://neo4j:7687")
-            self.user = os.environ.get("NEO4J_USER", "neo4j")
-            self.password = os.environ.get("NEO4J_PASSWORD", "password")
-            
             logger.info(f"GraphDBClient: 正在初始化驱动程序，目标 {self.uri}")
             self.driver = AsyncGraphDatabase.driver(self.uri, auth=(self.user, self.password))
             self.log_prefix = "GraphDBClient:"
@@ -103,6 +100,17 @@ class GraphDBClient:
         except Exception as e:
             logger.warning(f"{self.log_prefix} Schema constraint warning: {e}")
             return False
+            
+    def validate_cypher_query(self, query: str) -> bool:
+        """
+        验证 Cypher 查询的安全性与格式。
+        目前仅做基础非空检查，未来可扩展 AST 校验。
+        """
+        if not query or not isinstance(query, str) or not query.strip():
+            logger.warning(f"{self.log_prefix} Invalid or empty Cypher query.")
+            return False
+        # [Future] Add safety checks for DELETE/DETACH if read-only is required
+        return True
 
     def _parse_id(self, entity_id: str) -> Tuple[str, str]:
         """
