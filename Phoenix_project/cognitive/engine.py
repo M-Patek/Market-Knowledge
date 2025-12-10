@@ -76,7 +76,8 @@ class CognitiveEngine:
                     "task": {
                         "task_id": f"l1_{name}_{uuid.uuid4().hex[:8]}",
                         "content": {"events": events},
-                        "context": {} # 可以传递 state 信息如果 L1 需要
+                        # [Task 3.1] Pass pipeline_state in context for L1 agents
+                        "context": {"state": pipeline_state}
                     }
                 })
             
@@ -126,10 +127,11 @@ class CognitiveEngine:
             raise CognitiveError(f"L1 Cognition Critical Failure: {e}") from e
             
     # [Placeholder] run_l2_supervision 需要实现，但这里主要修复 L1 和 融合逻辑
-    async def run_l2_supervision(self, l1_insights: List[EvidenceItem], raw_events: List[Any]) -> List[SupervisionResult]:
+    async def run_l2_supervision(self, l1_insights: List[EvidenceItem], raw_events: List[Any], pipeline_state: Optional[PipelineState] = None) -> List[SupervisionResult]:
         """
         [Task 3.3 Fix] Active L2 Supervision
         Executes the 'l2_critic' agent to review L1 insights.
+        [Task 3.1] Added pipeline_state argument.
         """
         if not l1_insights:
             return []
@@ -144,7 +146,8 @@ class CognitiveEngine:
                         "l1_insights": [item.model_dump() for item in l1_insights],
                         "raw_events": raw_events
                     },
-                    "context": {}
+                    # [Task 3.1] Pass pipeline_state in context
+                    "context": {"state": pipeline_state} if pipeline_state else {}
                 }
             }
             
