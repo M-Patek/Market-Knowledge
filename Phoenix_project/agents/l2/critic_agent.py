@@ -16,9 +16,10 @@ class CriticAgent(L2Agent):
     评估证据的质量、逻辑一致性和潜在偏见。
     """
 
-    async def run(self, state: PipelineState, dependencies: List[Any]) -> AsyncGenerator[CriticResult, None]:
+    async def run(self, state: PipelineState, dependencies: List[Any]) -> List[CriticResult]:
         """
         [Refactored Phase 3.2] 适配 PipelineState，增加鲁棒性和兜底机制。
+        [Fix] Return list instead of AsyncGenerator.
         """
         target_symbol = state.main_task_query.get("symbol", "UNKNOWN")
         logger.info(f"[{self.agent_id}] Running Critique for: {target_symbol}")
@@ -36,9 +37,8 @@ class CriticAgent(L2Agent):
                         logger.warning(f"[{self.agent_id}] Skipping invalid evidence item: {e}")
 
         if not evidence_items:
-            logger.warning(f"[{self.agent_id}] No evidence to critique. Yielding fallback.")
-            yield self._create_fallback_result(state, target_symbol, "No evidence provided.")
-            return
+            logger.warning(f"[{self.agent_id}] No evidence to critique. Returning fallback.")
+            return [self._create_fallback_result(state, target_symbol, "No evidence provided.")]
 
         agent_prompt_name = "l2_critic"
 
@@ -58,8 +58,7 @@ class CriticAgent(L2Agent):
             )
 
             if not response_str:
-                yield self._create_fallback_result(state, target_symbol, "LLM returned empty response.")
-                return
+                return [self._create_fallback_result(state, target_symbol, "LLM returned empty response.")]
 
             # 4. 解析结果
             response_data = json.loads(response_str)
@@ -71,6 +70,7 @@ class CriticAgent(L2Agent):
             # Handle potential list response or single object
             raw_items = response_data if isinstance(response_data, list) else [response_data]
             
+            results = []
             for raw in raw_items:
                 # 1. Map Scores
                 q_score = float(raw.get("quality_score", 0.0))
@@ -102,11 +102,13 @@ class CriticAgent(L2Agent):
                 object.__setattr__(result, 'timestamp', state.current_time)
 
                 logger.info(f"[{self.agent_id}] Critique complete. Valid: {is_valid} (Avg: {avg_score:.2f})")
-                yield result
+                results.append(result)
+            
+            return results
 
         except Exception as e:
             logger.error(f"[{self.agent_id}] Error: {e}", exc_info=True)
-            yield self._create_fallback_result(state, target_symbol, f"Error: {e}")
+            return [self._create_fallback_result(state, target_symbol, f"Error: {e}")]
 
     def _create_fallback_result(self, state: PipelineState, symbol: str, reason: str) -> CriticResult:
         """创建兜底的批评结果 (默认为有效，但标记为弱)。"""
