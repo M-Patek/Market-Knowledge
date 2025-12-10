@@ -190,12 +190,10 @@ class Orchestrator:
             # 5. 运行 L3 决策层 (Reasoning Ensemble -> DRL)
             await self._run_l3_decision(pipeline_state)
             
-            # [Safety] Risk Blockade
+            # [Safety] Risk Blockade - Handled inside _run_portfolio_construction via Hard Gate now, 
+            # but we can log early warning here.
             if pipeline_state.l3_decision and pipeline_state.l3_decision.get("risk_action") == RiskAction.HALT.value:
-                logger.critical("HALT_TRADING triggered by L3 Risk Agent. Aborting cycle.")
-                # [Task 1.2 Fix] Do NOT return immediately. Let PortfolioConstructor handle Emergency Liquidation.
-                # proceed to _run_portfolio_construction which now handles HALT logic.
-                pass
+                logger.critical("HALT_TRADING triggered by L3 Risk Agent. Proceeding to Emergency Liquidation Flow.")
             
             if not pipeline_state.l3_decision:
                 logger.warning("L3 DRL Agents did not produce a decision. Cycle ending.")
@@ -231,7 +229,8 @@ class Orchestrator:
                await self.audit_manager.audit_error(e, "OrchestratorFatal", pipeline_state)
             
             # [Task 17] Emergency Shutdown & Re-raise (Prevent Exception Swallowing)
-            await self.portfolio_constructor.emergency_shutdown()
+            if self.portfolio_constructor:
+                await self.portfolio_constructor.emergency_shutdown()
             raise
 
         finally:
@@ -418,6 +417,26 @@ class Orchestrator:
 
     async def _run_portfolio_construction(self, pipeline_state: PipelineState):
         """[已实现] 运行投资组合构建。"""
+        # [Task 4.1] Hard Gate for Risk Halt: Enforce liquidation logic at Orchestrator level
+        if pipeline_state.l3_decision and pipeline_state.l3_decision.get("risk_action") == RiskAction.HALT.value:
+             logger.critical("RISK HARD GATE: Risk Agent triggered HALT. Overriding Portfolio Constructor to LIQUIDATE.")
+             
+             # Create a liquidation target (0 quantity for all held positions)
+             # This bypasses potential bugs or delays in PortfolioConstructor
+             current_positions = pipeline_state.portfolio_state.positions if pipeline_state.portfolio_state else {}
+             
+             # Target is simply empty, OrderManager reconciliation will handle selling
+             # But to be explicit for OrderManager (which might diff), we can explicitly set targets to 0 if needed.
+             # Typically, if target is empty dict, OrderManager should sell extras.
+             # However, let's assume OrderManager needs explicit 0s to close specific positions safely.
+             target_portfolio = {symbol: 0.0 for symbol in current_positions.keys()}
+             
+             pipeline_state.set_target_portfolio(target_portfolio)
+             # [Risk Metadata] Mark this override in metadata for audit
+             if pipeline_state.metadata is None: pipeline_state.metadata = {}
+             pipeline_state.metadata["RISK_OVERRIDE"] = True
+             return
+
         logger.info("Running PortfolioConstructor...")
         try:
             # [Fix] Await async construct_portfolio
@@ -428,7 +447,7 @@ class Orchestrator:
                 pipeline_state.set_target_portfolio(target_portfolio)
                 logger.info("PortfolioConstructor complete. Target portfolio generated.")
             else:
-                 logger.warning("PortfolioConstructor returned None (Risk Halt). Execution skipped.")
+                 logger.warning("PortfolioConstructor returned None (Risk Halt?). Execution skipped.")
         except Exception as e:
             raise PipelineError(f"PortfolioConstructor failed: {e}") from e
 
