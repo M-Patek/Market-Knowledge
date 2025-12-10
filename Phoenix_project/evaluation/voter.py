@@ -1,8 +1,9 @@
 import math
-from typing import List
+from typing import List, Union
 import asyncio
 
 from ..core.schemas.supervision_result import SupervisionResult, Decision
+from ..core.schemas.fusion_result import FusionResult
 from ..core.schemas.data_schema import Sentiment
 from ..monitor.logging import get_logger
 
@@ -54,12 +55,13 @@ class Voter:
             # 如果 log_odds 极大或极小
             return 1.0 if log_odds > 0 else 0.0
 
-    async def vote(self, decisions: List[SupervisionResult]) -> SupervisionResult:
+    async def vote(self, decisions: List[Union[SupervisionResult, FusionResult]]) -> SupervisionResult:
         """
         使用贝叶斯融合逻辑聚合 L2 决策。
+        [Fix] Supports FusionResult inputs to prevent AttributeErrors.
 
         Args:
-            decisions: L2 智能体的 SupervisionResult 列表。
+            decisions: L2 智能体的 SupervisionResult 或 FusionResult 列表。
 
         Returns:
             一个代表 L2 统一意见的 SupervisionResult。
@@ -82,42 +84,49 @@ class Voter:
         # 假设先验概率为 50/50 (P(Pos)=0.5)，其对数几率为 log(0.5/0.5) = 0
         total_log_odds = 0.0
         total_confidence_weight = 0.0
+        
+        override_reasons = []
+        final_action_flags = set()
 
         for res in decisions:
-            decision = res.decision
+            # --- Adapter Logic for FusionResult ---
+            if isinstance(res, FusionResult):
+                confidence = res.confidence
+                # Convert float score to Sentiment
+                if res.sentiment_score > 0.1:
+                    sentiment = Sentiment.POSITIVE
+                elif res.sentiment_score < -0.1:
+                    sentiment = Sentiment.NEGATIVE
+                else:
+                    sentiment = Sentiment.NEUTRAL
+                source_agent = f"Fusion_{res.id[:4]}"
+                action = "MAINTAIN" # FusionResult usually doesn't carry override flags
+                
+            # --- Standard SupervisionResult ---
+            elif isinstance(res, SupervisionResult):
+                confidence = res.decision.confidence or 0.5
+                sentiment = res.decision.final_sentiment
+                source_agent = res.source_agent
+                action = res.decision.action
+                if action == "OVERRIDE":
+                    override_reasons.append(f"({source_agent}: {res.decision.reason})")
+                final_action_flags.add(action)
+            else:
+                logger.warning(f"Voter received unknown type: {type(res)}. Skipping.")
+                continue
             
-            # 将情感和置信度转换为 P(Positive)
-            # 我们假设置信度代表了 P(AssignedSentiment)
-            confidence = decision.confidence or 0.5
-            
+            # --- Bayesian Update ---
             prob_positive = 0.5 # NEUTRAL 的情况
-            if decision.final_sentiment == Sentiment.POSITIVE:
+            if sentiment == Sentiment.POSITIVE:
                 prob_positive = confidence
-            elif decision.final_sentiment == Sentiment.NEGATIVE:
+            elif sentiment == Sentiment.NEGATIVE:
                 prob_positive = 1.0 - confidence
             
-            # 将 P(Positive) 转换为对数几率
-            # 我们使用置信度本身作为权重，来调整弱信号的影响
-            # (例如，一个 0.5 置信度的信号不应该贡献任何对数几率)
-            # weight = (confidence - 0.5) * 2  (映射 [0.5, 1] -> [0, 1])
-            # 
-            # 简化：我们直接使用 logit，但我们会根据原始置信度对其进行加权
-            # 一个更简单的方法：
-            # (P(Pos)=0.8) -> log(0.8/0.2) = 1.38
-            # (P(Pos)=0.6) -> log(0.6/0.4) = 0.40
-            # (P(Pos)=0.5) -> log(0.5/0.5) = 0.0
-            
             signal_log_odds = self._to_log_odds(prob_positive)
-            
-            # 按置信度加权信号 (一个 100% 置信度的信号贡献全部 log_odds)
-            # (一个 50% 置信度的信号 [即 P(Pos)=0.5] 贡献 0 log_odds)
-            # (一个 60% 置信度的信号 [P(Pos)=0.6] 贡献 0.2 * log(0.6/0.4)) -> 不，这太复杂了
-            
-            # 让我们保持简单：每个信号都贡献其全部的对数几率
             total_log_odds += signal_log_odds
-            total_confidence_weight += confidence # 跟踪总置信度以用于归一化
+            total_confidence_weight += confidence
             
-            logger.debug(f"  - Decision {res.source_agent}: Sent={decision.final_sentiment}, Conf={confidence:.2f} -> P(Pos)={prob_positive:.2f} -> LogOdds={signal_log_odds:.2f}")
+            logger.debug(f"  - Decision {source_agent}: Sent={sentiment}, Conf={confidence:.2f} -> P(Pos)={prob_positive:.2f} -> LogOdds={signal_log_odds:.2f}")
 
         # --- 融合结果 ---
         
@@ -143,15 +152,12 @@ class Voter:
         # 确保置信度在 [0, 1] 范围内
         final_confidence = max(0.0, min(1.0, final_confidence))
 
-        # 确定最终行动 (如果任何一个 L2 智能体要求否决，则升级为否决)
+        # 确定最终行动
         final_action = "MAINTAIN"
-        override_reasons = []
-        for res in decisions:
-            if res.decision.action == "OVERRIDE":
-                final_action = "OVERRIDE"
-                override_reasons.append(f"({res.source_agent}: {res.decision.reason})")
-            elif res.decision.action == "FLAG_FOR_REVIEW" and final_action != "OVERRIDE":
-                final_action = "FLAG_FOR_REVIEW"
+        if "OVERRIDE" in final_action_flags or override_reasons:
+             final_action = "OVERRIDE"
+        elif "FLAG_FOR_REVIEW" in final_action_flags:
+             final_action = "FLAG_FOR_REVIEW"
 
         reason = (
             f"Bayesian fusion of {len(decisions)} decisions. "
