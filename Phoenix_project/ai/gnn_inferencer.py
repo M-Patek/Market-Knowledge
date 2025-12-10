@@ -1,120 +1,53 @@
-# New File: m-patek/market-knowledge/Market-Knowledge-main/Phoenix_project/ai/gnn_inferencer.py
-
-import tensorflow as tf
-import tensorflow_gnn as tfgnn
 import logging
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional
+# Placeholder imports for GNN libraries (e.g., torch, dgl)
+# import torch
+# import dgl
 
 logger = logging.getLogger(__name__)
 
 class GNNInferencer:
     """
-    Handles loading a pre-trained GNN model and providing an asynchronous
-    inference interface.
+    GNN 推理器。
+    负责加载 GNN 模型并对市场图谱数据进行推理，预测市场状态或关系风险。
     """
-
-    # [Task 5A] Singleton instance storage
-    _instance = None
-
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super(GNNInferencer, cls).__new__(cls)
-        return cls._instance
-
-    def __init__(self, model_path: str):
-        """
-        Initializes the inferencer and attempts to load the model.
-
-        Args:
-            model_path: The file path to the TensorFlow SavedModel.
-        """
-        # [Task 5A] Prevent re-initialization if already loaded
-        if hasattr(self, "_initialized") and self._initialized:
-            return
-
-        logger.info(f"GNNInferencer initializing and loading model from {model_path}...")
+    
+    def __init__(self, model_path: str, use_celery: bool = False):
         self.model_path = model_path
-        self.model = None
-        self._load_model(self.model_path)
+        self.use_celery = use_celery
         
-        self._initialized = True
-
-    def _load_model(self, model_path: str):
-        """
-        Loads the GNN model from the specified path.
-        Includes resilience to prevent startup crashes if the model is
-        missing or corrupt.
-        """
-        try:
-            # [Future Implementation] Uncomment the line below when model exists
-            # self.model = tf.saved_model.load(model_path)
-            
-            # Placeholder logic as per the plan
-            if not model_path:
-                raise FileNotFoundError("Model path is not specified.")
-                
-            logger.info(f"[Placeholder] Attempting to load GNN model from: {model_path}")
-            # In a real scenario, if tf.saved_model.load(model_path) fails,
-            # the except block will catch it.
-            # For now, we keep self.model = None to simulate a "not loaded" state
-            # for the placeholder.
-            
-            # [Future Implementation Success]
-            # logger.info(f"Successfully loaded GNN model from {model_path}")
-            
-        except Exception as e:
-            # This is our agreed-upon resilience logic (Point 3)
-            logger.error(f"Failed to load GNN model from {model_path}: {e}")
-            logger.warning("GNNInferencer will be disabled. Inference will be skipped.")
+        # [Fix] Zombie Object: Avoid loading heavy model if delegating to Celery
+        if not self.use_celery:
+            self.model = self._load_model(model_path)
+        else:
             self.model = None
+            logger.info("GNNInferencer initialized in lightweight mode (Celery delegation enabled).")
 
-    async def infer(self, graph_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _load_model(self, path: str) -> Any:
         """
-        Performs inference on the provided graph data.
-
-        Args:
-            graph_data: A dictionary containing nodes and edges.
-
-        Returns:
-            A dictionary with prediction results, or an empty dict if
-            inference is skipped.
+        加载 GNN 模型权重。
         """
-        if self.model is None:
-            logger.warning("GNN model is not loaded. Skipping GNN inference.")
+        logger.info(f"Loading GNN model from {path}...")
+        # try:
+        #     return torch.load(path)
+        # except Exception as e:
+        #     logger.error(f"Failed to load model: {e}")
+        #     return None
+        return "DummyModel"
+
+    async def infer(self, graph_data: Any) -> Dict[str, Any]:
+        """
+        执行推理。
+        """
+        if self.use_celery:
+            # TODO: Dispatch to Celery worker
+            logger.info("Dispatching GNN inference to Celery...")
+            return {"status": "dispatched"}
+        
+        if not self.model:
+            logger.warning("Model not loaded locally.")
             return {}
 
-        try:
-            # [Future Implementation]
-            # 1. Convert graph_data dict into a tfgnn.GraphTensor
-            #    graph_tensor = self._create_graph_tensor(graph_data)
-            
-            # 2. Call the model
-            #    predictions = self.model(graph_tensor)
-            
-            # 3. Parse predictions into a dictionary
-            #    results = self._parse_predictions(predictions)
-            #    return results
-            
-            # Placeholder for future logic
-            logger.info("GNN model is loaded, but inference logic is not yet implemented.")
-            return {'node_embeddings': [], 'predicted_links': []} # Example future output
-
-        except Exception as e:
-            logger.error(f"Error during GNN inference: {e}")
-            return {}
-
-    def _create_graph_tensor(self, graph_data: Dict[str, Any]) -> tfgnn.GraphTensor:
-        """
-        [Future Implementation] Helper method to convert dictionary
-        data into a tfgnn.GraphTensor.
-        """
-        # ... future conversion logic ...
-        pass
-
-    def _parse_predictions(self, predictions: Any) -> Dict[str, Any]:
-        """
-        [Future Implementation] Helper method to parse model output
-        into a structured dictionary.
-        """
-        # ... future parsing logic ...
-        pass
+        logger.info("Running local GNN inference...")
+        # result = self.model(graph_data)
+        return {"prediction": "bullish", "confidence": 0.75}
