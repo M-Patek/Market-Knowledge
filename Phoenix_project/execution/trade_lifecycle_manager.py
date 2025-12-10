@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 
 # FIX (E2, E4): 从核心模式导入 Order, Fill, Position, PortfolioState
 from Phoenix_project.core.schemas.data_schema import Order, Fill, Position, PortfolioState
+from Phoenix_project.data_manager import DataManager
 
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.ai.tabular_db_client import TabularDBClient
@@ -30,15 +31,25 @@ class TradeLifecycleManager:
     维护投资组合状态 (持仓和现金)，并同步到 TabularDB 以防止状态丢失。
     [Phase II Fix] Decimal Precision & Atomic Transactions
     """
-    def __init__(self, initial_cash: float, tabular_db: Optional[TabularDBClient] = None):
+    def __init__(self, initial_cash: float, data_manager: Optional[DataManager] = None, tabular_db: Optional[TabularDBClient] = None, bus: Any = None):
         self.positions: Dict[str, Position] = {} # key: symbol
         # [Phase II Fix] Use Decimal for financial precision (The "Penny Gap")
         self.cash = Decimal(str(initial_cash))
         self.realized_pnl = Decimal("0.0")
-        self.tabular_db = tabular_db
+        
+        self.data_manager = data_manager
+        # Fallback logic: prefer explicit tabular_db, else get from data_manager, else None
+        if tabular_db:
+            self.tabular_db = tabular_db
+        elif data_manager and hasattr(data_manager, 'tabular_db'):
+            self.tabular_db = data_manager.tabular_db
+        else:
+            self.tabular_db = None
+            
+        self.bus = bus
         self.log_prefix = "TradeLifecycleManager:"
         self._lock = asyncio.Lock()
-        logger.info(f"{self.log_prefix} Initialized. DB Connected: {self.tabular_db is not None}")
+        logger.info(f"{self.log_prefix} Initialized. DB Connected: {self.tabular_db is not None}, Bus Connected: {self.bus is not None}")
 
     async def initialize(self):
         """
