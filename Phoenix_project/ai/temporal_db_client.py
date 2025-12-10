@@ -1,326 +1,206 @@
-import pandas as pd
-from elasticsearch import AsyncElasticsearch
-from typing import List, Dict, Any, Optional, Tuple
+import os
+import logging
+from typing import List, Dict, Any, Optional
 from datetime import datetime
-from elasticsearch.helpers import async_bulk
+import pandas as pd
+from elasticsearch import AsyncElasticsearch, helpers
 
-# 修复：将相对导入 'from ..monitor.logging...' 更改为绝对导入
-from Phoenix_project.monitor.logging import get_logger
-from Phoenix_project.utils.retry import retry_with_exponential_backoff
-
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class TemporalDBClient:
     """
-    Client for interacting with a temporal database (e.g., Elasticsearch).
-    Used for storing and retrieving time-series events (news, filings, etc.).
+    Client for interacting with the Temporal Database (Elasticsearch/OpenSearch).
+    Stores and retrieves time-series events (news, market data, signals).
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initializes the Elasticsearch client.
+    def __init__(self, config: Dict[str, Any] = None):
+        self.config = config or {}
         
-        Args:
-            config (Dict[str, Any]): Configuration dict, expects 'temporal_db'
-                                      with 'hosts' and 'index_name'.
-        """
-        # [蓝图 2 修复]：配置现在是 config['temporal_db']
-        db_config = config # 假设 config 已经是 config['temporal_db']
-        self.es = AsyncElasticsearch(
-            hosts=db_config.get('hosts', ["http://localhost:9200"])
-        )
-        self.index_name = db_config.get('index_name', 'market_events')
-        logger.info(f"TemporalDBClient initialized for index: {self.index_name}")
-
-    @retry_with_exponential_backoff()
-    async def connect(self):
-        """Checks the connection to Elasticsearch."""
-        try:
-            if not await self.es.ping():
-                logger.error("Elasticsearch connection failed.")
-                raise ConnectionError("Failed to connect to Elasticsearch")
-            
-            # Ensure index exists
-            if not await self.es.indices.exists(index=self.index_name):
-                logger.warning(f"Elasticsearch index '{self.index_name}' not found. Attempting to create.")
-                
-                # --- [任务 1 已添加] ---
-                # 定义索引映射 (Index Mapping)
-                index_mapping = {
-                    "mappings": {
-                        "properties": {
-                            "timestamp": {"type": "date"},
-                            "measurement": {"type": "keyword"},
-                            "symbols": {"type": "keyword"},
-                            "headline": {"type": "text", "analyzer": "standard"},
-                            "summary": {"type": "text", "analyzer": "standard"},
-                            "content": {"type": "text", "analyzer": "standard"},
-                            "tags": {"type": "keyword"},
-                            "source": {"type": "keyword"}
-                        }
-                    }
-                }
-                logger.info(f"Creating index '{self.index_name}' with mapping.")
-                await self.es.indices.create(index=self.index_name, body=index_mapping)
-                # --- [任务 1 结束] ---
-                
-            logger.info("Elasticsearch connection successful.")
-        except Exception as e:
-            logger.error(f"Error connecting to Elasticsearch: {e}", exc_info=True)
-            raise
-
-    async def close(self):
-        """Closes the Elasticsearch connection."""
-        await self.es.close()
-        logger.info("Elasticsearch connection closed.")
-
-    @retry_with_exponential_backoff()
-    async def index_event(self, event_id: str, event_data: Dict[str, Any]) -> bool:
-        """
-        Indexes a single event document in Elasticsearch.
+        self.host = self.config.get("host", "phoenix_elasticsearch")
+        self.port = self.config.get("port", 9200)
+        self.username = self.config.get("user_env") or os.environ.get("ELASTIC_USER", "elastic")
+        self.password = self.config.get("pass_env") or os.environ.get("ELASTIC_PASSWORD", "changeme")
+        self.index_name = self.config.get("index_name", "phoenix-temporal-events")
         
-        Args:
-            event_id (str): The unique ID for the document.
-            event_data (Dict[str, Any]): The event data (must be JSON-serializable).
-            
-        Returns:
-            bool: True on success, False on failure.
-        """
+        self.client = None
+        self._initialize_client()
+
+    def _initialize_client(self):
         try:
-            # Ensure timestamp is in correct format
-            if 'timestamp' in event_data and isinstance(event_data['timestamp'], (pd.Timestamp, datetime)):
-                event_data['timestamp'] = event_data['timestamp'].isoformat()
-                
-            response = await self.es.index(
-                index=self.index_name,
-                id=event_id,
-                document=event_data
+            # Construct URI or use explicit host/port
+            # For simplicity using basic auth with host/port
+            self.client = AsyncElasticsearch(
+                hosts=[f"http://{self.host}:{self.port}"],
+                basic_auth=(self.username, self.password),
+                verify_certs=False # In internal docker network usually fine
             )
-            
-            if response.get('result') not in ['created', 'updated']:
-                logger.warning(f"Failed to index event {event_id}: {response}")
-                return False
-                
-            return True
+            logger.info(f"TemporalDBClient initialized for {self.host}:{self.port}")
         except Exception as e:
-            logger.error(f"Error indexing event {event_id} in Elasticsearch: {e}", exc_info=True)
-            return False
+            logger.error(f"Failed to initialize TemporalDBClient: {e}")
 
-    @retry_with_exponential_backoff()
-    async def search_events(
-        self, 
-        symbols: Optional[List[str]] = None,
-        start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None,
-        query_string: Optional[str] = None,
-        size: int = 25
-    ) -> List[Tuple[Dict[str, Any], float]]: # <--- [蓝图 2] 更改返回类型
+    async def query_market_data(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         """
-        Searches the temporal database for events matching the criteria.
-        
-        Args:
-            symbols: List of ticker symbols to match.
-            start_time: The start of the time window.
-            end_time: The end of the time window.
-            query_string: A free-text query string.
-            size: The maximum number of hits to return.
-            
-        Returns:
-            List[Tuple[Dict[str, Any], float]]: A list of (event_data, score) tuples.
+        Retrieves market data (OHLCV) for a symbol within a time range.
+        Returns a Pandas DataFrame.
         """
-        try:
-            query = {"bool": {"filter": []}}
-            
-            # Time range filter
-            time_range = {}
-            if start_time:
-                time_range["gte"] = start_time.isoformat()
-            if end_time:
-                time_range["lte"] = end_time.isoformat()
-            if time_range:
-                query["bool"]["filter"].append({"range": {"timestamp": time_range}})
-                
-            # Symbols filter (assuming 'symbols' is a keyword field)
-            if symbols:
-                query["bool"]["filter"].append({"terms": {"symbols": symbols}})
-                
-            # Full-text query (if provided)
-            if query_string:
-                query["bool"]["must"] = {
-                    "query_string": {
-                        "query": query_string,
-                        # 假设这些字段在 ES 映射中存在
-                        "fields": ["headline", "summary", "tags", "content"] # <--- [蓝图 2] 添加 'content'
-                    }
-                }
-            
-            # 如果没有 query_string，我们仍然希望有结果，但按时间排序
-            sort_order = [{"_score": "desc"}, {"timestamp": "desc"}]
-            if not query_string:
-                sort_order = [{"timestamp": "desc"}] # 如果没有查询，则按时间排序
+        if not self.client:
+            return pd.DataFrame()
 
-            response = await self.es.search(
-                index=self.index_name,
-                query=query,
-                size=size,
-                sort=sort_order # <--- [蓝图 2] 按分数排序
-            )
-            
-            hits = response.get('hits', {}).get('hits', [])
-            
-            # [蓝图 2] 提取 _source 和 _score
-            results_with_scores = []
-            for hit in hits:
-                source_data = hit.get('_source', {})
-                # 如果没有提供 query_string，ES 可能不会返回 _score，或者返回 0.0
-                score = float(hit.get('_score') or 1.0) # 如果没有分数则默认为 1.0
-                results_with_scores.append((source_data, score))
-                
-            return results_with_scores
-            
-        except Exception as e:
-            logger.error(f"Error searching Elasticsearch: {e}", exc_info=True)
-            return []
-
-    @retry_with_exponential_backoff()
-    async def query_market_data(
-        self,
-        symbol: str,
-        start_time: datetime,
-        end_time: datetime
-    ) -> pd.DataFrame:
-        """
-        Wrapper around query_range specifically for market data failover.
-        """
-        return await self.query_range(
-            measurement="market_data", 
-            symbol=symbol, 
-            start=start_time, 
-            end=end_time
-        )
-
-    @retry_with_exponential_backoff()
-    async def query_range(
-        self,
-        measurement: str,
-        symbol: str,
-        start: datetime,
-        end: datetime,
-        columns: Optional[List[str]] = None,
-        limit: int = 50000 # [Fix] OOM Safety Cap
-    ) -> pd.DataFrame:
-        """
-        Retrieves historical data for a specific measurement and symbol within a time range.
-        """
-        try:
-            query = {
-                "bool": {
-                    "filter": [
-                        {"term": {"measurement": measurement}},
-                        {"term": {"symbols": symbol}},
-                        {"range": {"timestamp": {"gte": start.isoformat(), "lte": end.isoformat()}}}
-                    ]
-                }
+        query = {
+            "bool": {
+                "must": [
+                    {"term": {"symbol": symbol}},
+                    {"term": {"event_type": "market_data"}},
+                    {"range": {"timestamp": {"gte": start_time.isoformat(), "lte": end_time.isoformat()}}}
+                ]
             }
-            
-            # [Task 2.2] Implement Pagination using search_after to prevent truncation
+        }
+        
+        sort_criteria = [{"timestamp": {"order": "asc"}}]
+        batch_size = 1000 # Pagination size
+
+        try:
             all_source_data = []
-            sort_criteria = [{"timestamp": "asc"}, {"_id": "asc"}] # Use _id as tie-breaker
             last_sort_values = None
-            batch_size = 1000
-            
+
             while True:
-                kwargs = {
-                    "index": self.index_name, 
-                    "query": query, 
-                    "size": batch_size,
-                    "sort": sort_criteria, 
-                    "_source": columns if columns else True
+                # Prepare search args
+                search_args = {
+                    "index": self.index_name,
+                    "query": query,
+                    "sort": sort_criteria,
+                    "size": batch_size
                 }
                 if last_sort_values:
-                    kwargs["search_after"] = last_sort_values
+                    search_args["search_after"] = last_sort_values
 
-                response = await self.es.search(**kwargs)
-                hits = response.get('hits', {}).get('hits', [])
+                # Execute search
+                resp = await self.client.search(**search_args)
                 
+                hits = resp.get('hits', {}).get('hits', [])
                 if not hits:
                     break
-                    
-                for hit in hits:
-                    all_source_data.append(hit['_source'])
+
+                # Collect data
+                for h in hits:
+                    all_source_data.append(h['_source'])
                 
-                # [Fix] OOM Safety Cap: Prevent unbounded growth
-                if len(all_source_data) >= limit:
-                    logger.warning(f"Query limit reached ({limit}). Returning partial results to prevent OOM.")
-                    break
-                
-                last_sort_values = hits[-1]['sort']
+                # Update for next page
+                last_hit = hits[-1]
+                if 'sort' in last_hit:
+                    last_sort_values = last_hit['sort']
+                else:
+                    break # Should not happen with explicit sort
+
                 if len(hits) < batch_size:
                     break
 
             if not all_source_data:
                 return pd.DataFrame()
 
+            # Parse results
             df = pd.DataFrame(all_source_data)
             
+            # Ensure timestamp is datetime and set as index
             if 'timestamp' in df.columns:
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
-                
+                df.set_index('timestamp', inplace=True)
+            
             return df
+
         except Exception as e:
-            logger.error(f"Error querying range in TemporalDB: {e}", exc_info=True)
+            logger.error(f"TemporalDB query_market_data failed: {e}")
             return pd.DataFrame()
 
-    @retry_with_exponential_backoff()
-    async def get_latest_data_point(self, symbol: str, point_in_time: datetime) -> Optional[Dict[str, Any]]:
+    async def query_events(self, event_type: str, start_time: datetime, end_time: datetime, limit: int = 100) -> List[Dict[str, Any]]:
         """
-        [Time Machine] Retrieves the latest data point for a symbol prior to or at point_in_time.
+        Generic event query (e.g., news, signals) within a time window.
         """
-        try:
-            query = {
-                "bool": {
-                    "filter": [
-                        {"term": {"symbols": symbol}},
-                        {"range": {"timestamp": {"lte": point_in_time.isoformat()}}}
-                    ]
-                }
-            }
-            response = await self.es.search(
-                index=self.index_name, 
-                query=query, 
-                size=1, 
-                sort=[{"timestamp": "desc"}]
-            )
-            hits = response.get('hits', {}).get('hits', [])
-            return hits[0]['_source'] if hits else None
-        except Exception as e:
-            logger.error(f"Error getting latest data point: {e}", exc_info=True)
-            return None
+        if not self.client:
+            return []
 
-    @retry_with_exponential_backoff()
-    async def write_dataframe(self, measurement: str, df: pd.DataFrame, tags: Dict[str, str] = None) -> bool:
-        """
-        Writes a Pandas DataFrame to Elasticsearch using Bulk API.
-        """
-        if df.empty: return True
+        query = {
+            "bool": {
+                "must": [
+                    {"term": {"event_type": event_type}},
+                    {"range": {"timestamp": {"gte": start_time.isoformat(), "lte": end_time.isoformat()}}}
+                ]
+            }
+        }
+        
+        sort_criteria = [{"timestamp": {"order": "desc"}}]
+        batch_size = 1000 
+        # Note: If limit is smaller than batch_size, we can just use limit.
+        # But if user asks for more than 10k (default max_result_window), pagination is needed.
+        # Here we assume limit can be large, so we paginate until limit is reached.
+        
+        effective_batch_size = min(limit, batch_size)
+
         try:
-            actions = []
-            for record in df.to_dict(orient='records'):
-                doc = record.copy()
-                doc['measurement'] = measurement
-                if tags:
-                    if 'symbol' in tags: doc['symbols'] = tags['symbol']
-                    doc.update(tags)
-                if 'timestamp' in doc and hasattr(doc['timestamp'], 'isoformat'):
-                    doc['timestamp'] = doc['timestamp'].isoformat()
-                actions.append({"_index": self.index_name, "_source": doc})
+            all_source_data = []
+            last_sort_values = None
             
-            # [Task 2.2] Optimize: Remove refresh=True per bulk, do it once manually
-            # [Fix] Refresh Storm: Removed explicit refresh call to prevent CPU spikes. 
-            # Rely on ES background refresh (1s default).
-            await async_bulk(self.es, actions)
-            # await self.es.indices.refresh(index=self.index_name) 
+            while len(all_source_data) < limit:
+                current_size = min(batch_size, limit - len(all_source_data))
+                
+                search_args = {
+                    "index": self.index_name,
+                    "query": query,
+                    "sort": sort_criteria,
+                    "size": current_size
+                }
+                if last_sort_values:
+                    search_args["search_after"] = last_sort_values
+                
+                resp = await self.client.search(**search_args)
+                
+                hits = resp.get('hits', {}).get('hits', [])
+                if not hits:
+                    break
+                    
+                for h in hits:
+                    all_source_data.append(h['_source'])
+                    
+                last_hit = hits[-1]
+                if 'sort' in last_hit:
+                    last_sort_values = last_hit['sort']
+                else:
+                    break
+                
+                if len(hits) < current_size:
+                    break
+
+            return all_source_data[:limit]
+
+        except Exception as e:
+            logger.error(f"TemporalDB query_events failed: {e}")
+            return []
+            
+    async def ingest_batch(self, events: List[Dict[str, Any]]) -> bool:
+        """
+        Bulk ingest a list of events.
+        """
+        if not self.client or not events:
+            return False
+            
+        actions = []
+        for event in events:
+            action = {
+                "_index": self.index_name,
+                "_source": event
+            }
+            # Optional: Deduplication ID generation if needed
+            # if 'id' in event: action['_id'] = event['id']
+            actions.append(action)
+            
+        try:
+            await helpers.async_bulk(self.client, actions)
             return True
         except Exception as e:
-            logger.error(f"Error writing dataframe to TemporalDB: {e}", exc_info=True)
+            logger.error(f"TemporalDB ingest_batch failed: {e}")
             return False
+
+    async def close(self):
+        """[Fix] Resource Cleanup: Close database connection pool."""
+        if hasattr(self, 'client') and self.client:
+            await self.client.close()
