@@ -15,9 +15,10 @@ class PlannerAgent(L2Agent):
     (通常在循环开始时运行)
     """
 
-    async def run(self, state: PipelineState, dependencies: List[Any]) -> AsyncGenerator[Task, None]:
+    async def run(self, state: PipelineState, dependencies: List[Any]) -> List[Task]:
         """
         [Refactored Phase 3.2] 适配 PipelineState，生成 Task 列表。
+        [Fix] Return list instead of AsyncGenerator.
         """
         # Planner 的输入通常是 state 中的 main_task_query
         main_query = state.main_task_query
@@ -44,25 +45,26 @@ class PlannerAgent(L2Agent):
 
             if not response_str:
                 logger.warning(f"[{self.agent_id}] Empty plan. Using default.")
-                yield self._create_default_task(state, target_symbol)
-                return
+                return [self._create_default_task(state, target_symbol)]
 
             response_data = json.loads(response_str)
             tasks_data = response_data.get("tasks", [])
 
             if not tasks_data:
-                 yield self._create_default_task(state, target_symbol)
-                 return
+                 return [self._create_default_task(state, target_symbol)]
 
+            tasks = []
             for task_dict in tasks_data:
                 # 确保 Task ID 唯一性
                 task_dict["task_id"] = f"{state.run_id}_{state.step_index}_{task_dict.get('task_id', 'subtask')}"
                 task = Task(**task_dict)
-                yield task
+                tasks.append(task)
+            
+            return tasks
 
         except Exception as e:
             logger.error(f"[{self.agent_id}] Planning failed: {e}", exc_info=True)
-            yield self._create_default_task(state, target_symbol)
+            return [self._create_default_task(state, target_symbol)]
 
     def _create_default_task(self, state: PipelineState, symbol: str) -> Task:
         """创建默认的基础分析任务。"""
