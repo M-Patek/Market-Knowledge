@@ -31,7 +31,7 @@ class L1Agent(ABC):
             agent_id (str): The unique identifier for the agent.
             llm_client (Any): An instance of an LLM client.
             data_manager (Any): Data Manager instance.
-            **kwargs: Additional args like 'role', 'prompt_template_name', 'prompt_manager', etc.
+            **kwargs: Additional args like 'role', 'prompt_template_name', 'prompt_manager', 'audit_manager', 'retriever' etc.
         """
         self.agent_id = agent_id
         self.llm_client = llm_client
@@ -39,9 +39,11 @@ class L1Agent(ABC):
         self.role = kwargs.get('role', 'Agent')
         self.prompt_template_name = kwargs.get('prompt_template_name')
         
-        # [Optional] Inject prompt handling dependencies if provided
+        # [Optional] Inject prompt handling dependencies if provided via kwargs
         self.prompt_manager = kwargs.get('prompt_manager')
         self.prompt_renderer = kwargs.get('prompt_renderer')
+        self.audit_manager = kwargs.get('audit_manager')
+        self.retriever = kwargs.get('retriever')
 
     @abstractmethod
     async def run(
@@ -65,7 +67,7 @@ class L1Agent(ABC):
             return template.format(**variables) # Simple format
         else:
             # Fallback for when no prompt system is injected (testing)
-            logger.warning(f"[{self.agent_id}] No PromptRenderer found. Using raw variable dump.")
+            # logger.warning(f"[{self.agent_id}] No PromptRenderer found. Using raw variable dump.")
             return str(variables)
 
     async def safe_run(self, state: PipelineState, dependencies: Dict[str, Any]) -> List[EvidenceItem]:
