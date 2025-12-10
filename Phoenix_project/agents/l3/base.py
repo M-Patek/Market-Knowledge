@@ -23,15 +23,20 @@ class BaseDRLAgent(ABC):
     Now dynamically adapts to the model's observation space.
     """
     
-    def __init__(self, algorithm: Algorithm, policy_id: str = "default_policy"):
+    def __init__(self, algorithm: Algorithm, policy_id: str = "default_policy", context_bus: Any = None, audit_manager: Any = None):
         """
         [任务 4.1] 构造函数现在接收一个已加载的 RLLib 算法实例。
+        [Task 3.3] 增加 context_bus 和 audit_manager 参数支持，以便子类记录决策日志。
         """
         if not isinstance(algorithm, Algorithm):
             raise ValueError(f"Expected ray.rllib.algorithms.algorithm.Algorithm, got {type(algorithm)}")
         self.algorithm = algorithm
         self.policy_id = policy_id # [Beta FIX] Bind to specific policy
         self.logger = get_logger(self.__class__.__name__)
+        
+        # [Task 3.3] Initialize dependencies
+        self.context_bus = context_bus
+        self.audit_manager = audit_manager
         
         # [Beta FIX] Dynamic Dimension Detection
         try:
@@ -45,6 +50,15 @@ class BaseDRLAgent(ABC):
         except Exception as e:
             self.logger.warning(f"Failed to inspect policy or initialize state: {e}. Will attempt adaptive inference.")
             # [Task 2.2 Fix] Non-blocking init
+
+    def set_dependencies(self, context_bus: Any, audit_manager: Any):
+        """
+        [Task 2.3] 允许手动注入核心依赖 (ContextBus, AuditManager)。
+        打破 L3 通信孤岛。
+        """
+        self.context_bus = context_bus
+        self.audit_manager = audit_manager
+        self.logger.info(f"Dependencies injected into {self.__class__.__name__} (Bus: {bool(context_bus)}, Audit: {bool(audit_manager)})")
 
     @abstractmethod
     def _format_obs(self, state_data: dict, fusion_result: Optional[FusionResult], market_state: Optional[Dict[str, Any]] = None) -> np.ndarray:
