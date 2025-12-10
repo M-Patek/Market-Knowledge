@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Dict, AsyncGenerator, List
+from typing import Any, Dict, List, Optional
 
 from Phoenix_project.agents.l1.base import L1Agent, logger
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceSource
@@ -16,21 +16,28 @@ class FundamentalAnalystAgent(L1Agent):
         agent_id: str,
         llm_client: Any,
         data_manager: Any,
-        config: Dict[str, Any] = None
+        prompt_manager: Any = None,
+        audit_manager: Any = None,
+        retriever: Any = None, # [Registry Fix] Must accept retriever
+        **kwargs
     ):
         super().__init__(
             agent_id=agent_id,
+            llm_client=llm_client,
+            data_manager=data_manager,
             role="Fundamental Analyst",
             prompt_template_name="l1_fundamental_analyst",
-            llm_client=llm_client,
-            data_manager=data_manager
+            prompt_manager=prompt_manager,
+            audit_manager=audit_manager,
+            retriever=retriever,
+            **kwargs
         )
-        self.config = config or {}
         logger.info(f"[{self.agent_id}] Initialized.")
 
-    async def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> AsyncGenerator[EvidenceItem, None]:
+    async def run(self, state: PipelineState, dependencies: Dict[str, Any]) -> List[EvidenceItem]:
         """
         [Refactored Phase 3.1] 适配 PipelineState 和 DataManager。
+        [Fix] Changed return type to List[EvidenceItem] and enforce Time Machine.
         """
         symbol = dependencies.get("symbol")
         task_id = dependencies.get("task_id", "unknown_task")
@@ -40,26 +47,29 @@ class FundamentalAnalystAgent(L1Agent):
 
         if not symbol:
             logger.warning(f"[{self.agent_id}] Task {task_id} missing 'symbol'.")
-            return
+            return []
 
         # 1. 获取基本面数据 (通过 DataManager)
+        data_summary = "{}"
         try:
-            # 使用 DataManager 的标准接口获取基本面数据
-            # 注意：get_fundamental_data 可能会返回 None
-            fund_data = await self.data_manager.get_fundamental_data(symbol)
+            # [Time Machine] Pass current_time to prevent future data leakage
+            fund_data = await self.data_manager.get_fundamental_data(symbol, as_of_date=state.current_time)
             
-            if not fund_data:
-                logger.warning(f"[{self.agent_id}] No fundamental data found for {symbol}.")
-                # 即使没有数据，我们也可以让 LLM 基于“无数据”的情况进行推断，或者直接返回
-                # 这里选择跳过，因为没有数据无法进行基本面分析
-                return
-
-            # 序列化数据以供 Prompt 使用
-            data_summary = fund_data.model_dump_json()
+            if fund_data:
+                # 序列化数据以供 Prompt 使用
+                if hasattr(fund_data, 'model_dump_json'):
+                    data_summary = fund_data.model_dump_json()
+                else:
+                    data_summary = json.dumps(fund_data, default=str)
+            else:
+                 logger.warning(f"[{self.agent_id}] No fundamental data found for {symbol} as of {state.current_time}.")
+                 # Continue execution to let LLM say "No Data" or use latent knowledge if allowed,
+                 # but usually better to provide explicit "Missing Data" context.
+                 data_summary = json.dumps({"status": "missing_data", "note": "No fundamental records found."})
 
         except Exception as e:
             logger.error(f"[{self.agent_id}] Error fetching fundamental data: {e}", exc_info=True)
-            return
+            data_summary = json.dumps({"error": str(e)})
 
         # 2. 渲染 Prompt
         prompt_data = {
@@ -69,17 +79,17 @@ class FundamentalAnalystAgent(L1Agent):
         }
 
         try:
-            prompt = self.render_prompt(prompt_data)
+            prompt = await self.render_prompt(prompt_data)
         except Exception as e:
             logger.error(f"[{self.agent_id}] Error rendering prompt: {e}", exc_info=True)
-            return
+            return []
 
         # 3. 调用 LLM
         try:
             llm_response = await self.llm_client.generate(prompt)
         except Exception as e:
             logger.error(f"[{self.agent_id}] Error calling LLM: {e}", exc_info=True)
-            return
+            return []
 
         # 4. 解析结果并生成 Evidence
         try:
@@ -102,18 +112,17 @@ class FundamentalAnalystAgent(L1Agent):
                 headline="Fundamental Analysis Report",
                 content=content,
                 data_source=EvidenceSource.AGENT_ANALYSIS,
-                timestamp=state.current_time.timestamp(), # [Time Machine] 使用仿真时间
+                timestamp=state.current_time.timestamp(), # [Time Machine]
                 tags=["fundamental", "financials", sentiment.lower()],
                 raw_data=response_json
             )
 
             logger.info(f"[{self.agent_id}] Generated evidence for {symbol}")
-            yield evidence
+            return [evidence]
 
         except json.JSONDecodeError:
             logger.warning(f"[{self.agent_id}] JSON Decode failed. Raw: {llm_response}")
-            # Fallback for raw text
-            yield EvidenceItem(
+            evidence = EvidenceItem(
                 agent_id=self.agent_id,
                 task_id=task_id,
                 event_id=event_id,
@@ -125,5 +134,7 @@ class FundamentalAnalystAgent(L1Agent):
                 tags=["fundamental", "raw", "error"],
                 raw_data={"raw_text": llm_response}
             )
+            return [evidence]
         except Exception as e:
             logger.error(f"[{self.agent_id}] Error processing response: {e}", exc_info=True)
+            return []
