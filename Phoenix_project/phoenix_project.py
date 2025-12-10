@@ -75,187 +75,24 @@ class PhoenixProject:
         self.systems = self._create_main_systems(self.services)
 
     def _create_services(self, config: DictConfig) -> Dict[str, Any]:
-        logger.info("Initializing core services...")
+        logger.info("Initializing core services via Registry...")
         
-        # --- 1. 基础管理器与工具 (Managers & Utils) ---
-        # [Task 8] Use Factory for Infrastructure
-        common_services = PhoenixFactory.create_common_services(config)
-        redis_client = common_services["redis_client"]
-        context_bus = common_services["context_bus"]
-        prompt_manager = common_services["prompt_manager"]
-        prompt_renderer = common_services["prompt_renderer"]
-        gemini_manager = common_services["gemini_manager"]
-
-        # [Fix IV.1] 全局 Registry (用于 V2 智能体)
-        global_registry = Registry()
-
-        # --- 2. API 客户端与 LLM (Clients & LLM) ---
-        # [Fix IV.1] 直接从 env 获取 API 密钥
-        gemini_api_key_list = os.environ.get("GEMINI_API_KEYS", "").split(',')
-        gemini_api_key = gemini_api_key_list[0].strip() if gemini_api_key_list else None
-        if not gemini_api_key:
-            logger.warning("GEMINI_API_KEYS 未在 .env 中设置！EmbeddingClient 可能失败。")
-
-        # [RAG] (RAG) 嵌入客户端 (Embedding Client)
-        embedding_client = EmbeddingClient(
-            provider=config.api_gateway.embedding_model.provider,
-            model_name=config.api_gateway.embedding_model.model_name,
-            api_key=gemini_api_key # [Fix IV.1]
-        )
-    
-        # (RAG) 搜索工具 (Search Tool)
-        search_client = GeminiSearchAdapter(gemini_manager=gemini_manager)
-        logger.info("Search Client: Switched to Gemini Grounding Adapter (Google Search).")
-    
-        # (RAG) LLM 客户端 (Ensemble Client)
-        ensemble_client = EnsembleClient(
-           gemini_manager=gemini_manager,
-           prompt_manager=prompt_manager,
-           agent_registry=config.l1_agents, 
-           global_registry=global_registry
-        )
-
-        # --- 3. 数据库和内存 (Databases & Memory) ---
-    
-        # (RAG) 向量存储 (Vector Store)
-        vector_store_client = VectorStore(
-            config=config.memory.vector_store,
-            embedding_client=embedding_client
-        )
-    
-        # (RAG) 知识图谱 (Knowledge Graph)
-        graph_db_client = GraphDBClient()
-    
-        # (RAG) 表格数据库 (Tabular DB)
-        tabular_db_client = TabularDBClient(
-            db_uri=config.data_manager.tabular_db.uri, # Explicitly pass URI
-            config=config.data_manager.tabular_db, 
-            llm_client=gemini_manager, 
-            prompt_manager=prompt_manager, 
-            prompt_renderer=prompt_renderer
-        )
-    
-        # (RAG) 时序数据库 (Temporal DB)
-        temporal_db_client = TemporalDBClient(config=config.data_manager.temporal_db)
-    
-        # (CoT) 审计/思维链数据库 (Audit/CoT Database)
-        cot_db_client = CoTDatabase(config=config.memory.cot_database)
-
-        # --- 4. 核心 AI 组件 (Core AI Components) ---
+        # [Task 3.2] Activate Agent Loading via Registry
+        # 1. Initialize Registry (Builds Core Infrastructure)
+        self.registry = Registry(config)
         
-        # (RAG) 数据管理器 (Data Manager) - [Task 4.2] Moved to services to inject into OrderManager
-        # [Task 2.3] Retrieve session_id if available (e.g. from env or args) - Default to None for live
-        session_id = os.environ.get("PHOENIX_SESSION_ID") 
-        data_manager = DataManager(
-            config_loader=ConfigLoader(os.environ.get('PHOENIX_CONFIG_PATH', 'config')), # Pass wrapper or just config if modified
-            # Actually DataManager expects ConfigLoader as per previous file definition
-            redis_client=redis_client,
-            # tabular_db, temporal_db initialized inside DataManager based on ConfigLoader...
-            # Wait, our modified DataManager takes ConfigLoader and RedisClient.
-            # It initializes DBs internally. Let's stick to that pattern or update if needed.
-            # Assuming DataManager constructor is consistent with data_manager.py
-        )
-        # Note: If DataManager constructs its own DB clients, we might have duplicate connections.
-        # Ideally, we should inject DB clients into DataManager.
-        # But based on data_manager.py provided earlier, it inits them. 
-        # For this final output, we assume consistency with the provided data_manager.py.
-    
-        # (RAG) 关系提取器 (Relation Extractor)
-        relation_extractor = RelationExtractor(
-            api_gateway=config.api_gateway, # Need adapter? RelationExtractor uses api_gateway and prompt_manager
-            prompt_manager=prompt_manager
-        )
-
-        # (RAG) 数据适配器 (Data Adapter)
-        data_adapter = DataAdapter()
-
-        # [GNN Plan Task 1.3] Instantiate GNNInferencer Service
-        gnn_model_path = config.ai_components.gnn.model_path if 'gnn' in config.ai_components else '/app/models/default_gnn'
-        gnn_inferencer_service = GNNInferencer(model_path=gnn_model_path)
-
-        # (RAG) 检索器 (Retriever)
-        retriever = Retriever(
-            vector_store=vector_store_client,
-            graph_db=graph_db_client,
-            temporal_db=temporal_db_client,
-            tabular_db=tabular_db_client,
-            search_client=search_client, 
-            ensemble_client=ensemble_client,
-            config=config.ai_components.retriever, 
-            gnn_inferencer=gnn_inferencer_service,
-            prompt_manager=prompt_manager,
-            prompt_renderer=prompt_renderer
-        )
-
-        # L1 智能体执行器 (L1 Agent Executor)
-        agent_executor = AgentExecutor(
-            agent_list=[], # Populate via registry loading if needed
-            context_bus=context_bus,
-            config=config
-        )
-
-        # --- 5. 核心逻辑引擎 (Core Logic Engines) ---
-    
-        # (L2) 认知引擎 (Cognitive Engine)
-        cognitive_engine = CognitiveEngine(
-            agent_executor=agent_executor,
-            reasoning_ensemble=None, # Will be set below due to circular dep or constructed here
-            fact_checker=None, # Placeholder
-            uncertainty_guard=None, # Placeholder
-            voter=Voter(llm_client=ensemble_client),
-            config=config.get("cognitive_engine", {})
-        )
+        # 2. Build System (Agents, Engines, Orchestrator)
+        sys_ctx = self.registry.build_system(config)
         
-        # [Task 3.3] Instantiate L2/Eval components properly
-        fusion_agent = FusionAgent(agent_id="l2_fusion", llm_client=ensemble_client)
-        fact_checker = FactChecker(llm_client=ensemble_client, prompt_manager=prompt_manager, prompt_renderer=prompt_renderer)
-        arbitrator = Arbitrator(llm_client=ensemble_client)
-        from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
-        uncertainty_guard = UncertaintyGuard() # Config injected inside or default
-
-        reasoning_ensemble = ReasoningEnsemble(
-            prompt_manager=prompt_manager,
-            gemini_pool=gemini_manager,
-            voter=Voter(llm_client=ensemble_client),
-            retriever=retriever,
-            ensemble_client=ensemble_client,
-            metacognitive_agent=None, # Optional
-            arbitrator=arbitrator,
-            fact_checker=fact_checker,
-            data_manager=data_manager # [Task 3.3] Inject DataManager
-        )
+        # --- 3. Instantiate Remaining L3/Execution Components (Not yet in Registry) ---
         
-        # Wiring Cognitive Engine
-        cognitive_engine.reasoning_ensemble = reasoning_ensemble
-        cognitive_engine.fact_checker = fact_checker
-        cognitive_engine.uncertainty_guard = uncertainty_guard
-    
-        # (L3) 风险管理器 (Risk Manager)
-        initial_capital = config.trading.get('initial_capital', 100000.0)
-        risk_manager = RiskManager(
-            config=config.trading, # Or specific risk config dict
-            redis_client=redis_client,
-            data_manager=data_manager, # [Task 5] Inject DataManager for warm-up
-            initial_capital=initial_capital
-        ) 
-    
-        # (L3) 投资组合构建器 (Portfolio Constructor)
-        # Sizing Strategy
-        from Phoenix_project.sizing.fixed_fraction import FixedFractionSizer
-        sizing_strategy = FixedFractionSizer(fraction_per_position=0.05)
-
-        portfolio_constructor = PortfolioConstructor(
-            config=config, # Pass full config or subsection
-            context_bus=context_bus,
-            risk_manager=risk_manager,
-            sizing_strategy=sizing_strategy, 
-            data_manager=data_manager
-        )
-
         # (L3) 交易生命周期管理器 (Trade Lifecycle Manager)
+        # Registry initializes this as None in Orchestrator, so we create and inject it here.
+        initial_capital = config.trading.get('initial_capital', 100000.0)
         trade_lifecycle_manager = TradeLifecycleManager(
             initial_cash=initial_capital,
-            tabular_db=tabular_db_client # [Task 4.1] Inject DB for persistence
+            tabular_db=self.registry.container.tabular_db, # Use container's DB
+            bus=sys_ctx.context_bus
         )
 
         # (L3) 券商适配器 (Broker Adapter)
@@ -263,90 +100,77 @@ class PhoenixProject:
             config=config.broker
         )
 
-        # (L3) 订单管理器 (Order Manager)
-        order_manager = OrderManager(
-            broker=broker_adapter,
-            trade_lifecycle_manager=trade_lifecycle_manager,
-            data_manager=data_manager # [Task 4.2] Inject DataManager
-        )
-    
-        # (L3) 核心 DRL 智能体 (Core DRL Agents)
-        alpha_agent = AlphaAgent(config=config.agents.l3.alpha) if 'agents' in config and 'l3' in config.agents else None
-        risk_agent = RiskAgent(config=config.agents.l3.risk) if 'agents' in config and 'l3' in config.agents else None
-        execution_agent = ExecutionAgent(config=config.agents.l3.execution) if 'agents' in config and 'l3' in config.agents else None
+        # [Injection Fix] Patch Registry-created instances with missing dependencies
+        if sys_ctx.order_manager:
+            sys_ctx.order_manager.broker = broker_adapter
+            sys_ctx.order_manager.tlm = trade_lifecycle_manager
+            # Ensure bus is set if OrderManager init didn't (Registry might have updated)
+            if not sys_ctx.order_manager.bus:
+                 sys_ctx.order_manager.bus = sys_ctx.context_bus
 
-        # --- (L3) 创建 Orchestrator 依赖 (Task 6) ---
-        # [Phase 0 Fix] Inject redis_client
-        event_distributor = EventDistributor(redis_client=redis_client) 
-        
-        event_filter = EventRiskFilter(
-            config=config.events.risk_filter 
-        )
-        
-        market_state_predictor = MarketStatePredictor(
-            llm_client=ensemble_client
-        )
+        if sys_ctx.orchestrator:
+            sys_ctx.orchestrator.trade_lifecycle_manager = trade_lifecycle_manager
+            # Orchestrator already has order_manager from Registry
 
-        logger.info("Core services initialized.")
+        logger.info("Core services initialized and wired.")
+        
+        # Return dictionary matching expected structure + Registry context
         return {
             "config": config,
-            "redis_client": redis_client,
-            "context_bus": context_bus,
-            "data_manager": data_manager, # [Task 4.2] Return data_manager
-            "gemini_manager": gemini_manager,
-            "embedding_client": embedding_client,
-            "ensemble_client": ensemble_client,
-            "vector_store": vector_store_client,
-            "graph_db": graph_db_client,
-            "tabular_db": tabular_db_client,
-            "temporal_db": temporal_db_client,
-            "cot_db": cot_db_client,
-            "prompt_manager": prompt_manager,
-            "prompt_renderer": prompt_renderer,
-            "data_adapter": data_adapter,
-            "relation_extractor": relation_extractor,
-            "retriever": retriever,
-            "gnn_inferencer": gnn_inferencer_service,
-            "agent_executor": agent_executor,
-            "cognitive_engine": cognitive_engine,
-            "risk_manager": risk_manager,
-            "portfolio_constructor": portfolio_constructor,
-            "order_manager": order_manager,
+            "registry": self.registry,
+            "sys_ctx": sys_ctx, # Pass full context
+            
+            # Map specific keys expected by legacy methods
+            "context_bus": sys_ctx.context_bus,
+            "redis_client": self.registry.container.data_manager.redis_client,
+            "data_manager": sys_ctx.data_manager,
+            "gemini_manager": self.registry.container.gemini_manager,
+            
+            # Clients
+            "ensemble_client": self.registry.container.ensemble_client,
+            "embedding_client": self.registry.container.embedding_client,
+            
+            # DBs
+            "vector_store": self.registry.container.vector_store,
+            "graph_db": self.registry.container.graph_db_client,
+            "tabular_db": self.registry.container.tabular_db,
+            "cot_db": self.registry.container.cot_database,
+            
+            # Engines & Managers
+            "agent_executor": getattr(sys_ctx, 'agent_executor', None), # Should be in sys_ctx
+            "cognitive_engine": sys_ctx.cognitive_engine,
+            "risk_manager": sys_ctx.risk_manager,
+            "order_manager": sys_ctx.order_manager,
             "trade_lifecycle_manager": trade_lifecycle_manager,
             "broker_adapter": broker_adapter,
-            "event_distributor": event_distributor,
-            "event_filter": event_filter,
-            "reasoning_ensemble": reasoning_ensemble,
-            "market_state_predictor": market_state_predictor,
-            "alpha_agent": alpha_agent,
-            "risk_agent": risk_agent,
-            "execution_agent": execution_agent
+            "audit_manager": sys_ctx.audit_manager,
+            
+            # Event components
+            "event_distributor": sys_ctx.event_distributor,
+            "event_filter": getattr(sys_ctx, 'event_filter', None), # Check Registry output
+            
+            # Agents (Optional mapping)
+            "alpha_agent": sys_ctx.l3_agents.get("alpha"),
+            "risk_agent": sys_ctx.l3_agents.get("risk"),
+            "execution_agent": sys_ctx.l3_agents.get("execution"),
+
+            # [Fix Attribute Error] Explicitly provide data_adapter
+            "data_adapter": self.registry.container.data_adapter,
         }
 
     def _create_main_systems(self, services: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("Initializing main systems...")
-    
-        # [修复 喵!] 审计管理器必须在 Orchestrator 之前创建
-        audit_manager = AuditManager(cot_db=services["cot_db"])
+        
+        # [Fix] Use Orchestrator from Registry (via services)
+        sys_ctx = services.get("sys_ctx")
+        if sys_ctx and hasattr(sys_ctx, "orchestrator") and sys_ctx.orchestrator:
+            orchestrator = sys_ctx.orchestrator
+        else:
+            # Fallback (Should not happen if Registry works)
+            logger.warning("Orchestrator not found in Registry context. Creating manually (Deprecated path).")
+            raise RuntimeError("Registry failed to build Orchestrator.")
 
-        # (L3) 编排器 (Orchestrator)
-        orchestrator = Orchestrator(
-            config=services["config"],
-            context_bus=services["context_bus"], # [Task 2.3] Inject ContextBus
-            data_manager=services["data_manager"], # [Task 4.2] Injected from services
-            cognitive_engine=services["cognitive_engine"],
-            event_distributor=services["event_distributor"],
-            event_filter=services["event_filter"],
-            market_state_predictor=services["market_state_predictor"],
-            portfolio_constructor=services["portfolio_constructor"],
-            order_manager=services.get("order_manager"), 
-            audit_manager=audit_manager,
-            trade_lifecycle_manager=services["trade_lifecycle_manager"],
-            alpha_agent=services["alpha_agent"],
-            risk_agent=services["risk_agent"],
-            risk_manager=services["risk_manager"], # [Phase II Fix] Inject RiskManager
-            execution_agent=services["execution_agent"]
-        )
+        audit_manager = services["audit_manager"]
 
         # (L0/L1/L2) 循环管理器 (Loop Manager)
         loop_manager = LoopManager(
@@ -359,9 +183,10 @@ class PhoenixProject:
         knowledge_injector = KnowledgeInjector(
             vector_store=services["vector_store"],
             graph_db=services["graph_db"],
-            data_adapter=services["data_adapter"],
-            relation_extractor=services["relation_extractor"],
-            data_manager=services["data_manager"] # [Task 4.2] Use from services
+            # [Fix] Use data_adapter from services directly
+            data_adapter=services.get("data_adapter"),
+            relation_extractor=services.get("relation_extractor") or getattr(sys_ctx, "knowledge_graph_service", None).relation_extractor,
+            data_manager=services["data_manager"]
         )
 
         logger.info("Main systems initialized.")
@@ -482,11 +307,41 @@ class PhoenixProject:
                 self.systems["loop_manager"].stop_loop()
 
             if hasattr(self, 'services'):
+                # [Task 1.4] Unify Resource Cleanup
+                
+                # 1. Close DataManager (Handles its own DB connections)
+                if "data_manager" in self.services and hasattr(self.services["data_manager"], "close"):
+                    try:
+                        dm_close = self.services["data_manager"].close
+                        if asyncio.iscoroutinefunction(dm_close):
+                            await dm_close()
+                        else:
+                            dm_close()
+                        logger.info("DataManager closed.")
+                    except Exception as e:
+                        logger.error(f"Error closing DataManager: {e}")
+
+                # 2. Close GraphDB
                 if "graph_db" in self.services and hasattr(self.services["graph_db"], "close"):
-                    await self.services["graph_db"].close() # If async
-                    pass
+                    try:
+                        gdb_close = self.services["graph_db"].close
+                        if asyncio.iscoroutinefunction(gdb_close):
+                            await gdb_close()
+                        else:
+                            gdb_close()
+                    except Exception as e:
+                        logger.error(f"Error closing GraphDB: {e}")
+
+                # 3. Close TabularDB (Standalone)
                 if "tabular_db" in self.services and hasattr(self.services["tabular_db"], "close"):
-                    self.services["tabular_db"].close() # It's synchronous or has internal handling
+                    try:
+                        tdb_close = self.services["tabular_db"].close
+                        if asyncio.iscoroutinefunction(tdb_close):
+                            await tdb_close()
+                        else:
+                            tdb_close()
+                    except Exception as e:
+                        logger.error(f"Error closing TabularDB: {e}")
 
             # Wait a moment for threads to join if necessary
             await asyncio.sleep(1)
