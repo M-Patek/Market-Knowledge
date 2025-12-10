@@ -29,11 +29,13 @@ class OrderManager:
         self, 
         broker: IBrokerAdapter, 
         trade_lifecycle_manager: TradeLifecycleManager,
-        data_manager: DataManager
+        data_manager: DataManager,
+        bus: Any = None # [Task 1.2] Inject ContextBus
     ):
         self.broker = broker
         self.tlm = trade_lifecycle_manager
         self.data_manager = data_manager
+        self.bus = bus
         
         # 内部跟踪: symbol -> order_id (防止对同一标的重复下单)
         # 也可以是 order_id -> Order object
@@ -42,10 +44,8 @@ class OrderManager:
         
         # [Task 3.3] Subscribe to Broker Updates
         # Ensure we listen to Status Updates (Canceled, Rejected, etc.) AND Fills
-        self.broker.subscribe_order_status(self.on_order_update)
-        # Fills might be handled by TLM, but we also subscribe here if needed 
-        # or rely on status updates 'filled' event. 
-        # Usually 'filled' event comes through order status stream too.
+        if self.broker:
+            self.broker.subscribe_order_status(self.on_order_update)
         
         # Connect explicitly if needed (Broker might handle lazy connect)
         # asyncio.create_task(self.broker.connect()) # Moved to Orchestrator or explicit start
@@ -103,13 +103,38 @@ class OrderManager:
                     # Handle 'replaced' logic specifically if needed?
                     # For now, we assume Orchestrator will issue new orders if needed.
 
-            # Pass 'fill' events to TradeLifecycleManager for Ledger recording
+            # [Task 1.2] Pass 'fill' events to TradeLifecycleManager and Publish Event
             if event == 'fill' or event == 'partial_fill':
-                # Convert to execution report format if needed by TLM
-                # But typically TLM subscribes to fills directly via adapter.
-                # If TLM is not subscribed, we could forward here.
-                # Assuming TLM handles its own subscription or we notify it.
-                pass 
+                # Extract fill details
+                filled_qty = getattr(order_data, 'filled_qty', 0) or order_data.get('filled_qty', 0)
+                filled_avg_price = getattr(order_data, 'filled_avg_price', 0) or order_data.get('filled_avg_price', 0)
+                
+                payload = {
+                    "symbol": symbol,
+                    "order_id": order_id,
+                    "status": event,
+                    "filled_qty": float(filled_qty),
+                    "filled_avg_price": float(filled_avg_price),
+                    "timestamp": datetime.now().isoformat()
+                }
+
+                # 1. Notify Ledger (TLM)
+                if self.tlm:
+                    await self.tlm.on_fill(payload) # Assuming payload matches expected Fill format or TLM adapts
+                
+                # 2. Publish to Bus
+                if self.bus:
+                    await self.bus.publish("ORDER_FILLED", payload)
+
+            # Publish Failure Events
+            elif event in {'canceled', 'rejected', 'expired', 'failed'}:
+                if self.bus:
+                    await self.bus.publish("ORDER_FAILED", {
+                        "symbol": symbol,
+                        "order_id": order_id,
+                        "status": event,
+                        "timestamp": datetime.now().isoformat()
+                    })
 
         except Exception as e:
             logger.error(f"Error processing order update: {e}", exc_info=True)
@@ -127,6 +152,10 @@ class OrderManager:
         
         # 1. Get Current Positions (from Broker or Ledger)
         # Using Broker for execution accuracy
+        if not self.broker:
+             logger.warning("No broker adapter configured. Skipping reconciliation.")
+             return
+
         account_info = self.broker.get_account_info()
         if account_info.get("status") == "error":
             logger.error(f"Cannot reconcile: {account_info.get('message')}")
