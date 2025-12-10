@@ -36,14 +36,14 @@ class DataManager:
         
         # [Fix Task 1] Dependency Injection to prevent Double Connection Pool
         # Use injected clients or fallback to lazy instantiation (only if not provided)
-        if tabular_db:
+        if tabular_db is not None:
             self.tabular_db = tabular_db
         else:
             # Fallback for tests/legacy
             from Phoenix_project.ai.tabular_db_client import TabularDBClient
             self.tabular_db = TabularDBClient(self.config.get("data_manager", {}).get("tabular_db", {}))
 
-        if temporal_db:
+        if temporal_db is not None:
             self.temporal_db = temporal_db
         else:
             from Phoenix_project.ai.temporal_db_client import TemporalDBClient
@@ -256,8 +256,16 @@ class DataManager:
     async def close(self):
         # [Fix Task 3] Resource Cleanup
         if self.tabular_db and hasattr(self.tabular_db, 'close'):
-            await self.tabular_db.close()
+            # Check if async
+            if asyncio.iscoroutinefunction(self.tabular_db.close):
+                await self.tabular_db.close()
+            else:
+                self.tabular_db.close()
+        
         if self.temporal_db and hasattr(self.temporal_db, 'close'):
-            await self.temporal_db.close()
+            if asyncio.iscoroutinefunction(self.temporal_db.close):
+                await self.temporal_db.close()
+            else:
+                self.temporal_db.close()
         # Note: Redis client is usually managed externally (Registry), but close if owned?
         # Typically we leave Redis close to the creator.
