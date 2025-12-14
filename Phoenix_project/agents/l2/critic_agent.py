@@ -6,6 +6,8 @@ from Phoenix_project.agents.l2.base import L2Agent
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 from Phoenix_project.core.schemas.critic_result import CriticResult
 from Phoenix_project.core.pipeline_state import PipelineState
+# [Task FIX-MED-002] Import utility
+from Phoenix_project.utils import extract_json_from_text
 from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
@@ -61,7 +63,13 @@ class CriticAgent(L2Agent):
                 return [self._create_fallback_result(state, target_symbol, "LLM returned empty response.")]
 
             # 4. 解析结果
-            response_data = json.loads(response_str)
+            # [Task FIX-MED-002] Robust JSON Extraction
+            clean_json_str = extract_json_from_text(response_str)
+            try:
+                response_data = json.loads(clean_json_str)
+            except json.JSONDecodeError as e:
+                logger.error(f"[{self.agent_id}] JSON Decode Failed: {e}. Raw: {response_str[:100]}...")
+                return [self._create_fallback_result(state, target_symbol, f"JSON Error: {e}")]
             
             if "timestamp" not in response_data:
                 response_data["timestamp"] = state.current_time
