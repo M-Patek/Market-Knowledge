@@ -32,6 +32,7 @@ class APIServer:
     """
     Provides an external API interface (e.g., REST) for the system.
     [Phase IV Fix] Dynamic Event Loop retrieval to fix scheduling crashes.
+    [Task FIX-CRIT-003] Injected Main Loop for Thread Safety
     """
 
     def __init__(
@@ -41,6 +42,7 @@ class APIServer:
         context_bus: ContextBus,
         logger: ESLogger,
         audit_viewer: Any, 
+        main_loop: asyncio.AbstractEventLoop # [Task FIX-CRIT-003] Injected Main Loop
     ):
         self.app = Flask(__name__, template_folder='../templates')
         CORS(self.app)  
@@ -56,7 +58,8 @@ class APIServer:
         self.logger = logger
         self.audit_viewer = audit_viewer
         self.executor = ThreadPoolExecutor(max_workers=5)
-        # [Phase IV Fix] Removed self.main_loop assignment here
+        # [Task FIX-CRIT-003] Store the main loop for thread-safe scheduling
+        self.main_loop = main_loop
         
         self._register_routes()
         self.logger.log_info(f"APIServer initialized. Will run on {self.host}:{self.port}")
@@ -93,18 +96,20 @@ class APIServer:
                 return jsonify({"error": "Invalid payload", "details": e.errors()}), 400
 
             try:
-                # [Phase IV Fix] Get running loop dynamically
-                loop = asyncio.get_running_loop()
+                # [Task FIX-CRIT-003] Use injected main_loop for thread safety
+                if not self.main_loop or self.main_loop.is_closed():
+                     self.logger.log_error("Main event loop is closed or unavailable.")
+                     return jsonify({"error": "System shutting down"}), 503
+
                 future = asyncio.run_coroutine_threadsafe(
                     self.context_bus.publish("external_events", event_data.model_dump()),
-                    loop
+                    self.main_loop
                 )
                 future.result(timeout=5)  
                 
                 self.logger.log_info(f"Successfully injected event from source: {event_data.source}")
                 return jsonify({"status": "event_received", "event_id": event_data.metadata.get("event_id", "N/A") if event_data.metadata else "N/A"}), 202
             except RuntimeError:
-                 # If we are in a thread without a loop (unlikely given startup), fall back
                  self.logger.log_error("No running event loop found for inject_event.")
                  return jsonify({"error": "System not ready (No Event Loop)"}), 503
             except Exception as e:
@@ -139,24 +144,13 @@ class APIServer:
         Fetches the current system status from the ContextBus.
         """
         try:
-            # [Phase IV Fix] Get running loop dynamically
-            # Note: This might raise RuntimeError if called from a thread without an event loop set.
-            # However, APIServer is typically running alongside the main loop.
-            # If Uvicorn runs in a separate thread, get_running_loop might fail if not checked.
-            # Robustness fix: Try getting loop, else return static status
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                # If we are in a pure thread (e.g. Uvicorn worker thread), we can't access main loop easily 
-                # unless we passed it.
-                # BUT, since we run via threadsafe, we assume there IS a main loop somewhere.
-                # We need a reference to it if we aren't IN it. 
-                # For now, we assume simple status.
-                return {"status": "RUNNING (Async context unavailable)"}
+            # [Task FIX-CRIT-003] Use injected main_loop
+            if not self.main_loop:
+                 return {"status": "RUNNING (Async context unavailable)"}
 
             future = asyncio.run_coroutine_threadsafe(
                 self.context_bus.get_status(),
-                loop
+                self.main_loop
             )
             return future.result(timeout=2)
         except Exception as e:
@@ -184,8 +178,5 @@ class APIServer:
     async def stop(self):
         """
         [Phase IV Fix] Graceful Shutdown Stub.
-        Uvicorn server.run is blocking in the thread, so stopping requires server.should_exit = True
-        if we had access to the server instance. Since we create it inside run(), 
-        external stop is harder. For now, daemon thread handles exit on main process death.
         """
         pass
