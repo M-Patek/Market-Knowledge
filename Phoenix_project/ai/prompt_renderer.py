@@ -2,14 +2,18 @@
 Phoenix_project/ai/prompt_renderer.py
 [Task B.3] Removed string.Template
 [Task 1.5] Security: Prompt Injection Defense (Escaping & XML Tagging).
+[Task 3.3] Time Context Injection.
 """
 import json
 import os
 import html
-from typing import Dict, Any, Union, List
+from typing import Dict, Any, Union, List, Optional
+from datetime import datetime, timezone
 
 from Phoenix_project.ai.prompt_manager import PromptManager
 from Phoenix_project.monitor.logging import get_logger
+# [Task 3.3] Optional TimeProvider import (to avoid circular deps, use type checking only or lazy)
+# from Phoenix_project.core.time_provider import TimeProvider
 
 logger = get_logger(__name__)
 
@@ -19,14 +23,16 @@ class PromptRenderer:
     Includes security mechanisms to prevent Prompt Injection.
     """
     
-    def __init__(self, prompt_manager: PromptManager):
+    def __init__(self, prompt_manager: PromptManager, time_provider: Any = None):
         """
         Initializes the PromptRenderer.
         
         Args:
             prompt_manager: An instance of PromptManager to load templates.
+            time_provider: Optional TimeProvider to inject current_time automatically.
         """
         self.prompt_manager = prompt_manager
+        self.time_provider = time_provider # [Task 3.3]
         logger.info("PromptRenderer initialized.")
 
     def render(
@@ -38,6 +44,7 @@ class PromptRenderer:
         [任务 B.3] Implemented.
         Renders a prompt template by name, filling placeholders with context.
         [Task 1.5] Applies security sanitization to context data.
+        [Task 3.3] Injects current_time if available.
         """
         logger.debug(f"Rendering prompt '{prompt_name}'...")
         
@@ -45,10 +52,18 @@ class PromptRenderer:
             # 1. 获取原始模板
             template_data = self.prompt_manager.get_prompt(prompt_name)
             
-            # [Task 1.5] PromptManager now raises exception, but double check doesn't hurt
             if not template_data:
                 raise KeyError(f"Prompt template '{prompt_name}' returned empty data.")
             
+            # [Task 3.3] Auto-inject time if missing
+            if 'current_time' not in context:
+                if self.time_provider:
+                    current_time = self.time_provider.get_current_time()
+                    context['current_time'] = current_time.isoformat()
+                else:
+                    # Fallback to system time (UTC) if no provider
+                    context['current_time'] = datetime.now(timezone.utc).isoformat()
+
             # 2. [Security] Sanitize Context (Defense against Injection)
             safe_context = self._sanitize_context(context)
 
@@ -73,11 +88,13 @@ class PromptRenderer:
         """
         sanitized = {}
         for k, v in context.items():
+            # [Task 3.3] Skip sanitization for trusted system variables like 'current_time'
+            if k in ['current_time']:
+                sanitized[k] = v
+                continue
+
             if isinstance(v, str):
-                # Escape chars like <, >, &, " to prevent breaking XML/JSON structure
                 escaped_val = html.escape(v)
-                # Encapsulate to prevent instruction override
-                # Note: We apply this to ALL string inputs from context as they are considered untrusted
                 sanitized[k] = f"<user_content>{escaped_val}</user_content>"
             elif isinstance(v, dict):
                 sanitized[k] = self._sanitize_context(v)
@@ -99,35 +116,29 @@ class PromptRenderer:
         """
         Helper function to recursively render parts of a prompt structure.
         """
-        # Case 1: 模板部分是字符串 -> 渲染它
         if isinstance(template_part, str):
             try:
                 # [Fix B.4] Switch to .format() 
                 return template_part.format(**context)
             except KeyError as e:
-                # [Robustness] Log missing key but keep running if possible, or re-raise?
-                # Task says "Fail-Fast" for loading, but for rendering partial might be dangerous.
-                # Let's fail fast to warn developer about mismatch.
+                # Log but re-raise to fail fast
                 logger.error(f"Missing context variable during rendering: {e}")
                 raise
             except Exception as e:
                 logger.warning(f"Error substituting template string: {e}")
-                raise # Re-raise to prevent silent failure
+                raise
 
-        # Case 2: 模板部分是字典 -> 递归渲染它的值
         elif isinstance(template_part, dict):
             rendered_dict = {}
             for key, value in template_part.items():
                 rendered_dict[key] = self._render_recursive(value, context)
             return rendered_dict
 
-        # Case 3: 模板部分是列表 -> 递归渲染它的项
         elif isinstance(template_part, list):
             rendered_list = []
             for item in template_part:
                 rendered_list.append(self._render_recursive(item, context))
             return rendered_list
 
-        # Case 4: 其他类型 (int, bool, etc.) -> 按原样返回
         else:
             return template_part
