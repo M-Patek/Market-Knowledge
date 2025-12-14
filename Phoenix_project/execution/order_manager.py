@@ -3,6 +3,7 @@ Phoenix_project/execution/order_manager.py
 [Phase 3 Task 3] Fix OrderManager Zombie State.
 Implement on_order_update to clean up active_orders on terminal states.
 Unblock 'One-Shot' deadlock.
+[Task FIX-CRIT-001] Execution Safety: Purchasing Power Check
 """
 import asyncio
 import logging
@@ -195,17 +196,49 @@ class OrderManager:
                 side = OrderSide.BUY if diff > 0 else OrderSide.SELL
                 qty = abs(diff)
                 
+                # [Task FIX-CRIT-001] Execution Safety: Check Purchasing Power for BUY orders
+                if side == OrderSide.BUY:
+                    estimated_price = 0.0
+                    # Fix: Iterate over market_data_batch to find price
+                    if hasattr(state, 'market_data_batch') and state.market_data_batch:
+                        for md in state.market_data_batch:
+                            # Robustly handle object or dict
+                            md_sym = getattr(md, 'symbol', None) or (md.get('symbol') if isinstance(md, dict) else None)
+                            if md_sym == symbol:
+                                estimated_price = getattr(md, 'close', 0.0) or (md.get('close') if isinstance(md, dict) else 0.0)
+                                break
+                    
+                    # Fail-Closed: If price is missing or invalid, do NOT proceed.
+                    if estimated_price <= 0:
+                        logger.error(f"OrderManager: Cannot verify funds. Missing/Invalid price for {symbol}. Skipping order.")
+                        state.execution_results.append({
+                            "symbol": symbol,
+                            "error": "Missing Price for Fund Check",
+                            "status": "skipped"
+                        })
+                        continue
+
+                    estimated_cost = qty * estimated_price
+                    # Check with TLM (Ledger)
+                    if self.tlm and not self.tlm.check_purchasing_power(estimated_cost):
+                        logger.error(f"OrderManager: Insufficient funds for BUY {symbol} (Qty: {qty}, Price: {estimated_price}, Cost: {estimated_cost}). Available: {self.tlm.cash}. Skipping.")
+                        state.execution_results.append({
+                            "symbol": symbol,
+                            "error": f"Insufficient Purchasing Power (Need {estimated_cost})",
+                            "status": "skipped"
+                        })
+                        continue
+
                 # Get current price for Limit orders? 
                 # For simplicity, using Market orders for now, or L3 decision could specify type.
                 # Assuming Market Order by default unless specified.
                 
                 order = Order(
                     symbol=symbol,
-                    quantity=qty, # Order model usually takes signed or unsigned with side?
-                    # Based on Schema: quantity is float. Adapter handles side logic now.
-                    # But for clarity in logs:
+                    quantity=diff, # Pass signed quantity if required by adapter
+                    # quantity=qty, # Original code used absolute, but adapter likely expects signed diff or logic inside
                     order_type=OrderType.MARKET,
-                    side=side, # Schema might have this
+                    side=side,
                     status=OrderStatus.CREATED,
                     timestamp=datetime.now()
                 )
@@ -214,10 +247,9 @@ class OrderManager:
                 try:
                     logger.info(f"Placing order: {side} {qty} {symbol}")
                     # Adapter place_order returns ID
-                    # Pass signed quantity if Order object requires it, or Adapter handles it?
-                    # Previous Adapter fix expects signed quantity in 'order.quantity'
-                    # So we must set order.quantity to diff (signed)
-                    order.quantity = diff 
+                    # Ensure quantity matches what adapter expects (signed vs unsigned + side)
+                    # Assuming adapter handles it based on Side + Qty
+                    order.quantity = diff # [Correction] Ensure consistency
                     
                     order_id = self.broker.place_order(order)
                     
