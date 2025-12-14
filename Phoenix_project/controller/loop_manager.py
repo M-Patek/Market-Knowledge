@@ -1,12 +1,13 @@
 """
 Phoenix_project/controller/loop_manager.py
 [Phase 4 Task 1] Fix Backtest Loop Data Injection & Time Machine.
+[Task 2.2] TimeProvider Synchronization.
 """
 import asyncio
 import logging
 import time
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 from omegaconf import DictConfig
 
 from Phoenix_project.controller.orchestrator import Orchestrator
@@ -93,6 +94,7 @@ class LoopManager:
         Backtest execution loop.
         [Fix] Injects data directly into Orchestrator to bypass Redis.
         [Fix] Time Machine: Syncs PipelineState time with historical data.
+        [Task 2.2] Sync TimeProvider.
         """
         if not self.data_iterator:
             logger.critical("Backtest mode requires a DataIterator.")
@@ -109,7 +111,7 @@ class LoopManager:
                 
             try:
                 # [Time Machine] 1. Extract timestamp from batch
-                current_step_time = datetime.now() # Fallback
+                current_step_time = datetime.now(timezone.utc) # Fallback
                 
                 # Check typical list of dicts structure
                 if batch and isinstance(batch, list) and len(batch) > 0:
@@ -119,7 +121,7 @@ class LoopManager:
                         ts = last_item.get('timestamp') or last_item.get('date') or last_item.get('time')
                         if ts:
                             if isinstance(ts, (int, float)):
-                                current_step_time = datetime.fromtimestamp(ts)
+                                current_step_time = datetime.fromtimestamp(ts, tz=timezone.utc)
                             elif isinstance(ts, str):
                                 try: current_step_time = datetime.fromisoformat(ts)
                                 except: pass
@@ -128,7 +130,17 @@ class LoopManager:
                     elif hasattr(last_item, 'timestamp'):
                         current_step_time = last_item.timestamp
 
-                # [Time Machine] 2. Force Sync PipelineState Time
+                if current_step_time.tzinfo is None:
+                    current_step_time = current_step_time.replace(tzinfo=timezone.utc)
+
+                # [Task 2.2] 2. Force Sync TimeProvider (Global Clock)
+                # Ensure this happens BEFORE any component logic runs
+                if hasattr(self.orchestrator, 'data_manager') and hasattr(self.orchestrator.data_manager, 'time_provider'):
+                    self.orchestrator.data_manager.time_provider.set_simulation_time(current_step_time)
+                else:
+                    logger.warning("Orchestrator or DataManager missing TimeProvider. Time Machine ineffective.")
+
+                # [Time Machine] 3. Sync PipelineState Time (Local Loop State)
                 self.pipeline_state.current_time = current_step_time
                 self.pipeline_state.step_index = total_steps
 
@@ -142,12 +154,8 @@ class LoopManager:
                 if total_steps % 100 == 0:
                     logger.info(f"Backtest progress: Step {total_steps} (Sim Time: {current_step_time})")
                 
-                # Optional: Flow control simulation
-                # await asyncio.sleep(0.001)
-                
             except Exception as e:
                 logger.error(f"Error in backtest step {total_steps}: {e}", exc_info=True)
-                # Configurable stop on error
                 if self.config.get("stop_on_error", True):
                     raise
         
