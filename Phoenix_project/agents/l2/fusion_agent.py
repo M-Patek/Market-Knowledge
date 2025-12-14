@@ -8,6 +8,8 @@ from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 # [Phase III Fix] Import SystemStatus
 from Phoenix_project.core.schemas.fusion_result import FusionResult, SystemStatus
 from Phoenix_project.core.pipeline_state import PipelineState
+# [Task FIX-MED-002] Import utility
+from Phoenix_project.utils import extract_json_from_text
 from pydantic import ValidationError
 
 # 获取日志记录器
@@ -106,23 +108,8 @@ class FusionAgent(L2Agent):
             # 5. 解析和验证 FusionResult
             logger.debug(f"[{self.agent_id}] Received LLM fusion response (raw): {response_str[:200]}...")
             
-            # [Robustness] Clean Markdown code blocks and extract JSON
-            clean_str = response_str.strip()
-            
-            # [Task 3.1 Fix] Prioritize Markdown Code Blocks
-            json_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", clean_str)
-            if json_match:
-                clean_str = json_match.group(1)
-            else:
-                # [Task 08] Fallback: Efficiently locate the outermost JSON boundaries
-                start_idx = clean_str.find('{')
-                end_idx = clean_str.rfind('}')
-                
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    clean_str = clean_str[start_idx : end_idx + 1]
-                else:
-                    # Fallback to simple strip if braces not found or malformed
-                    pass
+            # [Task FIX-MED-002] Robustness: Use utility function
+            clean_str = extract_json_from_text(response_str)
 
             response_data = json.loads(clean_str)
             
@@ -150,7 +137,7 @@ class FusionAgent(L2Agent):
                 mapping = self.config.get("sentiment_mapping")
                 
                 if not mapping:
-                     logger.warning(f"[{self.agent_id}] Sentiment mapping missing in config, using hardcoded fallback.")
+                     # logger.warning(f"[{self.agent_id}] Sentiment mapping missing in config, using hardcoded fallback.")
                      mapping = fallback_mapping
                 
                 response_data["sentiment"] = mapping.get(decision_key, 0.0)
