@@ -1,8 +1,7 @@
 """
 Phoenix_project/cognitive/risk_manager.py
 [Phase 3 Task 5] Fix RiskManager Silent Failure.
-Replace silent 'return None' in anomaly paths with 'raise RiskDataError' 
-to enforce Fail-Closed logic.
+[Task 3.2] Time-Aware Initialization.
 """
 
 import logging
@@ -88,7 +87,10 @@ class RiskManager:
             logger.error(f"Failed to load circuit breaker state: {e}. Defaulting to TRIPPED.")
             return True
 
-    async def initialize(self, symbols: List[str]):
+    async def initialize(self, symbols: List[str], current_time: Optional[datetime] = None):
+        """
+        [Task 3.2] Initialize Risk Manager with time-aware warm-up.
+        """
         self.circuit_breaker_tripped = await self._load_circuit_breaker_state()
         self.peak_equity = await self._load_peak_equity()
         self.current_equity = await self._load_current_equity()
@@ -101,7 +103,13 @@ class RiskManager:
             return
 
         logger.info(f"Warming up RiskManager for {len(symbols)} symbols...")
-        end_time = await self.data_manager.get_current_time()
+        
+        # [Task 3.2] Use provided time or fetch current system time
+        if current_time:
+            end_time = current_time
+        else:
+            end_time = await self.data_manager.get_current_time()
+            
         start_time = end_time - timedelta(days=int(self.volatility_window * 2) + 5)
 
         async def _fetch_and_fill(sym):
@@ -117,7 +125,7 @@ class RiskManager:
 
         await asyncio.gather(*[_fetch_and_fill(s) for s in symbols])
         asyncio.create_task(self._monitor_circuit_breaker())
-        logger.info(f"RiskManager warm-up complete.")
+        logger.info(f"RiskManager warm-up complete. Reference Time: {end_time}")
 
     async def _load_peak_equity(self) -> float:
         try:
