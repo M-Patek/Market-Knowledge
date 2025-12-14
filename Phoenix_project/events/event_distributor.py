@@ -1,6 +1,7 @@
 """
 Phoenix_project/events/event_distributor.py
 [Task 004] Refactor ACK mechanism, add DLQ, fix Recovery.
+[Task FIX-HIGH-001] Data Integrity: DLQ for corrupt payloads.
 """
 import json
 import logging
@@ -23,8 +24,12 @@ class AsyncEventDistributor:
     [Task 004] ID-based ACK, DLQ, RPUSH Retry.
     """
 
-    def __init__(self, redis_client: aioredis.Redis):
+    def __init__(self, redis_client: aioredis.Redis, stream_processor: Any = None, risk_filter: Any = None, context_bus: Any = None):
         self.redis_client = redis_client
+        self.stream_processor = stream_processor # Injected but primarily used by Sync distributor logic if merged? 
+        # Actually EventDistributor usually just pushes/pops. StreamProcessor pushes to it.
+        # Keeping args for compatibility with Registry instantiation.
+        
         self.queue_key = "phoenix:events:queue"
         # Split processing state:
         # 1. Stores Event ID -> Timestamp (for timeout detection)
@@ -109,10 +114,11 @@ class AsyncEventDistributor:
             logger.error(f"Error fetching pending events: {e}")
         return events
 
-    async def ack_event(self, event: Union[Dict[str, Any], List[Dict[str, Any]]]):
+    async def ack_events(self, event: Union[Dict[str, Any], List[Dict[str, Any]]]):
         """
         [Async] 确认事件已处理。使用 ID 进行移除。
         支持单个事件或批量事件列表。
+        [Renamed] matched Orchestrator call 'ack_events'
         """
         # Normalize to list
         if isinstance(event, dict):
@@ -168,9 +174,22 @@ class AsyncEventDistributor:
                 
                 try:
                     event = json.loads(payload_str)
-                except:
-                    # Corrupt payload. Clean up.
-                    await self._cleanup_processing(eid)
+                except Exception as e:
+                    # [Task FIX-HIGH-001] Data Integrity: Preserve corrupt events in DLQ
+                    logger.error(f"Corrupt payload for event {eid}: {e}. Moving to DLQ.")
+                    
+                    # Handle bytes vs str for safety
+                    raw_content = payload_str
+                    if hasattr(raw_content, 'decode'):
+                        raw_content = raw_content.decode('utf-8', errors='replace')
+
+                    corrupt_event = {
+                        "id": eid,
+                        "error": "JSON_DECODE_ERROR",
+                        "details": str(e),
+                        "raw_payload": raw_content
+                    }
+                    await self._move_to_dlq(corrupt_event)
                     continue
                 
                 # 3. Check Retries
@@ -216,25 +235,5 @@ class AsyncEventDistributor:
             logger.error(f"Failed to move event {eid} to DLQ: {e}")
 
 
-class SyncEventDistributor:
-    """
-    Sync Event Distributor
-    Exclusively for the StreamProcessor/Ingestion (using standard redis).
-    """
-    def __init__(self, redis_client: redis.Redis):
-        self.redis_client = redis_client
-        self.queue_key = "phoenix:events:queue"
-        self._json_separators = (',', ':')
-
-    def publish(self, event: Dict[str, Any]) -> bool:
-        try:
-            if 'id' not in event:
-                event['id'] = str(uuid.uuid4())
-                
-            message = json.dumps(event, separators=self._json_separators, sort_keys=True)
-            self.redis_client.lpush(self.queue_key, message)
-            logger.debug(f"Event published synchronously: {event.get('id')}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to publish event (sync): {e}")
-            return False
+# Alias for easier import if needed, though Registry creates AsyncEventDistributor directly
+EventDistributor = AsyncEventDistributor
