@@ -1,3 +1,8 @@
+"""
+Phoenix_project/data_manager.py
+[Task 2.1] TimeProvider Integration & Centralized Clock.
+Redirects all time-sensitive operations to the injected TimeProvider.
+"""
 import json
 import logging
 import asyncio
@@ -6,12 +11,11 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import redis.asyncio as redis
 
-# Remove direct instantiation imports to support dependency injection
-# from Phoenix_project.ai.tabular_db_client import TabularDBClient
-# from Phoenix_project.ai.temporal_db_client import TemporalDBClient
 from Phoenix_project.config.loader import ConfigLoader
 from Phoenix_project.core.schemas.data_schema import MarketData
 from Phoenix_project.config.constants import REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE
+# [Task 2.1] Import TimeProvider Interface
+from Phoenix_project.core.time_provider import TimeProvider
 
 logger = logging.getLogger(__name__)
 
@@ -22,24 +26,27 @@ class DataManager:
     充当系统的 "海马体"，连接 Redis (短期记忆) 和 Temporal/Tabular DB (长期记忆)。
     
     [Task 4] Integrated Failover & Read-Repair
-    [Task 4.2] Time Machine Support
+    [Task 2.1] Centralized Time Management via TimeProvider
     """
 
-    def __init__(self, config: Any, redis_client: Optional[redis.Redis] = None, tabular_db: Any = None, temporal_db: Any = None):
+    def __init__(self, config: Any, time_provider: TimeProvider, redis_client: Optional[redis.Redis] = None, tabular_db: Any = None, temporal_db: Any = None):
         # [Refactor] Support both ConfigLoader (legacy) and direct DictConfig (Registry injected)
         if hasattr(config, 'load_config'):
             self.config = config.load_config('system.yaml')
         else:
             self.config = config
 
+        # [Task 2.1] Mandatory TimeProvider Injection
+        if time_provider is None:
+            raise ValueError("TimeProvider must be injected into DataManager.")
+        self.time_provider = time_provider
+        
         self.redis_client = redis_client
         
         # [Fix Task 1] Dependency Injection to prevent Double Connection Pool
-        # Use injected clients or fallback to lazy instantiation (only if not provided)
         if tabular_db is not None:
             self.tabular_db = tabular_db
         else:
-            # Fallback for tests/legacy
             from Phoenix_project.ai.tabular_db_client import TabularDBClient
             self.tabular_db = TabularDBClient(self.config.get("data_manager", {}).get("tabular_db", {}))
 
@@ -52,24 +59,11 @@ class DataManager:
         # [Config] Allow configuring stale threshold
         self.stale_threshold_minutes = self.config.get("data_manager", {}).get("stale_threshold_minutes", 5)
         
-        # [Phase 4 Task 2] Time Machine State
-        self._simulation_time: Optional[datetime] = None
+        # [Task 2.1] Removed internal _simulation_time state
         
-        logger.info("DataManager initialized.")
+        logger.info("DataManager initialized with TimeProvider.")
 
-    def set_simulation_time(self, sim_time: datetime):
-        """
-        [Phase 4 Task 2] Activate Time Machine.
-        Sets the internal clock to a historical timestamp.
-        """
-        if sim_time.tzinfo is None:
-            sim_time = sim_time.replace(tzinfo=timezone.utc)
-        self._simulation_time = sim_time
-        # logger.debug(f"DataManager Time Machine set to: {self._simulation_time}")
-
-    def clear_simulation_time(self):
-        """Deactivate Time Machine (Return to Live)."""
-        self._simulation_time = None
+    # [Task 2.1] Removed set_simulation_time / clear_simulation_time (Delegated to TimeProvider)
 
     async def get_latest_market_data(self, symbol: str) -> Optional[MarketData]:
         """
@@ -77,14 +71,18 @@ class DataManager:
         [Hot Path] 优先读取 Redis。
         [Cold Path] 失败时降级到 TemporalDB (Failover)，并触发读修复 (Read-Repair)。
         [Fix] 严禁返回过期数据 (Zombie Data)。
+        [Task 2.1] Uses TimeProvider for current reference time.
         """
-        # [Time Machine] In backtest, query DB for specific time point.
-        if self._simulation_time:
-            return await self._get_market_data_at_time(symbol, self._simulation_time)
+        current_time = self.get_current_time()
+        
+        # [Time Machine Check] In backtest/simulation, we MUST query DB for specific time point.
+        # Redis (Live Cache) is only valid for REAL-TIME mode.
+        if self.time_provider.is_simulation_mode():
+            return await self._get_market_data_at_time(symbol, current_time)
 
         key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=symbol)
         
-        # 1. Try Redis (Hot Path)
+        # 1. Try Redis (Hot Path - LIVE ONLY)
         if self.redis_client:
             try:
                 data = await self.redis_client.get(key)
@@ -97,8 +95,8 @@ class DataManager:
         logger.warning(f"Cache miss for {symbol}, attempting DB failover...")
         if self.temporal_db:
             try:
-                # Use aware UTC time for failover query
-                end = datetime.now(timezone.utc)
+                # [Task 2.1] Use TimeProvider for reference time
+                end = current_time
                 start = end - timedelta(hours=72)
                 df = await self.temporal_db.query_market_data(symbol, start, end)
                 
@@ -114,8 +112,8 @@ class DataManager:
                         logger.error(f"CRITICAL: Stale data fetched for {symbol}. FAIL-SAFE TRIGGERED.")
                         return None
                     
-                    # 3. Read-Repair
-                    if self.redis_client:
+                    # 3. Read-Repair (Only in Live Mode)
+                    if self.redis_client and not self.time_provider.is_simulation_mode():
                         try:
                             await self.redis_client.setex(key, 60, market_data.model_dump_json())
                             logger.info(f"Read-Repair: Restored {symbol} to Redis cache.")
@@ -164,12 +162,12 @@ class DataManager:
             return None
             
         try:
-            # [Time Machine] Apply date filter if provided
-            date_clause = ""
-            if as_of_date:
-                # Ensure simple date comparison
-                date_str = as_of_date.strftime("%Y-%m-%d")
-                date_clause = f" AND date <= '{date_str}'"
+            # [Time Machine] Apply date filter if provided, or default to current system time
+            target_date = as_of_date or self.get_current_time()
+            
+            # Ensure simple date comparison
+            date_str = target_date.strftime("%Y-%m-%d")
+            date_clause = f" AND date <= '{date_str}'"
 
             # 简单的 SQL 查询，假设存在 fundamentals 表
             query = f"SELECT * FROM fundamentals WHERE symbol = '{symbol}'{date_clause} ORDER BY date DESC LIMIT 1"
@@ -238,14 +236,12 @@ class DataManager:
         
         return None
 
-    async def get_current_time(self) -> datetime:
+    def get_current_time(self) -> datetime:
         """
         获取当前系统时间 (UTC)。
-        [Phase 4 Task 2] Time Machine: Returns simulation time if active.
+        [Task 2.1] Delegated to TimeProvider.
         """
-        if self._simulation_time:
-            return self._simulation_time
-        return datetime.now(timezone.utc)
+        return self.time_provider.get_current_time()
 
     async def save_state(self, state: Dict[str, Any]):
         """
@@ -267,5 +263,3 @@ class DataManager:
                 await self.temporal_db.close()
             else:
                 self.temporal_db.close()
-        # Note: Redis client is usually managed externally (Registry), but close if owned?
-        # Typically we leave Redis close to the creator.
