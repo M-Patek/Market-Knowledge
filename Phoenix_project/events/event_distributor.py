@@ -2,6 +2,7 @@
 Phoenix_project/events/event_distributor.py
 [Task 004] Refactor ACK mechanism, add DLQ, fix Recovery.
 [Task FIX-HIGH-001] Data Integrity: DLQ for corrupt payloads.
+[Task 1.4] Redis Namespace Isolation.
 """
 import json
 import logging
@@ -9,7 +10,6 @@ import asyncio
 import time
 import uuid
 from typing import Dict, Any, List, Optional, Union
-import redis
 import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
@@ -22,25 +22,28 @@ class AsyncEventDistributor:
     [Task 001] Decoupled from Sync I/O.
     [Task 002] ZSET Architecture for Reliable ACK.
     [Task 004] ID-based ACK, DLQ, RPUSH Retry.
+    [Task 1.4] Namespace Isolation (phx:{run_mode}:...).
     """
 
-    def __init__(self, redis_client: aioredis.Redis, stream_processor: Any = None, risk_filter: Any = None, context_bus: Any = None):
+    def __init__(self, redis_client: aioredis.Redis, config: Dict[str, Any] = None, stream_processor: Any = None, risk_filter: Any = None, context_bus: Any = None):
         self.redis_client = redis_client
-        self.stream_processor = stream_processor # Injected but primarily used by Sync distributor logic if merged? 
-        # Actually EventDistributor usually just pushes/pops. StreamProcessor pushes to it.
-        # Keeping args for compatibility with Registry instantiation.
+        self.config = config or {}
+        self.stream_processor = stream_processor 
         
-        self.queue_key = "phoenix:events:queue"
+        # [Task 1.4] Extract Run Mode & Apply Namespace (Unified to UPPER)
+        self.run_mode = self.config.get("run_mode", "DEV").upper()
+        
+        self.queue_key = f"phx:{self.run_mode}:events:queue"
         # Split processing state:
-        # 1. Stores Event ID -> Timestamp (for timeout detection)
-        self.processing_timeouts_key = "phoenix:events:processing:timeouts"
-        # 2. Stores Event ID -> JSON Payload (for recovery)
-        self.processing_payloads_key = "phoenix:events:processing:payloads"
-        # 3. Dead Letter Queue
-        self.dlq_key = "phoenix:events:dead_letter"
+        self.processing_timeouts_key = f"phx:{self.run_mode}:events:processing:timeouts"
+        self.processing_payloads_key = f"phx:{self.run_mode}:events:processing:payloads"
+        # Dead Letter Queue
+        self.dlq_key = f"phx:{self.run_mode}:events:dead_letter"
         
         self.max_retries = 3
         self._json_separators = (',', ':') 
+        
+        logger.info(f"EventDistributor initialized in {self.run_mode} mode. Queue: {self.queue_key}")
 
     async def publish(self, event: Dict[str, Any]) -> bool:
         """
@@ -102,7 +105,6 @@ class AsyncEventDistributor:
                 if raw_event:
                     try:
                         event = json.loads(raw_event)
-                        # Fix: Ensure logic downstream knows this event needs ID-based ACK
                         if 'id' not in event:
                              logger.warning("Fetched event without ID. ACK will be impossible.")
                         events.append(event)
@@ -118,7 +120,6 @@ class AsyncEventDistributor:
         """
         [Async] 确认事件已处理。使用 ID 进行移除。
         支持单个事件或批量事件列表。
-        [Renamed] matched Orchestrator call 'ack_events'
         """
         # Normalize to list
         if isinstance(event, dict):
@@ -139,7 +140,7 @@ class AsyncEventDistributor:
                 pipe.hdel(self.processing_payloads_key, *event_ids)
                 results = await pipe.execute()
             
-            removed_count = results[0] # ZREM returns count of removed members
+            removed_count = results[0] 
             if removed_count < len(event_ids):
                 logger.debug(f"ACK Partial: Requested {len(event_ids)}, Removed {removed_count}. Some might have timed out.")
             else:
@@ -168,17 +169,14 @@ class AsyncEventDistributor:
                 payload_str = await self.redis_client.hget(self.processing_payloads_key, eid)
                 
                 if not payload_str:
-                    # Zombie ID in ZSet but no payload. Clean up.
                     await self.redis_client.zrem(self.processing_timeouts_key, eid)
                     continue
                 
                 try:
                     event = json.loads(payload_str)
                 except Exception as e:
-                    # [Task FIX-HIGH-001] Data Integrity: Preserve corrupt events in DLQ
                     logger.error(f"Corrupt payload for event {eid}: {e}. Moving to DLQ.")
                     
-                    # Handle bytes vs str for safety
                     raw_content = payload_str
                     if hasattr(raw_content, 'decode'):
                         raw_content = raw_content.decode('utf-8', errors='replace')
@@ -203,7 +201,6 @@ class AsyncEventDistributor:
                     new_payload = json.dumps(event, separators=self._json_separators, sort_keys=True)
                     
                     async with self.redis_client.pipeline(transaction=True) as pipe:
-                        # [Task 004] RPUSH (Queue Tail Retry / Priority) as requested
                         pipe.rpush(self.queue_key, new_payload)
                         # Cleanup processing state
                         pipe.zrem(self.processing_timeouts_key, eid)
@@ -233,7 +230,6 @@ class AsyncEventDistributor:
                 await pipe.execute()
         except Exception as e:
             logger.error(f"Failed to move event {eid} to DLQ: {e}")
-
 
 # Alias for easier import if needed, though Registry creates AsyncEventDistributor directly
 EventDistributor = AsyncEventDistributor
