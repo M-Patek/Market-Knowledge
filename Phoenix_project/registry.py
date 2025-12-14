@@ -30,6 +30,10 @@ from Phoenix_project.cognitive.engine import CognitiveEngine
 from Phoenix_project.cognitive.portfolio_constructor import PortfolioConstructor
 from Phoenix_project.cognitive.risk_manager import RiskManager
 from Phoenix_project.execution.order_manager import OrderManager
+# [Task FIX-MED-001] Import missing execution components
+from Phoenix_project.execution.trade_lifecycle_manager import TradeLifecycleManager
+from Phoenix_project.execution.adapters import AlpacaAdapter
+
 from Phoenix_project.events.stream_processor import StreamProcessor
 from Phoenix_project.events.risk_filter import EventRiskFilter
 from Phoenix_project.events.event_distributor import EventDistributor
@@ -43,6 +47,9 @@ from Phoenix_project.evaluation.arbitrator import Arbitrator
 from Phoenix_project.fusion.uncertainty_guard import UncertaintyGuard
 from Phoenix_project.ai.prompt_renderer import PromptRenderer
 
+# [Task FIX-HIGH-003] Time Machine Abstraction
+from Phoenix_project.core.time_provider import SystemTimeProvider
+
 logger = logging.getLogger(__name__)
 
 class DependencyContainer:
@@ -51,9 +58,12 @@ class DependencyContainer:
     持有核心服务的单例，并传递给工厂以解析依赖。
     """
     def __init__(self):
+        # [Task FIX-HIGH-003] Time Provider
+        self.time_provider: Optional[SystemTimeProvider] = None
+        
         self.context_bus: Optional[ContextBus] = None
         self.data_manager: Optional[DataManager] = None
-        self.gemini_manager: Optional[GeminiPoolManager] = None  # Added
+        self.gemini_manager: Optional[GeminiPoolManager] = None
         self.embedding_client: Optional[EmbeddingClient] = None
         self.ensemble_client: Optional[EnsembleClient] = None
         self.prompt_manager: Optional[PromptManager] = None
@@ -121,8 +131,6 @@ class AgentFactory:
         agent_cls = AgentFactory._import_agent_class(module_path, class_name)
         
         # [Fix 1.1] 注入 agent_id 和核心依赖
-        # Base Signature expected: (agent_id, llm_client, data_manager, ...)
-        # We prepend 'key' as agent_id and ensure DataManager is passed.
         base_args = [key, container.ensemble_client, container.data_manager]
         
         # [Task 2.1] Use kwargs for optional dependencies to match BaseAgent signature
@@ -134,19 +142,15 @@ class AgentFactory:
         if key == "technical_analyst":
             return agent_cls(*base_args, container.data_adapter, container.embedding_client, **common_kwargs)
         elif key in ["fundamental_analyst", "geopolitical_analyst", "innovation_tracker", "macro_strategist", "supply_chain_intelligence", "critic"]:
-             # 分析师和批评家需要 Retriever
             return agent_cls(*base_args, container.retriever, **common_kwargs)
         elif key == "fusion":
-            # Fusion agent specific signature adjustments
             return agent_cls(*base_args, container.knowledge_graph_service, container.source_credibility, **common_kwargs)
         else:
-            # 默认 (Catalyst, Planner, Metacognitive, Adversary)
             return agent_cls(*base_args, **common_kwargs)
 
     @staticmethod
     def create_l3_agent(key: str, config: DictConfig, container: DependencyContainer) -> Any:
         """使用 DRLAgentLoader 加载 L3 智能体的特殊加载器。"""
-        # 延迟导入 DRL Loader 以避免循环依赖
         from Phoenix_project.agents.l3.base import DRLAgentLoader
         
         if key not in AgentFactory.L3_MAP:
@@ -155,12 +159,9 @@ class AgentFactory:
         module_path, class_name = AgentFactory.L3_MAP[key]
         agent_cls = AgentFactory._import_agent_class(module_path, class_name)
         
-        # 从配置中解析检查点路径
-        # 假设配置结构: l3.<key>.checkpoint_path
         agent_config = config.agents.l3.get(key)
         if not agent_config:
              logger.warning(f"Configuration for L3 agent '{key}' not found.")
-             # return None # Allow default init if no config? DRL agent usually needs checkpoint.
         
         ckpt_path = getattr(agent_config, "checkpoint_path", None)
         policy_id = getattr(agent_config, "policy_id", "default_policy")
@@ -170,8 +171,6 @@ class AgentFactory:
             return DRLAgentLoader.load_agent(agent_class=agent_cls, checkpoint_path=ckpt_path, policy_id=policy_id)
         else:
             logger.warning(f"No checkpoint path for L3 Agent {key}. Initializing dummy/untrained agent.")
-            # For testing without checkpoint, might fail if __init__ enforces algo.
-            # Assuming we return None or handle gracefully if no checkpoint.
             return None
 
 class Registry:
@@ -189,8 +188,10 @@ class Registry:
         """Builds components that are shared across the system."""
         logger.info("Building core components...")
         
-        # [Task 1.2] Fail Fast Initialization: Verify Nervous System Connections
-        # Allow skipping if explicit env var set (for unit tests)
+        # [Task FIX-HIGH-003] Initialize TimeProvider first
+        self.container.time_provider = SystemTimeProvider()
+        
+        # [Task 1.2] Fail Fast Initialization
         if not os.getenv("GEMINI_API_KEYS") and not os.getenv("SKIP_API_CHECK"):
              logger.warning("GEMINI_API_KEYS not found. System running in limited mode or check .env")
         
@@ -198,9 +199,7 @@ class Registry:
         
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         try:
-            # We don't connect yet, just setup
             redis_client = redis.from_url(redis_url)
-            # redis_client.ping() # Optional: Ping to fail fast
         except Exception as e:
             raise RuntimeError(f"CRITICAL: Redis connection failed at {redis_url}. Cause: {str(e)}")
 
@@ -208,7 +207,24 @@ class Registry:
         self.container.context_bus = ContextBus(redis_client=redis_client)
         
         # 2. 核心 AI / 数据服务
-        self.container.embedding_client = EmbeddingClient(self.config.api_gateway.embedding_model)
+        # [Task FIX-CRIT-004] Fix instantiation and detect dimension
+        api_key = os.getenv("GEMINI_API_KEYS")
+        model_name = self.config.api_gateway.get("embedding_model", "models/text-embedding-004")
+        
+        self.container.embedding_client = EmbeddingClient(
+            api_key=api_key,
+            model_name=model_name,
+            provider="google",
+            config=self.config.api_gateway
+        )
+        
+        # Dynamic Dimension Probe
+        try:
+            real_dim = self.container.embedding_client.get_output_dimension()
+            logger.info(f"Registry: Detected embedding dimension {real_dim} for model {model_name}")
+        except Exception as e:
+            logger.error(f"Registry: Failed to detect dimension: {e}. Defaulting to 1536.")
+            real_dim = 1536
         
         self.container.ensemble_client = EnsembleClient(
             gemini_manager=self.container.gemini_manager,
@@ -222,25 +238,30 @@ class Registry:
         self.container.ensemble_client.prompt_manager = self.container.prompt_manager
 
         # 3. 核心内存
-        self.container.vector_store = VectorStore(self.config.memory.vector_store, self.container.embedding_client)
+        # [Task FIX-CRIT-004] Inject real dimension into VectorStore
+        self.container.vector_store = VectorStore(
+            config=self.config.memory.vector_store, 
+            embedding_client=self.container.embedding_client,
+            vector_size=real_dim # Explicit override
+        )
         self.container.cot_database = CoTDatabase(self.config.memory.cot_database)
         self.container.graph_db_client = GraphDBClient(self.config.memory.graph_database)
         
-        # 3b. 初始化 Shared DB Clients (Fix: Prevent Double Pool)
+        # 3b. 初始化 Shared DB Clients
         from Phoenix_project.ai.tabular_db_client import TabularDBClient
         from Phoenix_project.ai.temporal_db_client import TemporalDBClient
         
-        # config.data usually contains the db configs
         self.container.tabular_db = TabularDBClient(self.config.data_manager.tabular_db)
         self.container.temporal_db = TemporalDBClient(self.config.data_manager.temporal_db)
 
         # 4. 核心数据管理
-        # Inject the pre-initialized DB clients
+        # Inject the pre-initialized DB clients and TimeProvider
         self.container.data_manager = DataManager(
-            config=self.config, # DataManager handles config parsing or expects object
+            config=self.config,
             redis_client=redis_client,
             tabular_db=self.container.tabular_db,
-            temporal_db=self.container.temporal_db
+            temporal_db=self.container.temporal_db,
+            time_provider=self.container.time_provider # [Task FIX-HIGH-003] Injected
         )
 
         # 5. 核心审计
@@ -262,7 +283,7 @@ class Registry:
             graph_db=c.graph_db_client,
             temporal_db=c.temporal_db,
             tabular_db=c.tabular_db,
-            search_client=None, # TBD: Add search client if needed
+            search_client=None,
             ensemble_client=c.ensemble_client,
             config=config.ai_components.retriever,
             prompt_manager=c.prompt_manager,
@@ -279,16 +300,15 @@ class Registry:
             audit_manager=c.audit_manager
         )
 
-        # --- L1 智能体 (数据处理/分析) ---
+        # --- L1 智能体 ---
         l1_agents = {}
         for key in AgentFactory.L1_MAP.keys():
             try:
                 l1_agents[key] = AgentFactory.create_agent(AgentFactory.L1_MAP, key, c)
             except Exception as e:
                 logger.error(f"Failed to initialize L1 Agent '{key}': {e}", exc_info=True)
-                # Fail soft? Or hard? Depending on criticality. L1 usually critical, but let's allow partial startup.
         
-        # --- L2 智能体 (认知/融合) ---
+        # --- L2 智能体 ---
         l2_agents = {}
         for key in AgentFactory.L2_MAP.keys():
             try:
@@ -296,7 +316,7 @@ class Registry:
             except Exception as e:
                 logger.error(f"Failed to initialize L2 Agent '{key}': {e}", exc_info=True)
 
-        # --- L3 智能体 (决策/DRL) ---
+        # --- L3 智能体 ---
         l3_agents = {}
         for key in ["alpha", "risk", "execution"]:
             try:
@@ -343,10 +363,24 @@ class Registry:
         )
 
         # --- 执行层 ---
-        # Note: OrderManager is partially built here, dependencies like Broker are injected later in phoenix_project.py
+        # [Task FIX-MED-001] Fully Initialize Execution Layer in Registry
+        
+        # 1. Trade Lifecycle Manager
+        initial_capital = config.trading.get('initial_capital', 100000.0)
+        trade_lifecycle_manager = TradeLifecycleManager(
+            initial_cash=initial_capital,
+            data_manager=c.data_manager,
+            tabular_db=c.tabular_db,
+            bus=c.context_bus
+        )
+
+        # 2. Broker Adapter
+        broker_adapter = AlpacaAdapter(config=config.broker)
+
+        # 3. Order Manager (Fully Wired)
         order_manager = OrderManager(
-            broker=None, # TBD: Injected from main
-            trade_lifecycle_manager=None, # TBD
+            broker=broker_adapter,
+            trade_lifecycle_manager=trade_lifecycle_manager,
             data_manager=c.data_manager,
             bus=c.context_bus
         )
@@ -364,7 +398,7 @@ class Registry:
             config=config.trading, 
             redis_client=c.data_manager.redis_client, 
             data_manager=c.data_manager,
-            initial_capital=config.trading.get('initial_capital', 100000.0)
+            initial_capital=initial_capital
         )
         
         # Wiring Portfolio Constructor deps
@@ -395,7 +429,7 @@ class Registry:
             stream_processor=stream_processor,
             risk_filter=risk_filter,
             context_bus=c.context_bus,
-            redis_client=c.data_manager.redis_client # Added based on EventDistributor signature
+            redis_client=c.data_manager.redis_client
         )
 
         # --- 主协调器 ---
@@ -406,11 +440,11 @@ class Registry:
             cognitive_engine=cognitive_engine,
             event_distributor=event_distributor,
             event_filter=risk_filter,
-            market_state_predictor=None, # TBD: Add if needed
+            market_state_predictor=None,
             portfolio_constructor=portfolio_constructor,
             order_manager=order_manager,
             audit_manager=c.audit_manager,
-            trade_lifecycle_manager=None, # TBD
+            trade_lifecycle_manager=trade_lifecycle_manager, # [Task FIX-MED-001] Injected directly
             # Inject Agents
             alpha_agent=l3_agents.get("alpha"),
             risk_agent=l3_agents.get("risk"),
@@ -418,8 +452,7 @@ class Registry:
             risk_manager=risk_manager
         )
 
-        # --- 数据迭代器 (用于回测) ---
-        # config.data.iterator path might vary, assuming exists
+        # --- 数据迭代器 ---
         data_iterator = DataIterator(config.data_manager.get("iterator", {}), c.data_manager)
 
         logger.info("Full Phoenix system built.")
@@ -435,13 +468,16 @@ class Registry:
             l1_agents=l1_agents,
             l2_agents=l2_agents,
             l3_agents=l3_agents,
-            agent_executor=agent_executor, # Exported for access
+            agent_executor=agent_executor, 
             cognitive_engine=cognitive_engine,
             order_manager=order_manager,
             event_distributor=event_distributor,
             knowledge_graph_service=c.knowledge_graph_service,
             ensemble_client=c.ensemble_client,
-            risk_manager=risk_manager
+            risk_manager=risk_manager,
+            # [Task FIX-MED-001] Export new components
+            trade_lifecycle_manager=trade_lifecycle_manager,
+            broker_adapter=broker_adapter
         )
 
     def get_component(self, name: str):
