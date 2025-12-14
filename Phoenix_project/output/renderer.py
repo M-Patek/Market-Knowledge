@@ -1,5 +1,5 @@
 # Phoenix_project/output/renderer.py
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from pathlib import Path
 import logging # (主人喵的清洁计划 5.3) [新]
 from jinja2 import Template # (主人喵的清洁计划 5.3) [新]
@@ -11,12 +11,17 @@ logger = logging.getLogger(__name__)
 # 也许我们稍后应该将它移动到 `output/`，但现在我们遵循它的位置。
 TEMPLATE_PATH = Path(__file__).parent.parent / 'report_template.html'
 
-def render_report(fusion_result: dict) -> str:
+def render_report(fusion_result: Optional[Dict[str, Any]]) -> str:
     """
     (主人喵的清洁计划 5.3) [已修改]
     使用 Jinja2 模板引擎渲染报告。
+    [Fix FIX-HIGH-004] Robustness against None input.
     """
-    
+    # [Task FIX-HIGH-004] Guard clause for empty input
+    if not fusion_result:
+        logger.warning("Renderer received empty fusion_result.")
+        return "<h1>Error: No Data Available</h1><p>The system failed to generate a fusion result.</p>"
+
     # [主人喵的修复 11.10] 移除过时的 TODO。
     # 此实现现在使用 Jinja2，这是一个真正的模板引擎。
     try:
@@ -38,9 +43,5 @@ def render_report(fusion_result: dict) -> str:
         
     except Exception as e:
         logger.error(f"Failed to render Jinja2 template: {e}", exc_info=True)
-        # 回退到简单的字符串替换 (以防模板或数据出错)
-        report_html = template_str.replace(
-            "{{causal_graph_data}}", 
-            str(fusion_result.get("causal_graph_data", "Error: Data missing"))
-        )
-        return report_html
+        # [Task FIX-HIGH-004] Safe Fallback
+        return "<h1>Render Error</h1><p>An error occurred while rendering the report template.</p>"
