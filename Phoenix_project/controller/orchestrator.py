@@ -10,6 +10,7 @@
 # [Code Opt Expert Fix] Task 17: Poison Pill Protection (Reliable ACK)
 # [Task 005, 006, 010] Real-time Risk Integration, Temporal Safety, Magic String Removal
 # [Task FIX-CRIT-002] Logic Signature Update & Backtest Support
+# [Task 3.4] Concurrent State Isolation (Deep Copy)
 
 import logging
 import asyncio
@@ -272,10 +273,15 @@ class Orchestrator:
         """[已实现] 运行 L1 认知智能体。"""
         logger.info("Running L1 Cognition Layer...")
         try:
-            # [Fix Phase I] Pass pipeline_state to run_l1_cognition
+            # [Task 3.4] Concurrent State Isolation: Deep copy state for agents
+            # This prevents race conditions or state pollution when multiple agents
+            # process data concurrently.
+            state_copy = pipeline_state.model_copy(deep=True)
+
+            # [Fix Phase I] Pass pipeline_state copy to run_l1_cognition
             l1_insights = await self.cognitive_engine.run_l1_cognition(
                 filtered_events,
-                pipeline_state
+                state_copy
             )
             pipeline_state.set_l1_insights(l1_insights)
             logger.info(f"L1 Cognition complete. {len(l1_insights)} insights generated.")
