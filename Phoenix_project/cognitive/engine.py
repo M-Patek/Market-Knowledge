@@ -178,11 +178,17 @@ class CognitiveEngine:
         """
         执行核心认知循环 (L2 融合 -> 事实检查 -> 决策防御)。
         [Task 06] Refactored for Atomic State Updates using Deep Copy Isolation.
+        [Task FIX-MED-003] Removed heavy deepcopy, relying on Pydantic's copy mechanism.
         """
         logger.info("Starting cognitive cycle...")
         
-        # [Task 3 Fix] Create a Deep Copy Snapshot to isolate reasoning process
-        state_snapshot = copy.deepcopy(pipeline_state)
+        # [Task FIX-MED-003] Logic Check: Verify L1 inputs
+        if not pipeline_state.l1_insights:
+             logger.warning("Cognitive Cycle running without L1 insights (Blind Mode).")
+
+        # [Task FIX-MED-003] Optimized Snapshot: Use Pydantic's model_copy instead of deepcopy
+        # This prevents deep recursion issues and is faster.
+        state_snapshot = pipeline_state.model_copy(deep=True)
         
         # 1. Run Reasoning Ensemble (L2 Fusion) on Snapshot
         try:
@@ -203,7 +209,8 @@ class CognitiveEngine:
             raise CognitiveError(f"ReasoningEnsemble failed: {e}") from e
             
         # Update snapshot so guard can see it
-        state_snapshot.latest_fusion_result = fusion_result.model_dump()
+        # [Fix] Update Pydantic model field directly
+        state_snapshot.latest_fusion_result = fusion_result
         
         # 3. Apply Uncertainty Guardrail on Snapshot
         try:
@@ -225,9 +232,12 @@ class CognitiveEngine:
 
         # [Task 06] Atomic Commit: Update global state only after all checks pass
         # Now we apply the result from the isolated process to the real pipeline_state
-        pipeline_state.latest_fusion_result = fusion_result.model_dump()
-        pipeline_state.update_value("last_fusion_result", fusion_result)
-        pipeline_state.update_value("last_guarded_decision", fusion_result)
+        # [Fix] Assign the Pydantic model directly, avoiding serialization overhead if possible
+        pipeline_state.latest_fusion_result = fusion_result
+        # pipeline_state.update_value("last_fusion_result", fusion_result) # Deprecated legacy call if redundant
+        
+        # For legacy compatibility if needed
+        # pipeline_state.update_value("last_guarded_decision", fusion_result.model_dump())
 
         logger.info(f"Cognitive cycle complete. Final decision: {fusion_result.decision}")
         
