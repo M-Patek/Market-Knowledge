@@ -5,29 +5,39 @@ Explicitly pass 'side' and prioritize it over quantity sign inference.
 [Phase 3 Task 2] Fix Adapter Hearing Loss (WebSocket & Watchdog).
 1. Implement subscribe_order_status with unified stream handler.
 2. Add Thread Watchdog to monitor and restart dead streams.
+[Task 1.1] Added SimulatedBroker for Backtesting/Paper Trading isolation.
 """
 import pandas as pd
+import asyncio
+import uuid
+import logging
+import os
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
+from decimal import Decimal
 from abc import ABC, abstractmethod
-import os
-import asyncio
 
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.execution.interfaces import IBrokerAdapter
-from Phoenix_project.core.schemas.data_schema import Order, OrderStatus
+from Phoenix_project.core.schemas.data_schema import Order, OrderStatus, Fill, Position
 
 # [任务 B.2] 导入 Alpaca 客户端
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    MarketOrderRequest, LimitOrderRequest,
-    StopOrderRequest, StopLimitOrderRequest, TrailingStopOrderRequest
-)
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.stream import TradingStream
+# 注意：这些导入仅在 LIVE 模式下真正被使用，但在文件层级导入是为了类型提示。
+# 实际运行时，Registry 通过 Lazy Import 避免在非 Alpaca 环境中加载这些库引发错误。
+try:
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import (
+        MarketOrderRequest, LimitOrderRequest,
+        StopOrderRequest, StopLimitOrderRequest, TrailingStopOrderRequest
+    )
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    from alpaca.trading.stream import TradingStream
+except ImportError:
+    # 允许在没有安装 alpaca-py 的环境中运行回测
+    pass
 
 logger = get_logger(__name__)
 
@@ -83,7 +93,6 @@ class AlpacaAdapter(IBrokerAdapter):
             raise
 
     # --- IMarketData 实现 ---
-    # (保持原样)
     def get_market_data(
         self, 
         symbols_list: List[str], 
@@ -232,7 +241,6 @@ class AlpacaAdapter(IBrokerAdapter):
     def get_all_open_orders(self) -> List[Order]:
         return []
 
-    # (其余方法保持不变)
     def get_portfolio_value(self) -> float:
         try:
             return float(self.trading_client.get_account().portfolio_value)
@@ -384,3 +392,177 @@ class AlpacaAdapter(IBrokerAdapter):
         except Exception as e:
             logger.error(f"Failed to get account info: {e}", exc_info=True)
             return {"status": "error", "message": str(e)}
+
+
+class SimulatedBroker(IBrokerAdapter):
+    """
+    In-memory simulated broker for backtesting and dry-runs.
+    Maintains self.cash, self.positions, self.orders in memory.
+    [Task 1.1] Implementation.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.initial_cash = Decimal(str(config.get("initial_cash", 100000.0)))
+        self.cash = self.initial_cash
+        self.positions: Dict[str, Position] = {}
+        self.orders: Dict[str, Order] = {}
+        
+        self._fill_handlers: List[Callable] = []
+        self._status_handlers: List[Callable] = []
+        self._logger = logger
+
+    def connect(self) -> None:
+        self._logger.info("SimulatedBroker connected (In-Memory).")
+
+    def disconnect(self) -> None:
+        self._logger.info("SimulatedBroker disconnected.")
+
+    def subscribe_fills(self, callback: Callable) -> None:
+        if callback not in self._fill_handlers:
+            self._fill_handlers.append(callback)
+
+    def subscribe_order_status(self, callback: Callable) -> None:
+        if callback not in self._status_handlers:
+            self._status_handlers.append(callback)
+
+    def get_market_data(self, *args, **kwargs) -> Dict:
+        return {}
+
+    def get_portfolio_value(self) -> float:
+        # Estimated Total Value = Cash + Sum(Position Market Value)
+        pos_val = sum(p.market_value for p in self.positions.values())
+        return float(self.cash + pos_val)
+
+    def get_cash_balance(self) -> float:
+        return float(self.cash)
+
+    def get_position(self, symbol: str) -> float:
+        pos = self.positions.get(symbol)
+        return float(pos.quantity) if pos else 0.0
+
+    def get_positions(self) -> List[Position]:
+        """
+        Returns all open positions.
+        Requested by blueprint to list all active holdings.
+        """
+        return list(self.positions.values())
+
+    def get_all_open_orders(self) -> List[Order]:
+        return [
+            o for o in self.orders.values() 
+            if o.status in [OrderStatus.NEW, OrderStatus.PENDING, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED]
+        ]
+
+    def get_order_status(self, order_id: str) -> Dict[str, Any]:
+        order = self.orders.get(order_id)
+        if order:
+            return {"status": "success", "data": order.dict()}
+        return {"status": "error", "message": "Order not found"}
+
+    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        order = self.orders.get(order_id)
+        if order and order.status in [OrderStatus.NEW, OrderStatus.PENDING, OrderStatus.ACCEPTED]:
+            order.status = OrderStatus.CANCELLED
+            self._notify_status(order)
+            return {"status": "success", "order_id": order_id}
+        return {"status": "error", "message": "Order cannot be cancelled or not found"}
+
+    def get_account_info(self) -> Dict[str, Any]:
+        return {
+            "status": "success",
+            "account": {
+                "cash": str(self.cash),
+                "portfolio_value": str(self.get_portfolio_value()),
+                "currency": "USD",
+                "buying_power": str(self.cash)
+            },
+            "positions": [p.dict() for p in self.positions.values()]
+        }
+
+    def place_order(self, order: Order, price: Optional[float] = None) -> str:
+        """
+        Simulates order placement and immediate execution at 'price'.
+        """
+        if price is None:
+            if order.limit_price:
+                price = float(order.limit_price)
+            else:
+                raise ValueError("SimulatedBroker requires 'price' (or order.limit_price) for execution.")
+
+        exec_price = Decimal(str(price))
+        qty = order.quantity # Signed quantity: +Buy, -Sell
+
+        # 1. Update Order State
+        order.status = OrderStatus.FILLED
+        if not order.id:
+            order.id = str(uuid.uuid4())
+        self.orders[order.id] = order
+
+        # 2. Update Cash
+        cost = qty * exec_price
+        self.cash -= cost
+
+        # 3. Update Position
+        self._update_position(order.symbol, qty, exec_price)
+
+        # 4. Create Fill
+        fill = Fill(
+            id=str(uuid.uuid4()),
+            order_id=order.id,
+            symbol=order.symbol,
+            timestamp=datetime.utcnow(),
+            quantity=qty,
+            price=exec_price,
+            commission=Decimal("0.0")
+        )
+
+        # 5. Notify Callbacks
+        self._notify_status(order)
+        self._notify_fill(fill)
+
+        return order.id
+
+    def _update_position(self, symbol: str, qty: Decimal, price: Decimal):
+        if symbol not in self.positions:
+            if qty == 0: return
+            self.positions[symbol] = Position(
+                symbol=symbol,
+                quantity=qty,
+                average_price=price,
+                market_value=qty * price,
+                unrealized_pnl=Decimal("0.0")
+            )
+        else:
+            pos = self.positions[symbol]
+            new_qty = pos.quantity + qty
+            
+            if new_qty == 0:
+                del self.positions[symbol]
+            else:
+                if (pos.quantity > 0 and qty > 0) or (pos.quantity < 0 and qty < 0):
+                    current_cost = pos.quantity * pos.average_price
+                    added_cost = qty * price
+                    pos.average_price = (current_cost + added_cost) / new_qty
+                
+                pos.quantity = new_qty
+                pos.market_value = pos.quantity * price
+                pos.unrealized_pnl = (price - pos.average_price) * pos.quantity
+
+    def _notify_status(self, order: Order):
+        for cb in self._status_handlers:
+            try:
+                if asyncio.iscoroutinefunction(cb):
+                    asyncio.create_task(cb(order))
+                else:
+                    cb(order)
+            except Exception as e:
+                self._logger.error(f"Error in simulated status callback: {e}")
+
+    def _notify_fill(self, fill: Fill):
+        for cb in self._fill_handlers:
+            try:
+                if asyncio.iscoroutinefunction(cb):
+                    asyncio.create_task(cb(fill))
+                else:
+                    cb(fill)
+            except Exception as e:
+                self._logger.error(f"Error in simulated fill callback: {e}")
