@@ -12,14 +12,21 @@ class VectorStore:
     Stores L1 Evidence and RAG Documents.
     """
 
-    def __init__(self, config: Dict[str, Any], embedding_client: Any):
+    def __init__(self, config: Dict[str, Any], embedding_client: Any, vector_size: Optional[int] = None):
         self.config = config
         self.embedding_client = embedding_client
         
         self.host = self.config.get("host", "phoenix_qdrant")
         self.port = self.config.get("port", 6333)
         self.collection_name = self.config.get("l1_evidence_collection", "phoenix_l1_evidence")
-        self.vector_size = self.config.get("vector_size", 1536) # Default for generic models, should match model
+        
+        # [Task FIX-CRIT-004] Priority: Explicit Arg > Config > Default
+        if vector_size:
+            self.vector_size = vector_size
+        else:
+            self.vector_size = self.config.get("vector_size", 1536)
+        
+        logger.info(f"VectorStore configured with vector_size: {self.vector_size}")
         
         self.client = None
         self._initialize_client()
