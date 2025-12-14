@@ -5,6 +5,7 @@
 这个实现替换了之前的 graph_db_stub 存根。
 """
 import asyncio
+import time
 from typing import List, Dict, Any, Optional
 
 # 导入新的 GraphDBClient
@@ -18,13 +19,12 @@ class KnowledgeGraphService:
     [蓝图 3 已更新]
     管理知识图谱的生命周期，使用 GraphDBClient 连接到
     在 docker-compose.yml 中定义的 Neo4j 服务。
+    [Task 2.3] Time-Aware Updates.
     """
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
         初始化 Neo4j 客户端。
-        'config' 参数被保留以兼容旧的实例化方式，但 GraphDBClient
-        会从环境变量中读取其配置。
         """
         self.db_client = GraphDBClient()
         self.log_prefix = "KnowledgeGraphService:"
@@ -44,7 +44,7 @@ class KnowledgeGraphService:
         """
         return await self.db_client.execute_query(cypher_query, params)
 
-    async def update_knowledge_graph(self, extracted_data: Dict[str, List[Dict]]) -> bool:
+    async def update_knowledge_graph(self, extracted_data: Dict[str, List[Dict]], timestamp_ms: Optional[int] = None) -> bool:
         """
         [蓝图 3 新增]
         接收来自 RelationExtractor 的原始节点和边，
@@ -52,9 +52,8 @@ class KnowledgeGraphService:
         
         Args:
             extracted_data (Dict): 包含 "nodes" 和 "edges" 键的字典。
-                - "nodes": [{"id": "AAPL", "type": "Company", "properties": {"name": "Apple Inc."}}]
-                - "edges": [{"id": "rel_1", "source": "AAPL", "target": "TSMC", "type": "SUPPLIER_OF", "properties": {"product": "M3 Chip"}}]
-
+            timestamp_ms (Optional[int]): 显式的时间戳 (毫秒)。如果为 None，使用系统当前时间。
+        
         Returns:
             bool: 如果所有更新都成功，则为 True。
         """
@@ -64,6 +63,10 @@ class KnowledgeGraphService:
         if not nodes and not edges:
             logger.warning(f"{self.log_prefix} update_knowledge_graph 接收到空数据，无需操作。")
             return True
+
+        # [Task 2.3] Explicit Timestamp Handling
+        if timestamp_ms is None:
+             timestamp_ms = int(time.time() * 1000)
 
         node_success = True
         edge_success = True
@@ -84,18 +87,17 @@ class KnowledgeGraphService:
                     logger.warning(f"无效的节点标签 '{node_label}'，将使用 'Node'。")
                     node_label = "Node"
                 
-                # MERGE (n:Label {id: $id}) ON CREATE SET n = $props ON MATCH SET n += $props
-                # 'id' 是我们的唯一键
-                # 'props' 包含了所有属性，包括 'id'
+                # [Task 2.3] Use explicit timestamp instead of timestamp()
                 query = f"""
                 MERGE (n:{node_label} {{id: $id}})
-                ON CREATE SET n = $props
+                ON CREATE SET n = $props, n.created_at = $ts
                 ON MATCH SET n += $props
                 """
                 
                 params = {
                     "id": node_id,
-                    "props": properties
+                    "props": properties,
+                    "ts": timestamp_ms
                 }
                 
                 if not await self.db_client.execute_write(query, params):
@@ -126,12 +128,11 @@ class KnowledgeGraphService:
                     
                 properties["id"] = edge_id
                 
-                # 找到源节点和目标节点，然后合并关系
-                # 我们假设源节点和目标节点使用 'id' 作为键
+                # [Task 2.3] Use explicit timestamp
                 query = f"""
                 MATCH (a {{id: $source_id}}), (b {{id: $target_id}})
                 MERGE (a)-[r:{edge_type} {{id: $edge_id}}]->(b)
-                ON CREATE SET r = $props
+                ON CREATE SET r = $props, r.created_at = $ts
                 ON MATCH SET r += $props
                 """
                 
@@ -139,7 +140,8 @@ class KnowledgeGraphService:
                     "source_id": source_id,
                     "target_id": target_id,
                     "edge_id": edge_id,
-                    "props": properties
+                    "props": properties,
+                    "ts": timestamp_ms
                 }
                 
                 if not await self.db_client.execute_write(query, params):
