@@ -6,6 +6,7 @@ Phoenix_project/context_bus.py
 2. [Fix] 负责基于 Redis Pub/Sub 的组件间异步通信 (Native AsyncIO)。
 3. [Phase I Fix] 实现环境隔离 (run_mode)。
 4. [Task 2] 实现分布式锁 (Distributed Lock) 防止状态覆盖。
+[Task 1.4] Enforced Namespace Isolation for Pub/Sub and State Keys (UPPERCASE unified).
 """
 import json
 import redis.asyncio as redis
@@ -15,8 +16,6 @@ from pydantic import BaseModel
 
 from Phoenix_project.core.pipeline_state import PipelineState
 from Phoenix_project.monitor.logging import get_logger
-
-# [Task 2] Import LockException
 from redis.exceptions import LockError
 
 logger = get_logger(__name__)
@@ -30,8 +29,8 @@ class ContextBus:
         self.redis = redis_client
         self.config = config or {}
         self.ttl = self.config.get("state_ttl_sec", 86400)
-        # [Phase I Fix] 提取运行模式，用于 Key 隔离
-        self.run_mode = self.config.get("run_mode", "DEV").lower()
+        # [Phase I Fix] Extract Run Mode & Apply Namespace (Unified to UPPER)
+        self.run_mode = self.config.get("run_mode", "DEV").upper()
         
         # 管理订阅任务
         self._listening = False
@@ -43,13 +42,20 @@ class ContextBus:
         self._background_tasks = set()
         # [Fix] Backpressure: Limit concurrent handler tasks
         self._task_semaphore = asyncio.Semaphore(1000)
+    
+    def _get_namespaced_channel(self, channel: str) -> str:
+        """
+        [Task 1.4] Helper to prefix channel with run_mode for isolation.
+        Example: 'market_events' -> 'phx:LIVE:market_events'
+        """
+        prefix = f"phx:{self.run_mode}:"
+        if channel.startswith(prefix):
+            return channel
+        return f"{prefix}{channel}"
 
-    # --- 核心通信功能 (修复点: 全异步 & 健壮) ---
+    # --- 核心通信功能 (修复点: 全异步 & 健壮 & 隔离) ---
 
     def _handle_task_exception(self, task: asyncio.Task):
-        """
-        [Task 20] Callback to handle background task exceptions and cleanup.
-        """
         try:
             task.result()
         except asyncio.CancelledError:
@@ -62,8 +68,11 @@ class ContextBus:
 
     async def publish(self, channel: str, message: Union[Dict, str, BaseModel]) -> bool:
         """
-        向指定频道发布消息。支持自动 JSON 序列化。
+        向指定频道发布消息。自动应用命名空间前缀。
         """
+        # [Task 1.4] Apply Namespace
+        real_channel = self._get_namespaced_channel(channel)
+        
         try:
             # [Phase II Fix] Smart Serialization
             if isinstance(message, BaseModel):
@@ -73,22 +82,25 @@ class ContextBus:
             else:
                 payload = str(message)
             
-            await self.redis.publish(channel, payload)
-            logger.debug(f"Published to [{channel}]: {payload[:50]}...")
+            await self.redis.publish(real_channel, payload)
+            logger.debug(f"Published to [{real_channel}]: {payload[:50]}...")
             return True
         except Exception as e:
-            logger.error(f"Failed to publish to {channel}: {e}", exc_info=True)
+            logger.error(f"Failed to publish to {real_channel}: {e}", exc_info=True)
             return False
 
     async def subscribe(self, channel: str, handler: Callable[[Dict], Any]):
         """
         异步订阅接口。注册处理程序并确保后台监听任务正在运行。
+        自动应用命名空间前缀。
         """
-        logger.info(f"Subscribing to channel: {channel}")
+        # [Task 1.4] Apply Namespace
+        real_channel = self._get_namespaced_channel(channel)
+        logger.info(f"Subscribing to channel: {real_channel} (Original: {channel})")
         
         async with self._lock:
-            self._handlers[channel] = handler
-            await self._pubsub.subscribe(channel)
+            self._handlers[real_channel] = handler
+            await self._pubsub.subscribe(real_channel)
         
         if not self._listening:
             await self._start_listener()
@@ -106,7 +118,6 @@ class ContextBus:
         后台任务：异步监听 Redis 消息。
         [Task 0.3 Fix] 实现“复活循环” (Resurrection Loop) 和非阻塞分发。
         """
-        # [Task FIX-HIGH-002] Track reconnection state
         needs_resubscribe = False
 
         while self._listening:
@@ -156,7 +167,6 @@ class ContextBus:
             except Exception as e:
                 logger.error(f"ContextBus listener loop interrupted: {e}. Retrying in 1s...", exc_info=True)
                 await asyncio.sleep(1)
-                # [Task FIX-HIGH-002] Flag for resubscription
                 needs_resubscribe = True
 
     # --- 状态持久化功能 (修复点: Distributed Lock + CAS) ---
@@ -166,6 +176,7 @@ class ContextBus:
         保存状态。使用 Redis Lock 和 Version CAS 机制防止并发覆盖。
         [Task 2] Implemented Blind Overwrite Protection.
         """
+        # [Task 1.4] Ensure Key Uses Run Mode (UPPER)
         key = f"phx:{self.run_mode}:state:{state.run_id}"
         lock_key = f"lock:{key}"
         
@@ -216,7 +227,7 @@ class ContextBus:
 
     async def load_state(self, run_id: str) -> Optional[PipelineState]:
         try:
-            # [Phase I Fix] Apply Run Mode Namespacing
+            # [Phase I Fix] Apply Run Mode Namespacing (UPPER)
             key = f"phx:{self.run_mode}:state:{run_id}"
             data = await self.redis.get(key)
             if not data: return None
@@ -227,7 +238,7 @@ class ContextBus:
 
     async def load_latest_state(self) -> Optional[PipelineState]:
         try:
-            # [Phase I Fix] Apply Run Mode Namespacing
+            # [Phase I Fix] Apply Run Mode Namespacing (UPPER)
             run_id = await self.redis.get(f"phx:{self.run_mode}:state:latest_run_id")
             if run_id:
                 if isinstance(run_id, bytes): run_id = run_id.decode('utf-8')
