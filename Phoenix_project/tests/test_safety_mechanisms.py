@@ -57,6 +57,7 @@ class TestSafetyMechanisms(unittest.TestCase):
             mock_fusion = MagicMock(spec=FusionResult)
             mock_fusion.decision = "HALT"
             mock_fusion.confidence = 0.9
+            mock_fusion.system_status = "HALT" # [Task FIX-MED-004] Ensure status triggers override too
             
             # 3. Execute Action (Async)
             loop = asyncio.new_event_loop()
@@ -69,11 +70,12 @@ class TestSafetyMechanisms(unittest.TestCase):
             
             # 4. Assert Hard Stop
             print(f"Risk Action: {action}")
-            # Should be exactly [1.0]
+            # [Task FIX-MED-004] Updated expectation: RiskAgent now returns [0.0] for HALT
+            # Should be exactly [0.0] (Safe Neutral)
             np.testing.assert_array_equal(
                 action, 
-                np.array([1.0], dtype=np.float32), 
-                "RiskAgent did not return Hard Halt [1.0] on 'HALT' signal."
+                np.array([0.0], dtype=np.float32), 
+                "RiskAgent did not return Hard Halt [0.0] on 'HALT' signal."
             )
 
     def test_alpha_math_safety(self):
