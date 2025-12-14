@@ -84,33 +84,8 @@ class PhoenixProject:
         # 2. Build System (Agents, Engines, Orchestrator)
         sys_ctx = self.registry.build_system(config)
         
-        # --- 3. Instantiate Remaining L3/Execution Components (Not yet in Registry) ---
-        
-        # (L3) 交易生命周期管理器 (Trade Lifecycle Manager)
-        # Registry initializes this as None in Orchestrator, so we create and inject it here.
-        initial_capital = config.trading.get('initial_capital', 100000.0)
-        trade_lifecycle_manager = TradeLifecycleManager(
-            initial_cash=initial_capital,
-            tabular_db=self.registry.container.tabular_db, # Use container's DB
-            bus=sys_ctx.context_bus
-        )
-
-        # (L3) 券商适配器 (Broker Adapter)
-        broker_adapter: IBrokerAdapter = AlpacaAdapter(
-            config=config.broker
-        )
-
-        # [Injection Fix] Patch Registry-created instances with missing dependencies
-        if sys_ctx.order_manager:
-            sys_ctx.order_manager.broker = broker_adapter
-            sys_ctx.order_manager.tlm = trade_lifecycle_manager
-            # Ensure bus is set if OrderManager init didn't (Registry might have updated)
-            if not sys_ctx.order_manager.bus:
-                 sys_ctx.order_manager.bus = sys_ctx.context_bus
-
-        if sys_ctx.orchestrator:
-            sys_ctx.orchestrator.trade_lifecycle_manager = trade_lifecycle_manager
-            # Orchestrator already has order_manager from Registry
+        # [Task FIX-MED-001] Removed manual L3/Execution instantiation.
+        # Everything is now wired inside Registry.build_system().
 
         logger.info("Core services initialized and wired.")
         
@@ -137,17 +112,18 @@ class PhoenixProject:
             "cot_db": self.registry.container.cot_database,
             
             # Engines & Managers
-            "agent_executor": getattr(sys_ctx, 'agent_executor', None), # Should be in sys_ctx
+            "agent_executor": getattr(sys_ctx, 'agent_executor', None),
             "cognitive_engine": sys_ctx.cognitive_engine,
             "risk_manager": sys_ctx.risk_manager,
             "order_manager": sys_ctx.order_manager,
-            "trade_lifecycle_manager": trade_lifecycle_manager,
-            "broker_adapter": broker_adapter,
+            # [Task FIX-MED-001] Retrieve from sys_ctx
+            "trade_lifecycle_manager": sys_ctx.trade_lifecycle_manager,
+            "broker_adapter": sys_ctx.broker_adapter,
             "audit_manager": sys_ctx.audit_manager,
             
             # Event components
             "event_distributor": sys_ctx.event_distributor,
-            "event_filter": getattr(sys_ctx, 'event_filter', None), # Check Registry output
+            "event_filter": getattr(sys_ctx, 'event_filter', None), 
             
             # Agents (Optional mapping)
             "alpha_agent": sys_ctx.l3_agents.get("alpha"),
@@ -253,18 +229,23 @@ class PhoenixProject:
             
             # --- 5. 启动外部接口 (API Server) ---
             # [Task 005] 只有在内部状态 (Ledger & Risk) 就绪后，才暴露 API
+            # [Task FIX-CRIT-003] Pass main_loop to APIServer for thread-safe scheduling
+            main_loop = asyncio.get_running_loop()
+            
             self.api_server = APIServer(
                 host=self.cfg.api_gateway.host,
                 port=self.cfg.api_gateway.port,
                 context_bus=self.services["context_bus"],
                 logger=logger,
-                audit_viewer=None # TBD
+                audit_viewer=None, # TBD
+                main_loop=main_loop
             )
 
             # [Task 5.1 Fix] Offload API Server to Daemon Thread
-            api_thread = threading.Thread(target=self.api_server.run, daemon=True)
-            api_thread.start()
-            logger.info("API Server started in background thread (Ready to serve).")
+            # Note: APIServer.run spawns its own thread, so we can call it directly or wrap it.
+            # Given current impl of APIServer.run starts a thread, we can just call it.
+            self.api_server.run() 
+            logger.info("API Server started (Background Uvicorn).")
 
             # --- 6. 启动主循环 (Loop Manager) ---
             logger.info("Starting Orchestrator Loop...")
