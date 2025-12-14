@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple, AsyncGenerator
 from collections import defaultdict
 from uuid import UUID
 import re
+import time
 
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.utils.retry import retry_with_exponential_backoff
@@ -15,6 +16,7 @@ class GraphDBClient:
     """
     一个异步 Neo4j 数据库客户端。
     [Fix] 实现了通用的三元组写入逻辑，强制关系存储为边，防止图谱降维。
+    [Task 2.3] Timestamp Fix: Removed internal timestamp() calls for Time Machine compatibility.
     """
     
     # 定义常规属性白名单 (大小写不敏感处理)
@@ -130,14 +132,21 @@ class GraphDBClient:
         return re.sub(r'[^a-zA-Z0-9_]', '', identifier)
 
     @retry_with_exponential_backoff()
-    async def add_triples(self, triples: List[Tuple[str, str, Any]], batch_id: Optional[UUID] = None) -> bool:
+    async def add_triples(self, triples: List[Tuple[str, str, Any]], batch_id: Optional[UUID] = None, timestamp_ms: Optional[int] = None) -> bool:
         """
         [Phase 2 Task 3] 通用图谱写入。
         强制将非属性谓词写入为边 (Edge)。
         使用参数化查询和反引号转义防止注入。
+        
+        Args:
+            timestamp_ms: Explicit timestamp in milliseconds. If None, uses current system time (Live mode only).
         """
         if not self.driver or not triples:
             return True
+        
+        # [Task 2.3] Explicit Timestamp Handling
+        if timestamp_ms is None:
+             timestamp_ms = int(time.time() * 1000)
 
         # 1. Bucket Data
         # node_props: Label -> NodeID -> {prop_key: prop_val}
@@ -188,25 +197,27 @@ class GraphDBClient:
             for label, nodes_dict in node_props.items():
                 batch_data = list(nodes_dict.values())
                 # Use backticks for label safety
+                # [Task 2.3] Use $ts parameter instead of timestamp()
                 query = (
                     f"UNWIND $batch as item "
                     f"MERGE (n:`{label}` {{id: item.id}}) "
-                    f"ON CREATE SET n.ingestion_batch_id = $batch_id, n.created_at = timestamp() "
+                    f"ON CREATE SET n.ingestion_batch_id = $batch_id, n.created_at = $ts "
                     f"SET n += item " # item contains props
                 )
-                await self.execute_write(query, {'batch': batch_data, 'batch_id': batch_id_str})
+                await self.execute_write(query, {'batch': batch_data, 'batch_id': batch_id_str, 'ts': timestamp_ms})
 
             # 3. Execute Edge Batch Writes (Per RelType & Label Pair)
             for (rel_type, s_label, t_label), rels_list in edges.items():
                 # Use backticks for labels and rel_type safety
+                # [Task 2.3] Use $ts parameter
                 query = (
                     f"UNWIND $batch as r "
                     f"MATCH (s:`{s_label}` {{id: r.s}}) "
                     f"MERGE (t:`{t_label}` {{id: r.t}}) " # Use MERGE for target to be safe, though MATCH is faster if strictly ordered
                     f"MERGE (s)-[rel:`{rel_type}`]->(t) "
-                    f"ON CREATE SET rel.ingestion_batch_id = $batch_id, rel.created_at = timestamp() "
+                    f"ON CREATE SET rel.ingestion_batch_id = $batch_id, rel.created_at = $ts "
                 )
-                await self.execute_write(query, {'batch': rels_list, 'batch_id': batch_id_str})
+                await self.execute_write(query, {'batch': rels_list, 'batch_id': batch_id_str, 'ts': timestamp_ms})
 
             logger.info(f"{self.log_prefix} Processed {len(triples)} triples (Nodes: {sum(len(v) for v in node_props.values())}, Edges: {sum(len(v) for v in edges.values())})")
             return True
