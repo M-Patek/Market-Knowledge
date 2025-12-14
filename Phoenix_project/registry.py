@@ -1,7 +1,16 @@
+"""
+Phoenix_project/registry.py
+[Task 1.1] Dependency Container & Agent Factory.
+[Task 1.2] Fail Fast Initialization.
+[Task 2.2] Cognitive Engine Wiring.
+[Task 3.1] Embedding Dimension Probe Fix.
+[Task 1.2] Lazy Import for Broker Adapter.
+"""
 import logging
 import importlib
 import os
 import redis
+import asyncio
 from omegaconf import DictConfig
 from types import SimpleNamespace
 from typing import Dict, Any, Optional, Type
@@ -218,13 +227,27 @@ class Registry:
             config=self.config.api_gateway
         )
         
-        # Dynamic Dimension Probe
+        # [Task 3.1] Dynamic Dimension Probe with Robust Fallback
+        real_dim = 1536 # Default fallback
         try:
+            # Attempt probe
+            # If EmbeddingClient.get_output_dimension is sync:
             real_dim = self.container.embedding_client.get_output_dimension()
             logger.info(f"Registry: Detected embedding dimension {real_dim} for model {model_name}")
         except Exception as e:
-            logger.error(f"Registry: Failed to detect dimension: {e}. Defaulting to 1536.")
-            real_dim = 1536
+            logger.error(f"Registry: Failed to detect embedding dimension: {e}")
+            
+            # Intelligent Fallback based on Model Name
+            if "text-embedding-004" in model_name:
+                real_dim = 768
+                logger.warning(f"Registry: Using fallback dimension {real_dim} for {model_name}")
+            elif "text-embedding-3" in model_name:
+                real_dim = 1536 # OpenAI v3 small/large often 1536 by default (or 3072 for large)
+                if "large" in model_name: real_dim = 3072
+                logger.warning(f"Registry: Using fallback dimension {real_dim} for {model_name}")
+            else:
+                logger.critical(f"Registry: Could not determine dimension for unknown model {model_name}. System may crash.")
+                # We do not raise here to allow partial startup, but warn heavily.
         
         self.container.ensemble_client = EnsembleClient(
             gemini_manager=self.container.gemini_manager,
@@ -242,7 +265,7 @@ class Registry:
         self.container.vector_store = VectorStore(
             config=self.config.memory.vector_store, 
             embedding_client=self.container.embedding_client,
-            vector_size=real_dim # Explicit override
+            vector_size=real_dim # [Task 3.1] Explicit override with probed/fallback dim
         )
         self.container.cot_database = CoTDatabase(self.config.memory.cot_database)
         self.container.graph_db_client = GraphDBClient(self.config.memory.graph_database)
@@ -374,8 +397,9 @@ class Registry:
             bus=c.context_bus
         )
 
-        # 2. Broker Adapter
-        broker_adapter = AlpacaAdapter(config=config.broker)
+        # 2. Broker Adapter (Factory Method handles Lazy Import)
+        from Phoenix_project.registry import build_broker_adapter
+        broker_adapter = build_broker_adapter(config=config.broker)
 
         # 3. Order Manager (Fully Wired)
         order_manager = OrderManager(
@@ -429,7 +453,8 @@ class Registry:
             stream_processor=stream_processor,
             risk_filter=risk_filter,
             context_bus=c.context_bus,
-            redis_client=c.data_manager.redis_client
+            redis_client=c.data_manager.redis_client,
+            config=config # [Task 1.4] Pass config for run_mode
         )
 
         # --- 主协调器 ---
@@ -486,3 +511,35 @@ class Registry:
         if not component:
             logger.error(f"Component '{name}' not found in container.")
         return component
+
+# [Task 1.2] Factory method for Broker Adapter (Lazy Loading)
+from typing import Dict, Any
+from Phoenix_project.execution.interfaces import IBrokerAdapter
+
+def build_broker_adapter(config: Dict[str, Any]) -> IBrokerAdapter:
+    """
+    [Task 1.2] Factory method to instantiate the appropriate broker adapter.
+    
+    Implements Strict Mode Isolation:
+    - LIVE: Instantiates AlpacaAdapter (Real Trading).
+    - BACKTEST/PAPER/DEV: Instantiates SimulatedBroker (In-Memory).
+    
+    Uses Lazy Imports to prevent loading execution drivers in safe modes.
+    """
+    # Normalize run_mode to uppercase, default to BACKTEST for safety
+    run_mode = config.get("run_mode", "BACKTEST").upper()
+    
+    if run_mode == "LIVE":
+        logger.critical("⚠️  SYSTEM STARTING IN LIVE TRADING MODE ⚠️")
+        logger.info("Loading Live Execution Drivers...")
+        
+        # [Lazy Import] Only import Alpaca dependencies if strictly required
+        from Phoenix_project.execution.adapters import AlpacaAdapter
+        return AlpacaAdapter(config)
+        
+    else:
+        logger.info(f"System starting in {run_mode} mode. Loading Simulated Broker.")
+        
+        # [Lazy Import] Load Simulation Driver
+        from Phoenix_project.execution.adapters import SimulatedBroker
+        return SimulatedBroker(config)
