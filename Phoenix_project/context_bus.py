@@ -106,8 +106,23 @@ class ContextBus:
         后台任务：异步监听 Redis 消息。
         [Task 0.3 Fix] 实现“复活循环” (Resurrection Loop) 和非阻塞分发。
         """
+        # [Task FIX-HIGH-002] Track reconnection state
+        needs_resubscribe = False
+
         while self._listening:
             try:
+                # [Task FIX-HIGH-002] Restore subscriptions on reconnect
+                if needs_resubscribe and self._handlers:
+                    logger.info(f"ContextBus: Connection restored. Resubscribing to {len(self._handlers)} channels...")
+                    try:
+                        await self._pubsub.subscribe(*self._handlers.keys())
+                        needs_resubscribe = False
+                        logger.info("ContextBus: Resubscription successful.")
+                    except Exception as sub_e:
+                        logger.error(f"ContextBus: Resubscription failed: {sub_e}. Will retry.")
+                        await asyncio.sleep(1)
+                        continue
+
                 async for message in self._pubsub.listen():
                     if not self._listening:
                         break
@@ -141,6 +156,8 @@ class ContextBus:
             except Exception as e:
                 logger.error(f"ContextBus listener loop interrupted: {e}. Retrying in 1s...", exc_info=True)
                 await asyncio.sleep(1)
+                # [Task FIX-HIGH-002] Flag for resubscription
+                needs_resubscribe = True
 
     # --- 状态持久化功能 (修复点: Distributed Lock + CAS) ---
 
