@@ -9,6 +9,7 @@
 # [Task 5.3] Log Sampling for Idle Loops
 # [Code Opt Expert Fix] Task 17: Poison Pill Protection (Reliable ACK)
 # [Task 005, 006, 010] Real-time Risk Integration, Temporal Safety, Magic String Removal
+# [Task FIX-CRIT-002] Logic Signature Update & Backtest Support
 
 import logging
 import asyncio
@@ -87,11 +88,12 @@ class Orchestrator:
         
         logger.info("Orchestrator initialized.")
 
-    async def run_main_cycle(self):
+    async def run_main_cycle(self, state: Optional[PipelineState] = None, injected_data: Optional[List] = None):
         """
         [已实现]
         执行一个完整的认知-决策-行动 (CDA) 循环。
         这是由 Celery beat (LoopManager) 调度的主要入口点。
+        [Refactor] Added support for injected state and data for Backtesting.
         """
         start_time = datetime.now()
         # [Optimization] Reduced start log verbosity or moved to debug if needed, keeping info for now
@@ -99,34 +101,38 @@ class Orchestrator:
         
         # [Task 17] Scope Initialization: Ensure accessible in finally block
         new_events = []
+        # [Task FIX-CRIT-002] Determine mode
+        is_live_mode = state is None and injected_data is None
 
-        pipeline_state = None
+        pipeline_state = state
         try:
             # 0. 初始化/恢复状态 [Task 2.3 Refactor]
-            pipeline_state = await self.context_bus.load_latest_state()
-            
-            if not pipeline_state:
-                logger.info("No previous state found. Creating new PipelineState.")
-                pipeline_state = PipelineState()
+            if pipeline_state is None:
+                pipeline_state = await self.context_bus.load_latest_state()
+                
+                if not pipeline_state:
+                    logger.info("No previous state found. Creating new PipelineState.")
+                    pipeline_state = PipelineState()
 
-            # [Phase II Fix] Lazy Initialize RiskManager (Persistence Loading)
-            if self.risk_manager and not self.risk_initialized:
-                logger.info("Initializing RiskManager (loading persistence & warm-up)...")
-                # Default to system symbol if specific list unavailable
-                symbols = [self.config.get('trading', {}).get('default_symbol', 'BTC/USD')]
-                await self.risk_manager.initialize(symbols)
-                self.risk_initialized = True
-            
-            # [Time Machine] 关键：使用 DataManager 的时间同步 State
-            if self.data_manager:
-                pipeline_state.update_time(await self.data_manager.get_current_time())
-                pipeline_state.step_index += 1
+                # [Phase II Fix] Lazy Initialize RiskManager (Persistence Loading)
+                if self.risk_manager and not self.risk_initialized:
+                    logger.info("Initializing RiskManager (loading persistence & warm-up)...")
+                    # Default to system symbol if specific list unavailable
+                    symbols = [self.config.get('trading', {}).get('default_symbol', 'BTC/USD')]
+                    await self.risk_manager.initialize(symbols)
+                    self.risk_initialized = True
+                
+                # [Time Machine] 关键：使用 DataManager 的时间同步 State (仅实盘)
+                if self.data_manager:
+                    pipeline_state.update_time(await self.data_manager.get_current_time())
+                    pipeline_state.step_index += 1
 
             # [Task 1 Fix] State Sync: Active sync from Ledger (Brain-Body Connection)
             tlm = self.trade_lifecycle_manager or (self.order_manager.trade_lifecycle_manager if hasattr(self.order_manager, 'trade_lifecycle_manager') else None)
             
             # [Fail-Closed Patch] The Zombie Portfolio Fix
             if tlm:
+                # Use pipeline_state.current_time which is now consistent for both modes
                 real_portfolio = tlm.get_current_portfolio_state({}, timestamp=pipeline_state.current_time) 
                 pipeline_state.update_portfolio_state(real_portfolio)
                 logger.info(f"Synced portfolio state from Ledger: {len(real_portfolio.positions)} positions.")
@@ -134,9 +140,15 @@ class Orchestrator:
                 # CRITICAL: Do not run without a ledger.
                 raise RuntimeError("TradeLifecycleManager (Ledger) not available. Critical system dependency missing.")
 
-            # 1. 从事件分发器（Redis）获取新事件
-            # [Phase 0 Fix] Use native async call
-            new_events = await self.event_distributor.get_pending_events()
+            # 1. 从事件分发器获取新事件 (或注入)
+            if injected_data is not None:
+                new_events = injected_data
+                logger.info(f"Using {len(new_events)} injected events for Backtesting.")
+            else:
+                # 实盘从 Redis 获取
+                # [Phase 0 Fix] Use native async call
+                new_events = await self.event_distributor.get_pending_events()
+
             if not new_events:
                 # [Task 5.3] Log Sampling: Only log "No events" once every 100 ticks
                 self.no_event_counter += 1
@@ -146,7 +158,7 @@ class Orchestrator:
             
             # Reset counter on activity
             self.no_event_counter = 0
-            logger.info(f"Retrieved {len(new_events)} new events from EventDistributor.")
+            # logger.info(f"Retrieved {len(new_events)} new events from EventDistributor.")
             pipeline_state.set_raw_events(new_events)
 
             # [Task 005] Ghost Risk Manager Fix: Update Risk State immediately
@@ -235,7 +247,8 @@ class Orchestrator:
 
         finally:
             # [Task 17] Poison Pill Protection: Ensure events are ACKed even on failure
-            if new_events:
+            # [Task FIX-CRIT-002] Only ACK if we are in Live Mode
+            if is_live_mode and new_events:
                 try:
                     await self.event_distributor.ack_events(new_events)
                     logger.info("Events acknowledged in finally block.")
@@ -246,7 +259,9 @@ class Orchestrator:
             if pipeline_state:
                 self.audit_manager.log_cycle(pipeline_state)
                 logger.info("Pipeline state logged to AuditManager.")
-                await self.context_bus.save_state(pipeline_state)
+                # [Task FIX-CRIT-002] Only persist state if in Live Mode
+                if is_live_mode:
+                    await self.context_bus.save_state(pipeline_state)
                 
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
@@ -383,13 +398,14 @@ class Orchestrator:
                 logger.info(f"Execution Agent Action: {exec_action}")
 
             # 5. Consolidate Results
+            # [Task FIX-CRIT-002] Use pipeline_state time for consistency
             l3_decision = {
                 "type": "DRL_DECISION",
                 "symbol": symbol,
                 "alpha_action": alpha_action.tolist() if hasattr(alpha_action, 'tolist') else alpha_action,
                 "risk_action": risk_action,
                 "exec_action": exec_action.tolist() if hasattr(exec_action, 'tolist') else exec_action,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": pipeline_state.current_time.isoformat() if pipeline_state.current_time else datetime.now().isoformat()
             }
             
             pipeline_state.set_l3_decision(l3_decision)
