@@ -9,6 +9,7 @@
 [Phase V Fix] SQL Injection Protection
 [Code Opt Expert Fix] Task 11 & 12: Concurrency Crash Fix & Valuation Fallback
 [Task 012, 013] Append-Only Ledger & Ostrich Valuation Fix
+[Task P0-003] Flexible Valuation Fallback (No crash on missing price)
 """
 from typing import Dict, Optional, Any
 from datetime import datetime
@@ -156,17 +157,17 @@ class TradeLifecycleManager:
         positions_snapshot = {k: v.model_copy() for k, v in raw_positions.items()}
         
         total_value = self.cash
+        valuation_confidence = "high" # [Task TASK-P0-003] Track valuation confidence
         
         # 更新持仓的市值和未实现盈亏 (使用快照)
         for symbol, pos in positions_snapshot.items():
             current_price = current_market_data.get(symbol)
             
-            # [Task 1.1 Fix] Fail-Closed Valuation: Raise error on missing data
-            # Removed Ostrich Valuation (fallback to average_price) which hides losses
+            # [Task TASK-P0-003] Flexible Valuation: Fallback to average price
             if current_price is None or current_price <= 0:
-                error_msg = f"Valuation failed: Market data missing/invalid for {symbol}."
-                logger.critical(f"{self.log_prefix} {error_msg}")
-                raise ValueError(error_msg)
+                logger.warning(f"{self.log_prefix} Valuation fallback: Market data missing/invalid for {symbol}. Using AvgPrice.")
+                current_price = pos.average_price
+                valuation_confidence = "low"
 
             # Calculate in Decimal for safety
             # Note: Explicit casting Decimal -> float for schema compatibility
@@ -193,7 +194,8 @@ class TradeLifecycleManager:
             cash=float(self.cash), # Convert back to float for Schema
             total_value=float(total_value),
             positions=positions_snapshot, # Return the consistent snapshot
-            realized_pnl=float(self.realized_pnl)
+            realized_pnl=float(self.realized_pnl),
+            metadata={"valuation_confidence": valuation_confidence, "method": "flexible_fallback"}
         )
 
     async def on_fill(self, fill: Fill):
@@ -445,3 +447,7 @@ class TradeLifecycleManager:
             except Exception as e:
                 logger.error(f"{self.log_prefix} Reconciliation Error: {e}", exc_info=True)
                 return {"status": "error", "message": str(e)}
+            
+    def check_purchasing_power(self, estimated_cost: float) -> bool:
+        """Simple check to see if we have enough cash for a transaction."""
+        return self.cash >= Decimal(str(estimated_cost))
