@@ -1,10 +1,3 @@
-"""
-Phoenix_project/execution/order_manager.py
-[Phase 3 Task 3] Fix OrderManager Zombie State.
-Implement on_order_update to clean up active_orders on terminal states.
-Unblock 'One-Shot' deadlock.
-[Task FIX-CRIT-001] Execution Safety: Purchasing Power Check
-"""
 import asyncio
 import logging
 from typing import Dict, List, Optional, Any
@@ -24,6 +17,8 @@ class OrderManager:
     负责将目标投资组合转换为具体的订单，并管理订单生命周期。
     
     [Fix] 实时监听订单状态，自动清理已完成/取消的订单，防止死锁。
+    [Task FIX-CRIT-001] Execution Safety: Purchasing Power Check
+    [Task P1-002] Deadlock Watchdog: Timeout & Auto-Recovery
     """
 
     def __init__(
@@ -38,9 +33,9 @@ class OrderManager:
         self.data_manager = data_manager
         self.bus = bus
         
-        # 内部跟踪: symbol -> order_id (防止对同一标的重复下单)
-        # 也可以是 order_id -> Order object
-        self.active_orders: Dict[str, str] = {} 
+        # 内部跟踪: symbol -> {'id': order_id, 'ts': timestamp}
+        # 修改结构以支持超时检查
+        self.active_orders: Dict[str, Dict[str, Any]] = {} 
         self._lock = asyncio.Lock()
         
         # [Task 3.3] Subscribe to Broker Updates
@@ -95,9 +90,13 @@ class OrderManager:
             if event in TERMINAL_STATES:
                 async with self._lock:
                     # Check if this order is tracked as active
-                    current_active_id = self.active_orders.get(symbol)
+                    # [Task P1-002] Support dict structure
+                    current_active = self.active_orders.get(symbol)
                     
-                    if current_active_id == str(order_id):
+                    # Handle legacy string format or new dict format
+                    current_id = current_active if isinstance(current_active, str) else (current_active.get('id') if current_active else None)
+
+                    if current_id == str(order_id):
                         del self.active_orders[symbol]
                         logger.info(f"Order {order_id} for {symbol} finished ({event}). Removed from active tracking.")
                     
@@ -175,10 +174,49 @@ class OrderManager:
         
         async with self._lock:
             for symbol in all_symbols:
-                # Skip if there is an active order for this symbol
+                # [Task P1-002] Deadlock Watchdog & Timeout Check
                 if symbol in self.active_orders:
-                    logger.info(f"Skipping {symbol}: Active order {self.active_orders[symbol]} pending.")
-                    continue
+                    active_info = self.active_orders[symbol]
+                    
+                    # Migration/Safety: Handle if it's still a string
+                    if isinstance(active_info, str):
+                         active_info = {'id': active_info, 'ts': datetime.now().timestamp()}
+                         self.active_orders[symbol] = active_info
+                    
+                    order_id = active_info.get('id')
+                    ts = active_info.get('ts', datetime.now().timestamp())
+                    
+                    # Timeout Threshold: 60 seconds
+                    if (datetime.now().timestamp() - ts) > 60:
+                        logger.warning(f"Order {order_id} for {symbol} stale (>60s). Checking status...")
+                        try:
+                            # Verify status with broker (Synchronous call expected)
+                            status_res = self.broker.get_order_status(order_id)
+                            
+                            should_clear = False
+                            if status_res.get("status") == "error":
+                                logger.warning(f"Order {order_id} not found/error. Clearing active lock.")
+                                should_clear = True
+                            else:
+                                data = status_res.get("data", {})
+                                status = data.get("status", "").lower()
+                                TERMINAL_STATES = {'filled', 'canceled', 'expired', 'rejected', 'stopped', 'done_for_day', 'replaced'}
+                                if status in TERMINAL_STATES:
+                                    logger.info(f"Stale order {order_id} is actually {status}. Clearing active lock.")
+                                    should_clear = True
+                            
+                            if should_clear:
+                                del self.active_orders[symbol]
+                                # Proceed to execute new order logic for this symbol
+                            else:
+                                logger.info(f"Order {order_id} still active. Keeping lock.")
+                                continue
+                        except Exception as e:
+                            logger.error(f"Error checking stale order {order_id}: {e}")
+                            continue # Fail safe, keep lock
+                    else:
+                        logger.info(f"Skipping {symbol}: Active order {order_id} pending.")
+                        continue
                 
                 current_qty = current_positions.get(symbol, 0.0)
                 # Target format check: target_portfolio might be complex object or dict
@@ -254,7 +292,9 @@ class OrderManager:
                     order_id = self.broker.place_order(order)
                     
                     if order_id:
-                        self.active_orders[symbol] = order_id
+                        # [Task P1-002] Store with timestamp
+                        self.active_orders[symbol] = {'id': order_id, 'ts': datetime.now().timestamp()}
+                        
                         logger.info(f"Order placed successfully: {order_id}. Tracking as active.")
                         state.execution_results.append({
                             "symbol": symbol,
