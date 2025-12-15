@@ -21,6 +21,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
     - Observation Shape: 9
     - Asset Mapping: 固定资产列表
     - Execution: 委托给 SimulatedBroker (Task 1.3)
+    [Task P1-001] Logic Alignment: Use Open prices for execution to simulate T+1.
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -84,7 +85,8 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         self.current_allocation = {sym: 0.0 for sym in self.asset_list}
 
         # 状态缓存
-        self.current_prices = {}
+        self.current_prices = {} # Close prices (Observation)
+        self.execution_prices = {} # Open prices (Execution)
         self.current_volumes = {}
         self.current_spreads = {}
         self.current_imbalances = {}
@@ -111,6 +113,8 @@ class PhoenixMultiAgentEnvV7(gym.Env):
                 sym = md.symbol
                 if sym in self.asset_list:
                     self.current_prices[sym] = float(md.close)
+                    # [Task P1-001] Capture Open price for execution
+                    self.execution_prices[sym] = float(getattr(md, 'open', md.close))
                     self.current_volumes[sym] = float(md.volume)
                     self.current_spreads[sym] = float(getattr(md, 'spread', 0.0001))
                     self.current_imbalances[sym] = float(getattr(md, 'depth_imbalance', 0.0))
@@ -124,10 +128,12 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             self.l2_knowledge = {}
 
         # 2. 执行交易 (Delegated to SimulatedBroker)
+        # Uses self.execution_prices (Open) instead of self.current_prices (Close)
         team_action = action_dict.get('alpha') 
         costs_t1 = self._execute_trades(team_action, self.l2_knowledge)
 
         # 3. 更新价值 (From Broker)
+        # Note: Valuation uses CLOSE prices (mark-to-market), Execution uses OPEN prices.
         old_value = self.total_value
         self.total_value = self._get_current_portfolio_value()
 
@@ -159,6 +165,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         """
         (V7) 真实交易执行引擎 - Powered by SimulatedBroker
         Converts allocation weights to Orders and executes them via the Broker.
+        [Task P1-001] Uses Open Prices for Execution.
         """
         total_fees = 0.0
         total_slippage = 0.0
@@ -176,13 +183,15 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         else:
             target_allocation = target_allocation_vector if target_allocation_vector else {}
 
-        # Get Current Equity from Broker
+        # Get Current Equity from Broker (using Close prices for valuation base)
         current_equity = self._get_current_portfolio_value()
         
         # Execute
         for symbol in self.asset_list:
-            price = self.current_prices.get(symbol)
-            if not price or price <= 0:
+            # [Task P1-001] Use Execution Price (Open) for Trade
+            exec_base_price = self.execution_prices.get(symbol)
+            
+            if not exec_base_price or exec_base_price <= 0:
                 continue
             
             target_weight = target_allocation.get(symbol, 0.0)
@@ -190,13 +199,15 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             
             # Get current position from Broker
             current_pos_qty = self.broker.get_position(symbol)
-            current_pos_value = current_pos_qty * price
+            current_pos_value = current_pos_qty * exec_base_price # Re-eval at exec price for trade delta?
+            # Or usually target weight is based on *current* valuation (Close T-1) but execution is at Open T.
+            # Simplified: Target Value = Equity * Weight. Delta = Target Value - Current Value (at Execution Price).
             
             diff_value = target_pos_value - current_pos_value
             
             if abs(diff_value) < 10.0: continue # Minimum trade threshold
                 
-            delta_shares = diff_value / price
+            delta_shares = diff_value / exec_base_price
             trade_val_abs = abs(diff_value)
             
             # Slippage Calculation
@@ -207,7 +218,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             # Execute Price (Price + Slippage impact)
             # Buy (delta > 0): Price increases. Sell (delta < 0): Price decreases.
             side_sign = 1 if delta_shares > 0 else -1
-            exec_price = price * (1 + slippage_rate * side_sign)
+            final_exec_price = exec_base_price * (1 + slippage_rate * side_sign)
             
             # Construct Order
             order = Order(
@@ -221,7 +232,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
             try:
                 # Delegate to Broker
                 # Note: SimulatedBroker.place_order uses 'price' to settle immediately.
-                self.broker.place_order(order, price=exec_price)
+                self.broker.place_order(order, price=final_exec_price)
                 
                 # Fee Calculation (Manually deduct since Broker v1 doesn't auto-deduct fees yet)
                 fee = trade_val_abs * COMMISSION_RATE
@@ -231,9 +242,11 @@ class PhoenixMultiAgentEnvV7(gym.Env):
                 total_slippage += slippage
                 
                 # Update allocation cache for observation
+                # Observation uses Close prices
                 updated_equity = self._get_current_portfolio_value()
                 new_shares = self.broker.get_position(symbol)
-                self.current_allocation[symbol] = (new_shares * price) / updated_equity if updated_equity > 0 else 0.0
+                close_price = self.current_prices.get(symbol, 0.0)
+                self.current_allocation[symbol] = (new_shares * close_price) / updated_equity if updated_equity > 0 else 0.0
                 
             except Exception as e:
                 # Log error but don't crash env
@@ -242,9 +255,7 @@ class PhoenixMultiAgentEnvV7(gym.Env):
         return {'fees': total_fees, 'slippage': total_slippage}
 
     def _get_current_portfolio_value(self) -> float:
-        """Helper to calculate total value using Broker's state and Env's current prices."""
-        # Note: Broker's get_portfolio_value might use stale prices if we don't update it.
-        # But SimulatedBroker tracks quantities. We should calculate value using *current env prices*.
+        """Helper to calculate total value using Broker's state and Env's current CLOSE prices."""
         cash = self.broker.get_cash_balance()
         pos_val = 0.0
         for sym in self.asset_list:
