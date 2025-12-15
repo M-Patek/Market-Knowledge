@@ -1,5 +1,6 @@
 from typing import Dict, Any, Optional
 import uuid
+from copy import deepcopy
 from Phoenix_project.audit.logger import AuditLogger
 from Phoenix_project.memory.cot_database import CoTDatabase
 from Phoenix_project.core.schemas.fusion_result import FusionResult
@@ -14,6 +15,7 @@ class AuditManager:
     - Generates unique IDs for decisions.
     - Logs events to the persistent AuditLogger (file/db).
     - Stores Chain-of-Thought (CoT) reasoning in the CoTDatabase.
+    [Task P2-002] Sensitive data sanitization implemented.
     """
 
     def __init__(self, audit_logger: AuditLogger, cot_database: CoTDatabase):
@@ -24,6 +26,40 @@ class AuditManager:
     def generate_decision_id(self) -> str:
         """Generates a unique ID for a single reasoning cycle."""
         return f"dec_{uuid.uuid4()}"
+
+    def _sanitize_data(self, data: Any) -> Any:
+        """
+        [Task P2-002] 递归脱敏敏感信息。
+        查找键名包含 key, secret, password, token 的字段，并替换其值。
+        """
+        if not isinstance(data, (dict, list)):
+            return data
+
+        # Deep copy to ensure the original payload is not modified in memory
+        sanitized_data = deepcopy(data) 
+
+        if isinstance(sanitized_data, dict):
+            for key, value in sanitized_data.items():
+                lower_key = key.lower()
+                
+                # Check for sensitive keywords
+                is_sensitive = any(
+                    kw in lower_key for kw in ['key', 'secret', 'password', 'token']
+                )
+
+                if is_sensitive and isinstance(value, str):
+                    # Replace value with mask
+                    sanitized_data[key] = "******"
+                elif isinstance(value, (dict, list)):
+                    # Recurse into nested structures
+                    sanitized_data[key] = self._sanitize_data(value)
+        
+        elif isinstance(sanitized_data, list):
+            # Recurse into list elements
+            for i in range(len(sanitized_data)):
+                sanitized_data[i] = self._sanitize_data(sanitized_data[i])
+
+        return sanitized_data
 
     async def audit_decision_cycle(
         self,
@@ -43,6 +79,9 @@ class AuditManager:
         
         # 1. Log the full decision to the persistent audit trail (JSONL)
         try:
+            # Note: PipelineState and FusionResult are structured Pydantic models; 
+            # they should not contain raw secrets unless they are logged as a dictionary 
+            # within a key/value pair. Sanitization of generic 'details' in audit_event is primary.
             await self.audit_logger.log_decision(
                 decision_id=decision_id,
                 fusion_result=fusion_result,
@@ -95,10 +134,13 @@ class AuditManager:
         if not decision_id and pipeline_state:
             # (FIX) 使用 get_value 作为安全访问器
             decision_id = pipeline_state.get_value("current_decision_id")
+        
+        # [TASK-P2-002 Fix] Sanitize the details payload before logging
+        sanitized_details = self._sanitize_data(details)
             
         await self.audit_logger.log_event(
             event_type=event_type,
-            details=details,
+            details=sanitized_details,
             pipeline_state=pipeline_state,
             decision_id=decision_id
         )
