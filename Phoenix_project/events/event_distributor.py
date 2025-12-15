@@ -3,6 +3,7 @@ Phoenix_project/events/event_distributor.py
 [Task 004] Refactor ACK mechanism, add DLQ, fix Recovery.
 [Task FIX-HIGH-001] Data Integrity: DLQ for corrupt payloads.
 [Task 1.4] Redis Namespace Isolation.
+[Task P1-003] Auto-Recovery Background Task.
 """
 import json
 import logging
@@ -23,6 +24,7 @@ class AsyncEventDistributor:
     [Task 002] ZSET Architecture for Reliable ACK.
     [Task 004] ID-based ACK, DLQ, RPUSH Retry.
     [Task 1.4] Namespace Isolation (phx:{run_mode}:...).
+    [Task P1-003] Auto-Recovery Background Task.
     """
 
     def __init__(self, redis_client: aioredis.Redis, config: Dict[str, Any] = None, stream_processor: Any = None, risk_filter: Any = None, context_bus: Any = None):
@@ -43,7 +45,39 @@ class AsyncEventDistributor:
         self.max_retries = 3
         self._json_separators = (',', ':') 
         
+        # [Task P1-003] Initialize Recovery Task
+        self._recovery_task = None
+        if self.run_mode in ("LIVE", "PAPER"): # Activate only in active modes
+             self._start_recovery_task()
+        
         logger.info(f"EventDistributor initialized in {self.run_mode} mode. Queue: {self.queue_key}")
+
+    def _start_recovery_task(self):
+        """Starts the background recovery loop."""
+        try:
+            loop = asyncio.get_running_loop()
+            self._recovery_task = loop.create_task(self._recovery_loop())
+            logger.info("Event recovery background task started.")
+        except RuntimeError:
+            # Loop might not be running yet (e.g. during test init)
+            # Caller/Orchestrator responsible for starting if init outside loop
+            pass
+
+    async def _recovery_loop(self):
+        """
+        [Task P1-003] Periodic recovery of stale events.
+        """
+        logger.info("Starting event recovery loop.")
+        while True:
+            try:
+                await self.recover_stale_events(timeout_seconds=60) # Check every 60s window
+                await asyncio.sleep(60) # Interval
+            except asyncio.CancelledError:
+                logger.info("Event recovery loop cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Error in recovery loop: {e}")
+                await asyncio.sleep(60) # Prevent tight loop on error
 
     async def publish(self, event: Dict[str, Any]) -> bool:
         """
@@ -230,6 +264,15 @@ class AsyncEventDistributor:
                 await pipe.execute()
         except Exception as e:
             logger.error(f"Failed to move event {eid} to DLQ: {e}")
+    
+    async def stop(self):
+        """Clean shutdown of recovery task."""
+        if self._recovery_task:
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
 
 # Alias for easier import if needed, though Registry creates AsyncEventDistributor directly
 EventDistributor = AsyncEventDistributor
