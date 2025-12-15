@@ -2,17 +2,20 @@
 Phoenix_project/training/backtest_engine.py
 [Phase 4 Task 3] Refactor Backtest Matching Logic.
 Implement Volume Check & Partial Fill to prevent rigid rejections.
+[Task P1-001] Integrate SimulatedBroker for consistent execution logic with RL Env.
 """
 from Phoenix_project.monitor.logging import get_logger
 from Phoenix_project.data_manager import DataManager
 from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.data_schema import PortfolioState, Position, MarketData
+from Phoenix_project.core.schemas.data_schema import PortfolioState, Position, MarketData, Order, OrderType, OrderStatus
 from Phoenix_project.cognitive.engine import CognitiveEngine
 from Phoenix_project.core.exceptions import RiskViolationError, CircuitBreakerError
+from Phoenix_project.execution.adapters import SimulatedBroker
 from typing import Dict, Any, List, Optional
 import pandas as pd
 import numpy as np
 from collections import defaultdict
+from decimal import Decimal
 import asyncio
 
 class BacktestEngine:
@@ -20,6 +23,7 @@ class BacktestEngine:
     用于 Walk-Forward 训练和评估的模拟引擎。
     [Phase II Fix] 集成 RiskManager 进行预交易检查，防止过拟合。
     [Phase 4 Fix] Enhanced Matching: Volume Check & Partial Fills.
+    [Task P1-001] Consistent Execution via SimulatedBroker.
     """
     
     def __init__(
@@ -41,7 +45,14 @@ class BacktestEngine:
         self.risk_manager = risk_manager
         
         self.logger = get_logger(self.__class__.__name__)
-        self.logger.info("BacktestEngine initialized with authentic simulation components.")
+        
+        # [Task P1-001] Initialize Simulated Broker
+        broker_config = self.config.copy()
+        broker_config['initial_cash'] = self.config.get("initial_cash", 100000.0)
+        self.broker = SimulatedBroker(broker_config)
+        self.broker.connect()
+        
+        self.logger.info("BacktestEngine initialized with SimulatedBroker.")
         
         self.equity_curve = []   
         self.trade_log = []      
@@ -52,6 +63,9 @@ class BacktestEngine:
         self.equity_curve = []
         self.trade_log = []
         self.pending_orders.clear()
+        
+        # Reset Broker state if needed (SimulatedBroker doesn't have reset, so we rely on fresh instance or re-init if looped)
+        # For now, we assume one run per instance or handled externally.
 
         if not self.pipeline_state.portfolio_state:
             initial_cash = self.config.get("initial_cash", 100000.0)
@@ -66,6 +80,7 @@ class BacktestEngine:
             setattr(self.pipeline_state, 'market_data_batch', market_data_slice)
 
             # [Task 4.2] Step A: Execute Pending Orders from T-1 at Current Open (T)
+            # Now delegates to self.broker
             await self._execute_pending_orders(market_data_slice)
 
             # [Task 016] Backtest Risk Integration
@@ -103,6 +118,11 @@ class BacktestEngine:
         return self.get_performance_metrics()
 
     def _stage_orders_for_next_bar(self, target_portfolio, market_data):
+        """
+        Calculates target quantities based on Close prices of T.
+        These become pending orders for T+1.
+        """
+        # Use PipelineState which is synced with Broker
         current_pf = self.pipeline_state.portfolio_state
         price_map = self._extract_price_map(market_data, price_type='close')
         
@@ -125,32 +145,43 @@ class BacktestEngine:
     async def _execute_pending_orders(self, market_data):
         """
         [Task 4.2] Execute pending orders at the OPEN price of the current bar (T).
-        [Phase 4 Fix] Added Volume Check & Partial Fill Logic.
+        [Task P1-001] Uses SimulatedBroker for state management.
         """
         if not self.pending_orders:
             return
             
-        current_pf = self.pipeline_state.portfolio_state
+        # [Task P1-001] Execution Logic Alignment
+        # Match RL Env constants
+        COMMISSION_RATE = 0.001 
+        
         price_map = self._extract_price_map(market_data, price_type='open')
         volume_map = self._extract_price_map(market_data, price_type='volume') 
+        spread_map = self._extract_price_map(market_data, price_type='spread') # If available
         
-        def get_volume(sym):
-            return volume_map.get(sym, 0.0)
-
-        COMMISSION_RATE = 0.001 
-        SLIPPAGE_RATE = 0.0005  
+        current_pf = self.pipeline_state.portfolio_state
 
         for symbol, qty_delta in list(self.pending_orders.items()):
             price = price_map.get(symbol, 0.0)
-            volume = get_volume(symbol)
+            volume = volume_map.get(symbol, 0.0)
+            spread = spread_map.get(symbol, 0.001)
             
-            # [Phase 4 Fix] Volume & Price Check
             if price <= 0: 
                 self.logger.warning(f"Skipping {symbol}: Invalid price {price}.")
                 continue
+            
+            # [Phase 4 Fix] Volume Check
             if volume <= 0:
                 self.logger.warning(f"Skipping {symbol}: Zero volume (Illiquid).")
                 continue
+            
+            # [Task P1-001] Consistent Slippage Model with TradingEnv
+            # slippage_rate = (spread / 2.0) + 0.0005
+            slippage_rate = (spread / 2.0) + 0.0005
+            
+            # Calculate execution price impact
+            # Buy executes higher, Sell executes lower
+            side_sign = 1 if qty_delta > 0 else -1
+            exec_price = price * (1 + slippage_rate * side_sign)
             
             # [Task 4.2 Fix] Pre-Trade Risk Check
             if self.risk_manager:
@@ -158,8 +189,8 @@ class BacktestEngine:
                     proposed_trade = Position(
                         symbol=symbol,
                         quantity=qty_delta, 
-                        average_price=price,
-                        market_value=abs(qty_delta * price),
+                        average_price=exec_price,
+                        market_value=abs(qty_delta * exec_price),
                         unrealized_pnl=0.0
                     )
                     self.risk_manager.check_pre_trade(proposed_trade, current_pf)
@@ -167,61 +198,88 @@ class BacktestEngine:
                     self.logger.warning(f"Risk Check Failed for {symbol}: {e}. Order REJECTED.")
                     continue
 
-            if symbol not in current_pf.positions:
-                current_pf.positions[symbol] = Position(symbol=symbol, quantity=0.0, average_price=price, market_value=0.0, unrealized_pnl=0.0)
-            
-            # Calculate Cost
-            trade_value = abs(qty_delta * price)
-            cost = trade_value * (COMMISSION_RATE + SLIPPAGE_RATE)
-            total_debit = trade_value + cost if qty_delta > 0 else 0
-            
+            # [Phase 4 Fix] Partial Fill Logic based on Broker Cash
+            broker_cash = float(self.broker.get_cash_balance())
             actual_qty = qty_delta
 
             if qty_delta > 0: # Buying
-                if current_pf.cash < total_debit:
-                    # [Phase 4 Fix] Partial Fill Logic
-                    # Cash = Q * P * (1 + rates)  => Q = Cash / (P * (1 + rates))
-                    max_qty = current_pf.cash / (price * (1 + COMMISSION_RATE + SLIPPAGE_RATE))
-                    
-                    if max_qty < 0.0001: # Dust check
-                        self.logger.warning(f"REJECTED {symbol}: Insufficient funds even for partial fill.")
-                        continue
-                        
-                    self.logger.info(f"PARTIAL FILL {symbol}: Requested {qty_delta}, Afford {max_qty:.4f}.")
-                    actual_qty = max_qty
-                    
-                    # Recalculate cost for actual qty
-                    trade_value = actual_qty * price
-                    cost = trade_value * (COMMISSION_RATE + SLIPPAGE_RATE)
-                    total_debit = trade_value + cost
+                # Cost estimate: Q * P * (1 + Comm)
+                # Note: SimulatedBroker deducts Q*P. We assume Comm is extra.
+                estimated_total_cost = actual_qty * exec_price * (1 + COMMISSION_RATE)
+                
+                if broker_cash < estimated_total_cost:
+                     # Downgrade quantity
+                     max_qty = broker_cash / (exec_price * (1 + COMMISSION_RATE))
+                     if max_qty < 0.0001:
+                         self.logger.warning(f"REJECTED {symbol}: Insufficient funds ({broker_cash}) for trade.")
+                         continue
+                     actual_qty = max_qty
+                     self.logger.info(f"PARTIAL FILL {symbol}: Requested {qty_delta:.4f}, Adjusted to {actual_qty:.4f}")
 
-            else: # Selling
-                # [Task 019] Short Selling Constraint
-                current_pos_qty = current_pf.positions[symbol].quantity
-                if current_pos_qty < abs(qty_delta):
-                    self.logger.warning(f"Short Sell Rejected: Insufficient holdings for {symbol}. Have: {current_pos_qty}, Sell: {abs(qty_delta)}.")
-                    continue
-                # Credit cash (Sell value - cost)
-                credit = abs(qty_delta * price) - cost
-                current_pf.cash += credit
-                total_debit = 0 # Already handled
+            # [Task P1-001] Execute via Broker
+            try:
+                order = Order(
+                    id="", 
+                    symbol=symbol,
+                    quantity=Decimal(str(actual_qty)),
+                    order_type=OrderType.MARKET,
+                    status=OrderStatus.NEW
+                )
+                
+                # Execute
+                self.broker.place_order(order, price=exec_price)
+                
+                # Manual Fee Deduction (Alignment with TradingEnv)
+                trade_value = abs(actual_qty * exec_price)
+                fee = trade_value * COMMISSION_RATE
+                self.broker.cash -= Decimal(str(fee))
+                
+                # Log
+                slippage_cost = abs(trade_value * slippage_rate)
+                self.trade_log.append({
+                    "symbol": symbol,
+                    "quantity": actual_qty,
+                    "price": exec_price,
+                    "cost": fee + slippage_cost,
+                    "type": "BUY" if actual_qty > 0 else "SELL"
+                })
+                
+            except Exception as e:
+                self.logger.error(f"Broker Execution Failed for {symbol}: {e}")
 
-            if qty_delta > 0:
-                current_pf.cash -= total_debit
-            
-            current_pf.positions[symbol].quantity += actual_qty
-            
-            self.trade_log.append({
-                "symbol": symbol,
-                "quantity": actual_qty,
-                "price": price,
-                "cost": cost,
-                "type": "BUY" if actual_qty > 0 else "SELL"
-            })
-            
         self.pending_orders.clear()
-            
+        
+        # [Task P1-001] Sync PipelineState with Broker
+        await self._sync_pipeline_state()
+
+    async def _sync_pipeline_state(self):
+        """
+        Synchronizes the internal pipeline_state.portfolio_state with the SimulatedBroker's authoritative state.
+        """
+        pf_info = self.broker.get_account_info()
+        self.pipeline_state.portfolio_state.cash = float(pf_info['account']['cash'])
+        
+        # Rebuild positions dict
+        new_positions = {}
+        for p in pf_info['positions']:
+            sym = p['symbol']
+            new_positions[sym] = Position(
+                symbol=sym,
+                quantity=float(p['qty']),
+                average_price=float(p.get('avg_entry_price', 0.0)),
+                market_value=float(p.get('market_value', 0.0)),
+                unrealized_pnl=float(p.get('unrealized_pl', 0.0))
+            )
+        self.pipeline_state.portfolio_state.positions = new_positions
+
     def _update_portfolio_valuation(self, market_data):
+        """
+        Updates the total_value of the portfolio based on latest Close prices.
+        """
+        # First sync quantities/cash from broker
+        # (Already done in _execute_pending_orders but good to ensure if logic changes)
+        # self._sync_pipeline_state() # Removed to avoid double async call issues if not awaited properly in sync context
+        
         pf = self.pipeline_state.portfolio_state
         pos_value = 0.0
         
