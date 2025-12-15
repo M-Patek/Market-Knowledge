@@ -8,6 +8,7 @@ from typing import Optional, Type, List, Any, Dict
 from ray.rllib.algorithms.algorithm import Algorithm
 from Phoenix_project.core.schemas.fusion_result import FusionResult
 from Phoenix_project.monitor.logging import get_logger
+from Phoenix_project.core.exceptions import CriticalConfigurationError # [TASK-P2-003 Fix] Import new exception
 
 logger = get_logger(__name__)
 
@@ -46,10 +47,17 @@ class BaseDRLAgent(ABC):
                 self.logger.info(f"DRL Agent initialized. Policy: {self.policy_id}, Expected Obs Dim: {self.expected_dim}")
                 self.internal_state = policy.get_initial_state()
             else:
-                raise ValueError(f"Policy '{self.policy_id}' not found in algorithm.")
+                # [TASK-P2-003 Fix 2] Critical failure if policy is missing
+                error_msg = f"CRITICAL: Policy '{self.policy_id}' not found in algorithm. Cannot initialize DRL Agent."
+                self.logger.critical(error_msg)
+                raise CriticalConfigurationError(error_msg)
+        except CriticalConfigurationError:
+             raise # Re-raise if policy not found
         except Exception as e:
-            self.logger.warning(f"Failed to inspect policy or initialize state: {e}. Will attempt adaptive inference.")
-            # [Task 2.2 Fix] Non-blocking init
+            # [TASK-P2-003 Fix 2] Critical failure on dimension/policy inspection
+            error_msg = f"CRITICAL: Failed to inspect policy or initialize state for DRL Agent. Error: {e}"
+            self.logger.critical(error_msg)
+            raise CriticalConfigurationError(error_msg)
 
     def set_dependencies(self, context_bus: Any, audit_manager: Any):
         """
@@ -89,18 +97,13 @@ class BaseDRLAgent(ABC):
         [任务 4.1 & 0.2] 完成“神经连接”。
         使用加载的 RLLib 算法计算确定性动作。
         """
-        # [Task 2.2 Fix] Adaptive Observation Shaping
+        # [TASK-P2-003 Fix 1] Removed the soft/adaptive observation shaping logic.
+        # Enforce dimension check here, relying on RLLib to throw an error if it fails,
+        # or throwing a critical error if the expected dimension exists and the input doesn't match.
         if hasattr(self, 'expected_dim') and self.expected_dim and observation.shape[0] != self.expected_dim:
-            obs_dim = observation.shape[0]
-            if obs_dim < self.expected_dim:
-                # Padding
-                pad_width = self.expected_dim - obs_dim
-                observation = np.pad(observation, (0, pad_width), 'constant')
-                self.logger.warning(f"Adapting observation: Padded {obs_dim} -> {self.expected_dim}")
-            elif obs_dim > self.expected_dim:
-                # Truncation
-                observation = observation[:self.expected_dim]
-                self.logger.warning(f"Adapting observation: Truncated {obs_dim} -> {self.expected_dim}")
+             error_msg = f"CRITICAL: Observation dimension mismatch! Expected {self.expected_dim}, got {observation.shape[0]}. Aborting."
+             self.logger.critical(error_msg)
+             raise CriticalConfigurationError(error_msg)
 
         try:
             # explore=False 确保我们在生产 (Inference) 模式下
@@ -163,6 +166,10 @@ class DRLAgentLoader:
             
         except FileNotFoundError:
             logger.error(f"FATAL: Checkpoint directory not found at: {checkpoint_path}")
+        except CriticalConfigurationError as e:
+             # Propagate critical error raised during DRLAgent __init__
+             logger.error(f"FATAL: Critical configuration error during agent initialization: {e}")
+             return None
         except Exception as e:
             logger.error(f"FATAL: Failed to load algorithm from checkpoint {checkpoint_path}. Error: {e}", exc_info=True)
             
