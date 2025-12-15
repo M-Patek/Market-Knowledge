@@ -2,6 +2,7 @@
 Phoenix_project/cognitive/portfolio_constructor.py
 [Phase 3 Task 4] Fix Silent Liquidation on Missing Price.
 Prevents defaulting target quantity to 0 when market data is unavailable.
+[Task P0-002] Force normalization of portfolio weights.
 """
 import logging
 from omegaconf import DictConfig
@@ -132,6 +133,13 @@ class PortfolioConstructor:
             logger.debug(f"Sizing positions for: {adjusted_weights}")
             candidates = [{"ticker": s, "weight": w} for s, w in adjusted_weights.items()]
             allocation_results = self.sizing_strategy.size_positions(candidates, max_total_allocation=1.0)
+            
+            # [Task TASK-P0-002] Force normalization of allocation results
+            total_allocated_weight = sum(item.get("capital_allocation_pct", 0.0) for item in allocation_results)
+            if total_allocated_weight > 1.0:
+                logger.warning(f"Warning: Leverage exceeded 1.0 ({total_allocated_weight}), normalizing weights.")
+                for item in allocation_results:
+                    item["capital_allocation_pct"] = item.get("capital_allocation_pct", 0.0) / total_allocated_weight
             
             total_equity = float(real_time_portfolio.get("total_value", 0.0))
             price_map = {md.symbol: float(md.close) for md in market_data if md.close}
