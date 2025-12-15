@@ -1,5 +1,7 @@
 import asyncio
 import threading
+import os
+from functools import wraps
 from typing import Dict, Any, List, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,11 +24,6 @@ class EventInput(BaseModel):
     event_type: str
     data: Dict[str, Any]
     metadata: Optional[Dict[str, Any]] = None
-
-class ManualOverrideInput(BaseModel):
-    component: str
-    action: str  # e.g., "PAUSE", "RESUME", "TRIGGER_RUN"
-    parameters: Optional[Dict[str, Any]] = None
 
 class APIServer:
     """
@@ -61,6 +58,11 @@ class APIServer:
         # [Task FIX-CRIT-003] Store the main loop for thread-safe scheduling
         self.main_loop = main_loop
         
+        # [Task TASK-P0-001] Load API Key
+        self.api_key = os.getenv("PHOENIX_API_KEY")
+        if not self.api_key:
+            self.logger.log_warning("PHOENIX_API_KEY not set. API endpoints are unsecured!")
+        
         self._register_routes()
         self.logger.log_info(f"APIServer initialized. Will run on {self.host}:{self.port}")
         self.logger.log_info("Prometheus /metrics 端点已在 /metrics 激活")
@@ -68,6 +70,18 @@ class APIServer:
 
     def _register_routes(self):
         """Registers all Flask routes."""
+        
+        # [Task TASK-P0-001] API Key Decorator
+        def require_api_key(f):
+            @wraps(f)
+            def decorated_function(*args, **kwargs):
+                if self.api_key:
+                    auth_header = request.headers.get("X-API-Key")
+                    if not auth_header or auth_header != self.api_key:
+                        self.logger.log_warning(f"Unauthorized access attempt to {request.path} from {request.remote_addr}")
+                        return jsonify({"error": "Unauthorized", "message": "Invalid or missing API Key"}), 401
+                return f(*args, **kwargs)
+            return decorated_function
         
         @self.app.route("/", methods=["GET"])
         def index():
@@ -85,6 +99,7 @@ class APIServer:
             return jsonify(self.get_system_status()), 200
 
         @self.app.route("/api/v1/event", methods=["POST"])
+        @require_api_key
         def inject_event():
             """
             Endpoint to inject a new event into the system.
@@ -117,6 +132,7 @@ class APIServer:
                 return jsonify({"error": "Failed to process event"}), 500
 
         @self.app.route("/api/v1/audit", methods=["GET"])
+        @require_api_key
         def get_audit_logs():
             """
             Retrieves audit logs. Uses the AuditViewer.
