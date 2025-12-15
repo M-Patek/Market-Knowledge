@@ -1,148 +1,100 @@
-"""
-Phoenix_project/agents/l1/base.py
-[Refactor] Unified L1 Agent Interface Contract.
-[Fix] Renamed BaseL1Agent to L1Agent to match subclass usage.
-[Fix] safe_run now normalizes List, Generator, and Single Item into List[EvidenceItem].
-"""
-
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union, AsyncGenerator
 import logging
-import traceback
-import inspect
-from pydantic import ValidationError
-
-from Phoenix_project.core.pipeline_state import PipelineState
-from Phoenix_project.core.schemas.evidence_schema import EvidenceItem, EvidenceType
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-class L1Agent(ABC):
+class L1BaseAgent:
     """
-    Abstract Base Class for all L1 agents.
-    L1 agents are specialized LLM-driven experts that generate EvidenceItems.
+    Base class for all L1 Agents.
+    Provides common functionality for prompt rendering, tool execution, and memory interaction.
     """
     
-    def __init__(self, agent_id: str, llm_client: Any, data_manager: Any = None, **kwargs):
-        """
-        Initializes the L1 agent.
+    # [Task P1-004] Prompt Safety Constants
+    MAX_PROMPT_TOKENS = 4000
+    
+    def __init__(self, name: str, config: Dict[str, Any], prompt_renderer: Any = None):
+        self.name = name
+        self.config = config
+        self.prompt_renderer = prompt_renderer
+        self.logger = logger
         
-        Args:
-            agent_id (str): The unique identifier for the agent.
-            llm_client (Any): An instance of an LLM client.
-            data_manager (Any): Data Manager instance.
-            **kwargs: Additional args like 'role', 'prompt_template_name', 'prompt_manager', 'audit_manager', 'retriever' etc.
+    def _estimate_tokens(self, text: str) -> int:
         """
-        self.agent_id = agent_id
-        self.llm_client = llm_client
-        self.data_manager = data_manager
-        self.role = kwargs.get('role', 'Agent')
-        self.prompt_template_name = kwargs.get('prompt_template_name')
-        
-        # [Optional] Inject prompt handling dependencies if provided via kwargs
-        self.prompt_manager = kwargs.get('prompt_manager')
-        self.prompt_renderer = kwargs.get('prompt_renderer')
-        self.audit_manager = kwargs.get('audit_manager')
-        self.retriever = kwargs.get('retriever')
-
-    @abstractmethod
-    async def run(
-        self, state: PipelineState, dependencies: Dict[str, Any]
-    ) -> Union[EvidenceItem, List[EvidenceItem], AsyncGenerator[EvidenceItem, None]]:
+        Estimates token count using tiktoken if available, otherwise char approximation.
         """
-        The main execution method for the agent.
-        Can return a single Item, a List of Items, or an AsyncGenerator.
-        """
-        pass
-
-    async def render_prompt(self, variables: Dict[str, Any]) -> str:
-        """
-        Helper to render prompt using injected prompt_renderer or prompt_manager.
-        """
-        if self.prompt_renderer and self.prompt_template_name:
-            return await self.prompt_renderer.render(self.prompt_template_name, variables)
-        elif self.prompt_manager and self.prompt_template_name:
-            # Fallback if only manager is present
-            template = self.prompt_manager.get_prompt(self.prompt_template_name)
-            return template.format(**variables) # Simple format
-        else:
-            # Fallback for when no prompt system is injected (testing)
-            # logger.warning(f"[{self.agent_id}] No PromptRenderer found. Using raw variable dump.")
-            return str(variables)
-
-    async def safe_run(self, state: PipelineState, dependencies: Dict[str, Any]) -> List[EvidenceItem]:
-        """
-        [Unified Interface] A defensive wrapper that executes the agent and 
-        normalizes the output into a List[EvidenceItem].
-        """
-        results: List[EvidenceItem] = []
         try:
-            logger.info(f"Agent {self.agent_id} ({self.role}) starting execution.")
-            
-            # Execute run
-            raw_result = await self.run(state, dependencies)
-            
-            # [Normalization Strategy]
-            if inspect.isasyncgen(raw_result):
-                # Case 1: Async Generator (Streaming)
-                async for item in raw_result:
-                    if self._validate_item(item):
-                        results.append(item)
-                        
-            elif isinstance(raw_result, list):
-                # Case 2: Batch List
-                for item in raw_result:
-                    if self._validate_item(item):
-                        results.append(item)
-                        
-            elif isinstance(raw_result, EvidenceItem):
-                # Case 3: Single Item
-                results.append(raw_result)
-                
-            elif raw_result is None:
-                logger.info(f"Agent {self.agent_id} returned None.")
-                
-            else:
-                logger.warning(f"Agent {self.agent_id} returned unknown type: {type(raw_result)}")
+            import tiktoken
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except ImportError:
+            # Fallback: Approx 4 chars per token
+            return len(text) // 4
+        except Exception:
+            return 0
 
-            return results
-
-        except (ValueError, KeyError, TypeError, AttributeError, ValidationError) as e:
-            error_msg = str(e)
-            stack_trace = traceback.format_exc()
-            logger.error(f"Agent {self.agent_id} CRASHED: {error_msg}\n{stack_trace}")
+    def _truncate_content(self, content: Any, max_tokens: int) -> Any:
+        """
+        [Task P1-004] Hard truncation for prompt injection defense.
+        """
+        if not isinstance(content, str):
+            return content
             
-            # Return valid ERROR EvidenceItem in a list
-            error_item = EvidenceItem(
-                agent_id=self.agent_id,
-                headline=f"Agent Crash: {self.role}",
-                content=f"CRITICAL FAILURE: Agent crashed. Error: {error_msg}",
-                evidence_type=EvidenceType.GENERIC, 
-                confidence=0.0,
-                data_horizon="Immediate",
-                symbols=[],
-                metadata={
-                    "status": "CRASHED",
-                    "error_type": type(e).__name__,
-                    "stack_trace": stack_trace
-                }
-            )
-            return [error_item]
-        
+        # Quick check using char length (optimization)
+        # 1 token >= 1 char, so if chars < max_tokens, definitely safe (conservative)
+        if len(content) < max_tokens:
+            return content
+            
+        try:
+            import tiktoken
+            encoding = tiktoken.get_encoding("cl100k_base")
+            tokens = encoding.encode(content)
+            
+            if len(tokens) > max_tokens:
+                self.logger.warning(f"Content truncated: {len(tokens)} tokens > {max_tokens} limit.")
+                truncated_text = encoding.decode(tokens[:max_tokens])
+                return truncated_text + " ... [TRUNCATED]"
+            return content
+            
+        except ImportError:
+            # Fallback char limit (avg 4 chars/token)
+            char_limit = max_tokens * 4
+            if len(content) > char_limit:
+                self.logger.warning(f"Content truncated (char limit): {len(content)} > {char_limit}.")
+                return content[:char_limit] + " ... [TRUNCATED]"
+            return content
         except Exception as e:
-            # Re-raise unexpected system errors (let Retry mechanism handle)
-            logger.error(f"Agent {self.agent_id} System Error: {e}", exc_info=True)
-            raise
+            self.logger.error(f"Truncation failed: {e}")
+            return content
 
-    def _validate_item(self, item: Any) -> bool:
-        """Helper to validate if an item is a valid EvidenceItem."""
-        if isinstance(item, EvidenceItem):
-            return True
-        logger.warning(f"[{self.agent_id}] Ignored invalid output item type: {type(item)}")
-        return False
+    def render_prompt(self, template_name: str, context: Dict[str, Any]) -> str:
+        """
+        Renders the prompt using the PromptRenderer.
+        [Task P1-004] Applied Input Sanitization & Length Truncation.
+        """
+        if not self.prompt_renderer:
+            self.logger.error("PromptRenderer not initialized.")
+            return ""
 
-    def __repr__(self) -> str:
-        return f"<{self.__class__.__name__}(id='{self.agent_id}')>"
-
-# Alias for backward compatibility if needed, though most imports updated
-BaseL1Agent = L1Agent
+        # [Task P1-004] Sanitize Context
+        # Allow variables to take up to 75% of MAX_PROMPT_TOKENS to leave room for instructions
+        var_limit = int(self.MAX_PROMPT_TOKENS * 0.75)
+        
+        safe_context = {}
+        for key, value in context.items():
+            safe_context[key] = self._truncate_content(value, var_limit)
+        
+        try:
+            rendered = self.prompt_renderer.render(template_name, safe_context)
+            
+            # Handle return format (Dict or Str)
+            prompt_str = ""
+            if isinstance(rendered, dict):
+                prompt_str = rendered.get("full_prompt_template", "")
+            else:
+                prompt_str = str(rendered)
+                
+            return prompt_str
+            
+        except Exception as e:
+            self.logger.error(f"Failed to render prompt '{template_name}': {e}")
+            return ""
