@@ -1,169 +1,154 @@
+import logging
+import json
+from typing import Dict, Any, List, Optional, Union
 import asyncio
-import copy 
-from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, ValidationError, Field
 
-from ..ai.ensemble_client import EnsembleClient
-from ..ai.prompt_manager import PromptManager
-from ..ai.prompt_renderer import PromptRenderer
-from ..core.schemas.evidence_schema import Evidence, FactCheckResult
-from ..monitor.logging import get_logger
+# FIX (E1, E2, E3): 导入统一的模式
+from Phoenix_project.core.schemas.data_schema import MarketData
+# 假设的 FactCheckResult 模式，用于结构化输出解析
+# 实际应用中，此模式应从 core/schemas/ 导入
+class FactCheckResult(BaseModel):
+    claim: str = Field(description="The original claim that was checked.")
+    is_verified: bool = Field(description="True if the claim is verified, False if refuted or uncertain.")
+    confidence: float = Field(description="Confidence score (0.0 to 1.0) in the verification result.")
+    verification_reasoning: str = Field(description="Concise reasoning for the verification outcome.")
+    sources: List[Dict[str, str]] = Field(description="List of external sources used for verification (e.g., {'uri': '...', 'title': '...'}).")
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class FactChecker:
     """
-    事实核查器 (FactChecker) 负责验证由 L1 智能体
-    生成的分析中的具体、可核查的声明。
-    
-    它现在使用 L2 Critic 提示来执行此操作，以确保与核心智能体一致。
+    负责验证 L1 Agent 生成的 Evidence 中的关键“声明”(Claims) 的事实准确性。
+    使用 Gemini Search Tool 进行外部验证。
     """
-
-    def __init__(self, 
-                 llm_client: EnsembleClient, 
-                 prompt_manager: PromptManager, 
-                 prompt_renderer: PromptRenderer,
-                 config: Optional[Dict[str, Any]] = None):
+    
+    def __init__(self, config: Dict[str, Any], llm_client: Any, prompt_manager: Any, prompt_renderer: Any, search_adapter: Any):
+        self.config = config.get("fact_checker", {})
         self.llm_client = llm_client
         self.prompt_manager = prompt_manager
         self.prompt_renderer = prompt_renderer
-        self.config = config or {}
+        self.search_adapter = search_adapter
         
-        # [Task 4.1] Configuration Decoupling
-        self.model_name = self.config.get("evaluation", {}).get("fact_checker", {}).get("model_name", "gemini-1.5-flash-latest")
+        self.prompt_template_name = self.config.get("prompt_template", "l2_critic") 
+        self.response_schema = self._get_response_schema() # 结构化输出模式
+        # 注意：system_instruction 不再在此处静态生成，而是在运行时动态生成以包含时间约束
         
-        self.search_tool = {
-            "type": "function",
-            "function": {
-                "name": "search_documents",
-                "description": "Searches for relevant documents, news, and reports based on a query.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query."
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        }
-        
-        self.prompt = copy.deepcopy(self.prompt_manager.get_prompt("l2_critic"))
-        
-        if not self.prompt:
-             logger.error("Failed to load 'l2_critic' prompt for FactChecker. Check prompts directory.", exc_info=True)
-             raise FileNotFoundError("FactChecker prompt 'l2_critic' not found.")
-        
-        # [Task 6.1] Anti-Hallucination
-        search_instruction = (
-            "\n\n---\n"
-            "MANDATORY INSTRUCTION: You MUST use the 'search_documents' tool to verify the claims. "
-            "If no evidence is found after searching, you MUST report the claim as 'Unverified' or 'No Evidence Found'. "
-            "Do NOT fabricate sources or evidence to satisfy the request. "
-            "Do not rely on internal knowledge."
-            " You are allowed to report that no evidence was found. Do not feel pressured to find supporting facts if they do not exist."
-            "\n---\n"
-        )
-        
-        # [Task 3.3] Time-Travel Constraint Injection
-        time_instruction = (
-            "\n\n---\n"
-            "TEMPORAL CONSTRAINT: Current Simulation Time is {current_time}. "
-            "You are strictly PROHIBITED from using or searching for any information, news, or data dated AFTER {current_time}. "
-            "Treat the current time as the absolute present. Future events are unknown."
-            "\n---\n"
-        )
-        
-        full_instruction = search_instruction + time_instruction
+        logger.info(f"FactChecker initialized. Prompt: {self.prompt_template_name}")
 
-        if "system" in self.prompt:
-            if isinstance(self.prompt["system"], list):
-                self.prompt["system"].append(full_instruction)
-            else:
-                self.prompt["system"] = self.prompt["system"] + full_instruction
-        else:
-            self.prompt["system"] = full_instruction.strip()
+    def _get_system_instruction(self, current_time_str: Optional[str] = None) -> str:
+        """
+        [TASK-P2-001 Fix] 核心 LLM 约束注入：强制使用搜索工具、输出格式以及时间约束。
+        """
+        instruction = (
+            "You are a critical fact-checking agent. Your ONLY goal is to verify or refute "
+            "a list of claims using the provided search tool. You MUST use the search tool for external verification. "
+            "Do NOT use prior knowledge. Your final output MUST be a JSON object conforming to the FactCheckResult array schema."
+        )
+        
+        # [防幻觉关键修正] 注入时间约束
+        if current_time_str:
+            instruction += (
+                f"\n\nTEMPORAL CONSTRAINT: The Current Simulation Time is {current_time_str}. "
+                "You MUST NOT access or verify using any information available only AFTER this time. "
+                "Treat any event happening after this timestamp as unknown future."
+            )
             
-        logger.info(f"FactChecker initialized with 'l2_critic' prompt and model '{self.model_name}'.")
+        return instruction
 
-    async def check_facts(self, claims: List[str], symbol: str = "Unknown") -> List[FactCheckResult]:
+    def _get_response_schema(self) -> Dict[str, Any]:
         """
-        核查一系列声明。
-        [Task 3.3] Injects time context.
+        [TASK-P2-001 Fix] 定义强制结构化输出的 JSON Schema。
         """
-        if not claims:
+        # 定义一个包含 FactCheckResult 数组的顶级模式
+        return {
+            "type": "ARRAY",
+            "items": FactCheckResult.model_json_schema()
+        }
+
+    def _parse_response_to_results(self, raw_response: Dict[str, Any]) -> List[FactCheckResult]:
+        """
+        [TASK-P2-001 Fix] 解析 LLM 的原始响应，提取结构化数据。
+        """
+        if not raw_response or not raw_response.get('candidates'):
+            logger.error("LLM response is empty or invalid.")
             return []
             
-        logger.info(f"Fact-checking {len(claims)} claims using 'l2_critic' prompt...")
-        
-        claims_str = "\n".join([f"- {claim}" for claim in claims])
-        
         try:
-            # [Task 3.3] Let PromptRenderer handle time injection (via auto-injection or explicit pass if needed)
-            # However, prompt template uses {current_time} inside the string we just appended.
-            # We rely on PromptRenderer's auto-injection or we must ensure 'current_time' is in prompt_context.
-            # PromptRenderer auto-injects if missing, assuming it has TimeProvider.
+            # 假设结构化输出在第一个 part 的 text 字段中
+            json_text = raw_response['candidates'][0]['content']['parts'][0]['text']
             
-            prompt_context = {
-                "evidence_items": claims_str, 
-                "symbol": symbol
+            # LLM通常会返回JSON字符串，需要反序列化
+            raw_results = json.loads(json_text)
+            
+            validated_results = []
+            for item in raw_results:
+                try:
+                    # 使用 Pydantic 验证和构建对象
+                    validated_results.append(FactCheckResult(**item))
+                except ValidationError as e:
+                    logger.warning(f"Failed to validate FactCheckResult item: {e}. Skipping item.")
+            
+            return validated_results
+            
+        except (KeyError, json.JSONDecodeError, IndexError) as e:
+            logger.error(f"Failed to parse structured response from LLM: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error during result parsing: {e}")
+            return []
+
+
+    async def check_facts(self, claims: List[str], context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        验证事实并返回验证报告。
+        [TASK-P2-001 Fix] 将输入从 evidence: List[Dict[str, Any]] 改为 claims: List[str]。
+        """
+        if not claims:
+            return {"status": "skipped", "message": "No claims to check."}
+
+        logger.info(f"Starting fact check for {len(claims)} claims.")
+        
+        # 1. 渲染 Prompt
+        # [TASK-P2-001 Fix 1] Use the stored template name string and the new claims list.
+        prompt_context = {
+            "claims": "\n".join([f"- {c}" for c in claims]),
+            "context": str(context)
+        }
+        prompt = self.prompt_renderer.render(self.prompt_template_name, prompt_context)
+
+        # 2. 定义搜索工具
+        search_tool = self.search_adapter.get_tool_function()
+        
+        # 3. 动态构建系统指令 (包含时间约束)
+        # 尝试从 context 中获取时间，通常 context 会包含 current_time
+        current_time_val = context.get("current_time") or context.get("timestamp")
+        current_time_str = str(current_time_val) if current_time_val else "Unknown"
+        
+        dynamic_system_instruction = self._get_system_instruction(current_time_str)
+
+        # 4. 调用 LLM
+        try:
+            raw_response = await self.llm_client.generate_text_with_tools(
+                prompt=prompt,
+                tools=[search_tool],
+                temperature=self.config.get("temperature", 0.0),
+                system_instruction=dynamic_system_instruction, # 注入包含时间约束的指令
+                response_schema=self.response_schema      # 注入结构化模式
+            )
+
+            # 5. 解析结构化输出
+            fact_check_results = self._parse_response_to_results(raw_response)
+            
+            if not fact_check_results:
+                return {"status": "failed", "message": "Fact check failed to produce structured results."}
+
+            return {
+                "status": "success", 
+                "report": [r.model_dump() for r in fact_check_results], # 返回字典列表
+                "results_count": len(fact_check_results)
             }
-            
-            # Note: PromptRenderer.render will inject 'current_time' if initialized with TimeProvider.
-            # If not, it defaults to system time. 
-            prompt = self.prompt_renderer.render(
-                self.prompt, context=prompt_context # Keyword arg for clarity
-            )
-            
-            # [Task 3.3] Backtest Logic: Disable/Limit Search Tool
-            # Check if we are in simulation mode (heuristic: look for time provider on renderer)
-            tools_to_use = [self.search_tool]
-            if self.prompt_renderer.time_provider and self.prompt_renderer.time_provider.is_simulation_mode():
-                # In strict backtest, we might want to disable live search entirely OR ensure the search tool 
-                # implementation (in EnsembleClient/GeminiPool) respects the time filter.
-                # For now, we rely on the Prompt Constraint added above.
-                pass
-
-            response_json = await self.llm_client.run_chain_structured(
-                prompt,
-                tools=tools_to_use,
-                model_name=self.model_name
-            )
-            
-            if isinstance(response_json, dict):
-                response_json = [response_json]
-
-            if not isinstance(response_json, list):
-                logger.error(f"Fact-checker LLM returned non-list response: {response_json}")
-                raise ValueError("Fact-checker response is not a list of results.")
-
-            results = []
-            for item in response_json:
-                if isinstance(item, dict):
-                    evidence = Evidence(
-                        source=item.get('source_url', 'Unknown'),
-                        snippet=item.get('evidence_snippet', 'N/A')
-                    )
-                    results.append(FactCheckResult(
-                        claim=item.get('claim', 'N/A'),
-                        verified=bool(item.get('verified', False)),
-                        evidence=evidence,
-                        confidence=float(item.get('confidence', 0.0))
-                    ))
-                else:
-                    logger.warning(f"Skipping invalid item in fact-checker response: {item}")
-                    
-            logger.info(f"Fact-checking complete. Found {len(results)} results.")
-            return results
 
         except Exception as e:
-            logger.error(f"Error during fact-checking: {e}", exc_info=True)
-            return [
-                FactCheckResult(
-                    claim=claim,
-                    verified=False,
-                    evidence=Evidence(source="Fact-Check Error", snippet=str(e)),
-                    confidence=0.0
-                ) for claim in claims
-            ]
+            logger.error(f"Fact checking failed: {e}", exc_info=True)
+            return {"status": "error", "message": str(e)}
