@@ -2,14 +2,16 @@
 Phoenix_project/core/pipeline_state.py
 [Phase 4 Task 2] Time Machine Implementation.
 Remove default datetime.now to prevent future leakage.
+[Task P1-005] Snapshot Version Sync: Explicit History Fields.
 """
 import uuid
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Deque
 from datetime import datetime, timezone
+from collections import deque
 from pydantic import BaseModel, Field
 
 # FIX (E1, E2, E3): 导入统一的模式
-from Phoenix_project.core.schemas.data_schema import PortfolioState, TargetPortfolio, MarketData
+from Phoenix_project.core.schemas.data_schema import PortfolioState, TargetPortfolio, MarketData, NewsData, EconomicIndicator
 from Phoenix_project.core.schemas.fusion_result import AgentDecision, FusionResult
 from Phoenix_project.core.schemas.evidence_schema import EvidenceItem
 
@@ -21,13 +23,16 @@ class PipelineState(BaseModel):
     """
     管理系统的当前状态 (瞬时快照)。
     [Refactored Phase 2.1] 基于 Pydantic，移除内存历史，支持序列化。
+    [Task P1-005] Explicit History Fields for Snapshot Manager.
     """
+    # Version Control
+    VERSION: int = 1
+    
     # --- 身份与时间 ---
     run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     step_index: int = 0
     
     # [Phase 4 Task 2] Time Machine: Remove default now() to prevent future leakage.
-    # Must be explicitly set by LoopManager or Orchestrator.
     current_time: Optional[datetime] = None
 
     # --- 上下文与任务 ---
@@ -38,14 +43,19 @@ class PipelineState(BaseModel):
 
     # --- 认知状态 (仅保留上一帧结果) ---
     latest_decisions: List[AgentDecision] = Field(default_factory=list)
-    
-    # [Phase II Fix] Strict Typing for Fusion Result
     latest_fusion_result: Optional[FusionResult] = None
-    
     latest_final_decision: Optional[Dict[str, Any]] = None
-    # [Task 0.1 Fix] Added storage for fact check results
     latest_fact_check: Optional[Dict[str, Any]] = None
     
+    # --- History Buffers (Explicitly Defined) ---
+    # Used by SnapshotManager for state restoration
+    # Note: Pydantic doesn't handle 'maxlen' natively on load, logic handled in SnapshotManager or post-init
+    market_data_history: List[MarketData] = Field(default_factory=list)
+    news_history: List[NewsData] = Field(default_factory=list)
+    econ_history: List[EconomicIndicator] = Field(default_factory=list)
+    decision_history: List[AgentDecision] = Field(default_factory=list)
+    fusion_history: List[FusionResult] = Field(default_factory=list)
+
     # [Phase I Fix] Strict Typing for Serialization Safety
     target_portfolio: Optional[TargetPortfolio] = None 
     
@@ -56,7 +66,6 @@ class PipelineState(BaseModel):
     raw_events: List[Dict[str, Any]] = Field(default_factory=list)
     l3_decision: Dict[str, Any] = Field(default_factory=dict)
     
-    # [Phase I Fix] Strict Typing for formalized fields
     market_data_batch: Optional[List[MarketData]] = None 
     l3_alpha_signal: Optional[Dict[str, float]] = None
     
@@ -65,12 +74,10 @@ class PipelineState(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
-        # [Phase I Fix] Validate assignment to catch type errors immediately
         validate_assignment = True
 
     def update_time(self, new_time: datetime):
         """更新系统仿真时间。"""
-        # [Task 0.1 Fix] Enforce UTC (Offset-Aware)
         if new_time.tzinfo is None:
             self.current_time = new_time.replace(tzinfo=timezone.utc)
         else:
@@ -80,7 +87,6 @@ class PipelineState(BaseModel):
         """
         [Task 0.1 Fix] Safe Accessor with Legacy Mapping & Validation
         """
-        # Map legacy keys from CognitiveEngine to Schema fields
         key_map = {
             "last_fusion_result": "latest_fusion_result",
             "last_fact_check": "latest_fact_check",
@@ -89,7 +95,6 @@ class PipelineState(BaseModel):
         target_key = key_map.get(key, key)
         
         if target_key not in self.model_fields:
-            # Relaxed for dynamic fields during dev
             pass
             
         setattr(self, target_key, value)
@@ -98,29 +103,14 @@ class PipelineState(BaseModel):
         """更新持仓状态。"""
         self.portfolio_state = new_state
 
-    def set_l1_insights(self, insights: List[EvidenceItem]):
-        self.l1_insights = insights
-
-    def set_l2_supervision(self, results: Dict[str, Any]):
-        self.l2_supervision_results = results
-
-    def set_market_state(self, state: Dict[str, Any]):
-        self.market_state = state
-
-    def set_raw_events(self, events: List[Dict[str, Any]]):
-        self.raw_events = events
-
-    def set_target_portfolio(self, tp: TargetPortfolio):
-        self.target_portfolio = tp
-
-    def set_l3_decision(self, decision: Dict[str, Any]):
-        self.l3_decision = decision
-
-    def set_market_data_batch(self, batch: List[MarketData]):
-        self.market_data_batch = batch
-
-    def set_l3_alpha_signal(self, signal: Dict[str, float]):
-        self.l3_alpha_signal = signal
+    def set_l1_insights(self, insights: List[EvidenceItem]): self.l1_insights = insights
+    def set_l2_supervision(self, results: Dict[str, Any]): self.l2_supervision_results = results
+    def set_market_state(self, state: Dict[str, Any]): self.market_state = state
+    def set_raw_events(self, events: List[Dict[str, Any]]): self.raw_events = events
+    def set_target_portfolio(self, tp: TargetPortfolio): self.target_portfolio = tp
+    def set_l3_decision(self, decision: Dict[str, Any]): self.l3_decision = decision
+    def set_market_data_batch(self, batch: List[MarketData]): self.market_data_batch = batch
+    def set_l3_alpha_signal(self, signal: Dict[str, float]): self.l3_alpha_signal = signal
 
     def update_ai_outputs(self, fusion_result: FusionResult):
         """
