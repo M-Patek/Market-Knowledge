@@ -167,14 +167,21 @@ class DataManager:
             
             # Ensure simple date comparison
             date_str = target_date.strftime("%Y-%m-%d")
-            date_clause = f" AND date <= '{date_str}'"
 
-            # 简单的 SQL 查询，假设存在 fundamentals 表
-            query = f"SELECT * FROM fundamentals WHERE symbol = '{symbol}'{date_clause} ORDER BY date DESC LIMIT 1"
-            result = await self.tabular_db.query(query)
-            
-            if result and "results" in result and result["results"]:
-                return result["results"][0]
+            # [Task P0-004] SQL Injection Fix: Use parameter binding via execute_sql
+            # We strictly avoid f-string interpolation for the symbol.
+            sql = "SELECT * FROM fundamentals WHERE symbol = :symbol AND date <= :target_date ORDER BY date DESC LIMIT 1"
+            params = {"symbol": symbol, "target_date": date_str}
+
+            # Use execute_sql for direct, safe execution if available
+            if hasattr(self.tabular_db, 'execute_sql'):
+                results = await self.tabular_db.execute_sql(sql, params=params)
+                if results:
+                    return results[0]
+            else:
+                # Fail securely if parameterized execution is not supported
+                logger.error("TabularDBClient.execute_sql not available. Aborting get_fundamental_data to prevent SQL Injection.")
+                return None
                 
         except Exception as e:
             logger.error(f"Failed to fetch fundamental data for {symbol}: {e}")
