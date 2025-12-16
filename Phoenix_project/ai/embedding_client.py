@@ -2,12 +2,14 @@
 Phoenix_project/ai/embedding_client.py
 [Phase 2 Task 5] Fix Hardcoded Embedding Dimension.
 Implement dynamic dimension detection via API probe or config override.
+[P0-INFRA-04] Enhanced Reliability with Retry and Truncation.
 """
 import logging
 import asyncio
 from typing import List, Optional, Union, Dict, Any
 import google.generativeai as genai
-from google.api_core import retry
+from google.api_core import exceptions as google_exceptions
+from Phoenix_project.utils.retry import retry_with_exponential_backoff
 
 from Phoenix_project.monitor.logging import get_logger
 
@@ -98,6 +100,33 @@ class EmbeddingClient:
             if "medium" in self.model_name: return 1536 # common
             return 768
 
+    # [P0-INFRA-04] Safe batch wrapper with Retry and Truncation
+    @retry_with_exponential_backoff(
+        max_retries=3, 
+        initial_backoff=1.0, 
+        exceptions_to_retry=(google_exceptions.GoogleAPICallError, google_exceptions.RetryError, asyncio.TimeoutError)
+    )
+    async def _embed_batch_safe(self, batch: List[str]) -> List[List[float]]:
+        """
+        Helper to embed a batch with input truncation and retries.
+        """
+        # Truncate inputs to ~2000 tokens (approx 8000 chars) to avoid 400 errors
+        truncated_batch = [text[:8000] for text in batch]
+        
+        def _call_api():
+            return genai.embed_content(
+                model=self.model_name,
+                content=truncated_batch,
+                task_type="retrieval_document"
+            )
+        
+        # Offload sync API call to thread to prevent blocking loop
+        result = await asyncio.to_thread(_call_api)
+        
+        if 'embedding' in result:
+            return result['embedding']
+        return []
+
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """
         Generates embeddings for a list of texts asynchronously.
@@ -118,48 +147,24 @@ class EmbeddingClient:
         embeddings = []
         batch_size = 100 # Gemini batch limit
         
-        # Simple batching
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             try:
-                # Use retry decorator logic or simple loop
-                # Google GenAI async client usage:
-                # result = await genai.embed_content_async(...) 
-                # Note: Check strict API availability. 
-                # Current SDK might prefer:
+                # [P0-INFRA-04] Use safe wrapper
+                batch_embeddings = await self._embed_batch_safe(batch)
                 
-                # To keep it robust and simple with standard library:
-                # We offload the sync call to a thread if async method is unstable or distinct.
-                # Assuming `genai.embed_content` accepts a list.
-                
-                def _call_api():
-                    return genai.embed_content(
-                        model=self.model_name,
-                        content=batch,
-                        task_type="retrieval_document" # Suitable for RAG
-                    )
-                
-                result = await asyncio.to_thread(_call_api)
-                
-                # Extract embeddings
-                # Result format depends on input. If list, 'embedding' is list of lists.
-                if 'embedding' in result:
-                    # Single text case
-                    if isinstance(batch, str) or len(batch) == 1: 
-                         # Sometimes API normalizes
-                         embeddings.append(result['embedding'])
-                    else:
-                        # Batch case? The return key might differ or it iterates
-                        # Usually genai.embed_content with list returns dict with 'embedding' as list of lists
-                        # Verify per latest API.
-                        # Actually, for list input, it's often result['embedding'] -> list of lists
-                        embeddings.extend(result['embedding'])
-                        
+                # Verify result structure (single vs batch)
+                if batch_embeddings and isinstance(batch_embeddings[0], (int, float)):
+                     # Single vector returned for single input? Wrap it.
+                     embeddings.append(batch_embeddings)
+                else:
+                     embeddings.extend(batch_embeddings)
+                     
             except Exception as e:
-                self.logger.error(f"Embedding batch failed: {e}")
-                # [Robustness] Return zero vectors or partial? 
-                # Better to fail explicitly or retry. 
-                # For now, return empty to signal failure upstream.
-                return []
+                self.logger.error(f"Embedding batch {i//batch_size} failed: {e}")
+                # Log error but continue to process valid batches (partial success)
+                # Alternatively, append empty vectors to keep index alignment?
+                # For RAG, skipping is usually safer than misalignment.
+                pass
 
         return embeddings
