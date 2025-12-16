@@ -1,72 +1,111 @@
-import logging
 import json
+import logging
 from abc import ABC, abstractmethod
-from typing import List, Any, AsyncGenerator, TYPE_CHECKING
+from typing import List, Any, Dict, Optional, Union
 
-# [Phase I Fix] 解决循环导入并使用 PipelineState
-if TYPE_CHECKING:
-    from Phoenix_project.core.pipeline_state import PipelineState
+# [Task P2-BASE-01] Optional tiktoken import for precise counting
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 
 logger = logging.getLogger(__name__)
 
 class L2Agent(ABC):
     """
-    L2 智能体基类（元认知层）。
-    这些智能体通常依赖于 L1 智能体的输出。
+    Abstract Base Class for L2 agents.
+    Provides common context management and token counting utilities.
     """
-    def __init__(
-        self,
-        agent_id: str,
-        llm_client: Any,
-        data_manager: Any,
-    ):
-        """
-        初始化 L2 智能体。
-        
-        参数:
-            agent_id (str): 智能体的唯一标识符。
-            llm_client (Any): 用于与 LLM API 交互的客户端。
-            data_manager (Any): 用于检索数据的 DataManager (L2 可能也需要)。
-        """
+    def __init__(self, agent_id: str, llm_client: Any, data_manager: Any):
         self.agent_id = agent_id
         self.llm_client = llm_client
         self.data_manager = data_manager
-        logger.info(f"L2 Agent {self.agent_id} (Type: {type(self).__name__}) initialized.")
-
-    def _safe_prepare_context(self, data: Any, max_tokens: int = 15000) -> str:
-        """
-        [Safety] Safely serializes data to JSON, truncating to prevent context window explosion (DoS).
-        """
-        try:
-            json_str = json.dumps(data, default=str)
-            if len(json_str) <= max_tokens:
-                return json_str
-            
-            # Truncation Strategy to preserve partial valid JSON
-            if isinstance(data, list) and len(data) > 0:
-                # Rough estimation to keep valid JSON structure
-                ratio = max_tokens / len(json_str)
-                safe_count = max(1, int(len(data) * ratio))
-                logger.warning(f"[{self.agent_id}] Context overflow ({len(json_str)} chars). Truncating list from {len(data)} to {safe_count} items.")
-                return json.dumps(data[:safe_count], default=str)
-            
-            return json_str[:max_tokens] + "... [TRUNCATED]"
-        except Exception as e:
-            logger.error(f"[{self.agent_id}] Context serialization failed: {e}")
-            return "[]"
+        # Attempt to get model name from client config, default to gpt-4 for encoding
+        self.model_name = getattr(llm_client, "model_name", "gpt-4")
 
     @abstractmethod
-    async def run(self, state: "PipelineState", dependencies: List[Any]) -> AsyncGenerator[Any, None]:
+    async def run(self, state: Any, dependencies: List[Any]) -> Any:
         """
-        异步运行智能体。
-        [Phase I Fix] 更新签名以接收 PipelineState 而不是 Task。
+        Core logic to be implemented by concrete agents.
+        """
+        pass
+
+    # [Task P2-BASE-01] Token Counting Logic
+    def _count_tokens(self, text: str) -> int:
+        """
+        Counts tokens using tiktoken if available, otherwise approximates.
+        """
+        if tiktoken:
+            try:
+                try:
+                    encoding = tiktoken.encoding_for_model(self.model_name)
+                except KeyError:
+                    encoding = tiktoken.get_encoding("cl100k_base")
+                return len(encoding.encode(text))
+            except Exception as e:
+                logger.debug(f"Tiktoken error: {e}. Falling back to approximation.")
         
-        参数:
-            state (PipelineState): 当前管道状态。
-            dependencies (List[Any]): 来自上游智能体（L1）的输出列表。
-            
-        收益:
-            AsyncGenerator[Any, None]: 异步生成结果（例如 EvidenceItem, CriticResult）。
+        # Fallback: Approx 4 characters per token for English text
+        return len(text) // 4
+
+    # [Task P2-BASE-01] Structure-Safe Context Preparation
+    def _safe_prepare_context(self, data: Any, max_tokens: int = 6000) -> str:
         """
-        raise NotImplementedError
-        yield
+        Serializes data to JSON, ensuring the result stays within token limits.
+        For lists, it drops items from the tail to maintain valid JSON structure.
+        """
+        # 1. Handle Lists Structurally
+        if isinstance(data, list):
+            if not data:
+                return "[]"
+            
+            # Fast path: Check full JSON
+            full_json = json.dumps(data)
+            if self._count_tokens(full_json) <= max_tokens:
+                return full_json
+
+            # Iterative Construction
+            logger.info(f"[{self.agent_id}] Context list exceeds {max_tokens} tokens. Truncating items safely...")
+            
+            included_items = []
+            current_tokens = 2 # Overhead for "[]"
+            
+            for i, item in enumerate(data):
+                item_str = json.dumps(item)
+                # Add 1 token roughly for comma/spacing overhead
+                item_cost = self._count_tokens(item_str) + 1
+                
+                if current_tokens + item_cost > max_tokens:
+                    logger.warning(
+                        f"[{self.agent_id}] Truncated context at item {i}/{len(data)} "
+                        f"to maintain limit ({current_tokens + item_cost} > {max_tokens})."
+                    )
+                    break
+                
+                included_items.append(item)
+                current_tokens += item_cost
+            
+            return json.dumps(included_items)
+
+        # 2. Handle Non-List types (Dict, etc.) - Fallback to simple check
+        else:
+            try:
+                full_json = json.dumps(data)
+                if self._count_tokens(full_json) <= max_tokens:
+                    return full_json
+                else:
+                    logger.warning(f"[{self.agent_id}] Non-list context exceeds limit. Returning empty object/string.")
+                    return "{}" if isinstance(data, dict) else ""
+            except Exception as e:
+                logger.error(f"[{self.agent_id}] Serialization failed: {e}")
+                return ""
+
+    def _sanitize_symbol(self, symbol: Any) -> str:
+        if not symbol:
+            return "UNKNOWN"
+        return str(symbol).strip().upper()
+
+    def _sanitize_general_input(self, text: Any) -> str:
+        if not text:
+            return ""
+        return str(text).replace("\n", " ").strip()
