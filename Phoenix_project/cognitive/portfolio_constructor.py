@@ -3,6 +3,7 @@ Phoenix_project/cognitive/portfolio_constructor.py
 [Phase 3 Task 4] Fix Silent Liquidation on Missing Price.
 Prevents defaulting target quantity to 0 when market data is unavailable.
 [Task P0-002] Force normalization of portfolio weights.
+[Task P1-RISK-03] Optimized Construction with Sizer Volatility & Turnover Control.
 """
 import logging
 from omegaconf import DictConfig
@@ -131,7 +132,28 @@ class PortfolioConstructor:
         # 4. Sizing & Quantity Calculation
         try:
             logger.debug(f"Sizing positions for: {adjusted_weights}")
-            candidates = [{"ticker": s, "weight": w} for s, w in adjusted_weights.items()]
+            
+            # [Task P1-RISK-03] Inject Volatility for Sizer
+            # Create a map for quick lookup
+            volatility_map = {}
+            if market_data:
+                for md in market_data:
+                    # Assuming MarketData schema has 'volatility' or we derive it elsewhere.
+                    # If not present, Sizer might default or fail. 
+                    # Here we try to get it if available (e.g. from risk manager or data enrichment)
+                    # For now, check if 'metadata' has it or if risk_manager has history.
+                    # Simplest is to pass what's available.
+                    v = getattr(md, 'volatility', None)
+                    if v is not None:
+                        volatility_map[md.symbol] = float(v)
+            
+            candidates = []
+            for s, w in adjusted_weights.items():
+                item = {"ticker": s, "weight": w}
+                if s in volatility_map:
+                    item["volatility"] = volatility_map[s]
+                candidates.append(item)
+
             allocation_results = self.sizing_strategy.size_positions(candidates, max_total_allocation=1.0)
             
             # [Task TASK-P0-002] Force normalization of allocation results
@@ -145,46 +167,84 @@ class PortfolioConstructor:
             price_map = {md.symbol: float(md.close) for md in market_data if md.close}
             current_positions_map = real_time_portfolio.get('positions', {})
             
+            # [Task P1-RISK-03] Turnover Control (Buffer)
+            TURNOVER_BUFFER_PCT = 0.05 # 5% buffer zone
+            
             target_positions_list = []
             
             for res in allocation_results:
                 sym = res.get("ticker")
-                weight = res.get("capital_allocation_pct", 0.0)
+                target_weight = res.get("capital_allocation_pct", 0.0)
                 price = price_map.get(sym)
                 
+                # Get current weight
+                current_weight = 0.0
+                current_pos = current_positions_map.get(sym)
+                current_qty = 0.0
+                
+                if current_pos:
+                    current_qty = float(current_pos.get('quantity', 0.0)) if isinstance(current_pos, dict) else float(current_pos.quantity)
+                    current_val = float(current_pos.get('market_value', 0.0)) if isinstance(current_pos, dict) else float(current_pos.market_value)
+                    if total_equity > 0:
+                        current_weight = current_val / total_equity
+
                 # [Phase 3 Task 4] Fix Silent Liquidation
                 if not price or price <= 0:
-                    logger.critical(f"Missing price for {sym}. Cannot calculate target quantity.")
-                    
-                    # Fallback: Maintain current position if exists
-                    if sym in current_positions_map:
-                        current_pos = current_positions_map[sym]
-                        # Use dict access if positions are dicts, or attribute if objects
-                        # Model dump makes them dicts usually
-                        current_qty = float(current_pos.get('quantity', 0.0)) if isinstance(current_pos, dict) else float(current_pos.quantity)
-                        
-                        logger.warning(f"Price Missing for {sym}: Holding current quantity ({current_qty}) to prevent accidental liquidation.")
-                        
-                        target_positions_list.append(TargetPosition(
-                            symbol=sym,
-                            target_weight=0.0, # Weight unknown w/o price
-                            quantity=current_qty, # KEEP EXISTING QTY
-                            reasoning="Price Missing - Position Held"
-                        ))
-                    else:
-                        logger.warning(f"Price Missing for {sym} and no position held. Skipping.")
+                    logger.critical(f"Missing price for {sym}. Holding current quantity.")
+                    target_positions_list.append(TargetPosition(
+                        symbol=sym,
+                        target_weight=current_weight, # Use current weight if price unknown
+                        quantity=current_qty, 
+                        reasoning="Price Missing - Held"
+                    ))
                     continue
 
-                # Calculate quantity: Equity * Weight / Price
-                qty = (total_equity * weight) / price
+                # [Task P1-RISK-03] Apply Turnover Buffer
+                # Only rebalance if weight change > buffer, OR if flipping side (buy->sell), OR closing out (target=0)
+                weight_diff = abs(target_weight - current_weight)
+                
+                final_weight = target_weight
+                final_reason = "Sizing Strategy"
+                
+                # If change is small and not closing out completely
+                if weight_diff < TURNOVER_BUFFER_PCT and target_weight > 0:
+                    logger.info(f"Turnover Buffer: {sym} change {weight_diff:.2%} < {TURNOVER_BUFFER_PCT:.2%}. Holding current weight.")
+                    final_weight = current_weight
+                    # Recalculate Qty based on CURRENT weight (effectively hold qty)
+                    # Ideally just keep current qty to avoid price-induced drift?
+                    # Yes, keeping QTY is safer for 'Holding'.
+                    qty = current_qty
+                    final_reason = "Turnover Buffer - Held"
+                else:
+                    # Calculate new quantity
+                    qty = (total_equity * final_weight) / price
                 
                 target_positions_list.append(TargetPosition(
                     symbol=sym,
-                    target_weight=weight,
+                    target_weight=final_weight,
                     quantity=qty,
-                    reasoning="Sizing Strategy Output"
+                    reasoning=final_reason
                 ))
             
+            # Handle liquidations (symbols in current but not in allocation)
+            allocated_symbols = set(res.get("ticker") for res in allocation_results)
+            for sym, pos in current_positions_map.items():
+                if sym not in allocated_symbols:
+                    # Implicit Close
+                    # Check if price exists to close?
+                    price = price_map.get(sym)
+                    if not price or price <= 0:
+                         # Cannot calculate Close value, but Qty -> 0 is an instruction.
+                         # OrderManager handles execution.
+                         logger.warning(f"Closing {sym} (not in target).")
+                         target_positions_list.append(TargetPosition(
+                            symbol=sym, target_weight=0.0, quantity=0.0, reasoning="Not in Target"
+                        ))
+                    else:
+                        target_positions_list.append(TargetPosition(
+                            symbol=sym, target_weight=0.0, quantity=0.0, reasoning="Not in Target"
+                        ))
+
             target_portfolio = TargetPortfolio(positions=target_positions_list, metadata={"source": "PortfolioConstructor"})
             logger.info(f"Target portfolio constructed with {len(target_positions_list)} positions.")
             
