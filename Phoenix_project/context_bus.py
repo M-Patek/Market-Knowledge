@@ -7,6 +7,7 @@ Phoenix_project/context_bus.py
 3. [Phase I Fix] 实现环境隔离 (run_mode)。
 4. [Task 2] 实现分布式锁 (Distributed Lock) 防止状态覆盖。
 [Task 1.4] Enforced Namespace Isolation for Pub/Sub and State Keys (UPPERCASE unified).
+[P1-INFRA-05] Backpressure Control & Status Monitoring.
 """
 import json
 import redis.asyncio as redis
@@ -113,6 +114,17 @@ class ContextBus:
         self._listen_task.add_done_callback(self._handle_task_exception)
         logger.info("ContextBus background listener task started.")
 
+    # [P1-INFRA-05] Safe Handler Wrapper with Timeout
+    async def _safe_handler_run(self, handler: Callable, payload: Any):
+        try:
+            # Enforce 30s timeout for event handlers to prevent blockage
+            await asyncio.wait_for(handler(payload), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"Handler {getattr(handler, '__name__', 'Unknown')} timed out processing event.")
+        except Exception as e:
+            # Re-raise to let _handle_task_exception log it
+            raise e
+
     async def _listen_loop(self):
         """
         后台任务：异步监听 Redis 消息。
@@ -157,7 +169,8 @@ class ContextBus:
                                     await self._task_semaphore.acquire()
                                     
                                     # [Task 20] Fix Fire-and-Forget
-                                    task = asyncio.create_task(handler(payload))
+                                    # [P1-INFRA-05] Wrap with safety timeout
+                                    task = asyncio.create_task(self._safe_handler_run(handler, payload))
                                     self._background_tasks.add(task)
                                     task.add_done_callback(self._handle_task_exception)
                                 else:
@@ -168,6 +181,28 @@ class ContextBus:
                 logger.error(f"ContextBus listener loop interrupted: {e}. Retrying in 1s...", exc_info=True)
                 await asyncio.sleep(1)
                 needs_resubscribe = True
+
+    # [P1-INFRA-05] Status Interface
+    async def get_status(self) -> Dict[str, Any]:
+        """
+        Returns the health and status of the ContextBus.
+        """
+        redis_status = False
+        try:
+            if self.redis:
+                redis_status = await self.redis.ping()
+        except Exception:
+            pass
+
+        return {
+            "component": "ContextBus",
+            "status": "active" if self._listening else "stopped",
+            "run_mode": self.run_mode,
+            "active_subscriptions": len(self._handlers),
+            "background_tasks_count": len(self._background_tasks),
+            "concurrency_slots_free": self._task_semaphore._value if hasattr(self._task_semaphore, '_value') else "unknown",
+            "redis_connected": redis_status
+        }
 
     # --- 状态持久化功能 (修复点: Distributed Lock + CAS) ---
 
