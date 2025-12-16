@@ -1,14 +1,17 @@
 import os
 import logging
+import asyncio
+import uuid
 from typing import List, Dict, Any, Optional
-from qdrant_client import QdrantClient
+# [P0-INFRA-03] Replace with AsyncQdrantClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models
 
 logger = logging.getLogger(__name__)
 
 class VectorStore:
     """
-    Manages embedding storage and retrieval using Qdrant (default) or generic interface.
+    Manages embedding storage and retrieval using Qdrant (Async).
     Stores L1 Evidence and RAG Documents.
     """
 
@@ -28,48 +31,54 @@ class VectorStore:
         
         logger.info(f"VectorStore configured with vector_size: {self.vector_size}")
         
-        self.client = None
-        self._initialize_client()
+        # [P0-INFRA-03] Async Client Initialization
+        self.client = AsyncQdrantClient(host=self.host, port=self.port)
+        self._initialized = False
 
-    def _initialize_client(self):
+    async def _ensure_initialized(self):
+        """
+        [P0-INFRA-03] Lazy async initialization of collection.
+        """
+        if self._initialized:
+            return
+
         try:
-            # Initialize Qdrant Client
-            # Use host/port
-            self.client = QdrantClient(host=self.host, port=self.port)
-            
-            # Ensure Collection Exists
-            # Check if collection exists, if not create
+            # Check if collection exists (Async)
             try:
-                self.client.get_collection(self.collection_name)
+                await self.client.get_collection(self.collection_name)
             except Exception:
                 logger.info(f"Collection {self.collection_name} not found. Creating...")
-                self.client.create_collection(
+                await self.client.create_collection(
                     collection_name=self.collection_name,
                     vectors_config=models.VectorParams(size=self.vector_size, distance=models.Distance.COSINE)
                 )
             
+            self._initialized = True
             logger.info(f"VectorStore initialized for {self.host}:{self.port}")
         except Exception as e:
-            logger.error(f"Failed to initialize VectorStore: {e}")
-            self.client = None
+            logger.error(f"Failed to initialize VectorStore collection: {e}")
 
-    def add(self, texts: List[str], metadatas: List[Dict[str, Any]], ids: Optional[List[str]] = None) -> bool:
+    async def add(self, texts: List[str], metadatas: List[Dict[str, Any]], ids: Optional[List[str]] = None) -> bool:
         """
-        Embeds texts and stores them in the vector database.
+        Embeds texts and stores them in the vector database (Async).
         """
         if not self.client:
             return False
             
         try:
-            # 1. Generate Embeddings
-            embeddings = self.embedding_client.embed_batch(texts)
+            await self._ensure_initialized()
+            
+            # 1. Generate Embeddings 
+            # [P0-INFRA-03] Offload potentially blocking embedding call to executor
+            loop = asyncio.get_running_loop()
+            embeddings = await loop.run_in_executor(None, self.embedding_client.embed_batch, texts)
+            
             if not embeddings:
                 logger.warning("No embeddings generated.")
                 return False
             
             # 2. Prepare Points
             points = []
-            import uuid
             
             for i, text in enumerate(texts):
                 point_id = ids[i] if ids else str(uuid.uuid4())
@@ -83,8 +92,8 @@ class VectorStore:
                     payload=payload
                 ))
             
-            # 3. Upsert
-            self.client.upsert(
+            # 3. Upsert (Async)
+            await self.client.upsert(
                 collection_name=self.collection_name,
                 points=points
             )
@@ -94,22 +103,25 @@ class VectorStore:
             logger.error(f"VectorStore add failed: {e}")
             return False
 
-    def search(self, query_text: str, limit: int = 5, filter_criteria: Dict = None) -> List[Dict[str, Any]]:
+    async def search(self, query_text: str, limit: int = 5, filter_criteria: Dict = None) -> List[Dict[str, Any]]:
         """
-        Semantic search for query_text.
+        Semantic search for query_text (Async).
         """
         if not self.client:
             return []
             
         try:
+            await self._ensure_initialized()
+
             # 1. Embed Query
-            query_vector = self.embedding_client.embed_query(query_text)
+            loop = asyncio.get_running_loop()
+            query_vector = await loop.run_in_executor(None, self.embedding_client.embed_query, query_text)
+            
             if not query_vector:
                 return []
             
-            # 2. Search
-            # Simple search without complex filters for now
-            search_result = self.client.search(
+            # 2. Search (Async)
+            search_result = await self.client.search(
                 collection_name=self.collection_name,
                 query_vector=query_vector,
                 limit=limit
@@ -131,12 +143,10 @@ class VectorStore:
             logger.error(f"VectorStore search failed: {e}")
             return []
 
-    def close(self):
+    async def close(self):
         """[Fix] Resource Cleanup: Close vector database client."""
-        # QdrantClient (HTTP) might not have a strict close, but good practice to allow for it
-        # if using gRPC or persistent connections.
         if hasattr(self, 'client') and hasattr(self.client, 'close'):
             try:
-                self.client.close()
+                await self.client.close()
             except Exception:
                 pass
