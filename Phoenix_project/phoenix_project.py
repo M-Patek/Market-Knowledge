@@ -3,6 +3,7 @@ Phoenix Project (Market Knowledge) - 主入口点
 [Code Opt Expert Fix] Task 18: Pre-Trade Risk Manager Warm-up
 [Fix IV.1] Registry & API Key Fixes
 [Task 005] Fix Startup Race Condition (Order: Ledger -> Risk -> API -> Loop)
+[P1-INFRA-01] Explicit Shutdown & Lifecycle Refactor
 """
 
 import asyncio
@@ -137,22 +138,20 @@ class PhoenixProject:
     def _create_main_systems(self, services: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("Initializing main systems...")
         
-        # [Fix] Use Orchestrator from Registry (via services)
+        # [Refactor] Fail-fast retrieval of Orchestrator
+        # P1-INFRA-01: Remove dead fallback code and assertion logic
         sys_ctx = services.get("sys_ctx")
-        if sys_ctx and hasattr(sys_ctx, "orchestrator") and sys_ctx.orchestrator:
-            orchestrator = sys_ctx.orchestrator
-        else:
-            # Fallback (Should not happen if Registry works)
-            logger.warning("Orchestrator not found in Registry context. Creating manually (Deprecated path).")
-            raise RuntimeError("Registry failed to build Orchestrator.")
-
+        if not sys_ctx or not getattr(sys_ctx, "orchestrator", None):
+            raise RuntimeError("Critical: Orchestrator not found in Registry context.")
+            
+        orchestrator = sys_ctx.orchestrator
         audit_manager = services["audit_manager"]
 
         # (L0/L1/L2) 循环管理器 (Loop Manager)
+        # [Task P1-DATA-02] Drift correction enabled implicitly via LoopManager update
         loop_manager = LoopManager(
-            orchestrator=orchestrator,
-            context_bus=services["context_bus"],
-            loop_config=services["config"].controller
+            interval=services["config"].controller.get("loop_interval", 1.0),
+            bus=services["context_bus"]
         )
     
         # (RAG) 知识注入器 (Knowledge Injector)
@@ -174,6 +173,57 @@ class PhoenixProject:
             "audit_manager": audit_manager,
             "trade_lifecycle_manager": services["trade_lifecycle_manager"]
         }
+
+    async def shutdown(self):
+        """
+        [P1-INFRA-01] Explicit Graceful Shutdown Sequence.
+        Ensures all components are stopped in the correct order:
+        Loop -> API -> Data Connections.
+        """
+        logger.info("Initiating graceful shutdown sequence...")
+        
+        # 1. Stop Loop Manager (Stop accepting new events/tasks)
+        if self.systems.get("loop_manager"):
+            logger.info("Stopping Loop Manager...")
+            # Calls stop (was previously stop_loop)
+            await self.systems["loop_manager"].stop()
+
+        # 2. Stop API Server
+        if hasattr(self, 'api_server') and self.api_server:
+            logger.info("Stopping API Server...")
+            if hasattr(self.api_server, "stop"):
+                server_stop = self.api_server.stop
+                if asyncio.iscoroutinefunction(server_stop):
+                    await server_stop()
+                else:
+                    server_stop()
+            else:
+                logger.warning("API Server does not have a stop() method.")
+
+        # 3. Close Data Resources
+        if hasattr(self, 'services'):
+            logger.info("Closing Data Resources...")
+            
+            async def _close_resource(name: str, resource: Any):
+                if resource and hasattr(resource, "close"):
+                    try:
+                        c = resource.close
+                        if asyncio.iscoroutinefunction(c):
+                            await c()
+                        else:
+                            c()
+                        logger.info(f"{name} closed.")
+                    except Exception as e:
+                        logger.error(f"Error closing {name}: {e}")
+
+            # Close critical DB connections in parallel or sequence
+            await asyncio.gather(
+                _close_resource("DataManager", self.services.get("data_manager")),
+                _close_resource("GraphDB", self.services.get("graph_db")),
+                _close_resource("TabularDB", self.services.get("tabular_db"))
+            )
+
+        logger.info("Shutdown sequence complete.")
 
     def run_backtest(self, cli_args):
         """
@@ -249,7 +299,10 @@ class PhoenixProject:
 
             # --- 6. 启动主循环 (Loop Manager) ---
             logger.info("Starting Orchestrator Loop...")
-            await loop_manager.start_loop()
+            
+            # [Refactor] Use start() instead of start_loop() to match new LoopManager interface
+            # Passing orchestrator.run_cycle as the work function
+            await loop_manager.start(orchestrator.run_cycle)
             
             # [Phase IV Fix] Graceful Shutdown Handling
             loop = asyncio.get_running_loop()
@@ -258,8 +311,7 @@ class PhoenixProject:
             def _signal_handler():
                 logger.info("Shutdown signal received. Initiating graceful stop...")
                 stop_event.set()
-                if hasattr(loop_manager, "stop_loop"):
-                    loop_manager.stop_loop()
+                # loop_manager.stop() is async, handled in shutdown sequence or we can trigger event here
             
             # Register signal handlers
             for sig in (signal.SIGTERM, signal.SIGINT):
@@ -280,53 +332,10 @@ class PhoenixProject:
             logger.critical(f"Fatal error in main: {e}", exc_info=True)
 
         finally:
-            # [Code Opt Expert Fix] Task 6: Ensure cleanup uses self.services and runs in finally block
-            logger.info("Cleaning up resources...")
-            
-            # Stop Loop Manager first
-            if self.systems.get("loop_manager"):
-                self.systems["loop_manager"].stop_loop()
-
-            if hasattr(self, 'services'):
-                # [Task 1.4] Unify Resource Cleanup
-                
-                # 1. Close DataManager (Handles its own DB connections)
-                if "data_manager" in self.services and hasattr(self.services["data_manager"], "close"):
-                    try:
-                        dm_close = self.services["data_manager"].close
-                        if asyncio.iscoroutinefunction(dm_close):
-                            await dm_close()
-                        else:
-                            dm_close()
-                        logger.info("DataManager closed.")
-                    except Exception as e:
-                        logger.error(f"Error closing DataManager: {e}")
-
-                # 2. Close GraphDB
-                if "graph_db" in self.services and hasattr(self.services["graph_db"], "close"):
-                    try:
-                        gdb_close = self.services["graph_db"].close
-                        if asyncio.iscoroutinefunction(gdb_close):
-                            await gdb_close()
-                        else:
-                            gdb_close()
-                    except Exception as e:
-                        logger.error(f"Error closing GraphDB: {e}")
-
-                # 3. Close TabularDB (Standalone)
-                if "tabular_db" in self.services and hasattr(self.services["tabular_db"], "close"):
-                    try:
-                        tdb_close = self.services["tabular_db"].close
-                        if asyncio.iscoroutinefunction(tdb_close):
-                            await tdb_close()
-                        else:
-                            tdb_close()
-                    except Exception as e:
-                        logger.error(f"Error closing TabularDB: {e}")
-
-            # Wait a moment for threads to join if necessary
-            await asyncio.sleep(1)
-            logger.info("Cleanup complete. Goodbye.")
+            # [P1-INFRA-01] Ensure explicit cleanup via shutdown()
+            # Removed magic asyncio.sleep(1)
+            await self.shutdown()
+            logger.info("Phoenix Project exit.")
 
 
 @hydra.main(version_base=None, config_path="config", config_name="system")
