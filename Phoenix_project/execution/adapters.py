@@ -6,12 +6,16 @@ Explicitly pass 'side' and prioritize it over quantity sign inference.
 1. Implement subscribe_order_status with unified stream handler.
 2. Add Thread Watchdog to monitor and restart dead streams.
 [Task 1.1] Added SimulatedBroker for Backtesting/Paper Trading isolation.
+[Task P0-EXEC-02] Enforce Decimal Precision.
+[Task P2-EXEC-04] Rate Limiting & Error Classification.
 """
 import pandas as pd
 import asyncio
 import uuid
 import logging
 import os
+import time
+import threading # [Fix] Added for thread-safe RateLimiter
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
 from decimal import Decimal
@@ -22,8 +26,6 @@ from Phoenix_project.execution.interfaces import IBrokerAdapter
 from Phoenix_project.core.schemas.data_schema import Order, OrderStatus, Fill, Position
 
 # [任务 B.2] 导入 Alpaca 客户端
-# 注意：这些导入仅在 LIVE 模式下真正被使用，但在文件层级导入是为了类型提示。
-# 实际运行时，Registry 通过 Lazy Import 避免在非 Alpaca 环境中加载这些库引发错误。
 try:
     from alpaca.trading.client import TradingClient
     from alpaca.trading.requests import (
@@ -41,6 +43,33 @@ except ImportError:
 
 logger = get_logger(__name__)
 
+# [Task P2-EXEC-04] Thread-Safe Sync Rate Limiter
+class RateLimiter:
+    """
+    Thread-safe leaky bucket rate limiter for synchronous API calls.
+    Ensures calls do not exceed the specified limit by sleeping the calling thread.
+    """
+    def __init__(self, calls_per_minute: int = 200):
+        self.delay = 60.0 / calls_per_minute
+        self.last_call = 0.0
+        self._lock = threading.Lock()
+
+    def wait_sync(self):
+        """
+        Blocks the calling thread until the rate limit allows a new request.
+        """
+        with self._lock:
+            now = time.time()
+            # Calculate when the next call is allowed
+            target_time = self.last_call + self.delay
+            wait_time = target_time - now
+            
+            if wait_time > 0:
+                time.sleep(wait_time)
+                self.last_call = time.time() # Update to actual time after sleep
+            else:
+                self.last_call = now
+
 # --- 市场数据接口 ---
 
 class AlpacaAdapter(IBrokerAdapter):
@@ -56,6 +85,9 @@ class AlpacaAdapter(IBrokerAdapter):
         self.api_key = config.get('alpaca_api_key') or os.environ.get('ALPACA_API_KEY')
         self.api_secret = config.get('alpaca_api_secret') or os.environ.get('ALPACA_API_SECRET')
         self.paper = config.get('paper_trading', True)
+        
+        # [Task P2-EXEC-04] Rate Limiter Init (Sync & Thread-safe)
+        self.rate_limiter = RateLimiter(calls_per_minute=190) # Slightly below 200 limit
         
         if not self.api_key or not self.api_secret:
             raise ValueError("Alpaca API key/secret not provided or found in environment.")
@@ -91,6 +123,15 @@ class AlpacaAdapter(IBrokerAdapter):
         except Exception as e:
             logger.error(f"Failed to connect to Alpaca: {e}", exc_info=True)
             raise
+
+    # [Task P2-EXEC-04] Error Classification Helper
+    def _classify_error(self, e: Exception) -> str:
+        msg = str(e).lower()
+        # Network/Server errors -> RETRYABLE
+        if any(x in msg for x in ['timeout', 'connection', '502', '503', '504', '429', 'rate limit']):
+            return "RETRYABLE"
+        # Client/Auth errors -> FATAL
+        return "FATAL"
 
     # --- IMarketData 实现 ---
     def get_market_data(
@@ -241,26 +282,31 @@ class AlpacaAdapter(IBrokerAdapter):
     def get_all_open_orders(self) -> List[Order]:
         return []
 
-    def get_portfolio_value(self) -> float:
+    def get_portfolio_value(self) -> Decimal:
         try:
-            return float(self.trading_client.get_account().portfolio_value)
+            # [Task P0-EXEC-02] Enforce Decimal precision
+            val = self.trading_client.get_account().portfolio_value
+            return Decimal(str(val)) if val is not None else Decimal("0.0")
         except Exception as e:
             logger.error(f"Error fetching portfolio value: {e}")
-            return 0.0
+            return Decimal("0.0")
 
-    def get_cash_balance(self) -> float:
+    def get_cash_balance(self) -> Decimal:
         try:
-            return float(self.trading_client.get_account().cash)
+            # [Task P0-EXEC-02] Enforce Decimal precision
+            val = self.trading_client.get_account().cash
+            return Decimal(str(val)) if val is not None else Decimal("0.0")
         except Exception as e:
             logger.error(f"Error fetching cash balance: {e}")
-            return 0.0
+            return Decimal("0.0")
 
-    def get_position(self, symbol: str) -> float:
+    def get_position(self, symbol: str) -> Decimal:
         try:
             pos = self.trading_client.get_open_position(symbol)
-            return float(pos.qty)
+            # [Task P0-EXEC-02] Enforce Decimal precision
+            return Decimal(str(pos.qty))
         except Exception:
-            return 0.0
+            return Decimal("0.0")
 
     def place_order(self, order: Order, price: Optional[float] = None) -> str:
         # Calculate side explicitly from signed quantity or Order attributes
@@ -280,28 +326,29 @@ class AlpacaAdapter(IBrokerAdapter):
         raise RuntimeError(f"Alpaca placement failed: {result.get('message')}")
 
     def submit_order(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
-        symbol = order_data.get('symbol')
-        qty = order_data.get('quantity')
-        order_type = order_data.get('order_type', 'market')
-        limit_price = order_data.get('limit_price')
-        stop_price = order_data.get('stop_price')
-        trail_percent = order_data.get('trail_percent')
-        
-        explicit_side = order_data.get('side')
-        
-        if not symbol or not qty:
-            msg = "Order submission failed: Symbol and Quantity are required."
-            logger.error(msg)
-            return {"status": "error", "message": msg}
-
-        if explicit_side:
-            side = explicit_side
-        else:
-            side = OrderSide.BUY if qty > 0 else OrderSide.SELL
-
-        abs_qty = abs(qty)
-
         try:
+            # [Task P2-EXEC-04] Enforce Rate Limit (Thread-safe Wait)
+            self.rate_limiter.wait_sync()
+
+            symbol = order_data.get('symbol')
+            qty = order_data.get('quantity')
+            order_type = order_data.get('order_type', 'market')
+            limit_price = order_data.get('limit_price')
+            stop_price = order_data.get('stop_price')
+            trail_percent = order_data.get('trail_percent')
+            
+            explicit_side = order_data.get('side')
+            
+            if not symbol or not qty:
+                return {"status": "error", "message": "Symbol and Quantity are required.", "error_type": "FATAL"}
+
+            if explicit_side:
+                side = explicit_side
+            else:
+                side = OrderSide.BUY if qty > 0 else OrderSide.SELL
+
+            abs_qty = abs(qty)
+
             if order_type == 'market':
                 request = MarketOrderRequest(
                     symbol=symbol,
@@ -360,8 +407,13 @@ class AlpacaAdapter(IBrokerAdapter):
             return {"status": "success", "order_id": order.id, "data": order.dict()}
 
         except Exception as e:
-            logger.error(f"Failed to submit order to Alpaca: {e}", exc_info=True)
-            return {"status": "error", "message": str(e)}
+            error_type = self._classify_error(e)
+            logger.error(f"Failed to submit order to Alpaca ({error_type}): {e}", exc_info=True)
+            return {
+                "status": "error", 
+                "message": str(e),
+                "error_type": error_type # [Task P2-EXEC-04] Return classification
+            }
 
     def get_order_status(self, order_id: str) -> Dict[str, Any]:
         try:
@@ -427,17 +479,19 @@ class SimulatedBroker(IBrokerAdapter):
     def get_market_data(self, *args, **kwargs) -> Dict:
         return {}
 
-    def get_portfolio_value(self) -> float:
+    def get_portfolio_value(self) -> Decimal:
         # Estimated Total Value = Cash + Sum(Position Market Value)
-        pos_val = sum(p.market_value for p in self.positions.values())
-        return float(self.cash + pos_val)
+        # [Task P0-EXEC-02] Enforce Decimal precision
+        pos_val = sum(Decimal(str(p.market_value)) for p in self.positions.values())
+        return self.cash + pos_val
 
-    def get_cash_balance(self) -> float:
-        return float(self.cash)
+    def get_cash_balance(self) -> Decimal:
+        return self.cash
 
-    def get_position(self, symbol: str) -> float:
+    def get_position(self, symbol: str) -> Decimal:
         pos = self.positions.get(symbol)
-        return float(pos.quantity) if pos else 0.0
+        # Position model quantity is float, so we cast back to Decimal for interface consistency
+        return Decimal(str(pos.quantity)) if pos else Decimal("0.0")
 
     def get_positions(self) -> List[Position]:
         """
@@ -489,7 +543,7 @@ class SimulatedBroker(IBrokerAdapter):
                 raise ValueError("SimulatedBroker requires 'price' (or order.limit_price) for execution.")
 
         exec_price = Decimal(str(price))
-        qty = order.quantity # Signed quantity: +Buy, -Sell
+        qty = Decimal(str(order.quantity)) # Signed quantity: +Buy, -Sell
 
         # 1. Update Order State
         order.status = OrderStatus.FILLED
@@ -510,8 +564,8 @@ class SimulatedBroker(IBrokerAdapter):
             order_id=order.id,
             symbol=order.symbol,
             timestamp=datetime.utcnow(),
-            quantity=qty,
-            price=exec_price,
+            quantity=float(qty),
+            price=float(exec_price),
             commission=Decimal("0.0")
         )
 
@@ -526,26 +580,30 @@ class SimulatedBroker(IBrokerAdapter):
             if qty == 0: return
             self.positions[symbol] = Position(
                 symbol=symbol,
-                quantity=qty,
-                average_price=price,
-                market_value=qty * price,
-                unrealized_pnl=Decimal("0.0")
+                quantity=float(qty),
+                average_price=float(price),
+                market_value=float(qty * price),
+                unrealized_pnl=0.0
             )
         else:
             pos = self.positions[symbol]
-            new_qty = pos.quantity + qty
+            current_qty = Decimal(str(pos.quantity))
+            current_avg = Decimal(str(pos.average_price))
+            
+            new_qty = current_qty + qty
             
             if new_qty == 0:
                 del self.positions[symbol]
             else:
-                if (pos.quantity > 0 and qty > 0) or (pos.quantity < 0 and qty < 0):
-                    current_cost = pos.quantity * pos.average_price
+                if (current_qty > 0 and qty > 0) or (current_qty < 0 and qty < 0):
+                    current_cost = current_qty * current_avg
                     added_cost = qty * price
-                    pos.average_price = (current_cost + added_cost) / new_qty
+                    new_avg = (current_cost + added_cost) / new_qty
+                    pos.average_price = float(new_avg)
                 
-                pos.quantity = new_qty
-                pos.market_value = pos.quantity * price
-                pos.unrealized_pnl = (price - pos.average_price) * pos.quantity
+                pos.quantity = float(new_qty)
+                pos.market_value = float(new_qty * price)
+                pos.unrealized_pnl = float((price - Decimal(str(pos.average_price))) * new_qty)
 
     def _notify_status(self, order: Order):
         for cb in self._status_handlers:
