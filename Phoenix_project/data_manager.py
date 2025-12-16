@@ -1,272 +1,264 @@
-"""
-Phoenix_project/data_manager.py
-[Task 2.1] TimeProvider Integration & Centralized Clock.
-Redirects all time-sensitive operations to the injected TimeProvider.
-"""
+import asyncio
 import json
 import logging
-import asyncio
-from typing import Optional, Dict, List, Any
-from datetime import datetime, timedelta, timezone
-import pandas as pd
+from typing import List, Dict, Any, Optional, Union
 import redis.asyncio as redis
+from datetime import datetime, timedelta
+from abc import ABC, abstractmethod
 
-from Phoenix_project.config.loader import ConfigLoader
-from Phoenix_project.core.schemas.data_schema import MarketData
-from Phoenix_project.config.constants import REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE
-# [Task 2.1] Import TimeProvider Interface
-from Phoenix_project.core.time_provider import TimeProvider
+from Phoenix_project.core.schemas.data_schema import MarketData, PortfolioState, Order, Fill
+from Phoenix_project.config.constants import REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE, REDIS_KEY_PORTFOLIO_LATEST
+from Phoenix_project.monitor.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+# --- Time Provider Abstraction ---
+class TimeProvider(ABC):
+    @abstractmethod
+    def now(self) -> datetime:
+        pass
+
+class RealTimeProvider(TimeProvider):
+    def now(self) -> datetime:
+        return datetime.utcnow()
+
+class SimulatedTimeProvider(TimeProvider):
+    def __init__(self, start_time: datetime):
+        self._current_time = start_time
+
+    def now(self) -> datetime:
+        return self._current_time
+    
+    def advance(self, delta: timedelta):
+        self._current_time += delta
+        
+    def set_time(self, new_time: datetime):
+        self._current_time = new_time
+
+# --- Data Manager ---
 
 class DataManager:
     """
-    数据管理器 (DataManager)
-    负责所有数据的访问、缓存和持久化。
-    充当系统的 "海马体"，连接 Redis (短期记忆) 和 Temporal/Tabular DB (长期记忆)。
-    
-    [Task 4] Integrated Failover & Read-Repair
-    [Task 2.1] Centralized Time Management via TimeProvider
+    Centralized Data Manager for Phoenix Project.
+    Handles data retrieval/storage across Redis (Hot), TimescaleDB (Warm), and S3/Tabular (Cold).
     """
 
-    def __init__(self, config: Any, time_provider: TimeProvider, redis_client: Optional[redis.Redis] = None, tabular_db: Any = None, temporal_db: Any = None):
-        # [Refactor] Support both ConfigLoader (legacy) and direct DictConfig (Registry injected)
-        if hasattr(config, 'load_config'):
-            self.config = config.load_config('system.yaml')
-        else:
-            self.config = config
-
-        # [Task 2.1] Mandatory TimeProvider Injection
-        if time_provider is None:
-            raise ValueError("TimeProvider must be injected into DataManager.")
-        self.time_provider = time_provider
-        
+    def __init__(
+        self, 
+        config: Dict[str, Any],
+        redis_client: redis.Redis,
+        temporal_db: Any = None,
+        tabular_db: Any = None,
+        s3_client: Any = None,
+        time_provider: Optional[TimeProvider] = None 
+    ):
+        self.config = config
         self.redis_client = redis_client
+        self.temporal_db = temporal_db
+        self.tabular_db = tabular_db
+        self.s3_client = s3_client
         
-        # [Fix Task 1] Dependency Injection to prevent Double Connection Pool
-        if tabular_db is not None:
-            self.tabular_db = tabular_db
-        else:
-            from Phoenix_project.ai.tabular_db_client import TabularDBClient
-            self.tabular_db = TabularDBClient(self.config.get("data_manager", {}).get("tabular_db", {}))
+        # [Feature 1] Time Provider Integration
+        self.time_provider = time_provider or RealTimeProvider()
+        
+        # Configurable staleness threshold (e.g., 5 minutes)
+        self.max_data_age_seconds = self.config.get("max_data_age_seconds", 300) 
+        
+        logger.info(f"DataManager initialized. Mode: {type(self.time_provider).__name__}")
 
-        if temporal_db is not None:
-            self.temporal_db = temporal_db
-        else:
-            from Phoenix_project.ai.temporal_db_client import TemporalDBClient
-            self.temporal_db = TemporalDBClient(self.config.get("data_manager", {}).get("temporal_db", {}))
-        
-        # [Config] Allow configuring stale threshold
-        self.stale_threshold_minutes = self.config.get("data_manager", {}).get("stale_threshold_minutes", 5)
-        
-        # [Task 2.1] Removed internal _simulation_time state
-        
-        logger.info("DataManager initialized with TimeProvider.")
-
-    # [Task 2.1] Removed set_simulation_time / clear_simulation_time (Delegated to TimeProvider)
+    async def get_current_time(self) -> datetime:
+        """Returns current system time via the abstracted provider."""
+        return self.time_provider.now()
 
     async def get_latest_market_data(self, symbol: str) -> Optional[MarketData]:
         """
-        获取最新的市场数据。
-        [Hot Path] 优先读取 Redis。
-        [Cold Path] 失败时降级到 TemporalDB (Failover)，并触发读修复 (Read-Repair)。
-        [Fix] 严禁返回过期数据 (Zombie Data)。
-        [Task 2.1] Uses TimeProvider for current reference time.
+        Retrieves the single latest market data point for a symbol.
+        Strategy: Redis Cache -> [Staleness Check] -> Temporal DB -> None
         """
-        current_time = self.get_current_time()
+        if not symbol: return None
         
-        # [Time Machine Check] In backtest/simulation, we MUST query DB for specific time point.
-        # Redis (Live Cache) is only valid for REAL-TIME mode.
-        if self.time_provider.is_simulation_mode():
-            return await self._get_market_data_at_time(symbol, current_time)
-
-        key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=symbol)
+        current_time = await self.get_current_time()
         
-        # 1. Try Redis (Hot Path - LIVE ONLY)
+        # 1. Try Redis
         if self.redis_client:
+            key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=symbol)
             try:
                 data = await self.redis_client.get(key)
                 if data:
-                    return MarketData.model_validate_json(data)
+                    if isinstance(data, bytes): data = data.decode('utf-8')
+                    market_data = MarketData.model_validate_json(data)
+                    
+                    # [Feature 2] Zombie Data Check & Read Repair
+                    # Check if data is too old relative to current (simulated or real) time
+                    data_age = (current_time - market_data.timestamp).total_seconds()
+                    
+                    if data_age > self.max_data_age_seconds:
+                        logger.warning(f"Stale data detected for {symbol} in Redis (Age: {data_age:.1f}s). Triggering Read Repair.")
+                        # Fall through to DB for fresh data
+                    else:
+                        return market_data
+                        
             except Exception as e:
-                logger.error(f"Redis read failed for {symbol}: {e}")
+                logger.warning(f"Redis fetch/validate failed for {symbol}: {e}")
 
-        # 2. Failover to TemporalDB (Cold Path)
-        logger.warning(f"Cache miss for {symbol}, attempting DB failover...")
+        # 2. Try Temporal DB (Fallback / Read Repair Source)
         if self.temporal_db:
             try:
-                # [Task 2.1] Use TimeProvider for reference time
-                end = current_time
-                start = end - timedelta(hours=72)
-                df = await self.temporal_db.query_market_data(symbol, start, end)
+                # Assuming temporal_db has a method for latest
+                db_data = await self.temporal_db.get_latest_market_data(symbol)
                 
-                if not df.empty:
-                    latest_record = df.iloc[-1].to_dict()
-                    market_data = MarketData(**latest_record)
-                    
-                    # [Fix Phase 2 Task 4] Strict Stale Check (Fail-Closed)
-                    data_age = end - market_data.timestamp
-                    is_stale = data_age > timedelta(minutes=self.stale_threshold_minutes)
-                    
-                    if is_stale:
-                        logger.error(f"CRITICAL: Stale data fetched for {symbol}. FAIL-SAFE TRIGGERED.")
-                        return None
-                    
-                    # 3. Read-Repair (Only in Live Mode)
-                    if self.redis_client and not self.time_provider.is_simulation_mode():
+                if db_data:
+                    # [Feature 2] Read Repair: Write back to Redis if DB has fresher data
+                    if self.redis_client:
                         try:
-                            await self.redis_client.setex(key, 60, market_data.model_dump_json())
-                            logger.info(f"Read-Repair: Restored {symbol} to Redis cache.")
-                        except Exception:
-                            pass 
+                            # Verify DB data isn't also stale (double zombie check)
+                            db_age = (current_time - db_data.timestamp).total_seconds()
+                            if db_age <= self.max_data_age_seconds:
+                                key = REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=symbol)
+                                await self.redis_client.setex(key, 60, db_data.model_dump_json())
+                                logger.info(f"Read Repair successful for {symbol}.")
+                            else:
+                                logger.warning(f"DB data for {symbol} is also stale (Age: {db_age:.1f}s).")
+                        except Exception as e:
+                            logger.error(f"Read Repair write-back failed: {e}")
                             
-                    logger.info(f"Restored valid market data for {symbol} from TemporalDB.")
-                    return market_data
+                    return db_data
                     
             except Exception as e:
-                logger.error(f"Failover failed for {symbol}: {e}")
-                
-        return None
-
-    async def _get_market_data_at_time(self, symbol: str, timestamp: datetime) -> Optional[MarketData]:
-        """Helper to fetch data exactly at or before simulation time."""
-        if not self.temporal_db: return None
-        try:
-            # Query range slightly before sim time
-            start = timestamp - timedelta(hours=24)
-            df = await self.temporal_db.query_market_data(symbol, start, timestamp)
-            if not df.empty:
-                latest_record = df.iloc[-1].to_dict()
-                return MarketData(**latest_record)
-        except Exception:
-            pass
-        return None
-
-    async def get_market_data_history(self, symbol: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
-        """
-        从 TemporalDB 获取历史行情数据。
-        """
-        if not self.temporal_db:
-            logger.warning("TemporalDB not configured.")
-            return pd.DataFrame()
-            
-        return await self.temporal_db.query_market_data(symbol, start_time, end_time)
-
-    async def get_fundamental_data(self, symbol: str, as_of_date: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
-        """
-        获取基本面数据 (Financials, Ratios)。
-        [Time Machine] Supports as_of_date filtering to prevent future data leakage.
-        """
-        if not self.tabular_db:
-            logger.warning("TabularDB not configured.")
-            return None
-            
-        try:
-            # [Time Machine] Apply date filter if provided, or default to current system time
-            target_date = as_of_date or self.get_current_time()
-            
-            # Ensure simple date comparison
-            date_str = target_date.strftime("%Y-%m-%d")
-
-            # [Task P0-004] SQL Injection Fix: Use parameter binding via execute_sql
-            # We strictly avoid f-string interpolation for the symbol.
-            sql = "SELECT * FROM fundamentals WHERE symbol = :symbol AND date <= :target_date ORDER BY date DESC LIMIT 1"
-            params = {"symbol": symbol, "target_date": date_str}
-
-            # Use execute_sql for direct, safe execution if available
-            if hasattr(self.tabular_db, 'execute_sql'):
-                results = await self.tabular_db.execute_sql(sql, params=params)
-                if results:
-                    return results[0]
-            else:
-                # Fail securely if parameterized execution is not supported
-                logger.error("TabularDBClient.execute_sql not available. Aborting get_fundamental_data to prevent SQL Injection.")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Failed to fetch fundamental data for {symbol}: {e}")
-            
-        return None
-
-    async def fetch_news_data(self, start_time: datetime, end_time: datetime, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        [Restored] 获取新闻/事件数据。
-        """
-        if not self.temporal_db:
-            logger.warning("TemporalDB not configured. Cannot fetch news.")
-            return []
-            
-        try:
-            return await self.temporal_db.query_events(
-                event_type="news", 
-                start_time=start_time, 
-                end_time=end_time,
-                limit=limit
-            )
-        except Exception as e:
-            logger.error(f"Failed to fetch news data: {e}")
-            return []
-
-    async def get_current_portfolio(self) -> Optional[Dict[str, Any]]:
-        """
-        [Task 18 Dependency] 获取当前投资组合状态 (从持久化存储或 Ledger)。
-        """
-        if self.tabular_db:
-            try:
-                balance_res = await self.tabular_db.query("SELECT cash, realized_pnl FROM ledger_balance ORDER BY id DESC LIMIT 1")
-                positions_res = await self.tabular_db.query("SELECT * FROM ledger_positions")
-                
-                portfolio = {
-                    "cash": 100000.0,
-                    "positions": {},
-                    "realized_pnl": 0.0
-                }
-                
-                if balance_res and "results" in balance_res and balance_res["results"]:
-                    row = balance_res["results"][0]
-                    portfolio["cash"] = float(row["cash"])
-                    portfolio["realized_pnl"] = float(row["realized_pnl"])
-                    
-                if positions_res and "results" in positions_res:
-                    for row in positions_res["results"]:
-                        sym = row["symbol"]
-                        portfolio["positions"][sym] = {
-                            "symbol": sym,
-                            "quantity": float(row["quantity"]),
-                            "average_price": float(row["average_price"]),
-                            "market_value": float(row["market_value"]),
-                            "unrealized_pnl": float(row["unrealized_pnl"])
-                        }
-                return portfolio
-            except Exception as e:
-                logger.error(f"Failed to fetch portfolio from Ledger: {e}")
+                logger.error(f"TemporalDB fetch failed for {symbol}: {e}")
         
         return None
 
-    def get_current_time(self) -> datetime:
+    # [Task P1-DATA-01] Batch Market Data Interface
+    async def get_latest_market_data_batch(self, symbols: List[str]) -> Dict[str, MarketData]:
         """
-        获取当前系统时间 (UTC)。
-        [Task 2.1] Delegated to TimeProvider.
+        Retrieves the latest market data for a list of symbols efficiently.
+        Prioritizes Redis MGET to minimize latency.
+        Fallback to concurrent existing fetch method for misses.
         """
-        return self.time_provider.get_current_time()
+        if not symbols:
+            return {}
 
-    async def save_state(self, state: Dict[str, Any]):
+        results: Dict[str, MarketData] = {}
+        unique_symbols = list(set(symbols))
+        missing_symbols = []
+
+        # 1. Try Redis MGET (Fast Path)
+        if self.redis_client:
+            try:
+                # Use standard key template
+                keys = [REDIS_KEY_MARKET_DATA_LIVE_TEMPLATE.format(symbol=sym) for sym in unique_symbols]
+                
+                # Async MGET
+                values = await self.redis_client.mget(keys)
+                
+                for sym, val in zip(unique_symbols, values):
+                    if val:
+                        try:
+                            # Parse JSON
+                            if isinstance(val, bytes):
+                                val = val.decode('utf-8')
+                            data_dict = json.loads(val)
+                            
+                            # Reconstruct MarketData object
+                            try:
+                                md_obj = MarketData.model_validate(data_dict)
+                            except AttributeError:
+                                # Fallback if not Pydantic v2
+                                md_obj = MarketData(**data_dict)
+                            
+                            # [Feature 2] Batch Zombie Check
+                            # We can do a quick check here if we trust the timestamp in JSON
+                            # Otherwise, delegate to the single fetch which has robust logic
+                            current_time = await self.get_current_time()
+                            # Ensure timestamp is datetime
+                            ts = md_obj.timestamp
+                            if isinstance(ts, str):
+                                ts = datetime.fromisoformat(ts)
+                                
+                            if (current_time - ts).total_seconds() > self.max_data_age_seconds:
+                                missing_symbols.append(sym) # Treat as miss to trigger repair
+                            else:
+                                results[sym] = md_obj
+                                
+                        except (json.JSONDecodeError, TypeError, ValueError, Exception) as e:
+                            logger.warning(f"DataManager: Corrupt/Stale Redis data for {sym}: {e}")
+                            missing_symbols.append(sym)
+                    else:
+                        missing_symbols.append(sym)
+            except Exception as e:
+                logger.error(f"DataManager: Redis batch fetch failed: {e}")
+                missing_symbols = unique_symbols # Fail safe: try all in DB
+        else:
+            missing_symbols = unique_symbols
+
+        # 2. Fallback to Concurrent Single Fetch (Slow Path)
+        # Using existing get_latest_market_data (Redundant Redis check accepted for compatibility)
+        if missing_symbols:
+            # Limit concurrency to prevent overwhelming the DB/App
+            semaphore = asyncio.Semaphore(20) 
+            
+            async def fetch_safe(sym):
+                async with semaphore:
+                    try:
+                        # [Fix] Removed 'use_cache=False' to match existing signature
+                        return await self.get_latest_market_data(sym)
+                    except Exception as e:
+                        logger.error(f"DataManager: Error fetching {sym}: {e}")
+                        return None
+
+            tasks = [fetch_safe(sym) for sym in missing_symbols]
+            
+            if tasks:
+                db_items = await asyncio.gather(*tasks, return_exceptions=False)
+                
+                for sym, item in zip(missing_symbols, db_items):
+                    if item and isinstance(item, MarketData):
+                        results[sym] = item
+
+        logger.debug(f"Batch data fetch: {len(results)}/{len(unique_symbols)} symbols retrieved.")
+        return results
+
+    async def get_market_data_history(self, symbol: str, start: datetime, end: datetime) -> Any:
+        """Fetches historical data from TemporalDB."""
+        if self.temporal_db:
+            return await self.temporal_db.get_market_data_range(symbol, start, end)
+        return None
+    
+    # [Feature 3] Placeholder for News/Event Data
+    async def get_news_events(self, symbol: str, lookback_days: int = 7) -> List[Dict]:
         """
-        保存一般系统状态 (Snapshot)。
+        Retrieves news events for a symbol.
+        Currently a placeholder; implementation would query S3 or a news API.
         """
-        pass
+        start_date = (await self.get_current_time()) - timedelta(days=lookback_days)
+        # TODO: Implement actual news retrieval logic
+        logger.info(f"Fetching news for {symbol} since {start_date}")
+        return []
+
+    async def get_current_portfolio(self) -> Optional[PortfolioState]:
+        """Retrieves the latest portfolio state."""
+        if self.redis_client:
+            try:
+                data = await self.redis_client.get(REDIS_KEY_PORTFOLIO_LATEST)
+                if data:
+                    return PortfolioState.model_validate_json(data)
+            except Exception as e:
+                logger.error(f"Failed to fetch portfolio from Redis: {e}")
+        
+        # Fallback to DB
+        if self.tabular_db:
+            # Implement DB fetch logic here
+            pass
+            
+        return None
 
     async def close(self):
-        # [Fix Task 3] Resource Cleanup
-        if self.tabular_db and hasattr(self.tabular_db, 'close'):
-            # Check if async
-            if asyncio.iscoroutinefunction(self.tabular_db.close):
-                await self.tabular_db.close()
-            else:
-                self.tabular_db.close()
-        
+        """Closes all database connections."""
+        if self.redis_client:
+            await self.redis_client.close()
         if self.temporal_db and hasattr(self.temporal_db, 'close'):
-            if asyncio.iscoroutinefunction(self.temporal_db.close):
-                await self.temporal_db.close()
-            else:
-                self.temporal_db.close()
+            await self.temporal_db.close()
+        if self.tabular_db and hasattr(self.tabular_db, 'close'):
+            await self.tabular_db.close()
+        logger.info("DataManager closed.")
