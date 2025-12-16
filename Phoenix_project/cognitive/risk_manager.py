@@ -2,6 +2,7 @@
 Phoenix_project/cognitive/risk_manager.py
 [Phase 3 Task 5] Fix RiskManager Silent Failure.
 [Task 3.2] Time-Aware Initialization.
+[P0-RISK-01] Asset Correlation Risk Check.
 """
 
 import logging
@@ -217,11 +218,89 @@ class RiskManager:
         if conc_signal:
             signals.append(conc_signal)
 
+        # [Task P0-RISK-01] Correlation Check
+        corr_signal = self.check_correlation(proposed_position, portfolio)
+        if corr_signal:
+            signals.append(corr_signal)
+
         if signals:
             logger.warning(f"Pre-trade check failed for {proposed_position.symbol}: {signals}")
             raise RiskViolationError(f"Pre-trade risk violation: {signals[0].description}", signals)
 
         return signals
+
+    # [Task P0-RISK-01] Asset Correlation Risk Check
+    def check_correlation(
+        self, proposed_position: Position, portfolio: PortfolioState
+    ) -> Optional[RiskSignal]:
+        """
+        Checks if the proposed position is highly correlated with existing heavy positions,
+        increasing systemic risk exposure beyond limits.
+        """
+        symbol = proposed_position.symbol
+        # Require sufficient history for correlation calc
+        if symbol not in self.price_history or len(self.price_history[symbol]) < self.volatility_window:
+            return None
+
+        proposed_series = np.array(self.price_history[symbol])
+        if len(proposed_series) < 10 or np.std(proposed_series) == 0:
+            return None # Insufficient or constant data
+
+        # Calculate proposed weight approximation
+        pf_value = float(portfolio.total_value)
+        if pf_value <= 0: return None
+        
+        trade_value = float(proposed_position.quantity) * proposed_series[-1]
+        proposed_weight = trade_value / pf_value
+        
+        # Configuration
+        max_corr = self.config.get("max_correlation", 0.8)
+        
+        for other_sym, pos in portfolio.positions.items():
+            if other_sym == symbol: continue
+            
+            # Optimization: Skip negligible positions (< 1%)
+            other_val = float(pos.market_value)
+            other_weight = other_val / pf_value
+            if abs(other_weight) < 0.01: continue 
+
+            if other_sym not in self.price_history: continue
+            
+            other_series = np.array(self.price_history[other_sym])
+            
+            # Align series length
+            n = min(len(proposed_series), len(other_series))
+            if n < 10: continue
+            
+            s1 = proposed_series[-n:]
+            s2 = other_series[-n:]
+            
+            if np.std(s2) == 0: continue
+            
+            try:
+                corr = np.corrcoef(s1, s2)[0, 1]
+            except Exception:
+                continue
+                
+            if corr > max_corr:
+                # Check if combined exposure exceeds the limit for a single asset
+                combined_weight = proposed_weight + other_weight
+                if abs(combined_weight) > self.max_position_concentration_pct:
+                    desc = (f"Correlation Risk: {symbol} is {corr:.2f} correlated with {other_sym}. "
+                            f"Combined weight {combined_weight:.2%} exceeds limit {self.max_position_concentration_pct:.2%}")
+                    
+                    return RiskSignal(
+                        description=desc,
+                        symbol=symbol,
+                        triggers_circuit_breaker=False,
+                        metadata={
+                            "signal_type": "CORRELATION_RISK",
+                            "partner_symbol": other_sym, 
+                            "correlation": float(corr),
+                            "combined_weight": float(combined_weight)
+                        }
+                    )
+        return None
 
     async def check_post_trade(self, portfolio: PortfolioState) -> List[RiskSignal]:
         if self.circuit_breaker_tripped:
@@ -394,3 +473,5 @@ class RiskManager:
                             logger.info("Circuit breaker RESET via Pub/Sub.")
         except Exception as e:
             logger.error(f"Circuit breaker monitor failed: {e}")
+
+}
