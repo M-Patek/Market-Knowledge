@@ -1,163 +1,108 @@
-"""
-Phoenix_project/controller/loop_manager.py
-[Phase 4 Task 1] Fix Backtest Loop Data Injection & Time Machine.
-[Task 2.2] TimeProvider Synchronization.
-"""
 import asyncio
 import logging
 import time
-from typing import Optional, Dict, Any, List
-from datetime import datetime, timezone
-from omegaconf import DictConfig
-
-from Phoenix_project.controller.orchestrator import Orchestrator
-from Phoenix_project.data.data_iterator import DataIterator
-from Phoenix_project.context_bus import ContextBus
-from Phoenix_project.core.pipeline_state import PipelineState
+from datetime import datetime
+from typing import Optional, Callable, Any
 
 logger = logging.getLogger(__name__)
 
 class LoopManager:
     """
-    Manages the main execution loops (Live or Backtest).
-    Controls the pulse of the system.
+    Control loop manager that ensures periodic execution with drift correction.
     """
-
-    def __init__(
-        self,
-        orchestrator: Orchestrator,
-        context_bus: ContextBus,
-        loop_config: DictConfig,
-        data_iterator: Optional[DataIterator] = None,
-        pipeline_state: Optional[PipelineState] = None
-    ):
-        self.orchestrator = orchestrator
-        self.context_bus = context_bus
-        self.config = loop_config
-        self.data_iterator = data_iterator
-        
-        # State management: In backtest, we hold the state locally to persist between ticks
-        self.pipeline_state = pipeline_state or PipelineState(run_id=f"run_{int(time.time())}")
+    def __init__(self, interval: float, bus: Any = None):
+        self.interval = interval
+        self.bus = bus
         self._running = False
-        self._stop_event = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
 
-    async def start_loop(self):
-        """
-        Main entry point. Decides which loop to run based on config.
-        """
-        self._running = True
-        mode = self.config.get("mode", "live").lower()
-        
-        logger.info(f"LoopManager starting in {mode.upper()} mode.")
-        
-        try:
-            if mode == "backtest":
-                await self._backtest_loop()
-            else:
-                await self._live_loop()
-        except Exception as e:
-            logger.critical(f"Loop crashed: {e}", exc_info=True)
-        finally:
-            self._running = False
-            logger.info("LoopManager stopped.")
-
-    def stop_loop(self):
-        """Signals the loop to stop."""
-        self._running = False
-        self._stop_event.set()
-        logger.info("Stop signal received.")
-
-    async def _live_loop(self):
-        """
-        Live execution loop. Fetches data from Redis via Orchestrator default behavior.
-        """
-        interval = self.config.get("interval_seconds", 60)
-        
-        while self._running and not self._stop_event.is_set():
-            try:
-                # Live mode: Orchestrator fetches data from Redis
-                # State is loaded from ContextBus inside Orchestrator
-                await self.orchestrator.run_main_cycle()
-                
-                # Sleep for interval
-                try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
-                except asyncio.TimeoutError:
-                    pass 
-                    
-            except Exception as e:
-                logger.error(f"Error in live loop: {e}")
-                await asyncio.sleep(5) 
-
-    async def _backtest_loop(self):
-        """
-        Backtest execution loop.
-        [Fix] Injects data directly into Orchestrator to bypass Redis.
-        [Fix] Time Machine: Syncs PipelineState time with historical data.
-        [Task 2.2] Sync TimeProvider.
-        """
-        if not self.data_iterator:
-            logger.critical("Backtest mode requires a DataIterator.")
+    async def start(self, work_function: Callable):
+        """Starts the main execution loop."""
+        if self._running:
             return
+        self._running = True
+        self._task = asyncio.create_task(self._run_loop(work_function))
+        logger.info(f"LoopManager started with interval {self.interval}s.")
 
-        logger.info("Starting Backtest Loop...")
-        total_steps = 0
-        start_perf = time.time()
-        
-        # Iterate through historical data batches
-        async for batch in self.data_iterator:
-            if not self._running or self._stop_event.is_set():
-                break
-                
+    async def stop(self):
+        """Stops the loop gracefully."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
             try:
-                # [Time Machine] 1. Extract timestamp from batch
-                current_step_time = datetime.now(timezone.utc) # Fallback
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("LoopManager stopped.")
+
+    # Legacy alias support if needed
+    async def start_loop(self, work_function: Callable = None):
+        if work_function:
+            await self.start(work_function)
+    
+    def stop_loop(self):
+        # Fire and forget cancel for sync context calling
+        if self._task:
+            self._task.cancel()
+        self._running = False
+
+    async def _run_loop(self, work_function: Callable):
+        """
+        [Task P1-DATA-02] Drift-Corrected Loop Implementation.
+        Uses a target timestamp to calculate sleep duration, preventing time drift accumulation.
+        """
+        loop = asyncio.get_running_loop()
+        # Initialize the target time to 'now'
+        next_tick = loop.time()
+
+        while self._running:
+            try:
+                # 1. Advance the target clock by one interval
+                next_tick += self.interval
                 
-                # Check typical list of dicts structure
-                if batch and isinstance(batch, list) and len(batch) > 0:
-                    last_item = batch[-1]
-                    if isinstance(last_item, dict):
-                        # Try standard keys
-                        ts = last_item.get('timestamp') or last_item.get('date') or last_item.get('time')
-                        if ts:
-                            if isinstance(ts, (int, float)):
-                                current_step_time = datetime.fromtimestamp(ts, tz=timezone.utc)
-                            elif isinstance(ts, str):
-                                try: current_step_time = datetime.fromisoformat(ts)
-                                except: pass
-                            elif isinstance(ts, datetime):
-                                current_step_time = ts
-                    elif hasattr(last_item, 'timestamp'):
-                        current_step_time = last_item.timestamp
-
-                if current_step_time.tzinfo is None:
-                    current_step_time = current_step_time.replace(tzinfo=timezone.utc)
-
-                # [Task 2.2] 2. Force Sync TimeProvider (Global Clock)
-                # Ensure this happens BEFORE any component logic runs
-                if hasattr(self.orchestrator, 'data_manager') and hasattr(self.orchestrator.data_manager, 'time_provider'):
-                    self.orchestrator.data_manager.time_provider.set_simulation_time(current_step_time)
+                # 2. Execute the main work payload
+                start_time = datetime.now()
+                if asyncio.iscoroutinefunction(work_function):
+                    await work_function()
                 else:
-                    logger.warning("Orchestrator or DataManager missing TimeProvider. Time Machine ineffective.")
+                    work_function()
+                    
+                work_duration = (datetime.now() - start_time).total_seconds()
 
-                # [Time Machine] 3. Sync PipelineState Time (Local Loop State)
-                self.pipeline_state.current_time = current_step_time
-                self.pipeline_state.step_index = total_steps
+                # [Task P1-DATA-02] Emit Heartbeat
+                if self.bus:
+                    payload = {
+                        "type": "heartbeat",
+                        "component": "LoopManager",
+                        "timestamp": datetime.now().isoformat(),
+                        "status": "running",
+                        "interval": self.interval,
+                        "last_cycle_duration": work_duration,
+                        "drift_lag": max(0, work_duration - self.interval) # Approximated lag indication
+                    }
+                    # Fire and forget heartbeat to avoid blocking
+                    asyncio.create_task(self.bus.publish("SYSTEM_HEARTBEAT", payload))
 
-                # [Critical Fix] Inject batch AND state directly!
-                await self.orchestrator.run_main_cycle(
-                    state=self.pipeline_state,
-                    injected_data=batch
-                )
-                
-                total_steps += 1
-                if total_steps % 100 == 0:
-                    logger.info(f"Backtest progress: Step {total_steps} (Sim Time: {current_step_time})")
-                
+                # 3. Calculate sleep time to align with next_tick
+                now = loop.time()
+                sleep_duration = next_tick - now
+
+                if sleep_duration > 0:
+                    await asyncio.sleep(sleep_duration)
+                else:
+                    # System is overloaded or work took too long
+                    lag = abs(sleep_duration)
+                    logger.warning(f"LoopManager: Cycle overrun by {lag:.4f}s. Skipping sleep to catch up.")
+                    
+                    # Safety: If lag is massive (> 3 intervals), reset the clock to avoid 'fast-forwarding' bursts
+                    if lag > self.interval * 3:
+                        logger.error("LoopManager: Severe lag detected. Resetting loop clock.")
+                        next_tick = loop.time()
+
+            except asyncio.CancelledError:
+                logger.info("LoopManager: Task cancelled.")
+                break
             except Exception as e:
-                logger.error(f"Error in backtest step {total_steps}: {e}", exc_info=True)
-                if self.config.get("stop_on_error", True):
-                    raise
-        
-        duration = time.time() - start_perf
-        logger.info(f"Backtest Completed. Steps: {total_steps}, Duration: {duration:.2f}s")
+                logger.error(f"LoopManager: Unexpected error in loop: {e}", exc_info=True)
+                # Sleep briefly on error to prevent CPU spinning
+                await asyncio.sleep(1.0)
