@@ -10,6 +10,8 @@
 [Code Opt Expert Fix] Task 11 & 12: Concurrency Crash Fix & Valuation Fallback
 [Task 012, 013] Append-Only Ledger & Ostrich Valuation Fix
 [Task P0-003] Flexible Valuation Fallback (No crash on missing price)
+[Task P0-EXEC-01] Reserve Cash Mechanism
+[Task P0-EXEC-02] Enforce Decimal Precision
 """
 from typing import Dict, Optional, Any
 from datetime import datetime
@@ -36,6 +38,9 @@ class TradeLifecycleManager:
         self.positions: Dict[str, Position] = {} # key: symbol
         # [Phase II Fix] Use Decimal for financial precision (The "Penny Gap")
         self.cash = Decimal(str(initial_cash))
+        # [Task P0-EXEC-01] Reserve Cash tracking
+        self.reserved_cash = Decimal("0.0")
+        
         self.realized_pnl = Decimal("0.0")
         
         self.data_manager = data_manager
@@ -147,17 +152,18 @@ class TradeLifecycleManager:
         根据最新的市场价格计算并返回当前的投资组合状态。
         [Beta FIX] 增加了严格的数据完整性检查 (Ostrich Valuation Fix)。
         [Fix] 增加了线程安全的迭代快照 (Dirty Read Fix)。
+        [Task P0-EXEC-02] Aggregate in Decimal, convert to float only at boundary.
         :param current_market_data: Dict[symbol, current_price]
         :param timestamp: Optional simulation timestamp (for backtesting consistency)
         """
         # [Fix Dirty Read] Create a shallow copy of positions to allow safe iteration 
         # while on_fill might be modifying the main dict in the background.
-        # [Task 11] Atomic Snapshot: Copy dict keys/refs first to prevent iteration errors
         raw_positions = self.positions.copy()
         positions_snapshot = {k: v.model_copy() for k, v in raw_positions.items()}
         
-        total_value = self.cash
-        valuation_confidence = "high" # [Task TASK-P0-003] Track valuation confidence
+        # [Task P0-EXEC-02] Aggregate in Decimal, convert to float only at boundary
+        total_market_value_d = Decimal("0.0")
+        valuation_confidence = "high"
         
         # 更新持仓的市值和未实现盈亏 (使用快照)
         for symbol, pos in positions_snapshot.items():
@@ -169,21 +175,29 @@ class TradeLifecycleManager:
                 current_price = pos.average_price
                 valuation_confidence = "low"
 
-            # Calculate in Decimal for safety
-            # Note: Explicit casting Decimal -> float for schema compatibility
             try:
                 # 使用 Decimal 进行高精度计算，避免浮点数漂移
                 d_qty = Decimal(str(pos.quantity))
                 d_price = Decimal(str(current_price))
                 d_avg = Decimal(str(pos.average_price))
                 
-                pos.market_value = float(d_qty * d_price)
-                pos.unrealized_pnl = float((d_price - d_avg) * d_qty)
+                # Calculate metrics in Decimal
+                d_market_val = d_qty * d_price
+                d_unrealized_pnl = (d_price - d_avg) * d_qty
                 
-                total_value += Decimal(str(pos.market_value))
+                # Accumulate Total Value in Decimal
+                total_market_value_d += d_market_val
+                
+                # Update snapshot with floats (for Schema compatibility)
+                pos.market_value = float(d_market_val)
+                pos.unrealized_pnl = float(d_unrealized_pnl)
+                
             except Exception as e:
                 logger.error(f"{self.log_prefix} Valuation error for {symbol}: {e}")
                 # 保持原值或设为0，视具体策略。这里由上层捕获。
+        
+        # Final Total Value = Cash (Decimal) + Total Market Value (Decimal)
+        total_portfolio_value_d = self.cash + total_market_value_d
         
         # Determine timestamp: Use provided simulation time or UTC now (Default)
         # [Fix] Prefer injected timestamp for causal consistency
@@ -192,11 +206,41 @@ class TradeLifecycleManager:
         return PortfolioState(
             timestamp=state_timestamp,
             cash=float(self.cash), # Convert back to float for Schema
-            total_value=float(total_value),
+            total_value=float(total_portfolio_value_d), # High precision sum converted once
             positions=positions_snapshot, # Return the consistent snapshot
             realized_pnl=float(self.realized_pnl),
             metadata={"valuation_confidence": valuation_confidence, "method": "flexible_fallback"}
         )
+
+    # [Task P0-EXEC-01] Async Reservation Methods
+    async def reserve_cash(self, amount: float) -> bool:
+        """
+        Attempt to reserve cash for a pending BUY order.
+        Returns True if funds are available and reserved.
+        """
+        async with self._lock:
+            d_amount = Decimal(str(amount))
+            available = self.cash - self.reserved_cash
+            if available >= d_amount:
+                self.reserved_cash += d_amount
+                logger.info(f"{self.log_prefix} Reserved {d_amount}. Total Reserved: {self.reserved_cash}")
+                return True
+            else:
+                logger.warning(f"{self.log_prefix} Reservation failed. Req: {d_amount}, Avail: {available}")
+                return False
+
+    async def release_cash(self, amount: float):
+        """
+        Release reserved cash (e.g., order filled, canceled, or rejected).
+        """
+        async with self._lock:
+            d_amount = Decimal(str(amount))
+            if d_amount > self.reserved_cash:
+                logger.warning(f"{self.log_prefix} Releasing {d_amount} > Reserved {self.reserved_cash}. Resetting to 0.")
+                self.reserved_cash = Decimal("0.0")
+            else:
+                self.reserved_cash -= d_amount
+                logger.info(f"{self.log_prefix} Released {d_amount}. Total Reserved: {self.reserved_cash}")
 
     async def on_fill(self, fill: Fill):
         """
@@ -449,5 +493,6 @@ class TradeLifecycleManager:
                 return {"status": "error", "message": str(e)}
             
     def check_purchasing_power(self, estimated_cost: float) -> bool:
-        """Simple check to see if we have enough cash for a transaction."""
-        return self.cash >= Decimal(str(estimated_cost))
+        """Simple check to see if we have enough cash for a transaction (considering reservations)."""
+        # [Task P0-EXEC-01] Subtract reserved cash from check
+        return (self.cash - self.reserved_cash) >= Decimal(str(estimated_cost))
