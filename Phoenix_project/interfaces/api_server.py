@@ -30,6 +30,7 @@ class APIServer:
     Provides an external API interface (e.g., REST) for the system.
     [Phase IV Fix] Dynamic Event Loop retrieval to fix scheduling crashes.
     [Task FIX-CRIT-003] Injected Main Loop for Thread Safety
+    [P1-INFRA-02] Graceful Shutdown & Security
     """
 
     def __init__(
@@ -62,6 +63,10 @@ class APIServer:
         self.api_key = os.getenv("PHOENIX_API_KEY")
         if not self.api_key:
             self.logger.log_warning("PHOENIX_API_KEY not set. API endpoints are unsecured!")
+
+        # [P1-INFRA-02] Server state tracking
+        self.server = None
+        self.thread = None
         
         self._register_routes()
         self.logger.log_info(f"APIServer initialized. Will run on {self.host}:{self.port}")
@@ -94,6 +99,7 @@ class APIServer:
             return jsonify({"status": "healthy"}), 200
         
         @self.app.route("/api/v1/status", methods=["GET"])
+        @require_api_key # [P1-INFRA-02] Add security check
         def get_status():
             """Returns the overall system status from the ContextBus."""
             return jsonify(self.get_system_status()), 200
@@ -184,15 +190,26 @@ class APIServer:
             port=self.port,
             log_level="warning",
         )
-        server = uvicorn.Server(config)
+        # [P1-INFRA-02] Store server instance for shutdown
+        self.server = uvicorn.Server(config)
         
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        self.logger.log_info(f"Uvicorn server started in thread: {thread.name}")
-        return thread
+        self.thread = threading.Thread(target=self.server.run, daemon=True)
+        self.thread.start()
+        self.logger.log_info(f"Uvicorn server started in thread: {self.thread.name}")
+        return self.thread
 
     async def stop(self):
         """
-        [Phase IV Fix] Graceful Shutdown Stub.
+        [P1-INFRA-02] Gracefully stop the Uvicorn server.
         """
-        pass
+        if self.server:
+            self.logger.log_info("Signal Uvicorn to shutdown...")
+            self.server.should_exit = True
+        
+        if self.thread and self.thread.is_alive():
+            self.logger.log_info("Waiting for API Server thread to join...")
+            self.thread.join(timeout=5.0)
+            if self.thread.is_alive():
+                self.logger.log_warning("API Server thread force detached (timeout).")
+            else:
+                self.logger.log_info("API Server stopped.")
