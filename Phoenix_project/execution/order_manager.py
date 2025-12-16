@@ -19,6 +19,8 @@ class OrderManager:
     [Fix] 实时监听订单状态，自动清理已完成/取消的订单，防止死锁。
     [Task FIX-CRIT-001] Execution Safety: Purchasing Power Check
     [Task P1-002] Deadlock Watchdog: Timeout & Auto-Recovery
+    [Task P0-EXEC-01] Reserve Cash Mechanism
+    [Task P1-EXEC-03] In-flight Order Status Management & Frozen Capital Tracking
     """
 
     def __init__(
@@ -33,8 +35,8 @@ class OrderManager:
         self.data_manager = data_manager
         self.bus = bus
         
-        # 内部跟踪: symbol -> {'id': order_id, 'ts': timestamp}
-        # 修改结构以支持超时检查
+        # 内部跟踪: symbol -> {'id': order_id, 'ts': timestamp, 'frozen_amount': float}
+        # 修改结构以支持超时检查和资金冻结跟踪
         self.active_orders: Dict[str, Dict[str, Any]] = {} 
         self._lock = asyncio.Lock()
         
@@ -52,6 +54,7 @@ class OrderManager:
         """
         [Task 3.3] Callback for Order Status Updates.
         Cleans up active_orders when orders reach terminal state.
+        [Fix] Ensures frozen capital is released using the correct key 'frozen_amount'.
         """
         try:
             # Normalize update data (Alpaca stream returns objects or dicts)
@@ -90,15 +93,24 @@ class OrderManager:
             if event in TERMINAL_STATES:
                 async with self._lock:
                     # Check if this order is tracked as active
-                    # [Task P1-002] Support dict structure
                     current_active = self.active_orders.get(symbol)
                     
                     # Handle legacy string format or new dict format
                     current_id = current_active if isinstance(current_active, str) else (current_active.get('id') if current_active else None)
 
                     if current_id == str(order_id):
+                        # [Fix] Retrieve frozen amount using correct key 'frozen_amount'
+                        # Fallback to 'reserved' for backward compatibility during hot-reload
+                        frozen_amt = 0.0
+                        if isinstance(current_active, dict):
+                             frozen_amt = current_active.get('frozen_amount', current_active.get('reserved', 0.0))
+                        
+                        # [Task P0-EXEC-01] Release Reservation on terminal state
+                        if frozen_amt > 0 and self.tlm:
+                             await self.tlm.release_cash(frozen_amt)
+
                         del self.active_orders[symbol]
-                        logger.info(f"Order {order_id} for {symbol} finished ({event}). Removed from active tracking.")
+                        logger.info(f"Order {order_id} for {symbol} finished ({event}). Released {frozen_amt}. Removed from active tracking.")
                     
                     # Handle 'replaced' logic specifically if needed?
                     # For now, we assume Orchestrator will issue new orders if needed.
@@ -174,19 +186,50 @@ class OrderManager:
         
         async with self._lock:
             for symbol in all_symbols:
-                # [Task P1-002] Deadlock Watchdog & Timeout Check
+                # [Task P1-EXEC-03] Watchdog & Ambiguous Order Handling
                 if symbol in self.active_orders:
                     active_info = self.active_orders[symbol]
                     
                     # Migration/Safety: Handle if it's still a string
                     if isinstance(active_info, str):
-                         active_info = {'id': active_info, 'ts': datetime.now().timestamp()}
+                         active_info = {'id': active_info, 'ts': datetime.now().timestamp(), 'frozen_amount': 0.0}
                          self.active_orders[symbol] = active_info
                     
                     order_id = active_info.get('id')
                     ts = active_info.get('ts', datetime.now().timestamp())
+                    # [Task P1-EXEC-03] Retrieve frozen amount
+                    frozen_amt = active_info.get('frozen_amount', active_info.get('reserved', 0.0))
                     
-                    # Timeout Threshold: 60 seconds
+                    # A. Ambiguous State Recovery (Timeout Recovery)
+                    if order_id == 'AMBIGUOUS':
+                        logger.warning(f"Checking status for ambiguous order: {symbol}")
+                        try:
+                            # Attempt to find the order via open orders scan
+                            open_orders = self.broker.get_all_open_orders()
+                            # Assuming get_all_open_orders returns list of Order objects
+                            found_order = next((o for o in open_orders if o.symbol == symbol), None)
+                            
+                            if found_order:
+                                logger.info(f"Recovered ambiguous order for {symbol}. ID: {found_order.id}")
+                                active_info['id'] = found_order.id
+                                active_info['ts'] = datetime.now().timestamp() # Reset timeout
+                                self.active_orders[symbol] = active_info
+                                continue # Now tracked normally
+                            else:
+                                # Not found. If timeout exceeded, assume failed and release.
+                                if (datetime.now().timestamp() - ts) > 30: # 30s grace period for appearance
+                                    logger.error(f"Ambiguous order for {symbol} not found after 30s. Assuming failed. Releasing {frozen_amt}.")
+                                    if self.tlm and frozen_amt > 0:
+                                        await self.tlm.release_cash(frozen_amt)
+                                    del self.active_orders[symbol]
+                                    # Proceed to place new order? No, wait next cycle to be safe.
+                                else:
+                                    logger.info(f"Ambiguous order {symbol} not yet found. Waiting...")
+                        except Exception as e:
+                            logger.error(f"Error checking ambiguous order {symbol}: {e}")
+                        continue # Skip processing for this symbol
+                    
+                    # B. Standard Deadlock Watchdog (Timeout > 60s)
                     if (datetime.now().timestamp() - ts) > 60:
                         logger.warning(f"Order {order_id} for {symbol} stale (>60s). Checking status...")
                         try:
@@ -206,6 +249,9 @@ class OrderManager:
                                     should_clear = True
                             
                             if should_clear:
+                                # [Task P1-EXEC-03] Ensure frozen amount is released if not already done
+                                if self.tlm and frozen_amt > 0:
+                                     await self.tlm.release_cash(frozen_amt)
                                 del self.active_orders[symbol]
                                 # Proceed to execute new order logic for this symbol
                             else:
@@ -234,6 +280,10 @@ class OrderManager:
                 side = OrderSide.BUY if diff > 0 else OrderSide.SELL
                 qty = abs(diff)
                 
+                # [Task P0-EXEC-01] Execution Safety with Reservation
+                estimated_cost = 0.0
+                reserved_success = False
+
                 # [Task FIX-CRIT-001] Execution Safety: Check Purchasing Power for BUY orders
                 if side == OrderSide.BUY:
                     estimated_price = 0.0
@@ -257,15 +307,14 @@ class OrderManager:
                         continue
 
                     estimated_cost = qty * estimated_price
-                    # Check with TLM (Ledger)
-                    if self.tlm and not self.tlm.check_purchasing_power(estimated_cost):
-                        logger.error(f"OrderManager: Insufficient funds for BUY {symbol} (Qty: {qty}, Price: {estimated_price}, Cost: {estimated_cost}). Available: {self.tlm.cash}. Skipping.")
-                        state.execution_results.append({
-                            "symbol": symbol,
-                            "error": f"Insufficient Purchasing Power (Need {estimated_cost})",
-                            "status": "skipped"
-                        })
-                        continue
+                    
+                    # Attempt Reservation
+                    if self.tlm:
+                        reserved_success = await self.tlm.reserve_cash(estimated_cost)
+                        if not reserved_success:
+                            logger.error(f"OrderManager: Insufficient funds (Reserved) for {symbol}. Cost: {estimated_cost}. Skipping.")
+                            state.execution_results.append({"symbol": symbol, "error": "Insufficient Funds", "status": "skipped"})
+                            continue
 
                 # Get current price for Limit orders? 
                 # For simplicity, using Market orders for now, or L3 decision could specify type.
@@ -292,20 +341,49 @@ class OrderManager:
                     order_id = self.broker.place_order(order)
                     
                     if order_id:
-                        # [Task P1-002] Store with timestamp
-                        self.active_orders[symbol] = {'id': order_id, 'ts': datetime.now().timestamp()}
+                        # [Task P1-EXEC-03] Store with frozen_amount
+                        self.active_orders[symbol] = {
+                            'id': order_id, 
+                            'ts': datetime.now().timestamp(),
+                            'frozen_amount': estimated_cost if reserved_success else 0.0
+                        }
                         
-                        logger.info(f"Order placed successfully: {order_id}. Tracking as active.")
+                        logger.info(f"Order placed: {order_id}. Frozen: {estimated_cost if reserved_success else 0.0}")
                         state.execution_results.append({
                             "symbol": symbol,
                             "order_id": order_id,
                             "status": "submitted",
                             "diff": diff
                         })
+                    else:
+                        # Broker returned None/False immediately? Rollback.
+                        if reserved_success and self.tlm:
+                            await self.tlm.release_cash(estimated_cost)
+
                 except Exception as e:
-                    logger.error(f"Failed to place order for {symbol}: {e}")
-                    state.execution_results.append({
-                        "symbol": symbol,
-                        "error": str(e),
-                        "status": "failed"
-                    })
+                    # [Task P1-EXEC-03] Network Timeout Handling -> AMBIGUOUS
+                    error_msg = str(e).lower()
+                    if any(x in error_msg for x in ['timeout', 'connection', '504', '502']):
+                        logger.warning(f"Network timeout placing order for {symbol}. Entering AMBIGUOUS state. Error: {e}")
+                        self.active_orders[symbol] = {
+                            'id': 'AMBIGUOUS',
+                            'ts': datetime.now().timestamp(),
+                            'frozen_amount': estimated_cost if reserved_success else 0.0
+                        }
+                        # Do NOT release cash here; Watchdog will handle.
+                        state.execution_results.append({
+                            "symbol": symbol,
+                            "error": "Ambiguous (Timeout)",
+                            "status": "unknown"
+                        })
+                    else:
+                        logger.error(f"Failed to place order for {symbol}: {e}")
+                        # Rollback reservation on exception
+                        if reserved_success and self.tlm:
+                            await self.tlm.release_cash(estimated_cost)
+                        
+                        state.execution_results.append({
+                            "symbol": symbol,
+                            "error": str(e),
+                            "status": "failed"
+                        })
